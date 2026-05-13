@@ -7,6 +7,7 @@ pub mod order;
 pub mod error;
 pub mod event;
 pub mod pools;
+pub mod list_pool;
 pub mod skiplist;
 pub mod engine;
 pub mod snapshot;

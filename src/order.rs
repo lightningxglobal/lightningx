@@ -29,8 +29,7 @@ pub struct Order {
     pub filled: f64,
     pub time_in_force: TimeInForce,
     pub timestamp: u64,
-    pub cancelled: bool,
-    _padding: [u8; 17],
+    _padding: [u8; 18],
 }
 
 impl Order {
@@ -51,8 +50,7 @@ impl Order {
             filled: 0.0,
             time_in_force,
             timestamp,
-            cancelled: false,
-            _padding: [0; 17],
+            _padding: [0; 18],
         }
     }
 
@@ -85,8 +83,7 @@ impl Default for Order {
             filled: 0.0,
             time_in_force: TimeInForce::GTC,
             timestamp: 0,
-            cancelled: false,
-            _padding: [0; 17],
+            _padding: [0; 18],
         }
     }
 }

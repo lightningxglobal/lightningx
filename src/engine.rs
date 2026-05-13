@@ -18,8 +18,8 @@ impl MatchingEngine {
     /// 创建新的撮合引擎
     pub fn new(pool_config: PoolConfig) -> OrderResult<Self> {
         Ok(Self {
-            buy_book: SkipList::new(SortOrder::Descending),
-            sell_book: SkipList::new(SortOrder::Ascending),
+            buy_book: SkipList::new_with_pool(SortOrder::Descending, pool_config.queue_capacity),
+            sell_book: SkipList::new_with_pool(SortOrder::Ascending, pool_config.queue_capacity),
             orders: HashMap::with_capacity(pool_config.order_capacity),
             pools: Pools::new(pool_config.order_capacity, pool_config.queue_capacity),
             next_order_id: 1,
@@ -257,37 +257,27 @@ impl MatchingEngine {
                 None => break,
             };
 
-            // 从对手订单簿获取最优价格级别的第一个有效订单ID
-            // 跳过已取消的订单
+            // 从对手订单簿获取最优价格级别的第一个订单ID
+            // 使用List实现后，取消的订单已被真正移除，无需检查cancelled标志
             let counter_order_id = {
                 let opposite_book = match order.side {
                     Side::Buy => &mut self.sell_book,
                     Side::Sell => &mut self.buy_book,
                 };
 
-                let mut found = None;
-                loop {
-                    match opposite_book.get_node_mut(best_price) {
-                        Some(node) => {
-                            match node.orders.pop_front() {
-                                Some(id) => {
-                                    // 检查订单是否被取消
-                                    if let Some(o) = self.orders.get(&id) {
-                                        if !o.cancelled {
-                                            found = Some(id);
-                                            break;
-                                        }
-                                        // 订单已取消，继续循环跳过
-                                    }
-                                }
-                                None => break,  // 队列为空
+                match opposite_book.get_node_mut(best_price) {
+                    Some(node) => {
+                        // 获取链表的第一个节点
+                        if let Some(node_idx) = node.orders.front() {
+                            if let Some(list_node) = opposite_book.list_pool.get(node_idx) {
+                                list_node.order_id
+                            } else {
+                                break;
                             }
+                        } else {
+                            break;  // 链表为空
                         }
-                        None => break,
                     }
-                }
-                match found {
-                    Some(id) => id,
                     None => break,
                 }
             };
@@ -334,8 +324,12 @@ impl MatchingEngine {
             // 检查对手订单是否完全成交，如果是则从订单簿移除
             if let Some(counter) = self.orders.get(&counter_order_id) {
                 if counter.is_filled() {
-                    // 从订单簿的价格档位队列中移除此订单（已通过pop_front移除）
-                    // 如果此价格级别为空，可以移除节点（留作未来优化）
+                    // 从订单簿中移除已成交的订单
+                    let opposite_book = match order.side {
+                        Side::Buy => &mut self.sell_book,
+                        Side::Sell => &mut self.buy_book,
+                    };
+                    let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
                 }
             }
         }
@@ -345,7 +339,7 @@ impl MatchingEngine {
 
     // ===== Task 10: Cancel Order =====
 
-    /// 撤销订单（热路径 - 软删除版本）
+    /// 撤销订单（热路径 - 使用List实现，真正删除）
     #[inline]
     pub fn cancel_order(&mut self, order_id: u64) -> OrderResult<CancelOrderResult> {
         // 查询订单
@@ -358,17 +352,15 @@ impl MatchingEngine {
             return Err(MatchingEngineError::AlreadyFilled);
         }
 
-        // 检查是否已取消
-        if order.cancelled {
-            return Err(MatchingEngineError::AlreadyCancelled);
-        }
-
-        // 获取剩余数量
+        // 获取剩余数量和时间戳
         let remaining = order.remaining();
         let timestamp = order.timestamp;
 
-        // 软删除：只标记为已取消，不从VecDeque移除
-        self.orders.get_mut(&order_id).unwrap().cancelled = true;
+        // 从订单簿中真正移除订单
+        self.remove_from_book(order_id)?;
+
+        // 从orders HashMap中移除
+        self.orders.remove(&order_id);
 
         // 发布撤单事件
         self.publish_event(&MatchingEvent::OrderCancelled {
@@ -414,9 +406,16 @@ impl MatchingEngine {
             // 计算该价格档位的总剩余数量
             let mut total_remaining = 0.0;
             if let Some(node) = self.buy_book.get_node_at_price(price) {
-                for &order_id in &node.orders {
-                    if let Some(order) = self.orders.get(&order_id) {
-                        total_remaining += order.remaining();
+                // 遍历链表中的订单
+                let mut node_idx_opt = node.orders.front();
+                while let Some(node_idx) = node_idx_opt {
+                    if let Some(list_node) = self.buy_book.list_pool.get(node_idx) {
+                        if let Some(order) = self.orders.get(&list_node.order_id) {
+                            total_remaining += order.remaining();
+                        }
+                        node_idx_opt = list_node.next;
+                    } else {
+                        break;
                     }
                 }
             }
@@ -432,9 +431,16 @@ impl MatchingEngine {
             // 计算该价格档位的总剩余数量
             let mut total_remaining = 0.0;
             if let Some(node) = self.sell_book.get_node_at_price(price) {
-                for &order_id in &node.orders {
-                    if let Some(order) = self.orders.get(&order_id) {
-                        total_remaining += order.remaining();
+                // 遍历链表中的订单
+                let mut node_idx_opt = node.orders.front();
+                while let Some(node_idx) = node_idx_opt {
+                    if let Some(list_node) = self.sell_book.list_pool.get(node_idx) {
+                        if let Some(order) = self.orders.get(&list_node.order_id) {
+                            total_remaining += order.remaining();
+                        }
+                        node_idx_opt = list_node.next;
+                    } else {
+                        break;
                     }
                 }
             }

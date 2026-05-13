@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use crate::list_pool::{ListNodePool, PooledList};
 
 const MAX_LEVEL: usize = 12;
 const PROMOTION_PROBABILITY: f64 = 0.25;
@@ -7,7 +7,7 @@ const PROMOTION_PROBABILITY: f64 = 0.25;
 pub struct SkipListNode {
     pub price: f64,
     pub total_quantity: f64,
-    pub orders: VecDeque<u64>,
+    pub orders: PooledList,
     pub forward: Vec<Option<Box<SkipListNode>>>,
     pub level: usize,
 }
@@ -23,7 +23,7 @@ impl SkipListNode {
         Self {
             price,
             total_quantity: 0.0,
-            orders: VecDeque::new(),
+            orders: PooledList::new(),
             forward,
             level,
         }
@@ -51,11 +51,12 @@ pub struct SkipList {
     head: Box<SkipListNode>,
     order: SortOrder,
     count: usize,
+    pub list_pool: ListNodePool,
 }
 
 impl SkipList {
-    /// 创建新跳表
-    pub fn new(order: SortOrder) -> Self {
+    /// 创建新跳表，指定链表节点池的容量
+    pub fn new_with_pool(order: SortOrder, pool_capacity: usize) -> Self {
         let mut forward = Vec::with_capacity(MAX_LEVEL);
         for _ in 0..MAX_LEVEL {
             forward.push(None);
@@ -64,7 +65,7 @@ impl SkipList {
         let head = Box::new(SkipListNode {
             price: if order == SortOrder::Ascending { f64::NEG_INFINITY } else { f64::INFINITY },
             total_quantity: 0.0,
-            orders: VecDeque::new(),
+            orders: PooledList::new(),
             forward,
             level: MAX_LEVEL - 1,
         });
@@ -73,6 +74,7 @@ impl SkipList {
             head,
             order,
             count: 0,
+            list_pool: ListNodePool::new(pool_capacity),
         }
     }
 
@@ -246,6 +248,11 @@ impl SkipList {
     /// 向指定价格档位添加订单ID
     #[inline]
     pub fn add_order_at_level(&mut self, price: f64, order_id: u64, quantity: f64) -> Result<(), String> {
+        // 先从pool中获取节点，避免后续的借用冲突
+        let node_idx = self.list_pool.acquire(order_id, quantity)
+            .ok_or_else(|| "List pool exhausted".to_string())?;
+
+        // 现在处理skiplist导航，此时pool已经用过了
         unsafe {
             let head_ptr = &mut *self.head as *mut SkipListNode;
             let mut current = head_ptr;
@@ -274,13 +281,16 @@ impl SkipList {
             // 在第0层找到精确节点
             if let Some(Some(ref mut next_box)) = (&mut (*current).forward).get_mut(0) {
                 if (next_box.price - price).abs() < 1e-10 {
-                    next_box.orders.push_back(order_id);
+                    // 将节点添加到链表
+                    next_box.orders.push_back(node_idx, &mut self.list_pool);
                     next_box.total_quantity += quantity;
                     return Ok(());
                 }
             }
         }
 
+        // 如果没有找到价格节点，需要释放已获取的pool节点
+        self.list_pool.release(node_idx);
         Err(format!("Price level {} not found", price))
     }
 
@@ -315,10 +325,23 @@ impl SkipList {
             // 在第0层找到精确节点
             if let Some(Some(ref mut next_box)) = (&mut (*current).forward).get_mut(0) {
                 if (next_box.price - price).abs() < 1e-10 {
-                    // 从VecDeque中移除订单
-                    if let Some(pos) = next_box.orders.iter().position(|&id| id == order_id) {
-                        next_box.orders.remove(pos);
-                        return Ok(());
+                    // 从链表中移除订单节点
+                    // 需要遍历链表找到order_id对应的节点
+                    let mut node_idx_opt = next_box.orders.front();
+                    while let Some(node_idx) = node_idx_opt {
+                        // 先保存next指针，避免后续借用冲突
+                        let next_idx = if let Some(node) = self.list_pool.get(node_idx) {
+                            if node.order_id == order_id {
+                                // 找到了，从链表和池中移除
+                                next_box.orders.remove(node_idx, &mut self.list_pool);
+                                self.list_pool.release(node_idx);
+                                return Ok(());
+                            }
+                            node.next
+                        } else {
+                            break;
+                        };
+                        node_idx_opt = next_idx;
                     }
                     return Err(format!("Order {} not found at price level {}", order_id, price));
                 }

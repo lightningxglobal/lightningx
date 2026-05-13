@@ -12,7 +12,9 @@ pub mod engine;
 pub mod snapshot;
 pub mod recovery;
 
-pub use engine::MatchingEngine;
+pub use engine::{
+    MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, Trade, CancelOrderResult,
+};
 pub use order::{Order, Side, TimeInForce};
 pub use error::{MatchingEngineError, OrderResult};
 pub use event::MatchingEvent;

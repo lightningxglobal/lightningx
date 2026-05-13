@@ -60,7 +60,8 @@ impl MatchingEngine {
 
     // ===== Task 8: Place Order Methods =====
 
-    /// 下单
+    /// 下单（热路径）
+    #[inline]
     pub fn place_order(&mut self, mut order: Order) -> OrderResult<PlaceOrderResult> {
         // 验证订单
         self.validate_order(&order)?;
@@ -210,7 +211,8 @@ impl MatchingEngine {
 
     // ===== Task 9: Match Order Logic =====
 
-    /// 撮合订单
+    /// 撮合订单（关键热路径）
+    #[inline]
     fn match_order(&mut self, order: Order) -> OrderResult<(f64, Vec<Trade>)> {
         let mut filled = 0.0;
         let mut trades = Vec::new();
@@ -309,7 +311,8 @@ impl MatchingEngine {
 
     // ===== Task 10: Cancel Order =====
 
-    /// 撤销订单
+    /// 撤销订单（热路径）
+    #[inline]
     pub fn cancel_order(&mut self, order_id: u64) -> OrderResult<CancelOrderResult> {
         // 查询订单
         let order = self.orders.get(&order_id)

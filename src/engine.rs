@@ -381,22 +381,47 @@ impl MatchingEngine {
 
     /// 生成市场深度快照
     pub fn generate_depth_snapshot(&self) -> crate::snapshot::DepthSnapshot {
-        let mut snapshot = crate::snapshot::DepthSnapshot::new(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0),
-            self.snapshot_sequence,
-        );
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
 
-        // 添加买盘价格档位（最多20档）
-        if let Some(best_buy) = self.buy_book.best() {
-            snapshot.add_bid(best_buy.price, best_buy.total_quantity).ok();
+        let mut snapshot = crate::snapshot::DepthSnapshot::new(timestamp, self.snapshot_sequence);
+
+        // 添加买盘价格档位（最多20档）- 降序排列
+        let buy_levels = self.buy_book.get_top_levels(20);
+        for (price, _) in buy_levels {
+            // 计算该价格档位的总剩余数量
+            let mut total_remaining = 0.0;
+            if let Some(node) = self.buy_book.get_node_at_price(price) {
+                for &order_id in &node.orders {
+                    if let Some(order) = self.orders.get(&order_id) {
+                        total_remaining += order.remaining();
+                    }
+                }
+            }
+
+            if total_remaining > 0.0 {
+                snapshot.add_bid(price, total_remaining).ok();
+            }
         }
 
-        // 添加卖盘价格档位（最多20档）
-        if let Some(best_sell) = self.sell_book.best() {
-            snapshot.add_ask(best_sell.price, best_sell.total_quantity).ok();
+        // 添加卖盘价格档位（最多20档）- 升序排列
+        let sell_levels = self.sell_book.get_top_levels(20);
+        for (price, _) in sell_levels {
+            // 计算该价格档位的总剩余数量
+            let mut total_remaining = 0.0;
+            if let Some(node) = self.sell_book.get_node_at_price(price) {
+                for &order_id in &node.orders {
+                    if let Some(order) = self.orders.get(&order_id) {
+                        total_remaining += order.remaining();
+                    }
+                }
+            }
+
+            if total_remaining > 0.0 {
+                snapshot.add_ask(price, total_remaining).ok();
+            }
         }
 
         snapshot

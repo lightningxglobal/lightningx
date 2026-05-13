@@ -334,4 +334,47 @@ impl SkipList {
         }
         self.count = 0;
     }
+
+    /// 获取前N个价格档位（用于生成快照）
+    pub fn get_top_levels(&self, limit: usize) -> Vec<(f64, f64)> {
+        let mut result = Vec::new();
+        let mut current = &self.head;
+
+        while result.len() < limit {
+            match current.forward.get(0).and_then(|opt| opt.as_ref()) {
+                Some(node) => {
+                    result.push((node.price, node.total_quantity));
+                    current = node;
+                }
+                None => break,
+            }
+        }
+
+        result
+    }
+
+    /// 获取指定价格的只读节点
+    #[inline]
+    pub fn get_node_at_price(&self, price: f64) -> Option<&SkipListNode> {
+        let mut current = &self.head;
+
+        for _ in 0..MAX_LEVEL {
+            loop {
+                if let Some(ref next) = current.forward.get(0).and_then(|opt| opt.as_ref()) {
+                    if (next.price - price).abs() < 1e-10 {
+                        return Some(next);
+                    }
+
+                    if self.should_insert(price, next.price) {
+                        break;
+                    }
+                    current = next;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        None
+    }
 }

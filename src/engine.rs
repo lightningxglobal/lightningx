@@ -295,10 +295,11 @@ impl MatchingEngine {
                 timestamp: order.timestamp,
             });
 
-            // 检查对手订单是否完全成交
+            // 检查对手订单是否完全成交，如果是则从订单簿移除
             if let Some(counter) = self.orders.get(&counter_order_id) {
                 if counter.is_filled() {
-                    // 从订单簿移除（简化版本，TODO: 完整实现）
+                    // 从订单簿的价格档位队列中移除此订单
+                    let _ = self.remove_order_from_book(counter_order_id, best_price);
                 }
             }
         }
@@ -341,19 +342,36 @@ impl MatchingEngine {
         })
     }
 
-    /// 从订单簿移除订单
+    /// 从订单簿的价格档位队列中移除已成交订单
+    fn remove_order_from_book(&mut self, order_id: u64, price: f64) -> OrderResult<()> {
+        let order = self.orders.get(&order_id)
+            .copied()
+            .ok_or(MatchingEngineError::OrderNotFound)?;
+
+        let book = match order.side {
+            Side::Buy => &mut self.buy_book,
+            Side::Sell => &mut self.sell_book,
+        };
+
+        // 从指定价格的订单队列中移除订单ID
+        let _ = book.remove_order_at_level(price, order_id);
+
+        Ok(())
+    }
+
+    /// 从订单簿移除未成交订单（取消订单时调用）
     fn remove_from_book(&mut self, order_id: u64) -> OrderResult<()> {
         let order = self.orders.get(&order_id)
             .copied()
             .ok_or(MatchingEngineError::OrderNotFound)?;
 
-        let _book = match order.side {
+        let book = match order.side {
             Side::Buy => &mut self.buy_book,
             Side::Sell => &mut self.sell_book,
         };
 
-        // 简化版本：从价格档位的订单队列中移除
-        // TODO: 实现完整的从跳表节点的VecDeque中移除订单
+        // 从价格档位的订单队列中移除此订单
+        let _ = book.remove_order_at_level(order.price, order_id);
 
         Ok(())
     }

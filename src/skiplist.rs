@@ -186,6 +186,50 @@ impl SkipList {
             .map(|b| &**b)
     }
 
+    /// 从指定价格的订单队列中移除订单
+    pub fn remove_order_at_level(&mut self, price: f64, order_id: u64) -> Result<(), String> {
+        unsafe {
+            let head_ptr = &mut *self.head as *mut SkipListNode;
+            let mut current = head_ptr;
+
+            // 从最高层向下遍历找到目标节点
+            for i in (0..MAX_LEVEL).rev() {
+                loop {
+                    let forward_ref = &(&(*current).forward);
+                    if let Some(Some(ref next_box)) = forward_ref.get(i) {
+                        let price_match = (next_box.price - price).abs() < 1e-10;
+
+                        if price_match {
+                            // 找到目标价格，下一层继续查找
+                            break;
+                        }
+
+                        if self.should_insert(price, next_box.price) {
+                            break;
+                        }
+                        current = next_box.as_ref() as *const SkipListNode as *mut SkipListNode;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // 在第0层找到精确节点
+            if let Some(Some(ref mut next_box)) = (&mut (*current).forward).get_mut(0) {
+                if (next_box.price - price).abs() < 1e-10 {
+                    // 从VecDeque中移除订单
+                    if let Some(pos) = next_box.orders.iter().position(|&id| id == order_id) {
+                        next_box.orders.remove(pos);
+                        return Ok(());
+                    }
+                    return Err(format!("Order {} not found at price level {}", order_id, price));
+                }
+            }
+        }
+
+        Err(format!("Price level {} not found", price))
+    }
+
     /// 清空跳表
     pub fn clear(&mut self) {
         self.head.forward.clear();

@@ -15,7 +15,7 @@ pub struct SkipListNode {
 impl SkipListNode {
     /// 创建新节点
     fn new(price: f64, level: usize) -> Self {
-        let mut forward = Vec::with_capacity(MAX_LEVEL);
+        let mut forward = Vec::with_capacity(level + 1);
         for _ in 0..=level {
             forward.push(None);
         }
@@ -91,7 +91,7 @@ impl SkipList {
         }
     }
 
-    /// 插入价格档位节点
+    /// 插入价格档位节点 - 完整实现
     pub fn insert_level(&mut self, price: f64) -> Result<(), String> {
         // 检查是否已存在
         if self.find_node(price).is_ok() {
@@ -99,37 +99,72 @@ impl SkipList {
         }
 
         let level = SkipListNode::random_level();
-        let new_node = Box::new(SkipListNode::new(price, level));
 
-        // 简化实现：在最低层插入节点
-        // 对于完整的跳表，需要在每一层找到插入位置
-        if let Some(first) = self.head.forward[0].take() {
-            if self.should_insert(price, first.price) {
-                let mut new = new_node;
-                new.forward[0] = Some(first);
-                self.head.forward[0] = Some(new);
-            } else {
-                self.head.forward[0] = Some(first);
-                // 在后续节点之后插入（简化）
+        // 使用栈记录每层的插入点 - 存储原始指针
+        let mut update: Vec<*mut SkipListNode> = vec![std::ptr::null_mut(); MAX_LEVEL];
+
+        unsafe {
+            let head_ptr = &mut *self.head as *mut SkipListNode;
+            let mut current = head_ptr;
+
+            // 从最高层向下遍历，找到每层的插入位置
+            for i in (0..MAX_LEVEL).rev() {
+                // 在第i层向右遍历
+                loop {
+                    // 显式创建引用来安全访问Vec
+                    let forward_ref = &(&(*current).forward);
+                    if let Some(Some(ref next_box)) = forward_ref.get(i) {
+                        if self.should_insert(price, next_box.price) {
+                            break;
+                        }
+                        // 从不可变引用获取原始指针来继续遍历
+                        current = next_box.as_ref() as *const SkipListNode as *mut SkipListNode;
+                    } else {
+                        break;
+                    }
+                }
+
+                // 记录该层的插入点
+                update[i] = current;
             }
-        } else {
-            self.head.forward[0] = Some(new_node);
+
+            // 创建新节点
+            let new_node = Box::new(SkipListNode::new(price, level));
+            let new_node_ptr = Box::into_raw(new_node);
+
+            // 在每一层进行插入 - 从低层到高层
+            for i in 0..=level {
+                let prev = update[i];
+
+                // 显式创建可变引用来安全访问Vec
+                let prev_forward_mut = &mut (&mut (*prev).forward);
+                let new_node_forward_mut = &mut (&mut (*new_node_ptr).forward);
+
+                // 新节点的forward[i]指向prev的forward[i]
+                new_node_forward_mut[i] = prev_forward_mut[i].take();
+
+                // prev的forward[i]指向新节点
+                prev_forward_mut[i] = Some(Box::from_raw(new_node_ptr));
+            }
         }
 
         self.count += 1;
         Ok(())
     }
 
-    /// 查找价格节点
+    /// 查找价格节点 - 改进的实现
     pub fn find_node(&self, price: f64) -> Result<(), String> {
         let mut current = &self.head;
 
         for i in (0..MAX_LEVEL).rev() {
             loop {
                 if let Some(ref next) = current.forward.get(i).and_then(|opt| opt.as_ref()) {
+                    // 检查是否找到了目标价格
                     if (next.price - price).abs() < 1e-10 {
                         return Ok(());
                     }
+
+                    // 检查是否应该继续在这一层遍历
                     if self.should_insert(price, next.price) {
                         break;
                     }

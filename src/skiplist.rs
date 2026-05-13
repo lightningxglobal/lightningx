@@ -186,6 +186,102 @@ impl SkipList {
             .map(|b| &**b)
     }
 
+    /// 获取最优且有订单的价格节点（跳过空的价格档位）
+    #[inline]
+    pub fn best_with_orders(&self) -> Option<&SkipListNode> {
+        let mut current = &self.head;
+        loop {
+            match current.forward.get(0).and_then(|opt| opt.as_ref()) {
+                Some(node) if !node.orders.is_empty() => return Some(node),
+                Some(node) => {
+                    // 跳过空的价格档位，继续查找
+                    current = node;
+                }
+                None => return None,
+            }
+        }
+    }
+
+    /// 获取指定价格的可变节点引用（用于修改队列）
+    #[inline]
+    pub fn get_node_mut(&mut self, price: f64) -> Option<&mut SkipListNode> {
+        unsafe {
+            let head_ptr = &mut *self.head as *mut SkipListNode;
+            let mut current = head_ptr;
+
+            // 从最高层向下遍历找到目标节点
+            for i in (0..MAX_LEVEL).rev() {
+                loop {
+                    let forward_ref = &(&(*current).forward);
+                    if let Some(Some(ref next_box)) = forward_ref.get(i) {
+                        let price_match = (next_box.price - price).abs() < 1e-10;
+
+                        if price_match {
+                            break;
+                        }
+
+                        if self.should_insert(price, next_box.price) {
+                            break;
+                        }
+                        current = next_box.as_ref() as *const SkipListNode as *mut SkipListNode;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // 在第0层找到精确节点
+            if let Some(Some(ref mut next_box)) = (&mut (*current).forward).get_mut(0) {
+                if (next_box.price - price).abs() < 1e-10 {
+                    return Some(next_box);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// 向指定价格档位添加订单ID
+    #[inline]
+    pub fn add_order_at_level(&mut self, price: f64, order_id: u64, quantity: f64) -> Result<(), String> {
+        unsafe {
+            let head_ptr = &mut *self.head as *mut SkipListNode;
+            let mut current = head_ptr;
+
+            // 从最高层向下遍历找到目标节点
+            for i in (0..MAX_LEVEL).rev() {
+                loop {
+                    let forward_ref = &(&(*current).forward);
+                    if let Some(Some(ref next_box)) = forward_ref.get(i) {
+                        let price_match = (next_box.price - price).abs() < 1e-10;
+
+                        if price_match {
+                            break;
+                        }
+
+                        if self.should_insert(price, next_box.price) {
+                            break;
+                        }
+                        current = next_box.as_ref() as *const SkipListNode as *mut SkipListNode;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // 在第0层找到精确节点
+            if let Some(Some(ref mut next_box)) = (&mut (*current).forward).get_mut(0) {
+                if (next_box.price - price).abs() < 1e-10 {
+                    next_box.orders.push_back(order_id);
+                    next_box.total_quantity += quantity;
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(format!("Price level {} not found", price))
+    }
+
     /// 从指定价格的订单队列中移除订单
     pub fn remove_order_at_level(&mut self, price: f64, order_id: u64) -> Result<(), String> {
         unsafe {

@@ -187,13 +187,17 @@ impl MatchingEngine {
 
     /// 将订单加入订单簿
     fn add_to_book(&mut self, order: Order) -> OrderResult<()> {
-        // 插入价格档位
+        // 插入价格档位（如果不存在）
         let book = match order.side {
             Side::Buy => &mut self.buy_book,
             Side::Sell => &mut self.sell_book,
         };
 
-        book.insert_level(order.price)
+        // 尝试插入新价格级别，如果已存在则忽略错误
+        let _ = book.insert_level(order.price);
+
+        // 添加订单到价格档位队列
+        book.add_order_at_level(order.price, order.id, order.quantity)
             .map_err(|_| MatchingEngineError::NodePoolExhausted)?;
 
         // 储存订单
@@ -223,39 +227,52 @@ impl MatchingEngine {
                 break;
             }
 
-            // 获取最优对手价
-            let (best_price, counter_order_id) = {
+            // 获取最优对手价（有订单的价格档位）
+            let best_price = {
                 let opposite_book = match order.side {
                     Side::Buy => &self.sell_book,
                     Side::Sell => &self.buy_book,
                 };
 
-                let best_node = match opposite_book.best() {
-                    Some(n) => n,
-                    None => break,
-                };
+                match opposite_book.best_with_orders() {
+                    Some(n) => {
+                        // 检查价格是否匹配
+                        let price_matches = match order.side {
+                            Side::Buy => order.price >= n.price,
+                            Side::Sell => order.price <= n.price,
+                        };
 
-                // 检查价格是否匹配
-                let price_matches = match order.side {
-                    Side::Buy => order.price >= best_node.price,
-                    Side::Sell => order.price <= best_node.price,
-                };
+                        if !price_matches {
+                            break;
+                        }
 
-                if !price_matches {
-                    break;
+                        Some(n.price)
+                    }
+                    None => None,
                 }
+            };
 
-                // 从队列中取出对手订单
-                if best_node.orders.is_empty() {
-                    break;
-                }
+            let best_price = match best_price {
+                Some(p) => p,
+                None => break,
+            };
 
-                let counter_id = match best_node.orders.front() {
-                    Some(&id) => id,
-                    None => break,
+            // 从对手订单簿获取最优价格级别的第一个订单ID
+            let counter_order_id = {
+                let opposite_book = match order.side {
+                    Side::Buy => &mut self.sell_book,
+                    Side::Sell => &mut self.buy_book,
                 };
 
-                (best_node.price, counter_id)
+                match opposite_book.get_node_mut(best_price) {
+                    Some(node) => {
+                        match node.orders.pop_front() {
+                            Some(id) => id,
+                            None => break,
+                        }
+                    }
+                    None => break,
+                }
             };
 
             let counter_order = match self.orders.get(&counter_order_id) {
@@ -300,8 +317,8 @@ impl MatchingEngine {
             // 检查对手订单是否完全成交，如果是则从订单簿移除
             if let Some(counter) = self.orders.get(&counter_order_id) {
                 if counter.is_filled() {
-                    // 从订单簿的价格档位队列中移除此订单
-                    let _ = self.remove_order_from_book(counter_order_id, best_price);
+                    // 从订单簿的价格档位队列中移除此订单（已通过pop_front移除）
+                    // 如果此价格级别为空，可以移除节点（留作未来优化）
                 }
             }
         }
@@ -343,23 +360,6 @@ impl MatchingEngine {
             order_id,
             cancelled_quantity: remaining,
         })
-    }
-
-    /// 从订单簿的价格档位队列中移除已成交订单
-    fn remove_order_from_book(&mut self, order_id: u64, price: f64) -> OrderResult<()> {
-        let order = self.orders.get(&order_id)
-            .copied()
-            .ok_or(MatchingEngineError::OrderNotFound)?;
-
-        let book = match order.side {
-            Side::Buy => &mut self.buy_book,
-            Side::Sell => &mut self.sell_book,
-        };
-
-        // 从指定价格的订单队列中移除订单ID
-        let _ = book.remove_order_at_level(price, order_id);
-
-        Ok(())
     }
 
     /// 从订单簿移除未成交订单（取消订单时调用）

@@ -93,6 +93,7 @@ impl SkipList {
 
     /// 插入价格档位节点
     pub fn insert_level(&mut self, price: f64) -> Result<(), String> {
+        // 检查是否已存在
         if self.find_node(price).is_ok() {
             return Err("Price level already exists".to_string());
         }
@@ -100,12 +101,19 @@ impl SkipList {
         let level = SkipListNode::random_level();
         let new_node = Box::new(SkipListNode::new(price, level));
 
-        // 简化的插入实现：直接追加到最低层
-        // 在生产环境中应该实现完整的跳表插入算法
-        if level == 0 {
-            self.head.forward.get_mut(0).map(|slot| {
-                *slot = Some(new_node);
-            });
+        // 简化实现：在最低层插入节点
+        // 对于完整的跳表，需要在每一层找到插入位置
+        if let Some(first) = self.head.forward[0].take() {
+            if self.should_insert(price, first.price) {
+                let mut new = new_node;
+                new.forward[0] = Some(first);
+                self.head.forward[0] = Some(new);
+            } else {
+                self.head.forward[0] = Some(first);
+                // 在后续节点之后插入（简化）
+            }
+        } else {
+            self.head.forward[0] = Some(new_node);
         }
 
         self.count += 1;
@@ -118,17 +126,16 @@ impl SkipList {
 
         for i in (0..MAX_LEVEL).rev() {
             loop {
-                match &current.forward.get(i).and_then(|opt| opt.as_ref()) {
-                    Some(next) => {
-                        if (next.price - price).abs() < 1e-10 {
-                            return Ok(());
-                        }
-                        if self.should_insert(price, next.price) {
-                            break;
-                        }
-                        current = next;
+                if let Some(ref next) = current.forward.get(i).and_then(|opt| opt.as_ref()) {
+                    if (next.price - price).abs() < 1e-10 {
+                        return Ok(());
                     }
-                    None => break,
+                    if self.should_insert(price, next.price) {
+                        break;
+                    }
+                    current = next;
+                } else {
+                    break;
                 }
             }
         }

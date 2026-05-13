@@ -20,3 +20,7 @@ strip = false
 
 [profile.bench]
 inherits = "release"
+
+[[bench]]
+name = "matching_bench"
+harness = false

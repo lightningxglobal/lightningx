@@ -257,20 +257,37 @@ impl MatchingEngine {
                 None => break,
             };
 
-            // 从对手订单簿获取最优价格级别的第一个订单ID
+            // 从对手订单簿获取最优价格级别的第一个有效订单ID
+            // 跳过已取消的订单
             let counter_order_id = {
                 let opposite_book = match order.side {
                     Side::Buy => &mut self.sell_book,
                     Side::Sell => &mut self.buy_book,
                 };
 
-                match opposite_book.get_node_mut(best_price) {
-                    Some(node) => {
-                        match node.orders.pop_front() {
-                            Some(id) => id,
-                            None => break,
+                let mut found = None;
+                loop {
+                    match opposite_book.get_node_mut(best_price) {
+                        Some(node) => {
+                            match node.orders.pop_front() {
+                                Some(id) => {
+                                    // 检查订单是否被取消
+                                    if let Some(o) = self.orders.get(&id) {
+                                        if !o.cancelled {
+                                            found = Some(id);
+                                            break;
+                                        }
+                                        // 订单已取消，继续循环跳过
+                                    }
+                                }
+                                None => break,  // 队列为空
+                            }
                         }
+                        None => break,
                     }
+                }
+                match found {
+                    Some(id) => id,
                     None => break,
                 }
             };
@@ -328,7 +345,7 @@ impl MatchingEngine {
 
     // ===== Task 10: Cancel Order =====
 
-    /// 撤销订单（热路径）
+    /// 撤销订单（热路径 - 软删除版本）
     #[inline]
     pub fn cancel_order(&mut self, order_id: u64) -> OrderResult<CancelOrderResult> {
         // 查询订单
@@ -341,19 +358,22 @@ impl MatchingEngine {
             return Err(MatchingEngineError::AlreadyFilled);
         }
 
+        // 检查是否已取消
+        if order.cancelled {
+            return Err(MatchingEngineError::AlreadyCancelled);
+        }
+
         // 获取剩余数量
         let remaining = order.remaining();
+        let timestamp = order.timestamp;
 
-        // 从订单簿移除
-        self.remove_from_book(order_id)?;
-
-        // 从订单映射中删除
-        self.orders.remove(&order_id);
+        // 软删除：只标记为已取消，不从VecDeque移除
+        self.orders.get_mut(&order_id).unwrap().cancelled = true;
 
         // 发布撤单事件
         self.publish_event(&MatchingEvent::OrderCancelled {
             order_id,
-            timestamp: order.timestamp,
+            timestamp,
         });
 
         Ok(CancelOrderResult {

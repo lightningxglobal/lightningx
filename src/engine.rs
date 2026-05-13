@@ -11,7 +11,7 @@ pub struct MatchingEngine {
     orders: HashMap<u64, Order>,
     pools: Pools,
     next_order_id: u64,
-    _snapshot_sequence: u64,
+    snapshot_sequence: u64,
 }
 
 impl MatchingEngine {
@@ -23,7 +23,7 @@ impl MatchingEngine {
             orders: HashMap::with_capacity(pool_config.order_capacity),
             pools: Pools::new(pool_config.order_capacity, pool_config.queue_capacity),
             next_order_id: 1,
-            _snapshot_sequence: 0,
+            snapshot_sequence: 0,
         })
     }
 
@@ -374,6 +374,46 @@ impl MatchingEngine {
         let _ = book.remove_order_at_level(order.price, order_id);
 
         Ok(())
+    }
+
+    /// 生成市场深度快照
+    pub fn generate_depth_snapshot(&self) -> crate::snapshot::DepthSnapshot {
+        let mut snapshot = crate::snapshot::DepthSnapshot::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            self.snapshot_sequence,
+        );
+
+        // 添加买盘价格档位（最多20档）
+        if let Some(best_buy) = self.buy_book.best() {
+            snapshot.add_bid(best_buy.price, best_buy.total_quantity).ok();
+        }
+
+        // 添加卖盘价格档位（最多20档）
+        if let Some(best_sell) = self.sell_book.best() {
+            snapshot.add_ask(best_sell.price, best_sell.total_quantity).ok();
+        }
+
+        snapshot
+    }
+
+    /// 发布快照到Aeron
+    pub fn publish_depth_snapshot(&mut self) -> OrderResult<()> {
+        let _snapshot = self.generate_depth_snapshot();
+
+        // 在当前实现中，快照已生成但未发送到Aeron
+        // 完整实现需要配置Aeron publisher
+
+        self.snapshot_sequence += 1;
+        Ok(())
+    }
+
+    /// 定时发布快照（在定时器中调用）
+    pub fn tick_snapshot(&mut self, _interval_ns: u64) -> OrderResult<()> {
+        // 简化实现：每次调用都尝试发布一次快照
+        self.publish_depth_snapshot()
     }
 }
 

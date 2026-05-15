@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 aeron-wrapper = { path = "../aeron-wrapper" }
 tracing = "0.1"
+tracing-subscriber = "0.3"
 rand = "0.8"
 rtrb = "0.3"
 parking_lot = "0.12"

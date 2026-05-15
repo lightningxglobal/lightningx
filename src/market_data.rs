@@ -1209,6 +1209,122 @@ impl SnapshotTimer {
     }
 }
 
+/// Aeron快照发布器线程控制
+///
+/// SnapshotPublisherThread在单独的线程中运行，消费PublishedSnapshot通道
+/// 并通过Aeron发布到WebSocket服务器和其他消费者。
+///
+/// # 线程安全
+///
+/// - should_stop标志通过AtomicBool安全共享
+/// - 发布线程独占访问Publisher（无并发问题）
+pub struct SnapshotPublisherThread {
+    /// 停止信号
+    should_stop: Arc<AtomicBool>,
+}
+
+impl SnapshotPublisherThread {
+    /// 启动Aeron快照发布线程
+    ///
+    /// # 参数
+    /// - `snapshot_rx`: PublishedSnapshot接收器，由SnapshotTimer生成
+    /// - `aeron_config`: Aeron配置（目录、通道、流ID）
+    ///
+    /// # 返回
+    /// SnapshotPublisherThread控制句柄，用于停止线程
+    ///
+    /// # 行为
+    /// 线程会：
+    /// 1. 创建到Aeron媒体驱动的连接
+    /// 2. 持续消费snapshot_rx通道
+    /// 3. 将每个快照序列化为二进制格式
+    /// 4. 通过Aeron发布到订阅者
+    /// 5. 优雅地处理背压（丢弃快照而不是阻塞）
+    /// 6. 当should_stop标志被设置时退出
+    ///
+    /// 如果连接初始化失败，线程将记录错误并退出。
+    pub fn spawn(
+        snapshot_rx: Receiver<PublishedSnapshot>,
+        aeron_config: crate::aeron_publisher::AeronConfig,
+    ) -> Self {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = should_stop.clone();
+
+        thread::spawn(move || {
+            // 初始化Aeron发布器
+            let publisher = match crate::aeron_publisher::SnapshotPublisher::new(aeron_config) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to initialize Aeron publisher: {}", e);
+                    return;
+                }
+            };
+
+            let mut dropped_count = 0u64;
+            let mut published_count = 0u64;
+
+            loop {
+                // 检查是否应该停止
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // 尝试从通道接收快照（非阻塞）
+                match snapshot_rx.try_recv() {
+                    Ok(snapshot) => {
+                        // 尝试发布快照
+                        match publisher.publish(&snapshot) {
+                            Ok(()) => {
+                                published_count = published_count.wrapping_add(1);
+                            }
+                            Err(crate::aeron_publisher::PublisherError::BackPressured) => {
+                                // 环形缓冲区已满，丢弃此快照
+                                // 这是正常情况，不值得记录每一次
+                                dropped_count = dropped_count.wrapping_add(1);
+                            }
+                            Err(crate::aeron_publisher::PublisherError::NotConnected) => {
+                                // 没有连接的订阅者，忽略此快照
+                                dropped_count = dropped_count.wrapping_add(1);
+                            }
+                            Err(e) => {
+                                // 其他错误（序列化失败、已关闭等）
+                                eprintln!("Error publishing snapshot: {}", e);
+                                // 仍然计为丢弃
+                                dropped_count = dropped_count.wrapping_add(1);
+                            }
+                        }
+                    }
+                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                        // 通道暂时为空，让出CPU让出时间
+                        std::thread::yield_now();
+                    }
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        // 发送方已关闭，停止发布线程
+                        break;
+                    }
+                }
+            }
+
+            // 线程退出时的诊断信息
+            tracing::info!(
+                "Snapshot publisher thread stopped. Published: {}, Dropped: {}",
+                published_count,
+                dropped_count
+            );
+        });
+
+        Self { should_stop }
+    }
+
+    /// 停止发布线程
+    ///
+    /// 此方法是非阻塞的，它设置停止标志但不等待线程退出。
+    /// 线程将在下一次迭代时看到标志并退出。
+    pub fn stop(&self) {
+        self.should_stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

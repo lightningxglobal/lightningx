@@ -13,6 +13,7 @@ pub mod engine;
 pub mod snapshot;
 pub mod recovery;
 pub mod market_data;
+pub mod aeron_publisher;
 
 pub use engine::{
     MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, Trade, CancelOrderResult,
@@ -23,7 +24,10 @@ pub use event::MatchingEvent;
 pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use market_data::{
     TradeEvent, MarketDataEngine, BBOSnapshot, Level2Snapshot, AggregateTrade, Statistics24h,
-    PublishedSnapshot, SnapshotTimer,
+    PublishedSnapshot, SnapshotTimer, SnapshotPublisherThread,
+};
+pub use aeron_publisher::{
+    SnapshotPublisher, AeronConfig, PublisherResult, PublisherError,
 };
 
 #[cfg(test)]

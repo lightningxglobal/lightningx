@@ -526,6 +526,139 @@ impl MarketDataEngine {
         }
     }
 
+    /// 从交易事件更新Level2深度档位
+    ///
+    /// 基于交易事件的价格和数量，更新维护的Level2档位列表。
+    /// 对于每笔交易：
+    /// - 如果是买方成交：找到对应卖价档位并减少数量
+    /// - 如果是卖方成交：找到对应买价档位并减少数量
+    /// - 如果该档位数量降至0，则从列表中移除
+    /// - 保持买档（降序）和卖档（升序）的排序
+    ///
+    /// # 参数
+    /// - `event`: 交易事件
+    ///
+    /// # 返回
+    /// 如果Level2状态发生变化返回true，否则返回false
+    #[inline]
+    fn update_level2_from_trade(&mut self, event: TradeEvent) -> bool {
+        let mut changed = false;
+
+        match event.side {
+            Side::Buy => {
+                // 买方成交：更新卖方档位
+                // 在asks中查找event.price的档位
+                for i in 0..self.level2_snapshot.num_asks as usize {
+                    if (self.level2_snapshot.asks[i].price - event.price).abs() < 1e-10 {
+                        // 找到相同价格的档位，减少数量
+                        self.level2_snapshot.asks[i].quantity -= event.quantity;
+                        if self.level2_snapshot.asks[i].quantity < 1e-10 {
+                            // 数量降至0，从列表中移除
+                            for j in i..self.level2_snapshot.num_asks as usize - 1 {
+                                self.level2_snapshot.asks[j] = self.level2_snapshot.asks[j + 1];
+                            }
+                            // 清除最后一个元素
+                            self.level2_snapshot.asks[self.level2_snapshot.num_asks as usize - 1] =
+                                PriceLevel::default();
+                            self.level2_snapshot.num_asks -= 1;
+                        }
+                        changed = true;
+                        break;
+                    }
+                }
+
+                // 如果在现有档位中没有找到该价格，则添加为新档位
+                if !changed && self.level2_snapshot.num_asks < 10 {
+                    // 在保持升序的情况下，找到插入位置
+                    let mut insert_pos = self.level2_snapshot.num_asks as usize;
+                    for i in 0..self.level2_snapshot.num_asks as usize {
+                        if event.price < self.level2_snapshot.asks[i].price {
+                            insert_pos = i;
+                            break;
+                        }
+                    }
+
+                    // 向后移动元素
+                    for i in (insert_pos..self.level2_snapshot.num_asks as usize).rev() {
+                        self.level2_snapshot.asks[i + 1] = self.level2_snapshot.asks[i];
+                    }
+
+                    // 插入新档位
+                    self.level2_snapshot.asks[insert_pos] = PriceLevel::new(event.price, event.quantity);
+                    self.level2_snapshot.num_asks += 1;
+                    changed = true;
+                }
+            }
+            Side::Sell => {
+                // 卖方成交：更新买方档位
+                // 在bids中查找event.price的档位
+                for i in 0..self.level2_snapshot.num_bids as usize {
+                    if (self.level2_snapshot.bids[i].price - event.price).abs() < 1e-10 {
+                        // 找到相同价格的档位，减少数量
+                        self.level2_snapshot.bids[i].quantity -= event.quantity;
+                        if self.level2_snapshot.bids[i].quantity < 1e-10 {
+                            // 数量降至0，从列表中移除
+                            for j in i..self.level2_snapshot.num_bids as usize - 1 {
+                                self.level2_snapshot.bids[j] = self.level2_snapshot.bids[j + 1];
+                            }
+                            // 清除最后一个元素
+                            self.level2_snapshot.bids[self.level2_snapshot.num_bids as usize - 1] =
+                                PriceLevel::default();
+                            self.level2_snapshot.num_bids -= 1;
+                        }
+                        changed = true;
+                        break;
+                    }
+                }
+
+                // 如果在现有档位中没有找到该价格，则添加为新档位
+                if !changed && self.level2_snapshot.num_bids < 10 {
+                    // 在保持降序的情况下，找到插入位置
+                    let mut insert_pos = self.level2_snapshot.num_bids as usize;
+                    for i in 0..self.level2_snapshot.num_bids as usize {
+                        if event.price > self.level2_snapshot.bids[i].price {
+                            insert_pos = i;
+                            break;
+                        }
+                    }
+
+                    // 向后移动元素
+                    for i in (insert_pos..self.level2_snapshot.num_bids as usize).rev() {
+                        self.level2_snapshot.bids[i + 1] = self.level2_snapshot.bids[i];
+                    }
+
+                    // 插入新档位
+                    self.level2_snapshot.bids[insert_pos] = PriceLevel::new(event.price, event.quantity);
+                    self.level2_snapshot.num_bids += 1;
+                    changed = true;
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// 生成Level2快照
+    ///
+    /// 基于当前的Level2状态创建快照副本。
+    /// 此方法应在每次Level2更新后调用以生成最新的快照。
+    ///
+    /// # 返回
+    /// 当前状态的Level2Snapshot副本
+    #[allow(dead_code)]
+    #[inline]
+    fn generate_level2_snapshot(&self) -> Level2Snapshot {
+        Level2Snapshot {
+            timestamp: self.level2_snapshot.timestamp,
+            sequence: self.level2_snapshot.sequence,
+            bids: self.level2_snapshot.bids,
+            asks: self.level2_snapshot.asks,
+            num_bids: self.level2_snapshot.num_bids,
+            num_asks: self.level2_snapshot.num_asks,
+            _padding: [0; 12],
+        }
+    }
+
     /// 消费交易事件，更新所有内部状态
     ///
     /// 此方法在接收到TradeEvent时被调用，用于：
@@ -573,7 +706,9 @@ impl MarketDataEngine {
         // 更新BBO状态 - Task 2.2
         let _ = self.update_bbo_from_trade(event);
 
-        // TODO: Level2更新逻辑 - Task 2.3
+        // 更新Level2状态 - Task 2.3
+        let _ = self.update_level2_from_trade(event);
+
         // TODO: 聚合成交数据更新逻辑 - Task 2.4
 
         true
@@ -1287,6 +1422,409 @@ mod tests {
         assert_eq!(stats.quote_asset_volume_24h, expected_quote_volume);
         assert_eq!(stats.price_24h_high, 50100.0);
         assert_eq!(stats.price_24h_low, 49950.0);
+    }
+
+    // ===== Level2 更新逻辑测试 - Task 2.3 =====
+
+    #[test]
+    fn test_level2_initialization_empty_state() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let engine = MarketDataEngine::new(receiver);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.timestamp, 0);
+        assert_eq!(l2.sequence, 0);
+        assert_eq!(l2.num_bids, 0);
+        assert_eq!(l2.num_asks, 0);
+    }
+
+    #[test]
+    fn test_level2_update_on_first_buy_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event);
+
+        let l2 = engine.get_level2_snapshot();
+        // 买方成交：添加卖档
+        assert_eq!(l2.num_asks, 1);
+        assert_eq!(l2.asks[0].price, 50000.0);
+        assert_eq!(l2.asks[0].quantity, 10.0);
+        assert_eq!(l2.num_bids, 0);
+    }
+
+    #[test]
+    fn test_level2_update_on_first_sell_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event);
+
+        let l2 = engine.get_level2_snapshot();
+        // 卖方成交：添加买档
+        assert_eq!(l2.num_bids, 1);
+        assert_eq!(l2.bids[0].price, 50000.0);
+        assert_eq!(l2.bids[0].quantity, 10.0);
+        assert_eq!(l2.num_asks, 0);
+    }
+
+    #[test]
+    fn test_level2_ask_quantity_reduction() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade at 50000 with qty 20
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let l2_1 = engine.get_level2_snapshot();
+        assert_eq!(l2_1.num_asks, 1);
+        assert_eq!(l2_1.asks[0].quantity, 20.0);
+
+        // Second trade at same price with qty 8
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let l2_2 = engine.get_level2_snapshot();
+        assert_eq!(l2_2.num_asks, 1);
+        assert_eq!(l2_2.asks[0].price, 50000.0);
+        assert_eq!(l2_2.asks[0].quantity, 12.0); // 20 - 8
+    }
+
+    #[test]
+    fn test_level2_bid_quantity_reduction() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade at 50000 with qty 20
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let l2_1 = engine.get_level2_snapshot();
+        assert_eq!(l2_1.num_bids, 1);
+        assert_eq!(l2_1.bids[0].quantity, 20.0);
+
+        // Second trade at same price with qty 8
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Sell, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let l2_2 = engine.get_level2_snapshot();
+        assert_eq!(l2_2.num_bids, 1);
+        assert_eq!(l2_2.bids[0].price, 50000.0);
+        assert_eq!(l2_2.bids[0].quantity, 12.0); // 20 - 8
+    }
+
+    #[test]
+    fn test_level2_level_removal_when_quantity_depleted() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade at 50000 with qty 10
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let l2_1 = engine.get_level2_snapshot();
+        assert_eq!(l2_1.num_asks, 1);
+
+        // Second trade at same price consuming all qty
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 10.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let l2_2 = engine.get_level2_snapshot();
+        // Level should be removed when quantity reaches 0
+        assert_eq!(l2_2.num_asks, 0);
+    }
+
+    #[test]
+    fn test_level2_multiple_ask_levels_ascending_order() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add ask levels at different prices
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50001.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 20.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 50002.0, 5.0, Side::Buy, 1003, 2003);
+        engine.consume_trade_event(event3);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.num_asks, 3);
+        // Ask levels should be in ascending order
+        assert_eq!(l2.asks[0].price, 50000.0);
+        assert_eq!(l2.asks[0].quantity, 20.0);
+        assert_eq!(l2.asks[1].price, 50001.0);
+        assert_eq!(l2.asks[1].quantity, 10.0);
+        assert_eq!(l2.asks[2].price, 50002.0);
+        assert_eq!(l2.asks[2].quantity, 5.0);
+    }
+
+    #[test]
+    fn test_level2_multiple_bid_levels_descending_order() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add bid levels at different prices
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 49999.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 20.0, Side::Sell, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 49998.0, 5.0, Side::Sell, 1003, 2003);
+        engine.consume_trade_event(event3);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.num_bids, 3);
+        // Bid levels should be in descending order
+        assert_eq!(l2.bids[0].price, 50000.0);
+        assert_eq!(l2.bids[0].quantity, 20.0);
+        assert_eq!(l2.bids[1].price, 49999.0);
+        assert_eq!(l2.bids[1].quantity, 10.0);
+        assert_eq!(l2.bids[2].price, 49998.0);
+        assert_eq!(l2.bids[2].quantity, 5.0);
+    }
+
+    #[test]
+    fn test_level2_max_10_levels() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add 10 ask levels
+        for i in 0..10 {
+            let event = TradeEvent::new(
+                (i + 1) as u64,
+                100 + i as u64,
+                99 + i as u64,
+                1_000_000_000 + (i as u64 * 1_000_000),
+                50000.0 + i as f64,
+                10.0,
+                Side::Buy,
+                1001 + i as u64,
+                2001 + i as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.num_asks, 10);
+
+        // Try to add 11th level - should not be added
+        let event11 = TradeEvent::new(11, 110, 109, 11_000_000_000, 50010.0, 10.0, Side::Buy, 1011, 2011);
+        engine.consume_trade_event(event11);
+
+        let l2_after = engine.get_level2_snapshot();
+        // Should still be 10 levels
+        assert_eq!(l2_after.num_asks, 10);
+    }
+
+    #[test]
+    fn test_level2_mixed_bid_ask_updates() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Sequence of trades: sell, buy, sell, buy
+        let trades = vec![
+            (50000.0, 10.0, Side::Sell),
+            (50050.0, 5.0, Side::Buy),
+            (50025.0, 8.0, Side::Sell),
+            (50040.0, 3.0, Side::Buy),
+        ];
+
+        for (idx, (price, qty, side)) in trades.iter().enumerate() {
+            let event = TradeEvent::new(
+                (idx + 1) as u64,
+                100 + idx as u64,
+                99 + idx as u64,
+                1_000_000_000 + (idx as u64 * 1_000_000),
+                *price,
+                *qty,
+                *side,
+                1001 + idx as u64,
+                2001 + idx as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let l2 = engine.get_level2_snapshot();
+        // Should have 2 bid levels
+        assert_eq!(l2.num_bids, 2);
+        assert_eq!(l2.bids[0].price, 50025.0);
+        assert_eq!(l2.bids[0].quantity, 8.0);
+        assert_eq!(l2.bids[1].price, 50000.0);
+        assert_eq!(l2.bids[1].quantity, 10.0);
+
+        // Should have 2 ask levels
+        assert_eq!(l2.num_asks, 2);
+        assert_eq!(l2.asks[0].price, 50040.0);
+        assert_eq!(l2.asks[0].quantity, 3.0);
+        assert_eq!(l2.asks[1].price, 50050.0);
+        assert_eq!(l2.asks[1].quantity, 5.0);
+    }
+
+    #[test]
+    fn test_level2_timestamp_and_sequence() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(
+            5,
+            100,
+            99,
+            2_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+        engine.consume_trade_event(event);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.timestamp, 2_000_000_000);
+        assert_eq!(l2.sequence, 5);
+    }
+
+    #[test]
+    fn test_level2_complex_scenario() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Simulate a complex order flow
+        // Sell orders at 50000, 50001, 50002 (bids)
+        for i in 0..3 {
+            let event = TradeEvent::new(
+                (i + 1) as u64,
+                100 + i as u64,
+                99 + i as u64,
+                1_000_000_000 + (i as u64 * 1_000_000),
+                50000.0 + i as f64,
+                (10.0 - i as f64).max(1.0),
+                Side::Sell,
+                1001 + i as u64,
+                2001 + i as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        // Buy orders at 50050, 50051, 50052 (asks)
+        for i in 0..3 {
+            let event = TradeEvent::new(
+                (4 + i) as u64,
+                104 + i as u64,
+                103 + i as u64,
+                4_000_000_000 + (i as u64 * 1_000_000),
+                50050.0 + i as f64,
+                (5.0 + i as f64) as f64,
+                Side::Buy,
+                1004 + i as u64,
+                2004 + i as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let l2 = engine.get_level2_snapshot();
+
+        // Verify bid levels (descending)
+        assert_eq!(l2.num_bids, 3);
+        assert_eq!(l2.bids[0].price, 50002.0);
+        assert_eq!(l2.bids[1].price, 50001.0);
+        assert_eq!(l2.bids[2].price, 50000.0);
+
+        // Verify ask levels (ascending)
+        assert_eq!(l2.num_asks, 3);
+        assert_eq!(l2.asks[0].price, 50050.0);
+        assert_eq!(l2.asks[1].price, 50051.0);
+        assert_eq!(l2.asks[2].price, 50052.0);
+    }
+
+    #[test]
+    fn test_level2_level_removal_maintains_order() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add 3 ask levels: 50000, 50001, 50002
+        for i in 0..3 {
+            let event = TradeEvent::new(
+                (i + 1) as u64,
+                100 + i as u64,
+                99 + i as u64,
+                1_000_000_000 + (i as u64 * 1_000_000),
+                50000.0 + i as f64,
+                10.0,
+                Side::Buy,
+                1001 + i as u64,
+                2001 + i as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let l2_1 = engine.get_level2_snapshot();
+        assert_eq!(l2_1.num_asks, 3);
+        assert_eq!(l2_1.asks[0].price, 50000.0);
+        assert_eq!(l2_1.asks[1].price, 50001.0);
+        assert_eq!(l2_1.asks[2].price, 50002.0);
+
+        // Remove middle level (50001) by consuming all quantity
+        let event = TradeEvent::new(4, 104, 103, 4_000_000_000, 50001.0, 10.0, Side::Buy, 1004, 2004);
+        engine.consume_trade_event(event);
+
+        let l2_2 = engine.get_level2_snapshot();
+        assert_eq!(l2_2.num_asks, 2);
+        // Remaining levels should be in order
+        assert_eq!(l2_2.asks[0].price, 50000.0);
+        assert_eq!(l2_2.asks[1].price, 50002.0);
+    }
+
+    #[test]
+    fn test_level2_snapshot_independence() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let l2_1 = engine.get_level2_snapshot();
+        assert_eq!(l2_1.num_asks, 1);
+        assert_eq!(l2_1.asks[0].quantity, 10.0);
+
+        // Consume some quantity
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 3.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let l2_2 = engine.get_level2_snapshot();
+        assert_eq!(l2_2.num_asks, 1);
+        assert_eq!(l2_2.asks[0].quantity, 7.0);
+
+        // l2_1 should be independent (snap at event1 time)
+        // But since we're returning a copy, it should reflect the state at that moment
+        // This test verifies that snapshots are indeed independent copies
+        assert_eq!(l2_1.asks[0].quantity, 10.0); // Original snapshot value unchanged
+    }
+
+    #[test]
+    fn test_level2_best_bid_ask() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add bid
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let l2_1 = engine.get_level2_snapshot();
+        assert_eq!(l2_1.best_bid(), Some(PriceLevel::new(50000.0, 10.0)));
+
+        // Add ask
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 20.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let l2_2 = engine.get_level2_snapshot();
+        assert_eq!(l2_2.best_bid(), Some(PriceLevel::new(50000.0, 10.0)));
+        assert_eq!(l2_2.best_ask(), Some(PriceLevel::new(50050.0, 20.0)));
     }
 
     // ===== BBO 更新逻辑测试 - Task 2.2 =====

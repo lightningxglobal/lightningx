@@ -277,6 +277,7 @@ impl MatchingEngine {
     fn match_order(&mut self, order: Order) -> OrderResult<(f64, Vec<Trade>)> {
         let mut filled = 0.0;
         let mut trade_indices: SmallVec<[usize; 64]> = SmallVec::new();
+        let mut trade_events: SmallVec<[TradeEvent; 128]> = SmallVec::new();
 
         // 外层循环：获取最优对手价
         loop {
@@ -404,22 +405,20 @@ impl MatchingEngine {
                     timestamp: order.timestamp,
                 });
 
-                // 发布交易事件到ring buffer
-                if let Some(ref mut sender) = self.trade_event_sender {
-                    let trade_event = TradeEvent::new(
-                        self.trade_sequence,
-                        order.id,
-                        counter_order_id,
-                        order.timestamp,
-                        best_price,
-                        trade_qty,
-                        order.side,
-                        order.id,
-                        counter_order_id,
-                    );
-                    self.trade_sequence += 1;
-                    let _ = sender.push(trade_event);
-                }
+                // 收集交易事件到batch（后续一次性发送到ring buffer）
+                let trade_event = TradeEvent::new(
+                    self.trade_sequence,
+                    order.id,
+                    counter_order_id,
+                    order.timestamp,
+                    best_price,
+                    trade_qty,
+                    order.side,
+                    order.id,
+                    counter_order_id,
+                );
+                self.trade_sequence += 1;
+                trade_events.push(trade_event);
 
                 // 检查对手订单是否完全成交
                 if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
@@ -437,6 +436,13 @@ impl MatchingEngine {
             }
 
             // 内层循环退出后，下次调用get_best_price()会自动检测缓存的价格级别是否仍有订单
+        }
+
+        // 撮合完成后，批量发送所有交易事件到ring buffer
+        if let Some(ref mut sender) = self.trade_event_sender {
+            for trade_event in trade_events.iter() {
+                let _ = sender.push(*trade_event);
+            }
         }
 
         // 从池中读取Trade对象并构造返回Vec

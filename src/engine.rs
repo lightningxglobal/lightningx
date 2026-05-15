@@ -228,11 +228,12 @@ impl MatchingEngine {
 
     // ===== Task 9: Match Order Logic =====
 
-    /// 撮合订单（关键热路径，Phase 1 优化：内层循环避免重复查询最优价）
+    /// 撮合订单（关键热路径，Phase 3 优化：激进快速路径 + 缓存上次价格）
     #[inline]
     fn match_order(&mut self, order: Order) -> OrderResult<(f64, Vec<Trade>)> {
         let mut filled = 0.0;
         let mut trades = Vec::new();
+        let mut last_best_price: Option<f64> = None;
 
         // 外层循环：获取最优对手价
         loop {
@@ -240,8 +241,34 @@ impl MatchingEngine {
                 break;
             }
 
-            // 获取最优对手价（有订单的价格档位）
-            let best_price = {
+            // 快速路径：如果上次的价格仍然有效，直接使用
+            let best_price = if let Some(cached_price) = last_best_price {
+                let opposite_book = match order.side {
+                    Side::Buy => &self.sell_book,
+                    Side::Sell => &self.buy_book,
+                };
+
+                // 验证缓存价格仍然有订单
+                if let Some(node) = opposite_book.get_node_at_price(cached_price) {
+                    if !node.orders.is_empty() {
+                        Some(cached_price)
+                    } else {
+                        // 缓存失效，重新查询
+                        last_best_price = None;
+                        None
+                    }
+                } else {
+                    last_best_price = None;
+                    None
+                }
+            } else {
+                None
+            };
+
+            // 如果快速路径无效，调用标准查询
+            let best_price = if best_price.is_some() {
+                best_price
+            } else {
                 let opposite_book = match order.side {
                     Side::Buy => &self.sell_book,
                     Side::Sell => &self.buy_book,
@@ -259,6 +286,7 @@ impl MatchingEngine {
                             break;
                         }
 
+                        last_best_price = Some(n.price);
                         Some(n.price)
                     }
                     None => None,

@@ -120,7 +120,7 @@ impl MatchingEngine {
             self.next_order_id += 1;
         }
 
-        // 批量处理订单（共享order book查询）
+        // 批量处理订单
         for order in orders.into_iter() {
             let result = match order.time_in_force {
                 TimeInForce::PostOnly => self.handle_post_only(order)?,
@@ -456,6 +456,180 @@ impl MatchingEngine {
         }
 
         Ok((filled, result_trades))
+    }
+
+    /// 批量撮合多个订单（最多20个），共享TradeEvent批处理以提升性能
+    /// 所有订单的TradeEvent被收集到一个batch中，最后一次性发送
+    #[inline]
+    pub fn match_orders_batch(&mut self, orders: SmallVec<[Order; 20]>)
+        -> OrderResult<SmallVec<[(f64, Vec<Trade>); 20]>>
+    {
+        let mut results: SmallVec<[(f64, Vec<Trade>); 20]> = SmallVec::new();
+        let mut all_trade_events: SmallVec<[TradeEvent; 256]> = SmallVec::new();
+
+        // 处理每个订单，收集所有TradeEvent到共享的batch中
+        for order in orders.into_iter() {
+            let (mut filled, mut trade_indices): (f64, SmallVec<[usize; 64]>) = (0.0, SmallVec::new());
+
+            // 外层循环：获取最优对手价
+            loop {
+                if filled >= order.quantity {
+                    break;
+                }
+
+                // 获取最优价格
+                let best_price = {
+                    let opposite_book = match order.side {
+                        Side::Buy => &mut self.sell_book,
+                        Side::Sell => &mut self.buy_book,
+                    };
+
+                    match opposite_book.get_best_price() {
+                        Some(price) => {
+                            if opposite_book.get_node_at_price(price).is_some() {
+                                let price_matches = match order.side {
+                                    Side::Buy => order.price >= price,
+                                    Side::Sell => order.price <= price,
+                                };
+                                if !price_matches {
+                                    break;
+                                }
+                                Some(price)
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                };
+
+                let best_price = match best_price {
+                    Some(p) => p,
+                    None => break,
+                };
+
+                // 内层循环：在同一价格级别内成交
+                loop {
+                    if filled >= order.quantity {
+                        break;
+                    }
+
+                    let counter_order_id = {
+                        let opposite_book = match order.side {
+                            Side::Buy => &mut self.sell_book,
+                            Side::Sell => &mut self.buy_book,
+                        };
+
+                        match opposite_book.get_node_mut(best_price) {
+                            Some(node) => {
+                                if let Some(node_idx) = node.orders.front() {
+                                    let list_pool = opposite_book.get_list_pool();
+                                    if let Some(list_node) = list_pool.get(node_idx) {
+                                        list_node.order_id
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    };
+
+                    let counter_order = match self.orders.get(&counter_order_id) {
+                        Some(&pool_idx) => {
+                            match self.pools.orders.get(pool_idx) {
+                                Some(o) => *o,
+                                None => break,
+                            }
+                        }
+                        None => break,
+                    };
+
+                    let order_remaining = order.quantity - filled;
+                    let counter_remaining = counter_order.remaining();
+                    let trade_qty = order_remaining.min(counter_remaining);
+
+                    // 更新订单状态
+                    {
+                        if let Some(&pool_idx) = self.orders.get(&order.id) {
+                            if let Some(o) = self.pools.orders.get_mut(pool_idx) {
+                                o.filled += trade_qty;
+                            }
+                        }
+                        if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
+                            if let Some(o) = self.pools.orders.get_mut(counter_pool_idx) {
+                                o.filled += trade_qty;
+                            }
+                        }
+                    }
+
+                    filled += trade_qty;
+
+                    let trade_idx = self.pools.trades.acquire()
+                        .ok_or(MatchingEngineError::OrderPoolExhausted)?;
+
+                    {
+                        if let Some(trade) = self.pools.trades.get_mut(trade_idx) {
+                            trade.taker_id = order.id;
+                            trade.maker_id = counter_order_id;
+                            trade.price = best_price;
+                            trade.quantity = trade_qty;
+                        }
+                    }
+
+                    trade_indices.push(trade_idx);
+
+                    // 收集TradeEvent到共享batch中（不立即发送）
+                    let trade_event = TradeEvent::new(
+                        self.trade_sequence,
+                        order.id,
+                        counter_order_id,
+                        order.timestamp,
+                        best_price,
+                        trade_qty,
+                        order.side,
+                        order.id,
+                        counter_order_id,
+                    );
+                    self.trade_sequence += 1;
+                    all_trade_events.push(trade_event);
+
+                    if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
+                        if let Some(counter) = self.pools.orders.get(counter_pool_idx) {
+                            if counter.is_filled() {
+                                let opposite_book = match order.side {
+                                    Side::Buy => &mut self.sell_book,
+                                    Side::Sell => &mut self.buy_book,
+                                };
+                                let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 构造该订单的trade结果
+            let mut result_trades = Vec::with_capacity(trade_indices.len());
+            for trade_idx in trade_indices.iter() {
+                if let Some(trade) = self.pools.trades.get(*trade_idx) {
+                    result_trades.push(*trade);
+                }
+                self.pools.trades.release(*trade_idx);
+            }
+
+            results.push((filled, result_trades));
+        }
+
+        // 所有订单处理完毕，一次性批量发送所有TradeEvent到ring buffer
+        if let Some(ref mut sender) = self.trade_event_sender {
+            for event in all_trade_events.iter() {
+                let _ = sender.push(*event);
+            }
+        }
+
+        Ok(results)
     }
 
     // ===== Task 10: Cancel Order =====

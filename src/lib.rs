@@ -31,6 +31,7 @@ pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use market_data::{
     TradeEvent, MarketDataEngine, BBOSnapshot, Level2Snapshot, AggregateTrade, Statistics24h,
     PublishedSnapshot, SnapshotTimer, SnapshotPublisherThread, TradePublisherThread,
+    DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent, MarketDataConfig,
 };
 pub use aeron_publisher::{
     SnapshotPublisher, TradePublisher, AeronConfig, PublisherResult, PublisherError,

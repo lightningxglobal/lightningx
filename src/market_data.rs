@@ -1407,6 +1407,154 @@ impl TradePublisherThread {
     }
 }
 
+/// 浅层深度快照事件 - 由撮合引擎每10ms生成
+/// 包含BBO (1档) + Depth-20 (20档)
+/// Plain/POD 结构体：align(64)、Copy、零堆分配
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct DepthSnapshotEvent {
+    pub timestamp: u64,           // 纳秒时间戳
+    pub sequence: u64,            // 快照序列号
+    pub num_bids: u8,             // 实际bid档位数 (≤20)
+    pub num_asks: u8,             // 实际ask档位数 (≤20)
+    _pad1: [u8; 62],              // 填充至64字节对齐
+    pub bids: [(f64, f64); 20],   // (price, quantity)，从高到低排序
+    pub asks: [(f64, f64); 20],   // (price, quantity)，从低到高排序
+}
+
+impl DepthSnapshotEvent {
+    pub fn new(timestamp: u64, sequence: u64) -> Self {
+        Self {
+            timestamp,
+            sequence,
+            num_bids: 0,
+            num_asks: 0,
+            _pad1: [0; 62],
+            bids: [(0.0, 0.0); 20],
+            asks: [(0.0, 0.0); 20],
+        }
+    }
+}
+
+impl Default for DepthSnapshotEvent {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+/// Depth-50 快照事件 - 由撮合引擎每50ms生成（仅在enable_depth_increments时）
+/// 行情引擎在此基础上计算与prev的diff，返回真正的增量
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct Depth50SnapshotEvent {
+    pub timestamp: u64,
+    pub sequence: u64,
+    pub num_bids: u8,
+    pub num_asks: u8,
+    _pad1: [u8; 62],
+    pub bids: [(f64, f64); 50],
+    pub asks: [(f64, f64); 50],
+}
+
+impl Depth50SnapshotEvent {
+    pub fn new(timestamp: u64, sequence: u64) -> Self {
+        Self {
+            timestamp,
+            sequence,
+            num_bids: 0,
+            num_asks: 0,
+            _pad1: [0; 62],
+            bids: [(0.0, 0.0); 50],
+            asks: [(0.0, 0.0); 50],
+        }
+    }
+}
+
+impl Default for Depth50SnapshotEvent {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+/// Level2-400 快照事件 - 由撮合引擎每100ms生成（仅在enable_depth_increments时）
+/// 行情引擎在此基础上计算与prev的diff，返回真正的增量
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct Level2SnapshotEvent {
+    pub timestamp: u64,
+    pub sequence: u64,
+    pub num_bids: u16,           // 实际bid档位数 (≤400)
+    pub num_asks: u16,           // 实际ask档位数 (≤400)
+    _pad1: [u8; 60],             // 填充至64字节对齐
+    pub bids: [(f64, f64); 400],
+    pub asks: [(f64, f64); 400],
+}
+
+impl Level2SnapshotEvent {
+    pub fn new(timestamp: u64, sequence: u64) -> Self {
+        Self {
+            timestamp,
+            sequence,
+            num_bids: 0,
+            num_asks: 0,
+            _pad1: [0; 60],
+            bids: [(0.0, 0.0); 400],
+            asks: [(0.0, 0.0); 400],
+        }
+    }
+}
+
+impl Default for Level2SnapshotEvent {
+    fn default() -> Self {
+        Self::new(0, 0)
+    }
+}
+
+/// 市场数据采样配置
+/// 控制撮合引擎的深度采样行为
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct MarketDataConfig {
+    /// BBO + Depth20 采样间隔（纳秒），默认10ms
+    pub shallow_sample_interval_ns: u64,
+    /// 是否启用Depth50/Level2增量采样
+    pub enable_depth_increments: bool,
+    /// Depth50采样间隔（纳秒），默认50ms
+    pub depth50_interval_ns: u64,
+    /// Level2-400采样间隔（纳秒），默认100ms
+    pub level2_interval_ns: u64,
+    _pad1: [u8; 39],
+}
+
+impl MarketDataConfig {
+    pub fn new(
+        shallow_sample_interval_ns: u64,
+        enable_depth_increments: bool,
+        depth50_interval_ns: u64,
+        level2_interval_ns: u64,
+    ) -> Self {
+        Self {
+            shallow_sample_interval_ns,
+            enable_depth_increments,
+            depth50_interval_ns,
+            level2_interval_ns,
+            _pad1: [0; 39],
+        }
+    }
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            shallow_sample_interval_ns: 10_000_000,   // 10ms
+            enable_depth_increments: false,
+            depth50_interval_ns: 50_000_000,          // 50ms
+            level2_interval_ns: 100_000_000,          // 100ms
+            _pad1: [0; 39],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1416,6 +1564,55 @@ mod tests {
     #[test]
     fn test_trade_event_alignment() {
         assert_eq!(std::mem::align_of::<TradeEvent>(), 64);
+    }
+
+    #[test]
+    fn test_depth_snapshot_event_alignment() {
+        assert_eq!(std::mem::align_of::<DepthSnapshotEvent>(), 64);
+        assert!(std::mem::size_of::<DepthSnapshotEvent>() >= 704); // 至少704字节
+    }
+
+    #[test]
+    fn test_depth50_snapshot_event_alignment() {
+        assert_eq!(std::mem::align_of::<Depth50SnapshotEvent>(), 64);
+        assert!(std::mem::size_of::<Depth50SnapshotEvent>() >= 1728);
+    }
+
+    #[test]
+    fn test_level2_snapshot_event_alignment() {
+        assert_eq!(std::mem::align_of::<Level2SnapshotEvent>(), 64);
+        assert!(std::mem::size_of::<Level2SnapshotEvent>() >= 12928);
+    }
+
+    #[test]
+    fn test_market_data_config_alignment() {
+        assert_eq!(std::mem::align_of::<MarketDataConfig>(), 64);
+        assert!(std::mem::size_of::<MarketDataConfig>() >= 64);
+    }
+
+    #[test]
+    fn test_depth_snapshot_event_copy_and_plain() {
+        let evt1 = DepthSnapshotEvent::new(1000, 1);
+        let evt2 = evt1;  // Copy should work
+        assert_eq!(evt1.timestamp, evt2.timestamp);
+    }
+
+    #[test]
+    fn test_depth_snapshot_event_default() {
+        let evt = DepthSnapshotEvent::default();
+        assert_eq!(evt.timestamp, 0);
+        assert_eq!(evt.sequence, 0);
+        assert_eq!(evt.num_bids, 0);
+        assert_eq!(evt.num_asks, 0);
+    }
+
+    #[test]
+    fn test_market_data_config_default() {
+        let cfg = MarketDataConfig::default();
+        assert_eq!(cfg.shallow_sample_interval_ns, 10_000_000); // 10ms
+        assert_eq!(cfg.enable_depth_increments, false);
+        assert_eq!(cfg.depth50_interval_ns, 50_000_000);  // 50ms
+        assert_eq!(cfg.level2_interval_ns, 100_000_000);  // 100ms
     }
 
     #[test]

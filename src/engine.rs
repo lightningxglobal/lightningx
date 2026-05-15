@@ -8,6 +8,7 @@ use crate::orderbook_impl::OrderBookWrapper;
 use crate::orderbook::OrderBook;
 use std::collections::HashMap;
 use rtrb::Producer;
+use smallvec::SmallVec;
 
 pub struct MatchingEngine {
     buy_book: OrderBookWrapper,
@@ -232,7 +233,7 @@ impl MatchingEngine {
     #[inline]
     fn match_order(&mut self, order: Order) -> OrderResult<(f64, Vec<Trade>)> {
         let mut filled = 0.0;
-        let mut trades = Vec::new();
+        let mut trades: SmallVec<[Trade; 64]> = SmallVec::new();
 
         // 外层循环：获取最优对手价
         loop {
@@ -333,7 +334,7 @@ impl MatchingEngine {
                     price: best_price,
                     quantity: trade_qty,
                 };
-                trades.push(trade.clone());
+                trades.push(trade);
 
                 self.publish_event(&MatchingEvent::Trade {
                     taker_order_id: order.id,
@@ -376,7 +377,7 @@ impl MatchingEngine {
             // 内层循环退出后，下次调用get_best_price()会自动检测缓存的价格级别是否仍有订单
         }
 
-        Ok((filled, trades))
+        Ok((filled, trades.into_vec()))
     }
 
     // ===== Task 10: Cancel Order =====
@@ -562,7 +563,7 @@ pub enum OrderStatus {
 }
 
 /// 成交记录
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Trade {
     pub taker_id: u64,
     pub maker_id: u64,

@@ -440,6 +440,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "rtrb",
+ "smallvec",
  "tracing",
 ]
 

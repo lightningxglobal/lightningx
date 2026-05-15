@@ -10,6 +10,7 @@ rand = "0.8"
 rtrb = "0.2"
 parking_lot = "0.12"
 ordered-float = "5.3.0"
+smallvec = "1.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

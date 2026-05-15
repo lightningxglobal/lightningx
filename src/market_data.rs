@@ -1325,6 +1325,123 @@ impl SnapshotPublisherThread {
     }
 }
 
+/// TradePublisherThread在单独的线程中运行，消费TradeEvent通道
+/// 并通过Aeron立即发布到WebSocket服务器和其他消费者。
+///
+/// 与SnapshotPublisherThread不同的是，TradePublisherThread发布的是单个成交事件，
+/// 不进行任何缓冲或聚合。每个成交都立即发布（逐笔成交）。
+///
+/// # 线程安全
+///
+/// - should_stop标志通过AtomicBool安全共享
+/// - 发布线程独占访问Publisher（无并发问题）
+pub struct TradePublisherThread {
+    /// 停止信号
+    should_stop: Arc<AtomicBool>,
+}
+
+impl TradePublisherThread {
+    /// 启动Aeron成交事件发布线程
+    ///
+    /// # 参数
+    /// - `trade_rx`: TradeEvent接收器，由MatchingEngine发送
+    /// - `aeron_config`: Aeron配置（目录、通道、流ID）
+    ///
+    /// # 返回
+    /// TradePublisherThread控制句柄，用于停止线程
+    ///
+    /// # 行为
+    /// 线程会：
+    /// 1. 创建到Aeron媒体驱动的连接
+    /// 2. 持续消费trade_rx通道
+    /// 3. 将每个成交序列化为二进制格式
+    /// 4. 通过Aeron立即发布到订阅者（没有缓冲）
+    /// 5. 优雅地处理背压（丢弃成交而不是阻塞）
+    /// 6. 当should_stop标志被设置时退出
+    ///
+    /// 如果连接初始化失败，线程将记录错误并退出。
+    pub fn spawn(
+        trade_rx: Receiver<TradeEvent>,
+        aeron_config: crate::aeron_publisher::AeronConfig,
+    ) -> Self {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = should_stop.clone();
+
+        thread::spawn(move || {
+            // 初始化Aeron发布器
+            let publisher = match crate::aeron_publisher::TradePublisher::new(aeron_config) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to initialize Aeron trade publisher: {}", e);
+                    return;
+                }
+            };
+
+            let mut dropped_count = 0u64;
+            let mut published_count = 0u64;
+
+            loop {
+                // 检查是否应该停止
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // 尝试从通道接收成交（非阻塞）
+                match trade_rx.try_recv() {
+                    Ok(trade) => {
+                        // 尝试立即发布成交
+                        match publisher.publish(&trade) {
+                            Ok(()) => {
+                                published_count = published_count.wrapping_add(1);
+                            }
+                            Err(crate::aeron_publisher::PublisherError::BackPressured) => {
+                                // 环形缓冲区已满，丢弃此成交
+                                // 这很少发生，但可能在订阅者跟不上时发生
+                                dropped_count = dropped_count.wrapping_add(1);
+                            }
+                            Err(crate::aeron_publisher::PublisherError::NotConnected) => {
+                                // 没有连接的订阅者，忽略此成交
+                                dropped_count = dropped_count.wrapping_add(1);
+                            }
+                            Err(e) => {
+                                // 其他错误（序列化失败、已关闭等）
+                                eprintln!("Error publishing trade: {}", e);
+                                // 仍然计为丢弃
+                                dropped_count = dropped_count.wrapping_add(1);
+                            }
+                        }
+                    }
+                    Err(crossbeam::channel::TryRecvError::Empty) => {
+                        // 通道暂时为空，让出CPU
+                        std::thread::yield_now();
+                    }
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        // 发送方已关闭，停止发布线程
+                        break;
+                    }
+                }
+            }
+
+            // 线程退出时的诊断信息
+            tracing::info!(
+                "Trade publisher thread stopped. Published: {}, Dropped: {}",
+                published_count,
+                dropped_count
+            );
+        });
+
+        Self { should_stop }
+    }
+
+    /// 停止发布线程
+    ///
+    /// 此方法是非阻塞的，它设置停止标志但不等待线程退出。
+    /// 线程将在下一次迭代时看到标志并退出。
+    pub fn stop(&self) {
+        self.should_stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3399,6 +3516,87 @@ mod tests {
         for i in 1..sequences.len() {
             let expected = sequences[i - 1] + 1;
             assert_eq!(sequences[i], expected, "Sequences should increment by 1");
+        }
+    }
+
+    // ===== TradePublisherThread 测试 =====
+
+    #[test]
+    fn test_trade_publisher_thread_creation() {
+        let (trade_tx, trade_rx) = channel::bounded::<TradeEvent>(1000);
+        drop(trade_tx);  // Close sender to prevent blocking
+
+        let aeron_config = crate::aeron_publisher::AeronConfig {
+            aeron_dir: "/dev/shm/aeron".to_string(),
+            channel: "aeron:ipc".to_string(),
+            stream_id: 11,
+        };
+
+        // This should not panic - thread is spawned successfully even if Aeron is not available
+        let publisher = TradePublisherThread::spawn(trade_rx, aeron_config);
+        publisher.stop();
+    }
+
+    #[test]
+    fn test_trade_event_serialization() {
+        use crate::aeron_publisher::{trade_to_bytes, bytes_to_trade};
+
+        let trade = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+
+        let bytes = trade_to_bytes(&trade).expect("Should serialize");
+        let deserialized = bytes_to_trade(&bytes).expect("Should deserialize");
+
+        assert_eq!(deserialized.sequence, trade.sequence);
+        assert_eq!(deserialized.order_id, trade.order_id);
+        assert_eq!(deserialized.maker_order_id, trade.maker_order_id);
+        assert_eq!(deserialized.timestamp, trade.timestamp);
+        assert_eq!(deserialized.price, trade.price);
+        assert_eq!(deserialized.quantity, trade.quantity);
+        assert_eq!(deserialized.taker_id, trade.taker_id);
+        assert_eq!(deserialized.maker_id, trade.maker_id);
+        assert_eq!(deserialized.side, trade.side);
+    }
+
+    #[test]
+    fn test_trade_event_ordering() {
+        let (trade_tx, trade_rx) = channel::bounded::<TradeEvent>(1000);
+
+        // Create multiple trade events with increasing sequences
+        let trades = vec![
+            TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001),
+            TradeEvent::new(2, 101, 100, 2_000_000_000, 50100.0, 5.0, Side::Sell, 1002, 2002),
+            TradeEvent::new(3, 102, 101, 3_000_000_000, 50200.0, 20.0, Side::Buy, 1003, 2003),
+        ];
+
+        // Send all trades
+        for trade in &trades {
+            trade_tx.send(*trade).expect("Should send trade");
+        }
+        drop(trade_tx);
+
+        // Receive and verify order
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            match trade_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(trade) => received.push(trade),
+                Err(_) => break,
+            }
+        }
+
+        // Verify we got all trades in order
+        assert_eq!(received.len(), 3, "Should receive all 3 trades");
+        for (i, trade) in received.iter().enumerate() {
+            assert_eq!(trade.sequence, (i + 1) as u64, "Trades should be in order");
         }
     }
 }

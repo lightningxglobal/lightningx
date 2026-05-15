@@ -24,10 +24,11 @@ pub use event::MatchingEvent;
 pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use market_data::{
     TradeEvent, MarketDataEngine, BBOSnapshot, Level2Snapshot, AggregateTrade, Statistics24h,
-    PublishedSnapshot, SnapshotTimer, SnapshotPublisherThread,
+    PublishedSnapshot, SnapshotTimer, SnapshotPublisherThread, TradePublisherThread,
 };
 pub use aeron_publisher::{
-    SnapshotPublisher, AeronConfig, PublisherResult, PublisherError,
+    SnapshotPublisher, TradePublisher, AeronConfig, PublisherResult, PublisherError,
+    snapshot_to_bytes, bytes_to_snapshot, trade_to_bytes, bytes_to_trade,
 };
 
 #[cfg(test)]

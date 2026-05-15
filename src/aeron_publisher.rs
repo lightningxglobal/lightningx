@@ -1,13 +1,13 @@
-//! Aeron Publisher for distributing market data snapshots
+//! Aeron Publisher for distributing market data snapshots and trade events
 //!
-//! This module provides the SnapshotPublisher which:
-//! - Connects to the Aeron media driver
-//! - Publishes PublishedSnapshot messages on a dedicated stream
-//! - Handles back-pressure and reconnection errors gracefully
-//! - Allows WebSocket servers and other consumers to subscribe to snapshots
+//! This module provides:
+//! - SnapshotPublisher: Publishes PublishedSnapshot messages on dedicated stream
+//! - TradePublisher: Publishes TradeEvent messages on dedicated stream
+//! - Both handle back-pressure and reconnection errors gracefully
+//! - Allows WebSocket servers and other consumers to subscribe independently
 
 use aeron_wrapper::{AeronClient, Pub, Publisher, Error as AeronError};
-use crate::market_data::PublishedSnapshot;
+use crate::market_data::{PublishedSnapshot, TradeEvent};
 
 /// Aeron configuration for snapshot distribution
 pub struct AeronConfig {
@@ -266,6 +266,186 @@ pub fn bytes_to_snapshot(bytes: &[u8]) -> PublisherResult<PublishedSnapshot> {
     Ok(snapshot)
 }
 
+/// Publishes trade events via Aeron
+///
+/// TradePublisher handles:
+/// - Connection to Aeron media driver
+/// - Serialization of TradeEvent structs
+/// - Back-pressure handling (drop trades rather than block)
+/// - Lifecycle management
+///
+/// # Thread Safety
+///
+/// Publisher is Send but not Sync; intended for single-threaded use.
+/// The trade publishing thread owns a single Publisher instance.
+///
+/// # Example
+///
+/// ```ignore
+/// let config = AeronConfig {
+///     aeron_dir: "/dev/shm/aeron".to_string(),
+///     channel: "aeron:ipc".to_string(),
+///     stream_id: 11,
+/// };
+/// let publisher = TradePublisher::new(config)?;
+///
+/// let trade = TradeEvent::new(...);
+/// publisher.publish(&trade)?;
+/// ```
+pub struct TradePublisher {
+    /// Aeron client connection (kept alive for publisher)
+    _client: AeronClient,
+    /// Publisher handle
+    publisher: Publisher,
+}
+
+impl TradePublisher {
+    /// Create a new trade publisher
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Aeron configuration (dir, channel, stream_id)
+    ///
+    /// # Returns
+    ///
+    /// Ok(TradePublisher) if connection succeeds, Err otherwise.
+    /// If the Aeron media driver is not running, this will return ConnectionFailed.
+    pub fn new(config: AeronConfig) -> PublisherResult<Self> {
+        // Connect to Aeron media driver
+        let client = AeronClient::new(&config.aeron_dir)
+            .map_err(|e| PublisherError::ConnectionFailed(format!("{}", e)))?;
+
+        // Add publication on the configured channel and stream
+        let publisher = client
+            .add_publication(&config.channel, config.stream_id)
+            .map_err(map_aeron_error)?;
+
+        Ok(Self {
+            _client: client,
+            publisher,
+        })
+    }
+
+    /// Publish a trade event to Aeron subscribers
+    ///
+    /// # Arguments
+    ///
+    /// * `trade` - The TradeEvent to send
+    ///
+    /// # Behavior
+    ///
+    /// - Serializes the trade to bytes (binary format)
+    /// - Sends to Aeron publisher
+    /// - Does NOT retry on back-pressure; the trade is dropped if buffer is full
+    ///   (better to lose a single trade than block the generating thread)
+    /// - Returns NotConnected if no subscribers are connected
+    ///
+    /// # Return Value
+    ///
+    /// - Ok(()) on successful publish
+    /// - Err(BackPressured) if ring buffer is full (trade is lost)
+    /// - Err(NotConnected) if no subscribers are connected
+    /// - Err(Closed) if publisher was closed
+    /// - Err(Fatal) on unrecoverable error
+    #[inline]
+    pub fn publish(&self, trade: &TradeEvent) -> PublisherResult<()> {
+        // Convert trade to bytes for transmission
+        let bytes = trade_to_bytes(trade)?;
+
+        // Send to Aeron
+        self.publisher.send(&bytes).map_err(map_aeron_error)
+    }
+
+    /// Check if the publisher is connected to at least one subscriber
+    #[inline]
+    pub fn is_connected(&self) -> bool {
+        self.publisher.is_connected()
+    }
+
+    /// Check if the publisher has been closed
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        self.publisher.is_closed()
+    }
+
+    /// Get the stream ID this publisher is using
+    #[inline]
+    pub fn stream_id(&self) -> i32 {
+        self.publisher.stream_id()
+    }
+
+    /// Maximum bytes that fit in a single message without fragmentation
+    #[inline]
+    pub fn max_payload_length(&self) -> usize {
+        self.publisher.max_payload_length()
+    }
+}
+
+/// Serialize a TradeEvent to bytes using direct memory copy
+///
+/// TradeEvent has stable layout with align(64), so we can safely
+/// transmute it to bytes for binary transmission. This is very fast (~0 overhead).
+///
+/// Consumers must deserialize using the same binary format (Rust code only).
+/// For cross-language support, use manual serialization in Phase 4.
+#[inline]
+pub fn trade_to_bytes(trade: &TradeEvent) -> PublisherResult<Vec<u8>> {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            trade as *const _ as *const u8,
+            std::mem::size_of::<TradeEvent>(),
+        )
+    };
+    Ok(bytes.to_vec())
+}
+
+/// Deserialize bytes back to TradeEvent
+///
+/// This is the consumer-side deserialization. Used in WebSocket servers
+/// and other subscribers that receive trades from Aeron.
+///
+/// # Safety
+///
+/// This performs a binary copy from bytes. The bytes MUST have been produced
+/// by trade_to_bytes() and layout must match. Only safe when sender and
+/// receiver are both Rust (same compiler version / target).
+///
+/// The bytes must be properly aligned (64-byte boundary). Aeron guarantees
+/// this for messages from the publisher. For testing, use copy_from_slice instead.
+#[inline]
+pub fn bytes_to_trade(bytes: &[u8]) -> PublisherResult<TradeEvent> {
+    let expected_size = std::mem::size_of::<TradeEvent>();
+    if bytes.len() != expected_size {
+        return Err(PublisherError::SerializationFailed(format!(
+            "expected {} bytes, got {}",
+            expected_size,
+            bytes.len()
+        )));
+    }
+
+    // Check alignment: TradeEvent requires 64-byte alignment
+    let ptr = bytes.as_ptr() as usize;
+    if ptr % 64 != 0 {
+        // If not properly aligned, copy to aligned buffer
+        let mut trade = TradeEvent::default();
+        let trade_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut trade as *mut _ as *mut u8,
+                expected_size,
+            )
+        };
+        trade_bytes.copy_from_slice(bytes);
+        return Ok(trade);
+    }
+
+    // Properly aligned, can dereference directly
+    let trade = unsafe {
+        *(bytes.as_ptr() as *const TradeEvent)
+    };
+
+    Ok(trade)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +481,49 @@ mod tests {
         assert_eq!(config.aeron_dir, "/dev/shm/aeron");
         assert_eq!(config.channel, "aeron:ipc");
         assert_eq!(config.stream_id, 10);
+    }
+
+    #[test]
+    fn test_trade_serialization_roundtrip() {
+        use crate::order::Side;
+
+        let trade = TradeEvent::new(
+            1,           // sequence
+            100,         // order_id
+            99,          // maker_order_id
+            1_000_000_000, // timestamp
+            50000.0,     // price
+            10.0,        // quantity
+            Side::Buy,   // side
+            1001,        // taker_id
+            2001,        // maker_id
+        );
+
+        let bytes = trade_to_bytes(&trade).unwrap();
+        assert_eq!(bytes.len(), std::mem::size_of::<TradeEvent>());
+
+        let deserialized = bytes_to_trade(&bytes).unwrap();
+        assert_eq!(deserialized.sequence, trade.sequence);
+        assert_eq!(deserialized.order_id, trade.order_id);
+        assert_eq!(deserialized.maker_order_id, trade.maker_order_id);
+        assert_eq!(deserialized.timestamp, trade.timestamp);
+        assert_eq!(deserialized.price, trade.price);
+        assert_eq!(deserialized.quantity, trade.quantity);
+        assert_eq!(deserialized.taker_id, trade.taker_id);
+        assert_eq!(deserialized.maker_id, trade.maker_id);
+        assert_eq!(deserialized.side, trade.side);
+    }
+
+    #[test]
+    fn test_trade_bytes_wrong_size() {
+        let bytes = vec![0u8; 100];
+        let result = bytes_to_trade(&bytes);
+
+        match result {
+            Err(PublisherError::SerializationFailed(_)) => {
+                // Expected
+            }
+            _ => panic!("Expected SerializationFailed"),
+        }
     }
 }

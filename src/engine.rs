@@ -675,7 +675,10 @@ impl MatchingEngine {
                                 Side::Sell => &mut self.buy_book,
                             };
                             let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
-                            // 继续内层循环，自动 break 当链表为空
+                            // 从orders HashMap中移除并释放池索引
+                            if let Some(idx) = self.orders.remove(&counter_order_id) {
+                                self.pools.orders.release(idx);
+                            }
                         }
                     }
                 }
@@ -850,6 +853,10 @@ impl MatchingEngine {
                                     Side::Sell => &mut self.buy_book,
                                 };
                                 let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
+                                // 从orders HashMap中移除并释放池索引
+                                if let Some(idx) = self.orders.remove(&counter_order_id) {
+                                    self.pools.orders.release(idx);
+                                }
                             }
                         }
                     }

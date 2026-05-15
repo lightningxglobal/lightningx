@@ -1165,7 +1165,7 @@ impl SnapshotTimer {
         let stop_flag = should_stop.clone();
 
         thread::spawn(move || {
-            let mut sequence = 0u64;
+            let mut sequence = 1u64;
             let interval = Duration::from_millis(1);
 
             loop {
@@ -3223,5 +3223,66 @@ mod tests {
         assert_eq!(snapshot.current_agg_1s.close, 50000.0);
         assert_eq!(snapshot.current_agg_5s.close, 50000.0);
         assert_eq!(snapshot.current_agg_1m.close, 50000.0);
+    }
+
+    // ===== SnapshotTimer Tests =====
+
+    #[test]
+    fn test_snapshot_timer_sequence_starts_at_one() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let engine = Arc::new(parking_lot::Mutex::new(MarketDataEngine::new(receiver)));
+
+        let (snapshot_tx, snapshot_rx) = channel::unbounded::<PublishedSnapshot>();
+
+        // Spawn timer
+        let timer = SnapshotTimer::spawn(engine, snapshot_tx);
+
+        // Collect first snapshot
+        match snapshot_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(snapshot) => {
+                // Verify sequence starts at 1, not 0
+                assert!(snapshot.sequence > 0, "First snapshot sequence must be > 0");
+                assert_eq!(snapshot.sequence, 1, "First snapshot sequence should be 1");
+            }
+            Err(_) => {
+                panic!("Failed to receive first snapshot within 100ms");
+            }
+        }
+
+        timer.stop();
+    }
+
+    #[test]
+    fn test_snapshot_timer_sequence_increments() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let engine = Arc::new(parking_lot::Mutex::new(MarketDataEngine::new(receiver)));
+
+        let (snapshot_tx, snapshot_rx) = channel::unbounded::<PublishedSnapshot>();
+
+        // Spawn timer
+        let timer = SnapshotTimer::spawn(engine, snapshot_tx);
+
+        // Collect multiple snapshots
+        let mut sequences = Vec::new();
+        for _ in 0..3 {
+            match snapshot_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(snapshot) => {
+                    sequences.push(snapshot.sequence);
+                }
+                Err(_) => break,
+            }
+        }
+
+        timer.stop();
+
+        // Verify we got at least 2 snapshots with correct sequencing
+        assert!(sequences.len() >= 2, "Should collect at least 2 snapshots");
+        assert_eq!(sequences[0], 1, "First snapshot should have sequence 1");
+
+        // Verify sequences increment (allowing for wrapping, but should be sequential)
+        for i in 1..sequences.len() {
+            let expected = sequences[i - 1] + 1;
+            assert_eq!(sequences[i], expected, "Sequences should increment by 1");
+        }
     }
 }

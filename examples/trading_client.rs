@@ -91,31 +91,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tx.clone(),
     );
 
-    let _sub2 = client.add_subscription(
+    let mut sub2 = client.add_subscription(
         channel, 2, 10_000,
         EventCallback { tx: tx2, stream_id: 2 },
         NoopLifecycle,
     )?;
 
-    let _sub3 = client.add_subscription(
+    let mut sub3 = client.add_subscription(
         channel, 3, 10_000,
         EventCallback { tx: tx3, stream_id: 3 },
         NoopLifecycle,
     )?;
 
-    let _sub4 = client.add_subscription(
+    let mut sub4 = client.add_subscription(
         channel, 4, 10_000,
         EventCallback { tx: tx4, stream_id: 4 },
         NoopLifecycle,
     )?;
 
-    let _sub5 = client.add_subscription(
+    let mut sub5 = client.add_subscription(
         channel, 5, 10_000,
         EventCallback { tx: tx5, stream_id: 5 },
         NoopLifecycle,
     )?;
 
-    let _sub6 = client.add_subscription(
+    let mut sub6 = client.add_subscription(
         channel, 6, 10_000,
         EventCallback { tx: tx6, stream_id: 6 },
         NoopLifecycle,
@@ -252,6 +252,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while start.elapsed() < Duration::from_secs(45) {
         client.do_work();
+
+        // Poll all subscriptions to trigger EventCallback
+        let _n2 = sub2.poll();
+        let _n3 = sub3.poll();
+        let _n4 = sub4.poll();
+        let _n5 = sub5.poll();
+        let _n6 = sub6.poll();
 
         while let Ok(msg) = rx.try_recv() {
             parse_and_print_message(&msg, &mut stats);

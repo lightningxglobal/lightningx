@@ -4,7 +4,11 @@
 //! 所有结构都采用64字节对齐，以优化缓存性能。
 
 use crate::order::Side;
-use crossbeam::channel::Receiver;
+use crossbeam::channel::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 /// 交易事件 - 实时成交数据（64字节对齐）
 /// 用于匹配引擎和市场数据引擎之间的通信
@@ -314,6 +318,109 @@ impl Default for AggregateTrade {
     }
 }
 
+/// 时间桶类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketType {
+    OneSecond,      // 1秒桶
+    FiveSeconds,    // 5秒桶
+    OneMinute,      // 1分钟桶
+}
+
+impl BucketType {
+    /// 获取桶的时间窗口（纳秒）
+    pub fn window_nanos(&self) -> u64 {
+        match self {
+            BucketType::OneSecond => 1_000_000_000,      // 1秒 = 1e9纳秒
+            BucketType::FiveSeconds => 5_000_000_000,    // 5秒 = 5e9纳秒
+            BucketType::OneMinute => 60_000_000_000,     // 1分钟 = 6e10纳秒
+        }
+    }
+}
+
+/// 时间桶窗口 - 跟踪活跃的时间窗口
+#[derive(Debug, Clone, Copy)]
+pub struct AggregateTradeWindow {
+    pub bucket_type: BucketType,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub quote_asset_volume: f64,
+    pub trade_count: u32,
+    pub sequence: u64,
+    pub has_trades: bool,  // 是否有成交
+}
+
+impl AggregateTradeWindow {
+    /// 创建新的时间桶窗口
+    pub fn new(bucket_type: BucketType, start_time: u64, sequence: u64) -> Self {
+        let window_size = bucket_type.window_nanos();
+        Self {
+            bucket_type,
+            start_time,
+            end_time: start_time + window_size,
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            volume: 0.0,
+            quote_asset_volume: 0.0,
+            trade_count: 0,
+            sequence,
+            has_trades: false,
+        }
+    }
+
+    /// 检查时间是否在这个桶的窗口内
+    #[inline]
+    pub fn contains_time(&self, timestamp: u64) -> bool {
+        timestamp < self.end_time
+    }
+
+    /// 用第一笔成交初始化OHLC
+    #[inline]
+    pub fn init_with_first_trade(&mut self, price: f64, quantity: f64) {
+        self.open = price;
+        self.close = price;
+        self.high = price;
+        self.low = price;
+        self.volume = quantity;
+        self.quote_asset_volume = price * quantity;
+        self.trade_count = 1;
+        self.has_trades = true;
+    }
+
+    /// 用成交更新此窗口
+    #[inline]
+    pub fn update_with_trade(&mut self, price: f64, quantity: f64) {
+        self.close = price;
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.volume += quantity;
+        self.quote_asset_volume += price * quantity;
+        self.trade_count += 1;
+    }
+
+    /// 将此窗口转换为AggregateTrade
+    pub fn to_aggregate_trade(&self) -> AggregateTrade {
+        AggregateTrade {
+            start_time: self.start_time,
+            end_time: self.end_time,
+            sequence: self.sequence,
+            open: self.open,
+            close: self.close,
+            high: self.high,
+            low: self.low,
+            volume: self.volume,
+            quote_asset_volume: self.quote_asset_volume,
+            trade_count: self.trade_count as u64,
+        }
+    }
+}
+
 /// 24小时统计数据
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
@@ -398,6 +505,68 @@ impl Default for Statistics24h {
     }
 }
 
+/// 已发布快照 - 定时器生成的市场数据快照
+///
+/// 包含在1ms定时器间隔处生成的所有市场数据类型：
+/// - BBO（最优买卖价）
+/// - Level2深度（前10档）
+/// - 聚合成交数据（当前活跃的时间桶）
+/// - 24小时统计数据
+///
+/// 用于定期向Aeron通道发布市场数据（Phase 3.2）
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedSnapshot {
+    pub timestamp: u64,              // 快照时间戳（纳秒）
+    pub sequence: u64,               // 快照序列号
+    pub bbo: BBOSnapshot,            // 最优买卖价快照
+    pub level2: Level2Snapshot,      // Level2深度快照
+    pub current_agg_1s: AggregateTrade,   // 当前活跃的1秒聚合成交
+    pub current_agg_5s: AggregateTrade,   // 当前活跃的5秒聚合成交
+    pub current_agg_1m: AggregateTrade,   // 当前活跃的1分钟聚合成交
+    pub stats_24h: Statistics24h,    // 24小时统计数据
+}
+
+impl PublishedSnapshot {
+    /// 创建新的已发布快照
+    pub fn new(
+        timestamp: u64,
+        sequence: u64,
+        bbo: BBOSnapshot,
+        level2: Level2Snapshot,
+        current_agg_1s: AggregateTrade,
+        current_agg_5s: AggregateTrade,
+        current_agg_1m: AggregateTrade,
+        stats_24h: Statistics24h,
+    ) -> Self {
+        Self {
+            timestamp,
+            sequence,
+            bbo,
+            level2,
+            current_agg_1s,
+            current_agg_5s,
+            current_agg_1m,
+            stats_24h,
+        }
+    }
+}
+
+impl Default for PublishedSnapshot {
+    fn default() -> Self {
+        Self {
+            timestamp: 0,
+            sequence: 0,
+            bbo: BBOSnapshot::default(),
+            level2: Level2Snapshot::default(),
+            current_agg_1s: AggregateTrade::default(),
+            current_agg_5s: AggregateTrade::default(),
+            current_agg_1m: AggregateTrade::default(),
+            stats_24h: Statistics24h::default(),
+        }
+    }
+}
+
 /// 市场数据引擎 - 聚合和维护市场数据状态
 ///
 /// 从匹配引擎接收TradeEvent，维护以下状态：
@@ -416,8 +585,18 @@ pub struct MarketDataEngine {
     level2_snapshot: Level2Snapshot,
     /// 24小时统计数据
     statistics_24h: Statistics24h,
-    /// 聚合成交数据（预留，用于任务2.4）
-    aggregate_trades: Vec<AggregateTrade>,
+    /// 活跃的1秒时间桶
+    active_1s_bucket: AggregateTradeWindow,
+    /// 活跃的5秒时间桶
+    active_5s_bucket: AggregateTradeWindow,
+    /// 活跃的1分钟时间桶
+    active_1m_bucket: AggregateTradeWindow,
+    /// 完成的聚合成交历史（滚动窗口，保留最新10个）
+    completed_1s_trades: Vec<AggregateTrade>,
+    completed_5s_trades: Vec<AggregateTrade>,
+    completed_1m_trades: Vec<AggregateTrade>,
+    /// 最大历史记录数
+    max_history: usize,
 }
 
 impl MarketDataEngine {
@@ -429,12 +608,19 @@ impl MarketDataEngine {
     /// # 返回
     /// 初始化完毕的MarketDataEngine实例
     pub fn new(receiver: Receiver<TradeEvent>) -> Self {
+        let initial_time = 0u64;
         Self {
             receiver,
             bbo_snapshot: BBOSnapshot::default(),
             level2_snapshot: Level2Snapshot::default(),
             statistics_24h: Statistics24h::default(),
-            aggregate_trades: Vec::new(),
+            active_1s_bucket: AggregateTradeWindow::new(BucketType::OneSecond, initial_time, 0),
+            active_5s_bucket: AggregateTradeWindow::new(BucketType::FiveSeconds, initial_time, 0),
+            active_1m_bucket: AggregateTradeWindow::new(BucketType::OneMinute, initial_time, 0),
+            completed_1s_trades: Vec::new(),
+            completed_5s_trades: Vec::new(),
+            completed_1m_trades: Vec::new(),
+            max_history: 10,
         }
     }
 
@@ -709,9 +895,71 @@ impl MarketDataEngine {
         // 更新Level2状态 - Task 2.3
         let _ = self.update_level2_from_trade(event);
 
-        // TODO: 聚合成交数据更新逻辑 - Task 2.4
+        // 更新聚合成交数据 - Task 2.4
+        self.update_aggregate_trades_from_event(event);
 
         true
+    }
+
+    /// 从交易事件更新聚合成交数据
+    ///
+    /// 更新所有活跃的时间桶（1s, 5s, 1m）。如果成交时间超过桶的结束时间，
+    /// 则完成该桶并创建新桶。
+    #[inline]
+    fn update_aggregate_trades_from_event(&mut self, event: TradeEvent) {
+        // 更新1秒桶
+        if self.active_1s_bucket.contains_time(event.timestamp) {
+            if !self.active_1s_bucket.has_trades {
+                self.active_1s_bucket.init_with_first_trade(event.price, event.quantity);
+            } else {
+                self.active_1s_bucket.update_with_trade(event.price, event.quantity);
+            }
+        } else {
+            if self.active_1s_bucket.has_trades {
+                self.completed_1s_trades.push(self.active_1s_bucket.to_aggregate_trade());
+                if self.completed_1s_trades.len() > self.max_history {
+                    self.completed_1s_trades.remove(0);
+                }
+            }
+            self.active_1s_bucket = AggregateTradeWindow::new(BucketType::OneSecond, event.timestamp, event.sequence);
+            self.active_1s_bucket.init_with_first_trade(event.price, event.quantity);
+        }
+
+        // 更新5秒桶
+        if self.active_5s_bucket.contains_time(event.timestamp) {
+            if !self.active_5s_bucket.has_trades {
+                self.active_5s_bucket.init_with_first_trade(event.price, event.quantity);
+            } else {
+                self.active_5s_bucket.update_with_trade(event.price, event.quantity);
+            }
+        } else {
+            if self.active_5s_bucket.has_trades {
+                self.completed_5s_trades.push(self.active_5s_bucket.to_aggregate_trade());
+                if self.completed_5s_trades.len() > self.max_history {
+                    self.completed_5s_trades.remove(0);
+                }
+            }
+            self.active_5s_bucket = AggregateTradeWindow::new(BucketType::FiveSeconds, event.timestamp, event.sequence);
+            self.active_5s_bucket.init_with_first_trade(event.price, event.quantity);
+        }
+
+        // 更新1分钟桶
+        if self.active_1m_bucket.contains_time(event.timestamp) {
+            if !self.active_1m_bucket.has_trades {
+                self.active_1m_bucket.init_with_first_trade(event.price, event.quantity);
+            } else {
+                self.active_1m_bucket.update_with_trade(event.price, event.quantity);
+            }
+        } else {
+            if self.active_1m_bucket.has_trades {
+                self.completed_1m_trades.push(self.active_1m_bucket.to_aggregate_trade());
+                if self.completed_1m_trades.len() > self.max_history {
+                    self.completed_1m_trades.remove(0);
+                }
+            }
+            self.active_1m_bucket = AggregateTradeWindow::new(BucketType::OneMinute, event.timestamp, event.sequence);
+            self.active_1m_bucket.init_with_first_trade(event.price, event.quantity);
+        }
     }
 
     /// 获取当前BBO快照
@@ -741,13 +989,120 @@ impl MarketDataEngine {
         self.statistics_24h
     }
 
-    /// 获取聚合成交数据
+    /// 重置24小时统计数据
+    ///
+    /// 将所有24小时统计数据重置为初始状态。在正式环境中，
+    /// 应该在UTC午夜自动调用此方法（在Phase 3中通过定时器实现）。
+    /// 对于MVP版本，此方法可由外部代码在适当的时间点调用。
+    ///
+    /// # 参数
+    /// - `timestamp`: 新的开始时间戳（纳秒），通常是重置时刻的时间
+    ///
+    /// # 示例
+    /// ```ignore
+    /// engine.reset_24h_statistics(current_timestamp);
+    /// ```
+    pub fn reset_24h_statistics(&mut self, timestamp: u64) {
+        self.statistics_24h = Statistics24h {
+            timestamp,
+            open_time: timestamp,
+            close_time: timestamp,
+            price_24h_high: 0.0,
+            price_24h_low: 0.0,
+            price_change_percent: 0.0,
+            weighted_avg_price: 0.0,
+            volume_24h: 0.0,
+            quote_asset_volume_24h: 0.0,
+            bid_price: 0.0,
+            bid_qty: 0.0,
+            ask_price: 0.0,
+            ask_qty: 0.0,
+            first_trade_id: 0,
+            last_trade_id: 0,
+            trade_count: 0,
+        };
+    }
+
+    /// 获取当前活跃的1秒聚合成交
     ///
     /// # 返回
-    /// 当前聚合成交数据的副本
+    /// 当前活跃的1秒时间桶转换为AggregateTrade
     #[inline]
-    pub fn get_aggregate_trades(&self) -> Vec<AggregateTrade> {
-        self.aggregate_trades.clone()
+    pub fn get_current_1s_aggregate(&self) -> AggregateTrade {
+        self.active_1s_bucket.to_aggregate_trade()
+    }
+
+    /// 获取当前活跃的5秒聚合成交
+    ///
+    /// # 返回
+    /// 当前活跃的5秒时间桶转换为AggregateTrade
+    #[inline]
+    pub fn get_current_5s_aggregate(&self) -> AggregateTrade {
+        self.active_5s_bucket.to_aggregate_trade()
+    }
+
+    /// 获取当前活跃的1分钟聚合成交
+    ///
+    /// # 返回
+    /// 当前活跃的1分钟时间桶转换为AggregateTrade
+    #[inline]
+    pub fn get_current_1m_aggregate(&self) -> AggregateTrade {
+        self.active_1m_bucket.to_aggregate_trade()
+    }
+
+    /// 获取1秒聚合成交历史
+    ///
+    /// # 返回
+    /// 最近完成的1秒聚合成交列表（滚动窗口）
+    #[inline]
+    pub fn get_1s_aggregate_history(&self) -> Vec<AggregateTrade> {
+        self.completed_1s_trades.clone()
+    }
+
+    /// 获取5秒聚合成交历史
+    ///
+    /// # 返回
+    /// 最近完成的5秒聚合成交列表（滚动窗口）
+    #[inline]
+    pub fn get_5s_aggregate_history(&self) -> Vec<AggregateTrade> {
+        self.completed_5s_trades.clone()
+    }
+
+    /// 获取1分钟聚合成交历史
+    ///
+    /// # 返回
+    /// 最近完成的1分钟聚合成交列表（滚动窗口）
+    #[inline]
+    pub fn get_1m_aggregate_history(&self) -> Vec<AggregateTrade> {
+        self.completed_1m_trades.clone()
+    }
+
+    /// 生成已发布快照
+    ///
+    /// 根据当前的引擎状态生成一个PublishedSnapshot，包含：
+    /// - BBO快照
+    /// - Level2快照
+    /// - 所有活跃时间桶的聚合成交数据
+    /// - 24小时统计数据
+    ///
+    /// # 参数
+    /// - `timestamp`: 快照时间戳（纳秒），通常由定时器提供
+    /// - `sequence`: 快照序列号
+    ///
+    /// # 返回
+    /// 新生成的PublishedSnapshot
+    #[inline]
+    pub fn generate_published_snapshot(&self, timestamp: u64, sequence: u64) -> PublishedSnapshot {
+        PublishedSnapshot::new(
+            timestamp,
+            sequence,
+            self.bbo_snapshot,
+            self.level2_snapshot,
+            self.active_1s_bucket.to_aggregate_trade(),
+            self.active_5s_bucket.to_aggregate_trade(),
+            self.active_1m_bucket.to_aggregate_trade(),
+            self.statistics_24h,
+        )
     }
 
     /// 主事件循环 - 连续消费来自通道的TradeEvent
@@ -770,6 +1125,87 @@ impl MarketDataEngine {
                 }
             }
         }
+    }
+}
+
+/// 1ms定时器和快照发布器
+///
+/// 负责定期（每1ms）从MarketDataEngine收集快照并发送到发布通道。
+/// 运行在独立线程中，不阻塞主事件循环。
+///
+/// # 示例
+///
+/// ```ignore
+/// let engine = Arc::new(Mutex::new(MarketDataEngine::new(receiver)));
+/// let (snapshot_tx, snapshot_rx) = crossbeam::channel::unbounded();
+/// let timer = SnapshotTimer::spawn(engine.clone(), snapshot_tx);
+///
+/// // 处理快照...
+///
+/// timer.stop();  // 停止定时器
+/// ```
+pub struct SnapshotTimer {
+    should_stop: Arc<AtomicBool>,
+}
+
+impl SnapshotTimer {
+    /// 启动1ms定时器和快照生成线程
+    ///
+    /// # 参数
+    /// - `engine`: 市场数据引擎的Arc<Mutex<>>包装
+    /// - `snapshot_tx`: 快照发送器通道
+    ///
+    /// # 返回
+    /// SnapshotTimer控制句柄，用于停止定时器
+    pub fn spawn(
+        engine: Arc<parking_lot::Mutex<MarketDataEngine>>,
+        snapshot_tx: Sender<PublishedSnapshot>,
+    ) -> Self {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = should_stop.clone();
+
+        thread::spawn(move || {
+            let mut sequence = 0u64;
+            let interval = Duration::from_millis(1);
+
+            loop {
+                // 检查是否应该停止
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // 获取当前时间（模拟纳秒精度）
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64;
+
+                // 锁定引擎并生成快照
+                {
+                    let engine = engine.lock();
+                    let snapshot = engine.generate_published_snapshot(timestamp, sequence);
+
+                    // 发送快照到发布通道
+                    // 如果通道已关闭或满，忽略错误（接收方可能已停止）
+                    let _ = snapshot_tx.try_send(snapshot);
+                }
+
+                sequence = sequence.wrapping_add(1);
+
+                // 等待1ms再生成下一个快照
+                thread::sleep(interval);
+            }
+        });
+
+        Self { should_stop }
+    }
+
+    /// 停止定时器和快照生成线程
+    ///
+    /// 此方法是非阻塞的，它设置停止标志但不等待线程退出。
+    /// 线程将在下一次迭代时看到标志并退出。
+    pub fn stop(&self) {
+        self.should_stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1135,6 +1571,108 @@ mod tests {
         assert_eq!(stats.trade_count, 0);
     }
 
+    #[test]
+    fn test_reset_24h_statistics_clears_all_fields() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add trades to accumulate statistics
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50100.0, 5.0, Side::Sell, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        // Verify statistics are accumulated
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 2);
+        assert_eq!(stats.volume_24h, 15.0);
+        assert!(stats.price_24h_high > 0.0);
+        assert!(stats.price_24h_low > 0.0);
+
+        // Reset statistics
+        let reset_time = 3_000_000_000u64;
+        engine.reset_24h_statistics(reset_time);
+
+        // Verify all fields are reset
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.timestamp, reset_time);
+        assert_eq!(stats.open_time, reset_time);
+        assert_eq!(stats.close_time, reset_time);
+        assert_eq!(stats.trade_count, 0);
+        assert_eq!(stats.volume_24h, 0.0);
+        assert_eq!(stats.quote_asset_volume_24h, 0.0);
+        assert_eq!(stats.price_24h_high, 0.0);
+        assert_eq!(stats.price_24h_low, 0.0);
+        assert_eq!(stats.price_change_percent, 0.0);
+        assert_eq!(stats.first_trade_id, 0);
+        assert_eq!(stats.last_trade_id, 0);
+        assert_eq!(stats.bid_price, 0.0);
+        assert_eq!(stats.ask_price, 0.0);
+    }
+
+    #[test]
+    fn test_reset_24h_statistics_allows_new_trades() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add first trade
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        // Verify first trade is recorded
+        let mut stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 1);
+        assert_eq!(stats.first_trade_id, 100);
+        assert_eq!(stats.volume_24h, 10.0);
+
+        // Reset at new time
+        let reset_time = 2_000_000_000u64;
+        engine.reset_24h_statistics(reset_time);
+
+        // Verify reset
+        stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 0);
+        assert_eq!(stats.first_trade_id, 0);
+
+        // Add new trade after reset
+        let event2 = TradeEvent::new(2, 200, 199, 3_000_000_000, 51000.0, 5.0, Side::Sell, 2001, 3001);
+        engine.consume_trade_event(event2);
+
+        // Verify new trade is correctly recorded
+        stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 1);
+        assert_eq!(stats.first_trade_id, 200);
+        assert_eq!(stats.last_trade_id, 200);
+        assert_eq!(stats.volume_24h, 5.0);
+        assert_eq!(stats.price_24h_high, 51000.0);
+        assert_eq!(stats.price_24h_low, 51000.0);
+    }
+
+    #[test]
+    fn test_reset_24h_statistics_preserves_bbo_and_level2() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add trade
+        let event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event);
+
+        // Verify BBO was updated
+        let bbo_before = engine.get_bbo_snapshot();
+        assert_eq!(bbo_before.best_ask_price, 50000.0);
+
+        let reset_time = 2_000_000_000u64;
+        engine.reset_24h_statistics(reset_time);
+
+        // Verify BBO and Level2 are NOT reset (only 24h stats)
+        let bbo_after = engine.get_bbo_snapshot();
+        assert_eq!(bbo_after.best_ask_price, 50000.0);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.num_asks, 1);
+    }
+
     // ===== 集成测试 =====
 
     #[test]
@@ -1306,8 +1844,8 @@ mod tests {
         let engine = MarketDataEngine::new(receiver);
 
         // Should return empty vector initially
-        let trades = engine.get_aggregate_trades();
-        assert!(trades.is_empty());
+        let history = engine.get_1s_aggregate_history();
+        assert!(history.is_empty());
     }
 
     #[test]
@@ -1422,6 +1960,373 @@ mod tests {
         assert_eq!(stats.quote_asset_volume_24h, expected_quote_volume);
         assert_eq!(stats.price_24h_high, 50100.0);
         assert_eq!(stats.price_24h_low, 49950.0);
+    }
+
+    // ===== 聚合成交 (Aggregate Trade) 测试 - Task 2.4 =====
+
+    #[test]
+    fn test_aggregate_trade_window_contains_time() {
+        let bucket = AggregateTradeWindow::new(BucketType::OneSecond, 1_000_000_000, 1);
+
+        // 窗口: 1_000_000_000 to 2_000_000_000
+        assert!(bucket.contains_time(1_000_000_000));
+        assert!(bucket.contains_time(1_500_000_000));
+        assert!(!bucket.contains_time(2_000_000_000));
+        assert!(!bucket.contains_time(3_000_000_000));
+    }
+
+    #[test]
+    fn test_aggregate_trade_window_bucket_types() {
+        let bucket_1s = AggregateTradeWindow::new(BucketType::OneSecond, 1_000_000_000, 1);
+        assert_eq!(bucket_1s.end_time - bucket_1s.start_time, 1_000_000_000);
+
+        let bucket_5s = AggregateTradeWindow::new(BucketType::FiveSeconds, 1_000_000_000, 1);
+        assert_eq!(bucket_5s.end_time - bucket_5s.start_time, 5_000_000_000);
+
+        let bucket_1m = AggregateTradeWindow::new(BucketType::OneMinute, 1_000_000_000, 1);
+        assert_eq!(bucket_1m.end_time - bucket_1m.start_time, 60_000_000_000);
+    }
+
+    #[test]
+    fn test_aggregate_trade_window_init_and_update() {
+        let mut bucket = AggregateTradeWindow::new(BucketType::OneSecond, 1_000_000_000, 1);
+        assert!(!bucket.has_trades);
+
+        // 初始化第一笔成交
+        bucket.init_with_first_trade(100.0, 10.0);
+        assert!(bucket.has_trades);
+        assert_eq!(bucket.open, 100.0);
+        assert_eq!(bucket.close, 100.0);
+        assert_eq!(bucket.high, 100.0);
+        assert_eq!(bucket.low, 100.0);
+        assert_eq!(bucket.volume, 10.0);
+        assert_eq!(bucket.quote_asset_volume, 1000.0);
+        assert_eq!(bucket.trade_count, 1);
+
+        // 更新第二笔成交
+        bucket.update_with_trade(101.0, 5.0);
+        assert_eq!(bucket.open, 100.0);  // 开盘价不变
+        assert_eq!(bucket.close, 101.0);  // 收盘价更新
+        assert_eq!(bucket.high, 101.0);   // 最高价更新
+        assert_eq!(bucket.low, 100.0);    // 最低价不变
+        assert_eq!(bucket.volume, 15.0);
+        assert_eq!(bucket.quote_asset_volume, 1505.0);
+        assert_eq!(bucket.trade_count, 2);
+
+        // 更新第三笔成交
+        bucket.update_with_trade(99.0, 8.0);
+        assert_eq!(bucket.high, 101.0);
+        assert_eq!(bucket.low, 99.0);
+        assert_eq!(bucket.close, 99.0);
+        assert_eq!(bucket.volume, 23.0);
+        assert_eq!(bucket.trade_count, 3);
+    }
+
+    #[test]
+    fn test_aggregate_trade_window_to_aggregate_trade() {
+        let mut bucket = AggregateTradeWindow::new(BucketType::OneSecond, 1_000_000_000, 5);
+        bucket.init_with_first_trade(100.0, 10.0);
+        bucket.update_with_trade(101.0, 5.0);
+
+        let trade = bucket.to_aggregate_trade();
+        assert_eq!(trade.start_time, 1_000_000_000);
+        assert_eq!(trade.end_time, 2_000_000_000);
+        assert_eq!(trade.sequence, 5);
+        assert_eq!(trade.open, 100.0);
+        assert_eq!(trade.close, 101.0);
+        assert_eq!(trade.high, 101.0);
+        assert_eq!(trade.low, 100.0);
+        assert_eq!(trade.volume, 15.0);
+        assert_eq!(trade.quote_asset_volume, 1505.0);
+        assert_eq!(trade.trade_count, 2);
+    }
+
+    #[test]
+    fn test_market_data_engine_single_trade_updates_all_buckets() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+        engine.consume_trade_event(event);
+
+        // 检查所有三个活跃桶都更新了
+        let agg_1s = engine.get_current_1s_aggregate();
+        let agg_5s = engine.get_current_5s_aggregate();
+        let agg_1m = engine.get_current_1m_aggregate();
+
+        // 1秒桶
+        assert!(agg_1s.open == 50000.0);
+        assert_eq!(agg_1s.volume, 10.0);
+        assert_eq!(agg_1s.trade_count, 1);
+
+        // 5秒桶
+        assert_eq!(agg_5s.open, 50000.0);
+        assert_eq!(agg_5s.volume, 10.0);
+        assert_eq!(agg_5s.trade_count, 1);
+
+        // 1分钟桶
+        assert_eq!(agg_1m.open, 50000.0);
+        assert_eq!(agg_1m.volume, 10.0);
+        assert_eq!(agg_1m.trade_count, 1);
+    }
+
+    #[test]
+    fn test_market_data_engine_multiple_trades_within_bucket() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // 三笔成交在同一秒内
+        let trades = vec![
+            (1_000_000_000, 100.0, 10.0),
+            (1_300_000_000, 101.0, 5.0),
+            (1_800_000_000, 100.5, 8.0),
+        ];
+
+        for (idx, (timestamp, price, qty)) in trades.iter().enumerate() {
+            let event = TradeEvent::new(
+                (idx + 1) as u64,
+                100 + idx as u64,
+                99 + idx as u64,
+                *timestamp,
+                *price,
+                *qty,
+                Side::Buy,
+                1001 + idx as u64,
+                2001 + idx as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let agg_1s = engine.get_current_1s_aggregate();
+        assert_eq!(agg_1s.open, 100.0);
+        assert_eq!(agg_1s.close, 100.5);
+        assert_eq!(agg_1s.high, 101.0);
+        assert_eq!(agg_1s.low, 100.0);
+        assert_eq!(agg_1s.volume, 23.0);
+        assert_eq!(agg_1s.quote_asset_volume, 100.0*10.0 + 101.0*5.0 + 100.5*8.0);
+        assert_eq!(agg_1s.trade_count, 3);
+    }
+
+    #[test]
+    fn test_market_data_engine_bucket_expiration_1s() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // 第一笔成交在1秒时
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            100.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+        engine.consume_trade_event(event1);
+
+        let agg_1s_before = engine.get_current_1s_aggregate();
+        assert_eq!(agg_1s_before.volume, 10.0);
+        assert_eq!(agg_1s_before.start_time, 1_000_000_000);
+
+        // 第二笔成交超过1秒（在1.5秒）
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_100_000_000,  // 超过第一个1秒窗口的结束时间 (2_000_000_000)
+            101.0,
+            5.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
+        engine.consume_trade_event(event2);
+
+        // 历史应该包含已完成的第一个桶
+        let history = engine.get_1s_aggregate_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].volume, 10.0);
+        assert_eq!(history[0].open, 100.0);
+
+        // 当前活跃桶应该是新的
+        let agg_1s_after = engine.get_current_1s_aggregate();
+        assert_eq!(agg_1s_after.volume, 5.0);
+        assert_eq!(agg_1s_after.start_time, 2_100_000_000);
+        assert_eq!(agg_1s_after.open, 101.0);
+    }
+
+    #[test]
+    fn test_market_data_engine_rolling_window_history() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // 创建12个连续的1秒桶（超过max_history=10）
+        for i in 0..12 {
+            let timestamp = 1_000_000_000 + (i as u64 * 1_000_000_000) + 100;
+            let event = TradeEvent::new(
+                (i + 1) as u64,
+                100 + i as u64,
+                99 + i as u64,
+                timestamp,
+                50000.0 + i as f64,
+                10.0 + i as f64,
+                Side::Buy,
+                1001 + i as u64,
+                2001 + i as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        // 历史应该只包含最近的10个（max_history=10）
+        // 12个事件中，11个完成了桶（最后一个事件的桶是活跃的），
+        // 其中前1个被丢弃，保留最后的10个
+        let history = engine.get_1s_aggregate_history();
+        assert_eq!(history.len(), 10);
+
+        // 验证最早的桶（来自事件i=1，体积=11）
+        assert_eq!(history[0].volume, 11.0);  // 事件i=1
+        // 验证最后的桶（来自事件i=10，体积=20）
+        assert_eq!(history[9].volume, 20.0);  // 事件i=10（最后一个完成的桶）
+    }
+
+    #[test]
+    fn test_market_data_engine_bucket_expiration_5s() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // 第一笔成交在1秒
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            100.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+        engine.consume_trade_event(event1);
+
+        let agg_5s_before = engine.get_current_5s_aggregate();
+        // 初始桶始于0，结束于5秒
+        assert_eq!(agg_5s_before.end_time, 5_000_000_000);
+        assert_eq!(agg_5s_before.volume, 10.0);
+
+        // 第二笔成交在6秒（超过5秒窗口）
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            6_100_000_000,
+            101.0,
+            5.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
+        engine.consume_trade_event(event2);
+
+        // 历史应该包含已完成的5秒桶
+        let history = engine.get_5s_aggregate_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].volume, 10.0);
+
+        // 当前活跃桶应该是新的
+        let agg_5s_after = engine.get_current_5s_aggregate();
+        assert_eq!(agg_5s_after.start_time, 6_100_000_000);
+        assert_eq!(agg_5s_after.end_time, 11_100_000_000);
+        assert_eq!(agg_5s_after.volume, 5.0);
+    }
+
+    #[test]
+    fn test_market_data_engine_bucket_expiration_1m() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // 第一笔成交在0秒
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            100.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+        engine.consume_trade_event(event1);
+
+        // 第二笔成交在61秒（超过1分钟窗口）
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            61_000_000_000 + 100,  // 61秒 + 100纳秒
+            101.0,
+            5.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
+        engine.consume_trade_event(event2);
+
+        // 历史应该包含已完成的1分钟桶
+        let history = engine.get_1m_aggregate_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].volume, 10.0);
+
+        // 当前活跃桶应该是新的
+        let agg_1m_after = engine.get_current_1m_aggregate();
+        assert_eq!(agg_1m_after.volume, 5.0);
+    }
+
+    #[test]
+    fn test_market_data_engine_independent_bucket_types() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // 在同一时间戳创建多个事件，不同的桶应该独立更新
+        for i in 0..3 {
+            let timestamp = 1_000_000_000 + (i as u64 * 200_000_000);
+            let event = TradeEvent::new(
+                (i + 1) as u64,
+                100 + i as u64,
+                99 + i as u64,
+                timestamp,
+                50000.0 + i as f64 * 100.0,
+                10.0,
+                Side::Buy,
+                1001 + i as u64,
+                2001 + i as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        // 所有成交都在同一1秒窗口内
+        let agg_1s = engine.get_current_1s_aggregate();
+        assert_eq!(agg_1s.trade_count, 3);
+
+        // 所有成交都在同一5秒窗口内
+        let agg_5s = engine.get_current_5s_aggregate();
+        assert_eq!(agg_5s.trade_count, 3);
+
+        // 所有成交都在同一1分钟窗口内
+        let agg_1m = engine.get_current_1m_aggregate();
+        assert_eq!(agg_1m.trade_count, 3);
     }
 
     // ===== Level2 更新逻辑测试 - Task 2.3 =====
@@ -2184,5 +3089,139 @@ mod tests {
         assert_eq!(bid1, 50000.0);
         // New snapshot reflects updated bid
         assert_eq!(bid2, 50050.0);
+    }
+
+    // ===== PublishedSnapshot Tests =====
+
+    #[test]
+    fn test_published_snapshot_creation() {
+        let bbo = BBOSnapshot::default();
+        let level2 = Level2Snapshot::default();
+        let agg_1s = AggregateTrade::default();
+        let agg_5s = AggregateTrade::default();
+        let agg_1m = AggregateTrade::default();
+        let stats = Statistics24h::default();
+
+        let snapshot = PublishedSnapshot::new(
+            1_000_000_000,
+            1,
+            bbo,
+            level2,
+            agg_1s,
+            agg_5s,
+            agg_1m,
+            stats,
+        );
+
+        assert_eq!(snapshot.timestamp, 1_000_000_000);
+        assert_eq!(snapshot.sequence, 1);
+    }
+
+    #[test]
+    fn test_published_snapshot_default() {
+        let snapshot = PublishedSnapshot::default();
+
+        assert_eq!(snapshot.timestamp, 0);
+        assert_eq!(snapshot.sequence, 0);
+        assert_eq!(snapshot.bbo.best_bid_price, 0.0);
+        assert_eq!(snapshot.level2.num_bids, 0);
+        assert_eq!(snapshot.stats_24h.volume_24h, 0.0);
+    }
+
+    #[test]
+    fn test_generate_published_snapshot() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Consume some events within the same time bucket (to keep them in active_1s_bucket)
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        // Keep the second event within the same 1s bucket (1_500_000_000 is still within the first 1s window)
+        let event2 = TradeEvent::new(2, 101, 100, 1_500_000_000, 50100.0, 5.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        // Generate snapshot
+        let ts = 1_800_000_000u64;  // Still within the same 1s bucket
+        let seq = 42u64;
+        let snapshot = engine.generate_published_snapshot(ts, seq);
+
+        // Verify snapshot contains all required data
+        assert_eq!(snapshot.timestamp, ts);
+        assert_eq!(snapshot.sequence, seq);
+        assert_eq!(snapshot.bbo.best_bid_price, 50000.0);
+        assert_eq!(snapshot.bbo.best_ask_price, 50100.0);
+        assert_eq!(snapshot.stats_24h.volume_24h, 15.0);
+        assert_eq!(snapshot.current_agg_1s.volume, 15.0);
+    }
+
+    #[test]
+    fn test_published_snapshot_reflects_engine_state() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Add multiple trades
+        for i in 0..5 {
+            let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+            let event = TradeEvent::new(
+                i,
+                100 + i,
+                99 + i,
+                1_000_000_000 + (i as u64 * 1000),
+                50000.0 + (i as f64 * 10.0),
+                10.0,
+                side,
+                1000 + i,
+                2000 + i,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let snapshot = engine.generate_published_snapshot(10_000_000_000, 100);
+
+        // All snapshot types should be populated
+        assert!(snapshot.bbo.best_bid_price > 0.0 || snapshot.bbo.best_ask_price > 0.0);
+        assert_eq!(snapshot.stats_24h.trade_count, 5);
+        assert_eq!(snapshot.current_agg_1s.volume, 50.0);
+    }
+
+    #[test]
+    fn test_published_snapshot_sequence_increment() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let engine = MarketDataEngine::new(receiver);
+
+        let snap1 = engine.generate_published_snapshot(1_000_000_000, 1);
+        let snap2 = engine.generate_published_snapshot(2_000_000_000, 2);
+        let snap3 = engine.generate_published_snapshot(3_000_000_000, 3);
+
+        assert_eq!(snap1.sequence, 1);
+        assert_eq!(snap2.sequence, 2);
+        assert_eq!(snap3.sequence, 3);
+        assert!(snap2.timestamp > snap1.timestamp);
+        assert!(snap3.timestamp > snap2.timestamp);
+    }
+
+    #[test]
+    fn test_published_snapshot_contains_all_aggregate_types() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Create a trade at timestamp 500ms
+        let trade_ts = 500_000_000u64;
+        let event = TradeEvent::new(1, 100, 99, trade_ts, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event);
+
+        let snapshot = engine.generate_published_snapshot(700_000_000, 1);
+
+        // Verify all aggregate types are included in the published snapshot
+        // and have been updated with trade data
+        assert_eq!(snapshot.current_agg_1s.volume, 10.0);
+        assert_eq!(snapshot.current_agg_5s.volume, 10.0);
+        assert_eq!(snapshot.current_agg_1m.volume, 10.0);
+
+        // Verify that all buckets show the same price
+        assert_eq!(snapshot.current_agg_1s.close, 50000.0);
+        assert_eq!(snapshot.current_agg_5s.close, 50000.0);
+        assert_eq!(snapshot.current_agg_1m.close, 50000.0);
     }
 }

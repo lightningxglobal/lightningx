@@ -23,6 +23,7 @@ pub use event::MatchingEvent;
 pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use market_data::{
     TradeEvent, MarketDataEngine, BBOSnapshot, Level2Snapshot, AggregateTrade, Statistics24h,
+    PublishedSnapshot, SnapshotTimer,
 };
 
 #[cfg(test)]

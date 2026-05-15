@@ -15,13 +15,13 @@
 use matching_engine::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent,
     MarketDataEngine, SnapshotTimer, SnapshotPublisherThread, TradePublisherThread,
-    AeronConfig,
+    AeronConfig, PublishedSnapshot,
 };
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use parking_lot::Mutex;
-use crossbeam::channel;
+use rtrb::RingBuffer;
 
 /// 性能数据采集
 struct PerformanceMetrics {
@@ -82,14 +82,13 @@ fn main() {
     // ========== 初始化系统 ==========
     println!("初始化系统组件...\n");
 
-    let (trade_tx, trade_rx) = channel::bounded::<TradeEvent>(1_000_000);
+    let (trade_tx, mut trade_rx) = RingBuffer::<TradeEvent>::new(1_000_000);
     let mut engine = MatchingEngine::new(PoolConfig::default()).expect("创建匹配引擎失败");
     engine.set_trade_event_sender(trade_tx);
 
-    let market_data_rx = channel::unbounded::<TradeEvent>().1;
-    let market_data_engine = Arc::new(Mutex::new(MarketDataEngine::new(market_data_rx)));
+    let market_data_engine = Arc::new(Mutex::new(MarketDataEngine::new()));
 
-    let (snapshot_tx, snapshot_rx) = channel::unbounded();
+    let (mut snapshot_tx, snapshot_rx) = RingBuffer::<PublishedSnapshot>::new(1_000_000);
     let snapshot_timer = SnapshotTimer::spawn(market_data_engine, snapshot_tx);
 
     let snapshot_aeron_config = AeronConfig {

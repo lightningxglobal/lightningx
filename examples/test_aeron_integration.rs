@@ -12,6 +12,7 @@ use matching_engine::{
 };
 use std::thread;
 use std::time::Duration;
+use rtrb::RingBuffer;
 
 fn main() {
     println!("=== Aeron集成端到端测试 ===\n");
@@ -84,7 +85,7 @@ fn test_publisher_initialization() {
 
 fn test_publisher_thread_lifecycle() {
     // 创建快照通道
-    let (snapshot_tx, snapshot_rx) = crossbeam::channel::unbounded::<PublishedSnapshot>();
+    let (mut snapshot_tx, snapshot_rx) = RingBuffer::<PublishedSnapshot>::new(1_000_000);
 
     // 创建配置
     let config = AeronConfig::default();
@@ -97,7 +98,7 @@ fn test_publisher_thread_lifecycle() {
     let mut snapshot = PublishedSnapshot::default();
     for i in 1..=5 {
         snapshot.sequence = i;
-        let _ = snapshot_tx.try_send(snapshot.clone());
+        let _ = snapshot_tx.push(snapshot.clone());
     }
     println!("  ✓ 发送5个快照");
 

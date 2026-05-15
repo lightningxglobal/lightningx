@@ -15,20 +15,21 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use rtrb::RingBuffer;
 
 fn main() {
     println!("=== Aeron快照发布集成示例 ===\n");
 
     // ===== 1. 创建TradeEvent通道 =====
-    let (sender, receiver) = crossbeam::channel::bounded::<TradeEvent>(1_000_000);
+    let (sender, _receiver) = RingBuffer::<TradeEvent>::new(1_000_000);
     println!("✓ 创建TradeEvent通道 (capacity: 1,000,000)");
 
     // ===== 2. 创建市场数据引擎 =====
-    let engine = Arc::new(Mutex::new(MarketDataEngine::new(receiver)));
+    let engine = Arc::new(Mutex::new(MarketDataEngine::new()));
     println!("✓ 创建市场数据引擎");
 
     // ===== 3. 创建快照发布通道 =====
-    let (snapshot_tx, snapshot_rx) = crossbeam::channel::unbounded::<PublishedSnapshot>();
+    let (mut snapshot_tx, snapshot_rx) = RingBuffer::<PublishedSnapshot>::new(1_000_000);
     println!("✓ 创建快照发布通道（无界）");
 
     // ===== 4. 启动1ms定时器生成快照 =====
@@ -36,7 +37,14 @@ fn main() {
     let timer = SnapshotTimer::spawn(engine_clone, snapshot_tx);
     println!("✓ 启动1ms定时器");
 
-    // ===== 5. 启动Aeron发布线程 =====
+    // ===== 5. 创建匹配引擎 =====
+    let mut matching_engine = MatchingEngine::new(PoolConfig::default())
+        .expect("创建匹配引擎失败");
+    matching_engine.set_trade_event_sender(sender);
+    let matching_engine = Arc::new(Mutex::new(matching_engine));
+    println!("✓ 创建匹配引擎并设置发送器");
+
+    // ===== 6. 启动Aeron发布线程 =====
     let aeron_config = AeronConfig {
         aeron_dir: "/dev/shm/aeron".to_string(),
         channel: "aeron:ipc".to_string(),
@@ -46,8 +54,8 @@ fn main() {
     let publisher_thread = SnapshotPublisherThread::spawn(snapshot_rx, aeron_config);
     println!("✓ 启动Aeron快照发布线程\n");
 
-    // ===== 6. 在单独线程中生成交易事件 =====
-    let sender_clone = sender.clone();
+    // ===== 7. 在单独线程中生成交易事件 =====
+    let engine_trade = matching_engine.clone();
     let trade_thread = thread::spawn(move || {
         // 生成20笔交易（演示目的）
         for i in 1..=20 {
@@ -61,10 +69,10 @@ fn main() {
                 0,
             );
 
-            let mut matching_engine = MatchingEngine::new(PoolConfig::default())
-                .expect("创建匹配引擎失败");
-            matching_engine.set_trade_event_sender(sender_clone.clone());
-            let _ = matching_engine.place_order(buy_order);
+            {
+                let mut engine = engine_trade.lock();
+                let _ = engine.place_order(buy_order);
+            }
 
             // 卖单 - 触发成交
             let sell_order = Order::new(
@@ -76,14 +84,17 @@ fn main() {
                 0,
             );
 
-            let _ = matching_engine.place_order(sell_order);
+            {
+                let mut engine = engine_trade.lock();
+                let _ = engine.place_order(sell_order);
+            }
 
             // 稍微延迟以允许引擎处理
             thread::sleep(Duration::from_micros(100));
         }
     });
 
-    // ===== 7. 运行简短的观测期（验证快照生成） =====
+    // ===== 8. 运行简短的观测期（验证快照生成） =====
     println!("=== 快照生成验证 ===\n");
 
     let observation_start = std::time::Instant::now();

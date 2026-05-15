@@ -15,20 +15,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use rtrb::RingBuffer;
 
 fn main() {
     println!("=== 1ms定时器快照生成示例 ===\n");
 
     // 1. 创建TradeEvent通道
-    let (sender, receiver) = crossbeam::channel::bounded::<TradeEvent>(1_000_000);
+    let (sender, receiver) = RingBuffer::<TradeEvent>::new(1_000_000);
     println!("✓ 创建TradeEvent通道 (capacity: 1,000,000)");
 
     // 2. 创建市场数据引擎并包装在Arc<Mutex<>>中
-    let engine = Arc::new(Mutex::new(MarketDataEngine::new(receiver)));
+    let engine = Arc::new(Mutex::new(MarketDataEngine::new()));
     println!("✓ 创建市场数据引擎");
 
     // 3. 创建快照发布通道
-    let (snapshot_tx, snapshot_rx) = crossbeam::channel::unbounded::<PublishedSnapshot>();
+    let (snapshot_tx, mut snapshot_rx) = RingBuffer::<PublishedSnapshot>::new(1_000_000);
     println!("✓ 创建快照发布通道（无界）");
 
     // 4. 启动1ms定时器
@@ -36,8 +37,15 @@ fn main() {
     let timer = SnapshotTimer::spawn(engine_clone, snapshot_tx);
     println!("✓ 启动1ms定时器\n");
 
-    // 5. 在单独线程中生成交易事件
-    let sender_clone = sender.clone();
+    // 5. 创建匹配引擎并设置交易事件发送器
+    let mut matching_engine = MatchingEngine::new(PoolConfig::default())
+        .expect("创建匹配引擎失败");
+    matching_engine.set_trade_event_sender(sender);
+    let matching_engine = Arc::new(Mutex::new(matching_engine));
+    println!("✓ 创建匹配引擎并设置发送器");
+
+    // 6. 在单独线程中生成交易事件
+    let engine_trade = matching_engine.clone();
     let trade_thread = thread::spawn(move || {
         // 生成50笔交易
         for i in 1..=50 {
@@ -51,10 +59,10 @@ fn main() {
                 0,
             );
 
-            let mut matching_engine = MatchingEngine::new(PoolConfig::default())
-                .expect("创建匹配引擎失败");
-            matching_engine.set_trade_event_sender(sender_clone.clone());
-            let _ = matching_engine.place_order(buy_order);
+            {
+                let mut engine = engine_trade.lock();
+                let _ = engine.place_order(buy_order);
+            }
 
             // 卖单 - 触发成交
             let sell_order = Order::new(
@@ -66,14 +74,17 @@ fn main() {
                 0,
             );
 
-            let _ = matching_engine.place_order(sell_order);
+            {
+                let mut engine = engine_trade.lock();
+                let _ = engine.place_order(sell_order);
+            }
 
             // 稍微延迟以允许引擎处理
             thread::sleep(Duration::from_micros(100));
         }
     });
 
-    // 6. 收集快照并测量间隔
+    // 7. 收集快照并测量间隔
     let snapshot_count = Arc::new(AtomicUsize::new(0));
     let snapshot_count_clone = snapshot_count.clone();
 
@@ -81,39 +92,39 @@ fn main() {
         let start = Instant::now();
         let mut last_timestamp = 0u64;
         let mut interval_samples = Vec::new();
+        let mut collected = 0;
+        let timeout = Duration::from_secs(5);
+        let start_wait = Instant::now();
 
-        for _ in 0..100 {  // 收集100个快照
-            match snapshot_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(snapshot) => {
-                    let count = snapshot_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+        while collected < 100 && start_wait.elapsed() < timeout {
+            if let Ok(snapshot) = snapshot_rx.pop() {
+                let count = snapshot_count_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                collected += 1;
 
-                    // 计算快照间隔
-                    if last_timestamp > 0 && snapshot.timestamp > last_timestamp {
-                        let interval_ns = snapshot.timestamp - last_timestamp;
-                        interval_samples.push(interval_ns);
+                // 计算快照间隔
+                if last_timestamp > 0 && snapshot.timestamp > last_timestamp {
+                    let interval_ns = snapshot.timestamp - last_timestamp;
+                    interval_samples.push(interval_ns);
 
-                        if count <= 10 || count % 20 == 0 {
-                            println!(
-                                "快照 #{}: seq={}, interval={:.3}ms, BBO bid={}, ask={}",
-                                count,
-                                snapshot.sequence,
-                                interval_ns as f64 / 1_000_000.0,
-                                snapshot.bbo.best_bid_price,
-                                snapshot.bbo.best_ask_price
-                            );
-                        }
+                    if count <= 10 || count % 20 == 0 {
+                        println!(
+                            "快照 #{}: seq={}, interval={:.3}ms, BBO bid={}, ask={}",
+                            count,
+                            snapshot.sequence,
+                            interval_ns as f64 / 1_000_000.0,
+                            snapshot.bbo.best_bid_price,
+                            snapshot.bbo.best_ask_price
+                        );
                     }
-
-                    last_timestamp = snapshot.timestamp;
-
-                    // 验证快照完整性
-                    assert!(snapshot.timestamp > 0, "快照时间戳不能为0");
-                    assert!(snapshot.sequence > 0, "快照序列号不能为0");
                 }
-                Err(_) => {
-                    println!("等待快照超时");
-                    break;
-                }
+
+                last_timestamp = snapshot.timestamp;
+
+                // 验证快照完整性
+                assert!(snapshot.timestamp > 0, "快照时间戳不能为0");
+                assert!(snapshot.sequence > 0, "快照序列号不能为0");
+            } else {
+                thread::sleep(Duration::from_micros(100));
             }
         }
 

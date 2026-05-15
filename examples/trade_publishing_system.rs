@@ -13,12 +13,13 @@ use matching_engine::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, TradePublisherThread,
 };
 use std::time::Instant;
+use rtrb::RingBuffer;
 
 fn main() {
     println!("=== 实时成交事件发布系统集成示例 ===\n");
 
     // 1. 创建有界通道，容量1,000,000
-    let (trade_tx, trade_rx) = crossbeam::channel::bounded::<TradeEvent>(1_000_000);
+    let (trade_tx, trade_rx) = RingBuffer::<TradeEvent>::new(1_000_000);
     println!("✓ 创建交易事件通道 (capacity: 1,000,000)");
 
     // 2. 创建匹配引擎

@@ -12,12 +12,13 @@ use matching_engine::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent,
 };
 use std::time::Instant;
+use rtrb::RingBuffer;
 
 fn main() {
     println!("=== 市场数据系统集成示例 ===\n");
 
     // 1. 创建有界通道，容量1,000,000
-    let (sender, receiver) = crossbeam::channel::bounded::<TradeEvent>(1_000_000);
+    let (sender, mut receiver) = RingBuffer::<TradeEvent>::new(1_000_000);
     println!("✓ 创建有界通道 (capacity: 1,000,000)");
 
     // 2. 创建匹配引擎
@@ -64,7 +65,7 @@ fn main() {
         let _ = engine.place_order(sell_order);
 
         // 尝试从通道接收事件
-        if let Ok(_trade_event) = receiver.try_recv() {
+        if let Ok(_trade_event) = receiver.pop() {
             let elapsed = trade_start.elapsed();
             let latency_ns = elapsed.as_nanos() as u64;
             latencies.push(latency_ns);

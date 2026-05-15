@@ -4,7 +4,7 @@
 //! 所有结构都采用64字节对齐，以优化缓存性能。
 
 use crate::order::Side;
-use crossbeam::channel::{Receiver, Sender};
+use rtrb::{Consumer, Producer};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -577,8 +577,6 @@ impl Default for PublishedSnapshot {
 ///
 /// 线程安全：接收方由Crossbeam channel提供线程安全保证
 pub struct MarketDataEngine {
-    /// TradeEvent接收方
-    receiver: Receiver<TradeEvent>,
     /// 当前BBO快照
     bbo_snapshot: BBOSnapshot,
     /// 当前Level2快照
@@ -602,15 +600,11 @@ pub struct MarketDataEngine {
 impl MarketDataEngine {
     /// 创建新的市场数据引擎
     ///
-    /// # 参数
-    /// - `receiver`: TradeEvent的接收方，来自匹配引擎
-    ///
     /// # 返回
     /// 初始化完毕的MarketDataEngine实例
-    pub fn new(receiver: Receiver<TradeEvent>) -> Self {
+    pub fn new() -> Self {
         let initial_time = 0u64;
         Self {
-            receiver,
             bbo_snapshot: BBOSnapshot::default(),
             level2_snapshot: Level2Snapshot::default(),
             statistics_24h: Statistics24h::default(),
@@ -1105,27 +1099,6 @@ impl MarketDataEngine {
         )
     }
 
-    /// 主事件循环 - 连续消费来自通道的TradeEvent
-    ///
-    /// 此方法将阻塞并持续消费TradeEvent，直到通道关闭。
-    /// 每接收一个事件，调用consume_trade_event()更新内部状态。
-    ///
-    /// # 返回值
-    /// 当通道关闭时，循环结束并返回
-    pub fn run(&mut self) {
-        loop {
-            match self.receiver.recv() {
-                Ok(event) => {
-                    // 消费事件，更新状态
-                    let _ = self.consume_trade_event(event);
-                }
-                Err(_) => {
-                    // 通道已关闭，结束事件循环
-                    break;
-                }
-            }
-        }
-    }
 }
 
 /// 1ms定时器和快照发布器
@@ -1159,7 +1132,7 @@ impl SnapshotTimer {
     /// SnapshotTimer控制句柄，用于停止定时器
     pub fn spawn(
         engine: Arc<parking_lot::Mutex<MarketDataEngine>>,
-        snapshot_tx: Sender<PublishedSnapshot>,
+        mut snapshot_tx: Producer<PublishedSnapshot>,
     ) -> Self {
         let should_stop = Arc::new(AtomicBool::new(false));
         let stop_flag = should_stop.clone();
@@ -1185,9 +1158,9 @@ impl SnapshotTimer {
                     let engine = engine.lock();
                     let snapshot = engine.generate_published_snapshot(timestamp, sequence);
 
-                    // 发送快照到发布通道
-                    // 如果通道已关闭或满，忽略错误（接收方可能已停止）
-                    let _ = snapshot_tx.try_send(snapshot);
+                    // 发送快照到ring buffer
+                    // 如果缓冲满，忽略错误（接收方可能处理不过来）
+                    let _ = snapshot_tx.push(snapshot);
                 }
 
                 sequence = sequence.wrapping_add(1);
@@ -1244,7 +1217,7 @@ impl SnapshotPublisherThread {
     ///
     /// 如果连接初始化失败，线程将记录错误并退出。
     pub fn spawn(
-        snapshot_rx: Receiver<PublishedSnapshot>,
+        mut snapshot_rx: Consumer<PublishedSnapshot>,
         aeron_config: crate::aeron_publisher::AeronConfig,
     ) -> Self {
         let should_stop = Arc::new(AtomicBool::new(false));
@@ -1269,8 +1242,8 @@ impl SnapshotPublisherThread {
                     break;
                 }
 
-                // 尝试从通道接收快照（非阻塞）
-                match snapshot_rx.try_recv() {
+                // 尝试从ring buffer接收快照（非阻塞）
+                match snapshot_rx.pop() {
                     Ok(snapshot) => {
                         // 尝试发布快照
                         match publisher.publish(&snapshot) {
@@ -1294,13 +1267,9 @@ impl SnapshotPublisherThread {
                             }
                         }
                     }
-                    Err(crossbeam::channel::TryRecvError::Empty) => {
-                        // 通道暂时为空，让出CPU让出时间
+                    Err(_) => {
+                        // Ring buffer暂时为空，让出CPU
                         std::thread::yield_now();
-                    }
-                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                        // 发送方已关闭，停止发布线程
-                        break;
                     }
                 }
             }
@@ -1361,7 +1330,7 @@ impl TradePublisherThread {
     ///
     /// 如果连接初始化失败，线程将记录错误并退出。
     pub fn spawn(
-        trade_rx: Receiver<TradeEvent>,
+        mut trade_rx: Consumer<TradeEvent>,
         aeron_config: crate::aeron_publisher::AeronConfig,
     ) -> Self {
         let should_stop = Arc::new(AtomicBool::new(false));
@@ -1386,8 +1355,8 @@ impl TradePublisherThread {
                     break;
                 }
 
-                // 尝试从通道接收成交（非阻塞）
-                match trade_rx.try_recv() {
+                // 尝试从ring buffer接收成交（非阻塞）
+                match trade_rx.pop() {
                     Ok(trade) => {
                         // 尝试立即发布成交
                         match publisher.publish(&trade) {
@@ -1411,13 +1380,9 @@ impl TradePublisherThread {
                             }
                         }
                     }
-                    Err(crossbeam::channel::TryRecvError::Empty) => {
-                        // 通道暂时为空，让出CPU
+                    Err(_) => {
+                        // Ring buffer暂时为空，让出CPU
                         std::thread::yield_now();
-                    }
-                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
-                        // 发送方已关闭，停止发布线程
-                        break;
                     }
                 }
             }

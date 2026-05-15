@@ -3,18 +3,20 @@ use crate::error::{MatchingEngineError, OrderResult};
 use crate::event::MatchingEvent;
 use crate::market_data::TradeEvent;
 use crate::pools::Pools;
-use crate::skiplist::{SkipList, SortOrder};
+use crate::skiplist::SortOrder;
+use crate::orderbook_impl::OrderBookWrapper;
+use crate::orderbook::OrderBook;
 use std::collections::HashMap;
-use crossbeam::channel::Sender;
+use rtrb::Producer;
 
 pub struct MatchingEngine {
-    buy_book: SkipList,
-    sell_book: SkipList,
+    buy_book: OrderBookWrapper,
+    sell_book: OrderBookWrapper,
     orders: HashMap<u64, Order>,
     pools: Pools,
     next_order_id: u64,
     snapshot_sequence: u64,
-    trade_event_sender: Option<Sender<TradeEvent>>,
+    trade_event_sender: Option<Producer<TradeEvent>>,
     trade_sequence: u64,
 }
 
@@ -22,8 +24,8 @@ impl MatchingEngine {
     /// 创建新的撮合引擎
     pub fn new(pool_config: PoolConfig) -> OrderResult<Self> {
         Ok(Self {
-            buy_book: SkipList::new_with_pool(SortOrder::Descending, pool_config.queue_capacity),
-            sell_book: SkipList::new_with_pool(SortOrder::Ascending, pool_config.queue_capacity),
+            buy_book: OrderBookWrapper::new(pool_config.orderbook_type, SortOrder::Descending, pool_config.queue_capacity),
+            sell_book: OrderBookWrapper::new(pool_config.orderbook_type, SortOrder::Ascending, pool_config.queue_capacity),
             orders: HashMap::with_capacity(pool_config.order_capacity),
             pools: Pools::new(pool_config.order_capacity, pool_config.queue_capacity),
             next_order_id: 1,
@@ -34,7 +36,7 @@ impl MatchingEngine {
     }
 
     /// 设置交易事件发送器
-    pub fn set_trade_event_sender(&mut self, sender: Sender<TradeEvent>) {
+    pub fn set_trade_event_sender(&mut self, sender: Producer<TradeEvent>) {
         self.trade_event_sender = Some(sender);
     }
 
@@ -280,7 +282,9 @@ impl MatchingEngine {
                     Some(node) => {
                         // 获取链表的第一个节点
                         if let Some(node_idx) = node.orders.front() {
-                            if let Some(list_node) = opposite_book.list_pool.get(node_idx) {
+                            // 获取 list_pool 的可变引用来访问订单节点
+                            let list_pool = opposite_book.get_list_pool();
+                            if let Some(list_node) = list_pool.get(node_idx) {
                                 list_node.order_id
                             } else {
                                 break;
@@ -332,8 +336,8 @@ impl MatchingEngine {
                 timestamp: order.timestamp,
             });
 
-            // 发布交易事件到通道
-            if let Some(ref sender) = self.trade_event_sender {
+            // 发布交易事件到ring buffer
+            if let Some(ref mut sender) = self.trade_event_sender {
                 let trade_event = TradeEvent::new(
                     self.trade_sequence,
                     order.id,
@@ -346,8 +350,8 @@ impl MatchingEngine {
                     counter_order_id,  // 挂单方用户ID（使用订单ID）
                 );
                 self.trade_sequence += 1;
-                // 忽略发送错误（接收方可能已关闭）
-                let _ = sender.try_send(trade_event);
+                // 忽略发送错误（接收方可能已关闭或缓冲满）
+                let _ = sender.push(trade_event);
             }
 
             // 检查对手订单是否完全成交，如果是则从订单簿移除
@@ -437,8 +441,9 @@ impl MatchingEngine {
             if let Some(node) = self.buy_book.get_node_at_price(price) {
                 // 遍历链表中的订单
                 let mut node_idx_opt = node.orders.front();
+                let list_pool = self.buy_book.list_pool();
                 while let Some(node_idx) = node_idx_opt {
-                    if let Some(list_node) = self.buy_book.list_pool.get(node_idx) {
+                    if let Some(list_node) = list_pool.get(node_idx) {
                         if let Some(order) = self.orders.get(&list_node.order_id) {
                             total_remaining += order.remaining();
                         }
@@ -462,8 +467,9 @@ impl MatchingEngine {
             if let Some(node) = self.sell_book.get_node_at_price(price) {
                 // 遍历链表中的订单
                 let mut node_idx_opt = node.orders.front();
+                let list_pool = self.sell_book.list_pool();
                 while let Some(node_idx) = node_idx_opt {
-                    if let Some(list_node) = self.sell_book.list_pool.get(node_idx) {
+                    if let Some(list_node) = list_pool.get(node_idx) {
                         if let Some(order) = self.orders.get(&list_node.order_id) {
                             total_remaining += order.remaining();
                         }
@@ -505,6 +511,7 @@ impl MatchingEngine {
 pub struct PoolConfig {
     pub order_capacity: usize,
     pub queue_capacity: usize,
+    pub orderbook_type: crate::orderbook_impl::OrderBookType,
 }
 
 impl Default for PoolConfig {
@@ -512,6 +519,7 @@ impl Default for PoolConfig {
         Self {
             order_capacity: 1_000_000,
             queue_capacity: 100_000,
+            orderbook_type: crate::orderbook_impl::OrderBookType::SkipList,
         }
     }
 }

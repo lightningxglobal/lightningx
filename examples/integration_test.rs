@@ -16,13 +16,13 @@
 use matching_engine::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent,
     MarketDataEngine, SnapshotTimer, SnapshotPublisherThread, TradePublisherThread,
-    AeronConfig,
+    AeronConfig, PublishedSnapshot,
 };
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use parking_lot::Mutex;
-use crossbeam::channel;
+use rtrb::RingBuffer;
 
 fn main() {
     println!("=== 市场数据系统完整集成测试 ===\n");
@@ -31,7 +31,7 @@ fn main() {
     println!("初始化系统组件...\n");
 
     // 创建交易事件通道
-    let (trade_tx, trade_rx) = channel::bounded::<TradeEvent>(1_000_000);
+    let (trade_tx, mut trade_rx) = RingBuffer::<TradeEvent>::new(1_000_000);
     println!("✓ 创建交易事件通道 (capacity: 1,000,000)");
 
     // 创建匹配引擎
@@ -41,12 +41,11 @@ fn main() {
     println!("✓ 创建和配置匹配引擎");
 
     // 创建市场数据引擎
-    let market_data_rx = channel::unbounded::<TradeEvent>().1;
-    let market_data_engine = Arc::new(Mutex::new(MarketDataEngine::new(market_data_rx)));
+    let market_data_engine = Arc::new(Mutex::new(MarketDataEngine::new()));
     println!("✓ 创建市场数据引擎");
 
     // 创建快照定时器
-    let (snapshot_tx, snapshot_rx) = channel::unbounded();
+    let (mut snapshot_tx, snapshot_rx) = RingBuffer::<PublishedSnapshot>::new(1_000_000);
     let snapshot_timer = SnapshotTimer::spawn(market_data_engine.clone(), snapshot_tx);
     println!("✓ 启动快照定时器 (1ms周期)");
 

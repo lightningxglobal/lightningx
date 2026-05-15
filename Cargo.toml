@@ -7,7 +7,7 @@ edition = "2021"
 aeron-wrapper = { path = "../aeron-wrapper" }
 tracing = "0.1"
 rand = "0.8"
-crossbeam = "0.8"
+rtrb = "0.2"
 parking_lot = "0.12"
 
 [dev-dependencies]

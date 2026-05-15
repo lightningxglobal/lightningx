@@ -1,9 +1,11 @@
 use crate::list_pool::{ListNodePool, PooledList};
+use crate::orderbook::{OrderBook, PriceLevel as OrderBookPriceLevel};
 
 const MAX_LEVEL: usize = 12;
 const PROMOTION_PROBABILITY: f64 = 0.25;
 
 /// 跳表节点 - 使用原始指针支持多级链接
+#[repr(C)]
 pub struct SkipListNode {
     pub price: f64,
     pub total_quantity: f64,
@@ -410,6 +412,78 @@ impl Drop for SkipList {
     fn drop(&mut self) {
         // arena会自动释放所有Box<SkipListNode>
         // raw pointers会变成无效，但没有人会再访问它们
+    }
+}
+
+impl OrderBook for SkipList {
+    fn insert_level(&mut self, price: f64) -> Result<(), String> {
+        SkipList::insert_level(self, price)
+    }
+
+    fn find_node(&self, price: f64) -> Result<(), String> {
+        SkipList::find_node(self, price)
+    }
+
+    fn get_node_at_price(&self, price: f64) -> Option<&OrderBookPriceLevel> {
+        // 安全的转换：SkipListNode 用 #[repr(C)]，前三个字段与 PriceLevel 完全相同
+        SkipList::get_node_at_price(self, price)
+            .map(|node| unsafe {
+                &*(node as *const SkipListNode as *const OrderBookPriceLevel)
+            })
+    }
+
+    fn get_node_mut(&mut self, price: f64) -> Option<&mut OrderBookPriceLevel> {
+        SkipList::get_node_mut(self, price)
+            .map(|node| unsafe {
+                &mut *(node as *mut SkipListNode as *mut OrderBookPriceLevel)
+            })
+    }
+
+    fn best(&self) -> Option<&OrderBookPriceLevel> {
+        SkipList::best(self)
+            .map(|node| unsafe {
+                &*(node as *const SkipListNode as *const OrderBookPriceLevel)
+            })
+    }
+
+    fn best_with_orders(&self) -> Option<&OrderBookPriceLevel> {
+        SkipList::best_with_orders(self)
+            .map(|node| unsafe {
+                &*(node as *const SkipListNode as *const OrderBookPriceLevel)
+            })
+    }
+
+    fn add_order_at_level(
+        &mut self,
+        price: f64,
+        order_id: u64,
+        quantity: f64,
+    ) -> Result<(), String> {
+        SkipList::add_order_at_level(self, price, order_id, quantity)
+    }
+
+    fn remove_order_at_level(&mut self, price: f64, order_id: u64) -> Result<(), String> {
+        SkipList::remove_order_at_level(self, price, order_id)
+    }
+
+    fn remove_level(&mut self, price: f64) -> Result<(), String> {
+        SkipList::remove_level(self, price)
+    }
+
+    fn clear(&mut self) {
+        SkipList::clear(self)
+    }
+
+    fn get_top_levels(&self, limit: usize) -> Vec<(f64, f64)> {
+        SkipList::get_top_levels(self, limit)
+    }
+
+    fn count(&self) -> usize {
+        SkipList::count(self)
+    }
+
+    fn get_list_pool(&mut self) -> &mut crate::list_pool::ListNodePool {
+        &mut self.list_pool
     }
 }
 

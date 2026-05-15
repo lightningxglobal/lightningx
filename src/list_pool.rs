@@ -95,6 +95,7 @@ impl ListNodePool {
 }
 
 /// 使用节点池的链表
+#[derive(Debug)]
 pub struct PooledList {
     head: Option<usize>,
     tail: Option<usize>,

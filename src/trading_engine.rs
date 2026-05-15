@@ -167,27 +167,31 @@ fn run_matching_thread(
 
                     match engine.place_order(order) {
                         Ok(result) => {
-                            let evt = match result.status {
+                            // 根据订单状态生成相应的OrderUpdate
+                            // 参考ORDER_LIFECYCLE.md了解各状态转换规则
+                            match result.status {
                                 crate::engine::OrderStatus::Accepted => {
-                                    OrderUpdateEvent::accepted(
+                                    let evt = OrderUpdateEvent::accepted(
                                         order_id,
                                         req.client_order_id,
                                         req.participant_id,
                                         now,
-                                    )
+                                    );
+                                    let _ = order_update_tx.push(evt);
                                 }
                                 crate::engine::OrderStatus::Filled => {
-                                    OrderUpdateEvent::filled(
+                                    let evt = OrderUpdateEvent::filled(
                                         order_id,
                                         req.client_order_id,
                                         req.participant_id,
                                         req.price,
                                         result.filled,
                                         now,
-                                    )
+                                    );
+                                    let _ = order_update_tx.push(evt);
                                 }
                                 crate::engine::OrderStatus::PartiallyFilled => {
-                                    OrderUpdateEvent::partial_fill(
+                                    let evt = OrderUpdateEvent::partial_fill(
                                         order_id,
                                         req.client_order_id,
                                         req.participant_id,
@@ -195,11 +199,24 @@ fn run_matching_thread(
                                         result.filled,
                                         req.quantity - result.filled,
                                         now,
-                                    )
+                                    );
+                                    let _ = order_update_tx.push(evt);
                                 }
-                                _ => continue,
-                            };
-                            let _ = order_update_tx.push(evt);
+                                crate::engine::OrderStatus::Rejected => {
+                                    // IOC无匹配、FOK无法完全成交等情况
+                                    let evt = OrderUpdateEvent::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        1,  // 拒绝原因：无法成交或不符合条件
+                                        now,
+                                    );
+                                    let _ = order_update_tx.push(evt);
+                                }
+                                crate::engine::OrderStatus::Cancelled => {
+                                    // 这通常不会从place_order返回，但保险起见也处理
+                                    // Cancelled应该来自cancel_order操作
+                                }
+                            }
                         }
                         Err(_e) => {
                             let evt = OrderUpdateEvent::rejected(

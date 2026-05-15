@@ -21,6 +21,7 @@ pub use order::{Order, Side, TimeInForce};
 pub use error::{MatchingEngineError, OrderResult};
 pub use event::MatchingEvent;
 pub use snapshot::{DepthSnapshot, PriceLevel};
+pub use market_data::TradeEvent;
 
 #[cfg(test)]
 mod tests {

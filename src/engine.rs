@@ -1,9 +1,11 @@
 use crate::order::{Order, Side, TimeInForce};
 use crate::error::{MatchingEngineError, OrderResult};
 use crate::event::MatchingEvent;
+use crate::market_data::TradeEvent;
 use crate::pools::Pools;
 use crate::skiplist::{SkipList, SortOrder};
 use std::collections::HashMap;
+use crossbeam::channel::Sender;
 
 pub struct MatchingEngine {
     buy_book: SkipList,
@@ -12,6 +14,8 @@ pub struct MatchingEngine {
     pools: Pools,
     next_order_id: u64,
     snapshot_sequence: u64,
+    trade_event_sender: Option<Sender<TradeEvent>>,
+    trade_sequence: u64,
 }
 
 impl MatchingEngine {
@@ -24,7 +28,14 @@ impl MatchingEngine {
             pools: Pools::new(pool_config.order_capacity, pool_config.queue_capacity),
             next_order_id: 1,
             snapshot_sequence: 0,
+            trade_event_sender: None,
+            trade_sequence: 0,
         })
+    }
+
+    /// 设置交易事件发送器
+    pub fn set_trade_event_sender(&mut self, sender: Sender<TradeEvent>) {
+        self.trade_event_sender = Some(sender);
     }
 
     /// 验证订单有效性
@@ -321,6 +332,24 @@ impl MatchingEngine {
                 timestamp: order.timestamp,
             });
 
+            // 发布交易事件到通道
+            if let Some(ref sender) = self.trade_event_sender {
+                let trade_event = TradeEvent::new(
+                    self.trade_sequence,
+                    order.id,
+                    counter_order_id,
+                    order.timestamp,
+                    best_price,
+                    trade_qty,
+                    order.side,
+                    order.id,  // 吃单方用户ID（使用订单ID）
+                    counter_order_id,  // 挂单方用户ID（使用订单ID）
+                );
+                self.trade_sequence += 1;
+                // 忽略发送错误（接收方可能已关闭）
+                let _ = sender.try_send(trade_event);
+            }
+
             // 检查对手订单是否完全成交，如果是则从订单簿移除
             if let Some(counter) = self.orders.get(&counter_order_id) {
                 if counter.is_filled() {
@@ -529,4 +558,134 @@ pub struct Trade {
 pub struct CancelOrderResult {
     pub order_id: u64,
     pub cancelled_quantity: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam::channel;
+
+    #[test]
+    fn test_trade_event_channel_creation() {
+        let (sender, receiver) = channel::bounded::<TradeEvent>(1_000_000);
+
+        // 验证通道已创建
+        let test_event = TradeEvent::new(1, 100, 99, 1000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        sender.send(test_event).unwrap();
+
+        let received = receiver.recv().unwrap();
+        assert_eq!(received.sequence, 1);
+        assert_eq!(received.order_id, 100);
+    }
+
+    #[test]
+    fn test_matching_engine_with_trade_event_sender() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        let (sender, receiver) = channel::bounded::<TradeEvent>(1000);
+        engine.set_trade_event_sender(sender);
+
+        // 放置买单
+        let buy_order = Order::new(1, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
+        let result = engine.place_order(buy_order).unwrap();
+        assert_eq!(result.status, OrderStatus::Accepted);
+
+        // 放置卖单 - 应该触发成交
+        let sell_order = Order::new(2, Side::Sell, 50000.0, 10.0, TimeInForce::IOC, 0);
+        let result = engine.place_order(sell_order).unwrap();
+        assert_eq!(result.status, OrderStatus::Filled);
+
+        // 检查是否收到TradeEvent
+        let trade_event = receiver.recv().unwrap();
+        assert_eq!(trade_event.order_id, 2);  // 吃单订单ID
+        assert_eq!(trade_event.maker_order_id, 1);  // 挂单订单ID
+        assert_eq!(trade_event.price, 50000.0);
+        assert_eq!(trade_event.quantity, 10.0);
+        assert_eq!(trade_event.sequence, 0);
+    }
+
+    #[test]
+    fn test_multiple_trades_sequence() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        let (sender, receiver) = channel::bounded::<TradeEvent>(1000);
+        engine.set_trade_event_sender(sender);
+
+        // 进行多笔成交
+        for i in 1..=5 {
+            let buy_order = Order::new(
+                i * 2 - 1,
+                Side::Buy,
+                50000.0 + (i as f64),
+                10.0,
+                TimeInForce::GTC,
+                0,
+            );
+            engine.place_order(buy_order).unwrap();
+
+            let sell_order = Order::new(
+                i * 2,
+                Side::Sell,
+                50000.0 + (i as f64),
+                10.0,
+                TimeInForce::IOC,
+                0,
+            );
+            engine.place_order(sell_order).unwrap();
+        }
+
+        // 验证接收到5个成交事件，序列号递增
+        for i in 0..5 {
+            let trade_event = receiver.recv().unwrap();
+            assert_eq!(trade_event.sequence, i as u64);
+        }
+    }
+
+    #[test]
+    fn test_no_trade_event_without_sender() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // 不设置发送器，应该不会崩溃
+        let buy_order = Order::new(1, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
+        engine.place_order(buy_order).unwrap();
+
+        let sell_order = Order::new(2, Side::Sell, 50000.0, 10.0, TimeInForce::IOC, 0);
+        let result = engine.place_order(sell_order).unwrap();
+
+        // 成交应该正常发生
+        assert_eq!(result.status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn test_channel_bounded_capacity() {
+        let (sender, receiver) = channel::bounded::<TradeEvent>(10);
+
+        // 填满通道
+        for i in 0..10 {
+            let event = TradeEvent::new(
+                i as u64,
+                i as u64 + 100,
+                i as u64 + 200,
+                1000,
+                50000.0,
+                1.0,
+                Side::Buy,
+                1000,
+                2000,
+            );
+            sender.send(event).unwrap();
+        }
+
+        // 验证通道满了后不能再发送
+        let event = TradeEvent::new(10, 110, 210, 1000, 50000.0, 1.0, Side::Buy, 1000, 2000);
+        assert!(sender.try_send(event).is_err());
+
+        // 接收一个事件后，应该能发送
+        receiver.recv().unwrap();
+        let event = TradeEvent::new(10, 110, 210, 1000, 50000.0, 1.0, Side::Buy, 1000, 2000);
+        assert!(sender.try_send(event).is_ok());
+    }
 }

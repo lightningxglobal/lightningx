@@ -619,10 +619,17 @@ impl MatchingEngine {
                 self.pools.trades.release(*trade_idx);
             }
 
+            // 关键：如果有剩余，加入订单簿（允许批次内后续订单与其匹配）
+            if filled < order.quantity {
+                let mut remaining_order = order;
+                remaining_order.filled = filled;
+                self.add_to_book(remaining_order)?;
+            }
+
             results.push((filled, result_trades));
         }
 
-        // 所有订单处理完毕，一次性批量发送所有TradeEvent到ring buffer
+        // 所有订单处理完毕，批量发送所有TradeEvent到ring buffer
         if let Some(ref mut sender) = self.trade_event_sender {
             for event in all_trade_events.iter() {
                 let _ = sender.push(*event);

@@ -1,8 +1,6 @@
 /// 链表节点对象池实现
 /// 用于存储同价位的订单队列，相比VecDeque支持O(1)的真正删除
 
-use std::collections::VecDeque;
-
 /// 链表节点
 #[derive(Debug, Clone, Copy)]
 pub struct ListNode {
@@ -26,7 +24,7 @@ impl Default for ListNode {
 /// 链表节点对象池
 pub struct ListNodePool {
     nodes: Vec<ListNode>,
-    free_indices: VecDeque<usize>,
+    free_indices: Vec<usize>,
     allocated: usize,
     capacity: usize,
 }
@@ -52,7 +50,7 @@ impl ListNodePool {
     /// 从池中获取一个节点
     #[inline]
     pub fn acquire(&mut self, order_id: u64, quantity: f64) -> Option<usize> {
-        self.free_indices.pop_front().map(|idx| {
+        self.free_indices.pop().map(|idx| {
             self.nodes[idx] = ListNode {
                 order_id,
                 quantity,
@@ -67,8 +65,7 @@ impl ListNodePool {
     /// 将节点返还到池中
     #[inline]
     pub fn release(&mut self, index: usize) {
-        self.nodes[index] = ListNode::default();
-        self.free_indices.push_back(index);
+        self.free_indices.push(index);
         self.allocated -= 1;
     }
 

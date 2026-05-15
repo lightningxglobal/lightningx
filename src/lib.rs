@@ -12,6 +12,7 @@ pub mod skiplist;
 pub mod engine;
 pub mod snapshot;
 pub mod recovery;
+pub mod market_data;
 
 pub use engine::{
     MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, Trade, CancelOrderResult,

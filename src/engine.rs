@@ -2,7 +2,7 @@ use crate::order::{Order, Side, TimeInForce};
 use crate::trade::Trade;
 use crate::error::{MatchingEngineError, OrderResult};
 use crate::event::MatchingEvent;
-use crate::market_data::TradeEvent;
+use crate::market_data::{TradeEvent, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent, MarketDataConfig};
 use crate::pools::Pools;
 use crate::skiplist::SortOrder;
 use crate::orderbook_impl::OrderBookWrapper;
@@ -10,6 +10,7 @@ use crate::orderbook::OrderBook;
 use std::collections::HashMap;
 use rtrb::Producer;
 use smallvec::SmallVec;
+use std::time::SystemTime;
 
 pub struct MatchingEngine {
     buy_book: OrderBookWrapper,
@@ -20,6 +21,18 @@ pub struct MatchingEngine {
     snapshot_sequence: u64,
     trade_event_sender: Option<Producer<TradeEvent>>,
     trade_sequence: u64,
+
+    // 深度采样相关字段
+    depth_snapshot_sender: Option<Producer<DepthSnapshotEvent>>,
+    depth50_sender: Option<Producer<Depth50SnapshotEvent>>,
+    level2_sender: Option<Producer<Level2SnapshotEvent>>,
+    market_data_config: MarketDataConfig,
+    last_shallow_sample_ns: u64,
+    last_depth50_sample_ns: u64,
+    last_level2_sample_ns: u64,
+    depth_snapshot_seq: u64,
+    depth50_seq: u64,
+    level2_seq: u64,
 }
 
 impl MatchingEngine {
@@ -34,12 +47,42 @@ impl MatchingEngine {
             snapshot_sequence: 0,
             trade_event_sender: None,
             trade_sequence: 0,
+            depth_snapshot_sender: None,
+            depth50_sender: None,
+            level2_sender: None,
+            market_data_config: MarketDataConfig::default(),
+            last_shallow_sample_ns: 0,
+            last_depth50_sample_ns: 0,
+            last_level2_sample_ns: 0,
+            depth_snapshot_seq: 0,
+            depth50_seq: 0,
+            level2_seq: 0,
         })
     }
 
     /// 设置交易事件发送器
     pub fn set_trade_event_sender(&mut self, sender: Producer<TradeEvent>) {
         self.trade_event_sender = Some(sender);
+    }
+
+    /// 设置深度快照发送器
+    pub fn set_depth_snapshot_sender(&mut self, sender: Producer<DepthSnapshotEvent>) {
+        self.depth_snapshot_sender = Some(sender);
+    }
+
+    /// 设置Depth-50发送器
+    pub fn set_depth50_sender(&mut self, sender: Producer<Depth50SnapshotEvent>) {
+        self.depth50_sender = Some(sender);
+    }
+
+    /// 设置Level2发送器
+    pub fn set_level2_sender(&mut self, sender: Producer<Level2SnapshotEvent>) {
+        self.level2_sender = Some(sender);
+    }
+
+    /// 设置行情配置
+    pub fn set_market_data_config(&mut self, config: MarketDataConfig) {
+        self.market_data_config = config;
     }
 
     /// 验证订单有效性
@@ -75,6 +118,129 @@ impl MatchingEngine {
         }
     }
 
+    /// 获取当前时间戳（纳秒）
+    #[inline]
+    fn current_time_ns() -> u64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    }
+
+    /// 深度采样（检查是否需要发送深度快照）
+    #[inline]
+    fn maybe_sample_depth(&mut self) {
+        let now_ns = Self::current_time_ns();
+        let cfg = self.market_data_config;
+
+        // BBO + Depth-20 快照（每10ms）
+        if now_ns >= self.last_shallow_sample_ns + cfg.shallow_sample_interval_ns {
+            if let Some(ref mut sender) = self.depth_snapshot_sender {
+                let mut event = DepthSnapshotEvent::new(now_ns, self.depth_snapshot_seq);
+
+                let bids = self.buy_book.get_top_levels(20);
+                let asks = self.sell_book.get_top_levels(20);
+
+                for (i, (p, q)) in bids.iter().enumerate() {
+                    if i >= 20 {
+                        break;
+                    }
+                    event.bids[i] = (*p, *q);
+                    event.num_bids = (i + 1) as u8;
+                }
+
+                for (i, (p, q)) in asks.iter().enumerate() {
+                    if i >= 20 {
+                        break;
+                    }
+                    event.asks[i] = (*p, *q);
+                    event.num_asks = (i + 1) as u8;
+                }
+
+                let _ = sender.push(event);
+                self.depth_snapshot_seq += 1;
+            }
+            self.last_shallow_sample_ns = now_ns;
+        }
+
+        // 增量模式（仅在启用时）
+        if cfg.enable_depth_increments {
+            // Depth-50（每50ms）
+            if now_ns >= self.last_depth50_sample_ns + cfg.depth50_interval_ns {
+                let event = self.build_depth50_event(now_ns);
+                if let Some(ref mut sender) = self.depth50_sender {
+                    let _ = sender.push(event);
+                    self.depth50_seq += 1;
+                }
+                self.last_depth50_sample_ns = now_ns;
+            }
+
+            // Level2-400（每100ms）
+            if now_ns >= self.last_level2_sample_ns + cfg.level2_interval_ns {
+                let event = self.build_level2_event(now_ns);
+                if let Some(ref mut sender) = self.level2_sender {
+                    let _ = sender.push(event);
+                    self.level2_seq += 1;
+                }
+                self.last_level2_sample_ns = now_ns;
+            }
+        }
+    }
+
+    /// 构建Depth-50快照事件
+    #[inline]
+    fn build_depth50_event(&self, now_ns: u64) -> Depth50SnapshotEvent {
+        let mut event = Depth50SnapshotEvent::new(now_ns, self.depth50_seq);
+
+        let bids = self.buy_book.get_top_levels(50);
+        let asks = self.sell_book.get_top_levels(50);
+
+        for (i, (p, q)) in bids.iter().enumerate() {
+            if i >= 50 {
+                break;
+            }
+            event.bids[i] = (*p, *q);
+            event.num_bids = (i + 1) as u8;
+        }
+
+        for (i, (p, q)) in asks.iter().enumerate() {
+            if i >= 50 {
+                break;
+            }
+            event.asks[i] = (*p, *q);
+            event.num_asks = (i + 1) as u8;
+        }
+
+        event
+    }
+
+    /// 构建Level2-400快照事件
+    #[inline]
+    fn build_level2_event(&self, now_ns: u64) -> Level2SnapshotEvent {
+        let mut event = Level2SnapshotEvent::new(now_ns, self.level2_seq);
+
+        let bids = self.buy_book.get_top_levels(400);
+        let asks = self.sell_book.get_top_levels(400);
+
+        for (i, (p, q)) in bids.iter().enumerate() {
+            if i >= 400 {
+                break;
+            }
+            event.bids[i] = (*p, *q);
+            event.num_bids = (i + 1) as u16;
+        }
+
+        for (i, (p, q)) in asks.iter().enumerate() {
+            if i >= 400 {
+                break;
+            }
+            event.asks[i] = (*p, *q);
+            event.num_asks = (i + 1) as u16;
+        }
+
+        event
+    }
+
     // ===== Task 8: Place Order Methods =====
 
     /// 下单（热路径）
@@ -100,6 +266,7 @@ impl MatchingEngine {
             TimeInForce::GTC => self.handle_gtc(order)?,
         };
 
+        self.maybe_sample_depth();
         Ok(result)
     }
 
@@ -691,6 +858,7 @@ impl MatchingEngine {
             }
         }
 
+        self.maybe_sample_depth();
         Ok(results)
     }
 
@@ -732,6 +900,7 @@ impl MatchingEngine {
             timestamp,
         });
 
+        self.maybe_sample_depth();
         Ok(CancelOrderResult {
             order_id,
             cancelled_quantity: remaining,

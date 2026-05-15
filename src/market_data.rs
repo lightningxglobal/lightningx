@@ -595,6 +595,16 @@ pub struct MarketDataEngine {
     completed_1m_trades: Vec<AggregateTrade>,
     /// 最大历史记录数
     max_history: usize,
+    /// Depth-50前快照 - 用于计算增量
+    prev_depth50_bids: [(f64, f64); 50],
+    prev_depth50_asks: [(f64, f64); 50],
+    prev_depth50_num_bids: u8,
+    prev_depth50_num_asks: u8,
+    /// Level2-400前快照 - 用于计算增量
+    prev_level2_bids: [(f64, f64); 400],
+    prev_level2_asks: [(f64, f64); 400],
+    prev_level2_num_bids: u16,
+    prev_level2_num_asks: u16,
 }
 
 impl MarketDataEngine {
@@ -615,6 +625,14 @@ impl MarketDataEngine {
             completed_5s_trades: Vec::new(),
             completed_1m_trades: Vec::new(),
             max_history: 10,
+            prev_depth50_bids: [(0.0, 0.0); 50],
+            prev_depth50_asks: [(0.0, 0.0); 50],
+            prev_depth50_num_bids: 0,
+            prev_depth50_num_asks: 0,
+            prev_level2_bids: [(0.0, 0.0); 400],
+            prev_level2_asks: [(0.0, 0.0); 400],
+            prev_level2_num_bids: 0,
+            prev_level2_num_asks: 0,
         }
     }
 
@@ -1097,6 +1115,226 @@ impl MarketDataEngine {
             self.active_1m_bucket.to_aggregate_trade(),
             self.statistics_24h,
         )
+    }
+
+    /// 消费深度快照事件 - 提取BBO和更新Depth-20
+    /// 从撮合引擎的DepthSnapshotEvent直接更新BBO和20档深度
+    pub fn consume_depth_snapshot(&mut self, event: &DepthSnapshotEvent) {
+        let now = event.timestamp;
+
+        // BBO - 从第一档提取
+        if event.num_bids > 0 {
+            self.bbo_snapshot.best_bid_price = event.bids[0].0;
+            self.bbo_snapshot.best_bid_qty = event.bids[0].1;
+        }
+        if event.num_asks > 0 {
+            self.bbo_snapshot.best_ask_price = event.asks[0].0;
+            self.bbo_snapshot.best_ask_qty = event.asks[0].1;
+        }
+        self.bbo_snapshot.timestamp = now;
+        self.bbo_snapshot.sequence = event.sequence;
+
+        // Depth-20（更新到level2_snapshot）
+        self.level2_snapshot.clear();
+        for i in 0..event.num_bids as usize {
+            self.level2_snapshot.add_bid(event.bids[i].0, event.bids[i].1);
+        }
+        for i in 0..event.num_asks as usize {
+            self.level2_snapshot.add_ask(event.asks[i].0, event.asks[i].1);
+        }
+        self.level2_snapshot.timestamp = now;
+        self.level2_snapshot.sequence = event.sequence;
+    }
+
+    /// 计算两个深度快照的差异 - 内部辅助函数
+    /// 返回变化的档位列表（仅包含有变化的档位）
+    #[inline]
+    fn compute_depth_diff(
+        prev_prices: &[(f64, f64); 50],
+        prev_count: u8,
+        curr_prices: &[(f64, f64); 50],
+        curr_count: u8,
+        out_changes: &mut [(f64, f64); 50],
+    ) -> u8 {
+        let mut out_count = 0u8;
+
+        // 检查prev中有但curr中没有的价位（删除）
+        for i in 0..prev_count as usize {
+            let prev_price = prev_prices[i].0;
+            let mut found = false;
+
+            for j in 0..curr_count as usize {
+                if (curr_prices[j].0 - prev_price).abs() < 1e-10 {
+                    found = true;
+                    // 检查数量是否改变
+                    if (curr_prices[j].1 - prev_prices[i].1).abs() > 1e-10 {
+                        out_changes[out_count as usize] = (prev_price, curr_prices[j].1);
+                        out_count += 1;
+                    }
+                    break;
+                }
+            }
+
+            if !found {
+                // 价位删除（数量置0）
+                out_changes[out_count as usize] = (prev_price, 0.0);
+                out_count += 1;
+            }
+        }
+
+        // 检查curr中有但prev中没有的价位（新增）
+        for j in 0..curr_count as usize {
+            let curr_price = curr_prices[j].0;
+            let mut found = false;
+
+            for i in 0..prev_count as usize {
+                if (prev_prices[i].0 - curr_price).abs() < 1e-10 {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                // 新增价位
+                out_changes[out_count as usize] = (curr_price, curr_prices[j].1);
+                out_count += 1;
+            }
+        }
+
+        out_count
+    }
+
+    /// 消费Depth-50快照 - 计算增量
+    pub fn consume_depth50_snapshot(&mut self, event: &Depth50SnapshotEvent) -> Depth50SnapshotEvent {
+        let mut out = Depth50SnapshotEvent::new(event.timestamp, event.sequence);
+
+        // 计算bid差异
+        let bid_changes = Self::compute_depth_diff(
+            &self.prev_depth50_bids,
+            self.prev_depth50_num_bids,
+            &event.bids,
+            event.num_bids,
+            &mut out.bids,
+        );
+        out.num_bids = bid_changes;
+
+        // 计算ask差异
+        let ask_changes = Self::compute_depth_diff(
+            &self.prev_depth50_asks,
+            self.prev_depth50_num_asks,
+            &event.asks,
+            event.num_asks,
+            &mut out.asks,
+        );
+        out.num_asks = ask_changes;
+
+        // 更新prev状态
+        for i in 0..event.num_bids as usize {
+            self.prev_depth50_bids[i] = event.bids[i];
+        }
+        self.prev_depth50_num_bids = event.num_bids;
+
+        for i in 0..event.num_asks as usize {
+            self.prev_depth50_asks[i] = event.asks[i];
+        }
+        self.prev_depth50_num_asks = event.num_asks;
+
+        out
+    }
+
+    /// 计算两个深度快照的差异 - Level2版本
+    #[inline]
+    fn compute_level2_diff(
+        prev_prices: &[(f64, f64); 400],
+        prev_count: u16,
+        curr_prices: &[(f64, f64); 400],
+        curr_count: u16,
+        out_changes: &mut [(f64, f64); 400],
+    ) -> u16 {
+        let mut out_count = 0u16;
+
+        // 检查prev中有但curr中没有的价位（删除）
+        for i in 0..prev_count as usize {
+            let prev_price = prev_prices[i].0;
+            let mut found = false;
+
+            for j in 0..curr_count as usize {
+                if (curr_prices[j].0 - prev_price).abs() < 1e-10 {
+                    found = true;
+                    // 检查数量是否改变
+                    if (curr_prices[j].1 - prev_prices[i].1).abs() > 1e-10 {
+                        out_changes[out_count as usize] = (prev_price, curr_prices[j].1);
+                        out_count += 1;
+                    }
+                    break;
+                }
+            }
+
+            if !found {
+                // 价位删除（数量置0）
+                out_changes[out_count as usize] = (prev_price, 0.0);
+                out_count += 1;
+            }
+        }
+
+        // 检查curr中有但prev中没有的价位（新增）
+        for j in 0..curr_count as usize {
+            let curr_price = curr_prices[j].0;
+            let mut found = false;
+
+            for i in 0..prev_count as usize {
+                if (prev_prices[i].0 - curr_price).abs() < 1e-10 {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                // 新增价位
+                out_changes[out_count as usize] = (curr_price, curr_prices[j].1);
+                out_count += 1;
+            }
+        }
+
+        out_count
+    }
+
+    /// 消费Level2-400快照 - 计算增量
+    pub fn consume_level2_snapshot(&mut self, event: &Level2SnapshotEvent) -> Level2SnapshotEvent {
+        let mut out = Level2SnapshotEvent::new(event.timestamp, event.sequence);
+
+        // 计算bid差异
+        let bid_changes = Self::compute_level2_diff(
+            &self.prev_level2_bids,
+            self.prev_level2_num_bids,
+            &event.bids,
+            event.num_bids,
+            &mut out.bids,
+        );
+        out.num_bids = bid_changes;
+
+        // 计算ask差异
+        let ask_changes = Self::compute_level2_diff(
+            &self.prev_level2_asks,
+            self.prev_level2_num_asks,
+            &event.asks,
+            event.num_asks,
+            &mut out.asks,
+        );
+        out.num_asks = ask_changes;
+
+        // 更新prev状态
+        for i in 0..event.num_bids as usize {
+            self.prev_level2_bids[i] = event.bids[i];
+        }
+        self.prev_level2_num_bids = event.num_bids;
+
+        for i in 0..event.num_asks as usize {
+            self.prev_level2_asks[i] = event.asks[i];
+        }
+        self.prev_level2_num_asks = event.num_asks;
+
+        out
     }
 
 }

@@ -432,15 +432,15 @@ fn parse_order_update(msg: &RawMessage) {
     let timestamp = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0; 8]));
 
     match kind {
-        1 => info!("📨 [ACCEPTED] Order#{} | Client#{} | Participant#{} | ts={}",
+        1 => info!("📨 [NEW] Order#{} | Client#{} | Participant#{} | Status=ACCEPTED (进入簿) | ts={}",
                    order_id, client_order_id, participant_id, timestamp),
-        2 => info!("💯 [FILLED] Order#{} | Client#{} | Price={:.0} | Qty={:.2} | ts={}",
+        2 => info!("✅ [TRADED] Order#{} | Client#{} | Status=FULLY_FILLED (全部成交) | Price={:.0} | Qty={:.2} | ts={}",
                    order_id, client_order_id, fill_price, fill_qty, timestamp),
-        3 => info!("⟳ [PARTIAL] Order#{} | Client#{} | Price={:.0} | Filled={:.2} | Remaining={:.2} | ts={}",
+        3 => info!("⟳ [TRADED] Order#{} | Client#{} | Status=PARTIALLY_FILLED (部分成交) | Price={:.0} | Filled={:.2} | Remaining={:.2} | ts={}",
                    order_id, client_order_id, fill_price, fill_qty, remaining_qty, timestamp),
-        4 => info!("✗ [CANCELLED] Order#{} | Client#{} | Cancelled_qty={:.2} | ts={}",
+        4 => info!("❌ [DELETED] Order#{} | Client#{} | Status=CANCELLED (已撤销) | Cancelled_qty={:.2} | ts={}",
                    order_id, client_order_id, fill_qty, timestamp),
-        5 => info!("✗ [REJECTED] Client#{} | Reason={} | ts={}",
+        5 => info!("❌ [DELETED] Client#{} | Status=REJECTED (已拒绝) | Reason={} | ts={}",
                    client_order_id, reject_reason, timestamp),
         _ => info!("❓ [UNKNOWN type={}] Order#{} | Client#{} | ts={}",
                    kind, order_id, client_order_id, timestamp),

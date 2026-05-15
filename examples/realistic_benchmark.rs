@@ -2,20 +2,11 @@
 //! 包含完整的成交→行情处理流程（模拟生产环境）
 
 use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
-use std::sync::Arc;
 use std::time::Instant;
-use parking_lot::Mutex;
 use rtrb::RingBuffer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 真实场景基准测试 ===\n");
-
-    let config = PoolConfig::default();
-    let mut engine = MatchingEngine::new(config)?;
-    let (trade_tx, mut trade_rx) = RingBuffer::<TradeEvent>::new(1_000_000);
-    engine.set_trade_event_sender(trade_tx);
-
-    let market_engine = Arc::new(Mutex::new(MarketDataEngine::new()));
 
     // 测试1: 纯撮合（无行情处理）
     println!("【测试1】纯撮合 - 无行情处理");

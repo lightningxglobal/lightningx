@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 pub struct MatchingEngine {
     buy_book: OrderBookWrapper,
     sell_book: OrderBookWrapper,
-    orders: HashMap<u64, Order>,
+    orders: HashMap<u64, usize>,  // order_id -> pool index
     pools: Pools,
     next_order_id: u64,
     snapshot_sequence: u64,
@@ -59,7 +59,9 @@ impl MatchingEngine {
     /// 获取订单
     #[inline(always)]
     pub fn get_order(&self, order_id: u64) -> Option<Order> {
-        self.orders.get(&order_id).copied()
+        self.orders.get(&order_id)
+            .and_then(|&pool_idx| self.pools.orders.get(pool_idx))
+            .copied()
     }
 
     /// 获取统计信息
@@ -202,6 +204,15 @@ impl MatchingEngine {
 
     /// 将订单加入订单簿
     fn add_to_book(&mut self, order: Order) -> OrderResult<()> {
+        // 从对象池获取Order（减少allocation）
+        let pool_idx = self.pools.orders.acquire()
+            .ok_or(MatchingEngineError::OrderPoolExhausted)?;
+
+        // 初始化Order到池中
+        if let Some(pooled_order) = self.pools.orders.get_mut(pool_idx) {
+            *pooled_order = order;
+        }
+
         // 插入价格档位（如果不存在）
         let book = match order.side {
             Side::Buy => &mut self.buy_book,
@@ -215,8 +226,8 @@ impl MatchingEngine {
         book.add_order_at_level(order.price, order.id, order.quantity)
             .map_err(|_| MatchingEngineError::NodePoolExhausted)?;
 
-        // 储存订单
-        self.orders.insert(order.id, order);
+        // 储存池索引
+        self.orders.insert(order.id, pool_idx);
 
         Ok(())
     }
@@ -307,7 +318,12 @@ impl MatchingEngine {
                 };
 
                 let counter_order = match self.orders.get(&counter_order_id) {
-                    Some(o) => *o,
+                    Some(&pool_idx) => {
+                        match self.pools.orders.get(pool_idx) {
+                            Some(o) => *o,
+                            None => break,
+                        }
+                    }
                     None => break,
                 };
 
@@ -318,11 +334,15 @@ impl MatchingEngine {
 
                 // 更新订单状态
                 {
-                    if let Some(o) = self.orders.get_mut(&order.id) {
-                        o.filled += trade_qty;
+                    if let Some(&pool_idx) = self.orders.get(&order.id) {
+                        if let Some(o) = self.pools.orders.get_mut(pool_idx) {
+                            o.filled += trade_qty;
+                        }
                     }
-                    if let Some(o) = self.orders.get_mut(&counter_order_id) {
-                        o.filled += trade_qty;
+                    if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
+                        if let Some(o) = self.pools.orders.get_mut(counter_pool_idx) {
+                            o.filled += trade_qty;
+                        }
                     }
                 }
 
@@ -371,14 +391,16 @@ impl MatchingEngine {
                 }
 
                 // 检查对手订单是否完全成交
-                if let Some(counter) = self.orders.get(&counter_order_id) {
-                    if counter.is_filled() {
-                        let opposite_book = match order.side {
-                            Side::Buy => &mut self.sell_book,
-                            Side::Sell => &mut self.buy_book,
-                        };
-                        let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
-                        // 继续内层循环，自动 break 当链表为空
+                if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
+                    if let Some(counter) = self.pools.orders.get(counter_pool_idx) {
+                        if counter.is_filled() {
+                            let opposite_book = match order.side {
+                                Side::Buy => &mut self.sell_book,
+                                Side::Sell => &mut self.buy_book,
+                            };
+                            let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
+                            // 继续内层循环，自动 break 当链表为空
+                        }
                     }
                 }
             }
@@ -404,8 +426,13 @@ impl MatchingEngine {
     /// 撤销订单（热路径 - 使用List实现，真正删除）
     #[inline]
     pub fn cancel_order(&mut self, order_id: u64) -> OrderResult<CancelOrderResult> {
-        // 查询订单
-        let order = self.orders.get(&order_id)
+        // 查询订单池索引
+        let pool_idx = self.orders.get(&order_id)
+            .copied()
+            .ok_or(MatchingEngineError::OrderNotFound)?;
+
+        // 从池中读取订单
+        let order = self.pools.orders.get(pool_idx)
             .copied()
             .ok_or(MatchingEngineError::OrderNotFound)?;
 
@@ -421,8 +448,10 @@ impl MatchingEngine {
         // 从订单簿中真正移除订单
         self.remove_from_book(order_id)?;
 
-        // 从orders HashMap中移除
-        self.orders.remove(&order_id);
+        // 从orders HashMap中移除并release到池
+        if let Some(idx) = self.orders.remove(&order_id) {
+            self.pools.orders.release(idx);
+        }
 
         // 发布撤单事件
         self.publish_event(&MatchingEvent::OrderCancelled {
@@ -438,7 +467,11 @@ impl MatchingEngine {
 
     /// 从订单簿移除未成交订单（取消订单时调用）
     fn remove_from_book(&mut self, order_id: u64) -> OrderResult<()> {
-        let order = self.orders.get(&order_id)
+        let pool_idx = self.orders.get(&order_id)
+            .copied()
+            .ok_or(MatchingEngineError::OrderNotFound)?;
+
+        let order = self.pools.orders.get(pool_idx)
             .copied()
             .ok_or(MatchingEngineError::OrderNotFound)?;
 
@@ -473,8 +506,10 @@ impl MatchingEngine {
                 let list_pool = self.buy_book.list_pool();
                 while let Some(node_idx) = node_idx_opt {
                     if let Some(list_node) = list_pool.get(node_idx) {
-                        if let Some(order) = self.orders.get(&list_node.order_id) {
-                            total_remaining += order.remaining();
+                        if let Some(&pool_idx) = self.orders.get(&list_node.order_id) {
+                            if let Some(order) = self.pools.orders.get(pool_idx) {
+                                total_remaining += order.remaining();
+                            }
                         }
                         node_idx_opt = list_node.next;
                     } else {
@@ -499,8 +534,10 @@ impl MatchingEngine {
                 let list_pool = self.sell_book.list_pool();
                 while let Some(node_idx) = node_idx_opt {
                     if let Some(list_node) = list_pool.get(node_idx) {
-                        if let Some(order) = self.orders.get(&list_node.order_id) {
-                            total_remaining += order.remaining();
+                        if let Some(&pool_idx) = self.orders.get(&list_node.order_id) {
+                            if let Some(order) = self.pools.orders.get(pool_idx) {
+                                total_remaining += order.remaining();
+                            }
                         }
                         node_idx_opt = list_node.next;
                     } else {

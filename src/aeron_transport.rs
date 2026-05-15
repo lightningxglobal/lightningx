@@ -139,6 +139,7 @@ impl OrderSubscriber for AeronOrderSubscriber {
 // ============================================================================
 
 pub struct AeronOrderUpdatePublisher {
+    _client: AeronClient,  // 必须持有client以保持连接活跃
     publisher: aeron_wrapper::Publisher,
 }
 
@@ -151,7 +152,7 @@ impl AeronOrderUpdatePublisher {
             .add_publication(channel, stream_id)
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
 
-        Ok(Self { publisher })
+        Ok(Self { _client: client, publisher })
     }
 }
 
@@ -178,6 +179,7 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
 // ============================================================================
 
 pub struct AeronTradePublisher {
+    _client: AeronClient,
     publisher: aeron_wrapper::Publisher,
 }
 
@@ -190,7 +192,7 @@ impl AeronTradePublisher {
             .add_publication(channel, stream_id)
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
 
-        Ok(Self { publisher })
+        Ok(Self { _client: client, publisher })
     }
 }
 
@@ -217,6 +219,7 @@ impl TradePublisher for AeronTradePublisher {
 // ============================================================================
 
 pub struct AeronMarketDataPublisher {
+    _client: AeronClient,
     depth_publisher: aeron_wrapper::Publisher,
     depth50_publisher: aeron_wrapper::Publisher,
     level2_publisher: aeron_wrapper::Publisher,
@@ -246,6 +249,7 @@ impl AeronMarketDataPublisher {
             .map_err(|e| format!("Failed to add level2 publication: {:?}", e))?;
 
         Ok(Self {
+            _client: client,
             depth_publisher,
             depth50_publisher,
             level2_publisher,

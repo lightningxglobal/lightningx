@@ -98,13 +98,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✓ 已连接");
     info!("");
 
+    // 启动后台接收线程 - MUST be before sending orders!
+    // 这样subscriptions会准备好接收消息
+    info!("启动后台接收线程...");
+    let aeron_dir_clone = aeron_dir.clone();
+    let channel_clone = channel.to_string();
+    let receiver_handle = thread::spawn(move || {
+        receiver_thread_main(aeron_dir_clone, channel_clone)
+    });
+
+    // Wait for receiver thread to initialize subscriptions
+    thread::sleep(Duration::from_millis(500));
+    info!("✓ 接收线程已就绪");
+    info!("");
+
     let start = Instant::now();
     let mut next_order_id = 1000u64;
-
-    // 将接收逻辑放到后台线程
-    // 这样主线程可以快速发送订单，而不用等待poll
-    info!("启动后台接收线程...");
-    info!("");
 
     // 场景1: IOC单（立即返回，无成交）
     info!("═══════════════════════════════════════════════════════════════════");
@@ -212,13 +221,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✓ 所有订单已发送 (耗时: {:.0}ms)", start.elapsed().as_millis());
     info!("═══════════════════════════════════════════════════════════════════");
     info!("");
-
-    // 启动后台接收线程
-    let aeron_dir_clone = aeron_dir.clone();
-    let channel_clone = channel.to_string();
-    let receiver_handle = thread::spawn(move || {
-        receiver_thread_main(aeron_dir_clone, channel_clone)
-    });
 
     // 等待接收线程完成
     match receiver_handle.join() {

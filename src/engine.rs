@@ -10,7 +10,6 @@ use crate::orderbook::OrderBook;
 use std::collections::HashMap;
 use rtrb::Producer;
 use smallvec::SmallVec;
-use std::time::SystemTime;
 
 pub struct MatchingEngine {
     buy_book: OrderBookWrapper,
@@ -85,6 +84,16 @@ impl MatchingEngine {
         self.market_data_config = config;
     }
 
+    /// 获取指定数量的顶层价位（用于性能测试）
+    #[doc(hidden)]
+    pub fn get_top_levels(&self, limit: usize, is_buy: bool) -> Vec<(f64, f64)> {
+        if is_buy {
+            self.buy_book.get_top_levels(limit)
+        } else {
+            self.sell_book.get_top_levels(limit)
+        }
+    }
+
     /// 验证订单有效性
     #[inline(always)]
     fn validate_order(&self, order: &Order) -> OrderResult<()> {
@@ -118,13 +127,27 @@ impl MatchingEngine {
         }
     }
 
-    /// 获取当前时间戳（纳秒）
+    /// 获取当前时间戳（纳秒） - 使用Instant（单调递增）
+    /// 注意：起点是程序启动后的相对时间，不是绝对时间
     #[inline]
     fn current_time_ns() -> u64 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64
+        use std::sync::OnceLock;
+
+        // 用OnceLock存储程序启动时的绝对时间
+        static BASE_TIME: OnceLock<u64> = OnceLock::new();
+        static START_INSTANT: OnceLock<std::time::Instant> = OnceLock::new();
+
+        let _base = BASE_TIME.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64
+        });
+
+        let start = START_INSTANT.get_or_init(std::time::Instant::now);
+
+        // 返回程序启动后的相对纳秒数（足够精确用于采样时间间隔）
+        start.elapsed().as_nanos() as u64
     }
 
     /// 深度采样（检查是否需要发送深度快照）

@@ -430,6 +430,7 @@ dependencies = [
  "aeron-wrapper",
  "criterion",
  "hdrhistogram",
+ "libc",
  "ordered-float",
  "parking_lot",
  "rand",

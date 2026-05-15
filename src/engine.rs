@@ -7,6 +7,7 @@ use crate::pools::Pools;
 use crate::skiplist::SortOrder;
 use crate::orderbook_impl::OrderBookWrapper;
 use crate::orderbook::OrderBook;
+use crate::time_provider;
 use std::collections::HashMap;
 use rtrb::Producer;
 use smallvec::SmallVec;
@@ -129,28 +130,9 @@ impl MatchingEngine {
         }
     }
 
-    /// 获取当前时间戳（纳秒） - 使用monotonic time
-    fn current_time_ns() -> u64 {
-        use std::sync::OnceLock;
-        static START: OnceLock<std::time::Instant> = OnceLock::new();
-        static INIT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-        let start = START.get_or_init(|| {
-            if std::env::var("DEBUG_ENGINE").is_ok() {
-                let count = INIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if count > 0 {
-                    eprintln!("[WARNING] START reinitialized! Count={}", count + 1);
-                }
-            }
-            std::time::Instant::now()
-        });
-
-        start.elapsed().as_nanos() as u64
-    }
-
     /// 深度采样（检查是否需要发送深度快照）
     fn maybe_sample_depth(&mut self) {
-        let now_ns = Self::current_time_ns();
+        let now_ns = time_provider::monotonic_nanos();
         let cfg = self.market_data_config;
 
         // DEBUG: Log first few and periodic calls
@@ -1016,10 +998,7 @@ impl MatchingEngine {
 
     /// 生成市场深度快照
     pub fn generate_depth_snapshot(&self) -> crate::snapshot::DepthSnapshot {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        let timestamp = time_provider::wall_clock_nanos();
 
         let mut snapshot = crate::snapshot::DepthSnapshot::new(timestamp, self.snapshot_sequence);
 

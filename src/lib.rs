@@ -19,6 +19,7 @@ pub mod snapshot;
 pub mod recovery;
 pub mod market_data;
 pub mod aeron_publisher;
+pub mod time_provider;
 
 pub use engine::{
     MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult,

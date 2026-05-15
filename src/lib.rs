@@ -20,6 +20,10 @@ pub mod recovery;
 pub mod market_data;
 pub mod aeron_publisher;
 pub mod time_provider;
+pub mod sbe;
+pub mod transport;
+pub mod order_update;
+pub mod trading_engine;
 
 pub use engine::{
     MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult,

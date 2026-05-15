@@ -24,7 +24,7 @@ fn benchmark(name: &str, f: impl FnOnce() -> usize) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Comprehensive Performance Benchmarks ===\n");
 
-    let config = PoolConfig {
+    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 200_000,
         queue_capacity: 20_000,
     };

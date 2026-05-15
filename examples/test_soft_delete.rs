@@ -24,7 +24,7 @@ fn test_soft_delete_scenario(
     total_orders: usize,
     cancel_rate: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = PoolConfig {
+    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 200_000,
         queue_capacity: 20_000,
     };

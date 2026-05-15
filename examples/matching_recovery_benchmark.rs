@@ -7,7 +7,7 @@ use std::time::Instant;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 匹配引擎性能复现测试 ===\n");
 
-    let config = PoolConfig {
+    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 500_000,
         queue_capacity: 50_000,
     };

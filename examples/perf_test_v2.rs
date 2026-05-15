@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Matching Engine Performance Test V2 ===\n");
 
     // Use smaller pool sizes to avoid allocation issues
-    let config = PoolConfig {
+    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 50_000,
         queue_capacity: 5_000,
     };

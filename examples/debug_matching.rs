@@ -7,7 +7,7 @@ fn create_test_order(id: u64, side: Side, price: f64) -> Order {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Debug Matching Logic ===\n");
 
-    let config = PoolConfig {
+    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 5_000,
         queue_capacity: 500,
     };

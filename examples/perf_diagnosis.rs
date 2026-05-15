@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n【测试4】匹配引擎 - 纯放置 (无成交)");
     println!("{}", "=".repeat(50));
 
-    let mut engine = MatchingEngine::new(PoolConfig {
+    let mut engine = MatchingEngine::new(PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 500_000,
         queue_capacity: 50_000,
     })? ;
@@ -123,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n【测试5】匹配引擎 - 成交匹配");
     println!("{}", "=".repeat(50));
 
-    let mut engine2 = MatchingEngine::new(PoolConfig {
+    let mut engine2 = MatchingEngine::new(PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 500_000,
         queue_capacity: 50_000,
     })?;

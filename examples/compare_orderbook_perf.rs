@@ -6,7 +6,7 @@ use matching_engine::{
 use std::time::Instant;
 
 fn test_skiplist_matching() -> (u64, f64) {
-    let config = PoolConfig {
+    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 50_000,
         queue_capacity: 5_000,
     };

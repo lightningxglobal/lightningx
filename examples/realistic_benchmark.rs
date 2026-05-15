@@ -36,26 +36,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  延迟: {:.3}μs\n", duration1.as_secs_f64() * 1_000_000.0 / (num_rounds as f64 * 2.0));
 
     // 测试2: 撮合 + 行情处理（热路径中）
-    println!("【测试2】撮合 + 同步行情处理");
+    println!("【测试2】撮合 + 同步行情处理（无不必要的Mutex）");
     let mut engine2 = MatchingEngine::new(PoolConfig::default())?;
     let (trade_tx2, mut trade_rx2) = RingBuffer::<TradeEvent>::new(1_000_000);
     engine2.set_trade_event_sender(trade_tx2);
 
-    let market_engine2 = Arc::new(Mutex::new(MarketDataEngine::new()));
+    let mut market_engine2 = MarketDataEngine::new();  // 直接分配，不需要Mutex
 
     let start = Instant::now();
     for i in 0..num_rounds {
         let price = 50000.0 + (i % 100) as f64;
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
         let _ = engine2.place_order(buy)?;
-        
+
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
         let _ = engine2.place_order(sell)?;
 
-        // 在热路径中处理行情事件（真实场景模拟）
+        // 在热路径中处理行情事件（直接消费，无Mutex）
         while let Ok(trade) = trade_rx2.pop() {
-            let mut md = market_engine2.lock();
-            md.consume_trade_event(trade);
+            market_engine2.consume_trade_event(trade);
         }
     }
     let duration2 = start.elapsed();
@@ -66,30 +65,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  行情开销: {:.1}%\n", overhead_percent);
 
     // 测试3: 撮合 + 异步行情处理（批量）
-    println!("【测试3】撮合 + 批量行情处理");
+    println!("【测试3】撮合 + 批量行情处理（无不必要的Mutex）");
     let mut engine3 = MatchingEngine::new(PoolConfig::default())?;
     let (trade_tx3, mut trade_rx3) = RingBuffer::<TradeEvent>::new(1_000_000);
     engine3.set_trade_event_sender(trade_tx3);
 
-    let market_engine3 = Arc::new(Mutex::new(MarketDataEngine::new()));
-    
+    let mut market_engine3 = MarketDataEngine::new();  // 直接分配
+
     let start = Instant::now();
     for i in 0..num_rounds {
         let price = 50000.0 + (i % 100) as f64;
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
         let _ = engine3.place_order(buy)?;
-        
+
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
         let _ = engine3.place_order(sell)?;
     }
 
     // 撮合完成后再批量处理行情
     let batch_start = Instant::now();
-    let mut batch_count = 0;
     while let Ok(trade) = trade_rx3.pop() {
-        let mut md = market_engine3.lock();
-        md.consume_trade_event(trade);
-        batch_count += 1;
+        market_engine3.consume_trade_event(trade);
     }
     let batch_duration = batch_start.elapsed();
     let duration3 = start.elapsed();

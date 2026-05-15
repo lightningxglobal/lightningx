@@ -623,7 +623,30 @@ impl MatchingEngine {
             if filled < order.quantity {
                 let mut remaining_order = order;
                 remaining_order.filled = filled;
-                self.add_to_book(remaining_order)?;
+
+                // 优化：先检查价位是否已存在，避免redundant insert_level
+                let book = match remaining_order.side {
+                    Side::Buy => &mut self.buy_book,
+                    Side::Sell => &mut self.sell_book,
+                };
+
+                if book.get_node_at_price(remaining_order.price).is_none() {
+                    // 价位不存在，需要插入
+                    let _ = book.insert_level(remaining_order.price);
+                }
+
+                // 添加订单到价位
+                book.add_order_at_level(remaining_order.price, remaining_order.id, remaining_order.quantity - remaining_order.filled)
+                    .map_err(|_| MatchingEngineError::NodePoolExhausted)?;
+
+                // 储存池索引
+                let pool_idx = self.pools.orders.acquire()
+                    .ok_or(MatchingEngineError::OrderPoolExhausted)?;
+
+                if let Some(o) = self.pools.orders.get_mut(pool_idx) {
+                    *o = remaining_order;
+                }
+                self.orders.insert(remaining_order.id, pool_idx);
             }
 
             results.push((filled, result_trades));

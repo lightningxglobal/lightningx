@@ -78,52 +78,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = AeronClient::new(&aeron_dir)
         .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
 
-    let (tx, rx) = mpsc_channel();
-
-    // 创建订阅者 (Stream 2-6)
-    info!("初始化Aeron...");
-
-    let (tx2, tx3, tx4, tx5, tx6) = (
-        tx.clone(),
-        tx.clone(),
-        tx.clone(),
-        tx.clone(),
-        tx.clone(),
-    );
-
-    let mut sub2 = client.add_subscription(
-        channel, 2, 10_000,
-        EventCallback { tx: tx2, stream_id: 2 },
-        NoopLifecycle,
-    )?;
-
-    let mut sub3 = client.add_subscription(
-        channel, 3, 10_000,
-        EventCallback { tx: tx3, stream_id: 3 },
-        NoopLifecycle,
-    )?;
-
-    let mut sub4 = client.add_subscription(
-        channel, 4, 10_000,
-        EventCallback { tx: tx4, stream_id: 4 },
-        NoopLifecycle,
-    )?;
-
-    let mut sub5 = client.add_subscription(
-        channel, 5, 10_000,
-        EventCallback { tx: tx5, stream_id: 5 },
-        NoopLifecycle,
-    )?;
-
-    let mut sub6 = client.add_subscription(
-        channel, 6, 10_000,
-        EventCallback { tx: tx6, stream_id: 6 },
-        NoopLifecycle,
-    )?;
-
+    // 创建Publisher用于发送订单（主线程用）
+    // Subscriptions将在接收线程中创建
+    info!("初始化Aeron Publisher...");
     let mut publisher = client.add_publication(channel, 1)?;
-
-    info!("✓ 已初始化");
+    info!("✓ Publisher已初始化");
     info!("");
 
     // 等待连接
@@ -247,42 +206,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("");
 
-    // 收集并显示所有响应
+    // 所有订单已快速发送，现在启动接收线程来处理所有响应
+    info!("");
     info!("═══════════════════════════════════════════════════════════════════");
-    info!("接收订单更新、成交通知和行情数据...");
+    info!("✓ 所有订单已发送 (耗时: {:.0}ms)", start.elapsed().as_millis());
     info!("═══════════════════════════════════════════════════════════════════");
     info!("");
 
-    let mut stats = Stats::new();
+    // 启动后台接收线程
+    let aeron_dir_clone = aeron_dir.clone();
+    let channel_clone = channel.to_string();
+    let receiver_handle = thread::spawn(move || {
+        receiver_thread_main(aeron_dir_clone, channel_clone)
+    });
 
-    while start.elapsed() < Duration::from_secs(45) {
-        client.do_work();
-
-        // Poll all subscriptions to trigger EventCallback
-        let _n2 = sub2.poll();
-        let _n3 = sub3.poll();
-        let _n4 = sub4.poll();
-        let _n5 = sub5.poll();
-        let _n6 = sub6.poll();
-
-        while let Ok(msg) = rx.try_recv() {
-            parse_and_print_message(&msg, &mut stats);
+    // 等待接收线程完成
+    match receiver_handle.join() {
+        Ok(Ok(())) => {
+            info!("✓ 接收线程成功完成");
         }
-
-        thread::sleep(Duration::from_millis(100));
+        Ok(Err(e)) => {
+            info!("✗ 接收线程出错: {}", e);
+        }
+        Err(_) => {
+            info!("✗ 接收线程崩溃");
+        }
     }
 
     info!("");
-    info!("═══════════════════════════════════════════════════════════════════");
-    info!("统计信息");
-    info!("═══════════════════════════════════════════════════════════════════");
-    info!("收到的OrderUpdate: {}", stats.order_updates);
-    info!("收到的Trade: {}", stats.trades);
-    info!("收到的Depth20: {}", stats.depth20);
-    info!("收到的Depth50: {}", stats.depth50);
-    info!("收到的Level2: {}", stats.level2);
-    info!("");
-    info!("✓ 客户端演示完成");
+    info!("✓ 双线程交易客户端演示完成");
 
     Ok(())
 }
@@ -516,4 +468,93 @@ fn parse_level2_snapshot(msg: &RawMessage) {
     let num_asks = u32::from_le_bytes(data[20..24].try_into().unwrap_or([0; 4])) as usize;
 
     info!("📊 [Level2] Seq#{} {} bids {} asks", sequence, num_bids, num_asks);
+}
+
+/// 接收线程主函数 - 在单独的线程中运行
+/// 创建自己的AeronClient和subscriptions，持续poll并处理消息
+fn receiver_thread_main(aeron_dir: String, channel: String) -> Result<(), String> {
+    let client = AeronClient::new(&aeron_dir)
+        .map_err(|e| format!("Receiver thread: Failed to create AeronClient: {:?}", e))?;
+
+    let (tx, rx) = mpsc_channel();
+
+    // 创建接收线程专用的subscriptions
+    info!("[接收线程] 初始化subscriptions...");
+
+    let (tx2, tx3, tx4, tx5, tx6) = (
+        tx.clone(),
+        tx.clone(),
+        tx.clone(),
+        tx.clone(),
+        tx.clone(),
+    );
+
+    let mut sub2 = client.add_subscription(
+        &channel, 2, 10_000,
+        EventCallback { tx: tx2, stream_id: 2 },
+        NoopLifecycle,
+    ).map_err(|e| format!("Failed to add sub2: {:?}", e))?;
+
+    let mut sub3 = client.add_subscription(
+        &channel, 3, 10_000,
+        EventCallback { tx: tx3, stream_id: 3 },
+        NoopLifecycle,
+    ).map_err(|e| format!("Failed to add sub3: {:?}", e))?;
+
+    let mut sub4 = client.add_subscription(
+        &channel, 4, 10_000,
+        EventCallback { tx: tx4, stream_id: 4 },
+        NoopLifecycle,
+    ).map_err(|e| format!("Failed to add sub4: {:?}", e))?;
+
+    let mut sub5 = client.add_subscription(
+        &channel, 5, 10_000,
+        EventCallback { tx: tx5, stream_id: 5 },
+        NoopLifecycle,
+    ).map_err(|e| format!("Failed to add sub5: {:?}", e))?;
+
+    let mut sub6 = client.add_subscription(
+        &channel, 6, 10_000,
+        EventCallback { tx: tx6, stream_id: 6 },
+        NoopLifecycle,
+    ).map_err(|e| format!("Failed to add sub6: {:?}", e))?;
+
+    info!("[接收线程] ✓ Subscriptions已就绪");
+    info!("[接收线程] 开始接收消息...");
+    info!("");
+
+    let start = Instant::now();
+    let mut stats = Stats::new();
+
+    // 持续poll 45秒
+    while start.elapsed() < Duration::from_secs(45) {
+        client.do_work();
+
+        // Poll all subscriptions to trigger EventCallback
+        let _n2 = sub2.poll();
+        let _n3 = sub3.poll();
+        let _n4 = sub4.poll();
+        let _n5 = sub5.poll();
+        let _n6 = sub6.poll();
+
+        while let Ok(msg) = rx.try_recv() {
+            parse_and_print_message(&msg, &mut stats);
+        }
+
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    info!("");
+    info!("═══════════════════════════════════════════════════════════════════");
+    info!("[接收线程] 最终统计");
+    info!("═══════════════════════════════════════════════════════════════════");
+    info!("  OrderUpdate: {}", stats.order_updates);
+    info!("  Trade: {}", stats.trades);
+    info!("  Depth20: {}", stats.depth20);
+    info!("  Depth50: {}", stats.depth50);
+    info!("  Level2: {}", stats.level2);
+    info!("");
+    info!("[接收线程] 演示完成，45秒已过");
+
+    Ok(())
 }

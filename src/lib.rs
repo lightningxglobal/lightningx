@@ -4,6 +4,7 @@
 //! 单线程无锁设计，目标TPS > 6,000,000，延迟 < 3微秒。
 
 pub mod order;
+pub mod trade;
 pub mod error;
 pub mod event;
 pub mod pools;
@@ -20,8 +21,9 @@ pub mod market_data;
 pub mod aeron_publisher;
 
 pub use engine::{
-    MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, Trade, CancelOrderResult,
+    MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult,
 };
+pub use trade::Trade;
 pub use order::{Order, Side, TimeInForce};
 pub use error::{MatchingEngineError, OrderResult};
 pub use event::MatchingEvent;

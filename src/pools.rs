@@ -1,4 +1,5 @@
 use crate::order::Order;
+use crate::trade::Trade;
 use std::collections::VecDeque;
 
 /// 通用对象池
@@ -78,6 +79,7 @@ impl<T: Default> ObjectPool<T> {
 /// 所有对象池的容器
 pub struct Pools {
     pub orders: ObjectPool<Order>,
+    pub trades: ObjectPool<Trade>,
     pub queues: ObjectPool<VecDeque<u64>>,
 }
 
@@ -86,6 +88,7 @@ impl Pools {
     pub fn new(order_capacity: usize, queue_capacity: usize) -> Self {
         Self {
             orders: ObjectPool::new(order_capacity),
+            trades: ObjectPool::new(order_capacity),  // Trade容量 = Order容量（保守估计）
             queues: ObjectPool::new(queue_capacity),
         }
     }
@@ -100,6 +103,8 @@ impl Pools {
         PoolStats {
             orders_allocated: self.orders.allocated_count(),
             orders_capacity: self.orders.capacity,
+            trades_allocated: self.trades.allocated_count(),
+            trades_capacity: self.trades.capacity,
             queues_allocated: self.queues.allocated_count(),
             queues_capacity: self.queues.capacity,
         }
@@ -111,6 +116,8 @@ impl Pools {
 pub struct PoolStats {
     pub orders_allocated: usize,
     pub orders_capacity: usize,
+    pub trades_allocated: usize,
+    pub trades_capacity: usize,
     pub queues_allocated: usize,
     pub queues_capacity: usize,
 }

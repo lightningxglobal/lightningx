@@ -1,4 +1,5 @@
 use crate::order::{Order, Side, TimeInForce};
+use crate::trade::Trade;
 use crate::error::{MatchingEngineError, OrderResult};
 use crate::event::MatchingEvent;
 use crate::market_data::TradeEvent;
@@ -233,7 +234,7 @@ impl MatchingEngine {
     #[inline]
     fn match_order(&mut self, order: Order) -> OrderResult<(f64, Vec<Trade>)> {
         let mut filled = 0.0;
-        let mut trades: SmallVec<[Trade; 64]> = SmallVec::new();
+        let mut trade_indices: SmallVec<[usize; 64]> = SmallVec::new();
 
         // 外层循环：获取最优对手价
         loop {
@@ -327,14 +328,22 @@ impl MatchingEngine {
 
                 filled += trade_qty;
 
-                // 发布成交事件
-                let trade = Trade {
-                    taker_id: order.id,
-                    maker_id: counter_order_id,
-                    price: best_price,
-                    quantity: trade_qty,
-                };
-                trades.push(trade);
+                // 从对象池获取Trade（减少allocation churn）
+                let trade_idx = self.pools.trades.acquire()
+                    .ok_or(MatchingEngineError::OrderPoolExhausted)?;
+
+                // 初始化Trade内容
+                {
+                    if let Some(trade) = self.pools.trades.get_mut(trade_idx) {
+                        trade.taker_id = order.id;
+                        trade.maker_id = counter_order_id;
+                        trade.price = best_price;
+                        trade.quantity = trade_qty;
+                    }
+                }
+
+                // 存储Trade索引
+                trade_indices.push(trade_idx);
 
                 self.publish_event(&MatchingEvent::Trade {
                     taker_order_id: order.id,
@@ -377,7 +386,17 @@ impl MatchingEngine {
             // 内层循环退出后，下次调用get_best_price()会自动检测缓存的价格级别是否仍有订单
         }
 
-        Ok((filled, trades.into_vec()))
+        // 从池中读取Trade对象并构造返回Vec
+        let mut result_trades = Vec::with_capacity(trade_indices.len());
+        for trade_idx in trade_indices.iter() {
+            if let Some(trade) = self.pools.trades.get(*trade_idx) {
+                result_trades.push(*trade);
+            }
+            // 释放Trade回池
+            self.pools.trades.release(*trade_idx);
+        }
+
+        Ok((filled, result_trades))
     }
 
     // ===== Task 10: Cancel Order =====
@@ -563,13 +582,6 @@ pub enum OrderStatus {
 }
 
 /// 成交记录
-#[derive(Debug, Clone, Copy)]
-pub struct Trade {
-    pub taker_id: u64,
-    pub maker_id: u64,
-    pub price: f64,
-    pub quantity: f64,
-}
 
 /// 撤单结果
 #[derive(Debug, Clone)]

@@ -631,8 +631,40 @@ impl MatchingEngine {
 
         // 所有订单处理完毕，批量发送所有TradeEvent到ring buffer
         if let Some(ref mut sender) = self.trade_event_sender {
-            for event in all_trade_events.iter() {
-                let _ = sender.push(*event);
+            let num_events = all_trade_events.len();
+
+            // 优先使用write_chunk()批量写入
+            let should_fallback = if let Ok(mut chunk) = sender.write_chunk(num_events) {
+                // 批量写入所有events到ring buffer
+                let (s1, s2) = chunk.as_mut_slices();
+                let mut idx = 0;
+
+                // 写入第一段
+                for slot in s1.iter_mut() {
+                    if idx < num_events {
+                        *slot = all_trade_events[idx];
+                        idx += 1;
+                    }
+                }
+
+                // 写入第二段（环形缓冲区的环绕部分）
+                for slot in s2.iter_mut() {
+                    if idx < num_events {
+                        *slot = all_trade_events[idx];
+                        idx += 1;
+                    }
+                }
+                chunk.commit(num_events); // 提交所有写入的slots
+                false
+            } else {
+                true
+            };
+
+            // 如果批量写入失败，逐个push
+            if should_fallback {
+                for event in all_trade_events.iter() {
+                    let _ = sender.push(*event);
+                }
             }
         }
 

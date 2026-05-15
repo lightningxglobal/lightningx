@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let _ = engine.match_orders_batch(batch)?;
     }
-    let batch_tps = (num_rounds as f64 * 2.0) / start.elapsed().as_secs_f64();
+    let batch_tps = (num_rounds as f64 * 20.0) / start.elapsed().as_secs_f64();
     let improvement = ((batch_tps - single_tps) / single_tps) * 100.0;
     println!("  TPS: {:.0}", batch_tps);
     println!("  性能提升: {:+.1}%\n", improvement);
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let _ = engine.place_orders(batch)?;
     }
-    let place_orders_tps = (num_rounds as f64 * 2.0) / start.elapsed().as_secs_f64();
+    let place_orders_tps = (num_rounds as f64 * 20.0) / start.elapsed().as_secs_f64();
     let place_improvement = ((place_orders_tps - single_tps) / single_tps) * 100.0;
     println!("  TPS: {:.0}", place_orders_tps);
     println!("  性能提升: {:+.1}%\n", place_improvement);

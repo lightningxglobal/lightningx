@@ -7,7 +7,7 @@ edition = "2021"
 aeron-wrapper = { path = "../aeron-wrapper" }
 tracing = "0.1"
 rand = "0.8"
-rtrb = "0.2"
+rtrb = "0.3"
 parking_lot = "0.12"
 ordered-float = "5.3.0"
 smallvec = "1.13"

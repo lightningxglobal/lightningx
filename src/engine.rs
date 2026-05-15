@@ -26,6 +26,7 @@ pub struct MatchingEngine {
     depth50_sender: Option<Producer<Depth50SnapshotEvent>>,
     level2_sender: Option<Producer<Level2SnapshotEvent>>,
     market_data_config: MarketDataConfig,
+    depth_sampling_initialized: bool,
     last_shallow_sample_ns: u64,
     last_depth50_sample_ns: u64,
     last_level2_sample_ns: u64,
@@ -50,6 +51,7 @@ impl MatchingEngine {
             depth50_sender: None,
             level2_sender: None,
             market_data_config: MarketDataConfig::default(),
+            depth_sampling_initialized: false,
             last_shallow_sample_ns: 0,
             last_depth50_sample_ns: 0,
             last_level2_sample_ns: 0,
@@ -127,37 +129,91 @@ impl MatchingEngine {
         }
     }
 
-    /// 获取当前时间戳（纳秒） - 使用Instant（单调递增）
-    /// 注意：起点是程序启动后的相对时间，不是绝对时间
-    #[inline]
+    /// 获取当前时间戳（纳秒） - 使用monotonic time
     fn current_time_ns() -> u64 {
         use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        static INIT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-        // 用OnceLock存储程序启动时的绝对时间
-        static BASE_TIME: OnceLock<u64> = OnceLock::new();
-        static START_INSTANT: OnceLock<std::time::Instant> = OnceLock::new();
-
-        let _base = BASE_TIME.get_or_init(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64
+        let start = START.get_or_init(|| {
+            if std::env::var("DEBUG_ENGINE").is_ok() {
+                let count = INIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count > 0 {
+                    eprintln!("[WARNING] START reinitialized! Count={}", count + 1);
+                }
+            }
+            std::time::Instant::now()
         });
 
-        let start = START_INSTANT.get_or_init(std::time::Instant::now);
-
-        // 返回程序启动后的相对纳秒数（足够精确用于采样时间间隔）
         start.elapsed().as_nanos() as u64
     }
 
     /// 深度采样（检查是否需要发送深度快照）
-    #[inline]
     fn maybe_sample_depth(&mut self) {
         let now_ns = Self::current_time_ns();
         let cfg = self.market_data_config;
 
-        // BBO + Depth-20 快照（每10ms）
-        if now_ns >= self.last_shallow_sample_ns + cfg.shallow_sample_interval_ns {
+        // DEBUG: Log first few and periodic calls
+        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if std::env::var("DEBUG_ENGINE").is_ok() && (call_num < 20 || call_num % 1_000_000 == 0) {
+            eprintln!("[CALL #{}] now_ns={}", call_num, now_ns);
+        }
+
+        // Initialize sampling timestamps on first call
+        if !self.depth_sampling_initialized {
+            self.depth_sampling_initialized = true;
+            self.last_shallow_sample_ns = now_ns;
+
+            if std::env::var("DEBUG_ENGINE").is_ok() {
+                eprintln!("[INIT] last_shallow_sample_ns set to {}", now_ns);
+            }
+            if cfg.enable_depth_increments {
+                self.last_depth50_sample_ns = now_ns;
+                self.last_level2_sample_ns = now_ns;
+            }
+
+            // Trigger first sample immediately
+            if let Some(ref mut sender) = self.depth_snapshot_sender {
+                let mut event = DepthSnapshotEvent::new(now_ns, self.depth_snapshot_seq);
+                let bids = self.buy_book.get_top_levels(20);
+                let asks = self.sell_book.get_top_levels(20);
+                for (i, (p, q)) in bids.iter().enumerate() {
+                    if i >= 20 { break; }
+                    event.bids[i] = (*p, *q);
+                    event.num_bids = (i + 1) as u8;
+                }
+                for (i, (p, q)) in asks.iter().enumerate() {
+                    if i >= 20 { break; }
+                    event.asks[i] = (*p, *q);
+                    event.num_asks = (i + 1) as u8;
+                }
+                let _ = sender.push(event);
+                self.depth_snapshot_seq += 1;
+            }
+            if cfg.enable_depth_increments {
+                let depth50_event = self.build_depth50_event(now_ns);
+                if let Some(ref mut sender) = self.depth50_sender {
+                    let _ = sender.push(depth50_event);
+                    self.depth50_seq += 1;
+                }
+                let level2_event = self.build_level2_event(now_ns);
+                if let Some(ref mut sender) = self.level2_sender {
+                    let _ = sender.push(level2_event);
+                    self.level2_seq += 1;
+                }
+            }
+            return;
+        }
+
+        // BBO + Depth-20 快照
+        let threshold = self.last_shallow_sample_ns.saturating_add(cfg.shallow_sample_interval_ns);
+        if std::env::var("DEBUG_ENGINE").is_ok() && call_num < 50 {
+            eprintln!("[CHECK #{}] now={}, threshold={}, trigger={}", call_num, now_ns, threshold, now_ns >= threshold);
+        }
+
+        if now_ns >= threshold {
             if let Some(ref mut sender) = self.depth_snapshot_sender {
                 let mut event = DepthSnapshotEvent::new(now_ns, self.depth_snapshot_seq);
 

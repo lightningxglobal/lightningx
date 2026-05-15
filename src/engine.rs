@@ -228,13 +228,13 @@ impl MatchingEngine {
 
     // ===== Task 9: Match Order Logic =====
 
-    /// 撮合订单（关键热路径）
+    /// 撮合订单（关键热路径，Phase 1 优化：内层循环避免重复查询最优价）
     #[inline]
     fn match_order(&mut self, order: Order) -> OrderResult<(f64, Vec<Trade>)> {
         let mut filled = 0.0;
         let mut trades = Vec::new();
 
-        // 循环撮合直到不能撮合或订单完全成交
+        // 外层循环：获取最优对手价
         loop {
             if filled >= order.quantity {
                 break;
@@ -270,99 +270,102 @@ impl MatchingEngine {
                 None => break,
             };
 
-            // 从对手订单簿获取最优价格级别的第一个订单ID
-            // 使用List实现后，取消的订单已被真正移除，无需检查cancelled标志
-            let counter_order_id = {
-                let opposite_book = match order.side {
-                    Side::Buy => &mut self.sell_book,
-                    Side::Sell => &mut self.buy_book,
-                };
-
-                match opposite_book.get_node_mut(best_price) {
-                    Some(node) => {
-                        // 获取链表的第一个节点
-                        if let Some(node_idx) = node.orders.front() {
-                            // 获取 list_pool 的可变引用来访问订单节点
-                            let list_pool = opposite_book.get_list_pool();
-                            if let Some(list_node) = list_pool.get(node_idx) {
-                                list_node.order_id
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;  // 链表为空
-                        }
-                    }
-                    None => break,
+            // 内层循环：在同一价格级别内批量成交，减少 best_with_orders() 调用
+            loop {
+                if filled >= order.quantity {
+                    break;
                 }
-            };
 
-            let counter_order = match self.orders.get(&counter_order_id) {
-                Some(o) => *o,
-                None => break,
-            };
-
-            // 计算成交数量
-            let order_remaining = order.quantity - filled;
-            let counter_remaining = counter_order.remaining();
-            let trade_qty = order_remaining.min(counter_remaining);
-
-            // 更新订单状态
-            {
-                if let Some(o) = self.orders.get_mut(&order.id) {
-                    o.filled += trade_qty;
-                }
-                if let Some(o) = self.orders.get_mut(&counter_order_id) {
-                    o.filled += trade_qty;
-                }
-            }
-
-            filled += trade_qty;
-
-            // 发布成交事件
-            let trade = Trade {
-                taker_id: order.id,
-                maker_id: counter_order_id,
-                price: best_price,
-                quantity: trade_qty,
-            };
-            trades.push(trade.clone());
-
-            self.publish_event(&MatchingEvent::Trade {
-                taker_order_id: order.id,
-                maker_order_id: counter_order_id,
-                price: best_price,
-                quantity: trade_qty,
-                timestamp: order.timestamp,
-            });
-
-            // 发布交易事件到ring buffer
-            if let Some(ref mut sender) = self.trade_event_sender {
-                let trade_event = TradeEvent::new(
-                    self.trade_sequence,
-                    order.id,
-                    counter_order_id,
-                    order.timestamp,
-                    best_price,
-                    trade_qty,
-                    order.side,
-                    order.id,  // 吃单方用户ID（使用订单ID）
-                    counter_order_id,  // 挂单方用户ID（使用订单ID）
-                );
-                self.trade_sequence += 1;
-                // 忽略发送错误（接收方可能已关闭或缓冲满）
-                let _ = sender.push(trade_event);
-            }
-
-            // 检查对手订单是否完全成交，如果是则从订单簿移除
-            if let Some(counter) = self.orders.get(&counter_order_id) {
-                if counter.is_filled() {
-                    // 从订单簿中移除已成交的订单
+                // 从对手订单簿获取最优价格级别的第一个订单ID
+                let counter_order_id = {
                     let opposite_book = match order.side {
                         Side::Buy => &mut self.sell_book,
                         Side::Sell => &mut self.buy_book,
                     };
-                    let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
+
+                    match opposite_book.get_node_mut(best_price) {
+                        Some(node) => {
+                            if let Some(node_idx) = node.orders.front() {
+                                let list_pool = opposite_book.get_list_pool();
+                                if let Some(list_node) = list_pool.get(node_idx) {
+                                    list_node.order_id
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                };
+
+                let counter_order = match self.orders.get(&counter_order_id) {
+                    Some(o) => *o,
+                    None => break,
+                };
+
+                // 计算成交数量
+                let order_remaining = order.quantity - filled;
+                let counter_remaining = counter_order.remaining();
+                let trade_qty = order_remaining.min(counter_remaining);
+
+                // 更新订单状态
+                {
+                    if let Some(o) = self.orders.get_mut(&order.id) {
+                        o.filled += trade_qty;
+                    }
+                    if let Some(o) = self.orders.get_mut(&counter_order_id) {
+                        o.filled += trade_qty;
+                    }
+                }
+
+                filled += trade_qty;
+
+                // 发布成交事件
+                let trade = Trade {
+                    taker_id: order.id,
+                    maker_id: counter_order_id,
+                    price: best_price,
+                    quantity: trade_qty,
+                };
+                trades.push(trade.clone());
+
+                self.publish_event(&MatchingEvent::Trade {
+                    taker_order_id: order.id,
+                    maker_order_id: counter_order_id,
+                    price: best_price,
+                    quantity: trade_qty,
+                    timestamp: order.timestamp,
+                });
+
+                // 发布交易事件到ring buffer
+                if let Some(ref mut sender) = self.trade_event_sender {
+                    let trade_event = TradeEvent::new(
+                        self.trade_sequence,
+                        order.id,
+                        counter_order_id,
+                        order.timestamp,
+                        best_price,
+                        trade_qty,
+                        order.side,
+                        order.id,
+                        counter_order_id,
+                    );
+                    self.trade_sequence += 1;
+                    let _ = sender.push(trade_event);
+                }
+
+                // 检查对手订单是否完全成交
+                if let Some(counter) = self.orders.get(&counter_order_id) {
+                    if counter.is_filled() {
+                        let opposite_book = match order.side {
+                            Side::Buy => &mut self.sell_book,
+                            Side::Sell => &mut self.buy_book,
+                        };
+                        let _ = opposite_book.remove_order_at_level(best_price, counter_order_id);
+                        // 继续内层循环，自动 break 当链表为空
+                    }
                 }
             }
         }

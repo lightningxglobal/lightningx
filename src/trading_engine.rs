@@ -306,13 +306,23 @@ fn run_publishing_thread(
                 remaining_qty: evt.remaining_qty,
                 timestamp: evt.timestamp,
             };
+
+            // 调试日志：记录正在发送的消息内容
+            let kind_str = match evt.kind {
+                1 => "ACCEPTED",
+                2 => "FILLED",
+                3 => "PARTIAL_FILL",
+                4 => "CANCELLED",
+                5 => "REJECTED",
+                _ => "UNKNOWN",
+            };
+            info!("📤 OrderUpdate: kind={} | OrderId={} | ClientId={} | ParticipantId={} | FillPrice={} | FillQty={} | RemainingQty={}",
+                  kind_str, evt.order_id, evt.client_order_id, evt.participant_id, evt.fill_price, evt.fill_qty, evt.remaining_qty);
+
             match order_update_pub.publish(&msg) {
                 Ok(()) => {
                     published_count += 1;
                     any_published = true;
-                    if published_count % 10 == 1 {
-                        info!("📤 发布OrderUpdate #{}", published_count);
-                    }
                 }
                 Err(e) => {
                     info!("❌ OrderUpdate发布失败: {:?}", e);

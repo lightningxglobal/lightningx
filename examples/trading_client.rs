@@ -373,6 +373,7 @@ fn parse_and_print_message(msg: &RawMessage, stats: &mut Stats) {
 
 fn parse_order_update(msg: &RawMessage) {
     if msg.data.len() < 72 {  // 8-byte header + 64-byte body = 72
+        info!("❌ OrderUpdate消息过短: {} bytes (需要72)", msg.data.len());
         return;
     }
 
@@ -387,6 +388,10 @@ fn parse_order_update(msg: &RawMessage) {
     let fill_qty = f64::from_le_bytes(data[48..56].try_into().unwrap_or([0; 8]));
     let remaining_qty = f64::from_le_bytes(data[56..64].try_into().unwrap_or([0; 8]));
     let timestamp = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0; 8]));
+
+    // 调试日志：记录接收到的消息
+    info!("📨 OrderUpdate接收: kind={} | OrderId={} | ClientId={} | ParticipantId={} | FillPrice={} | FillQty={} | RemainingQty={} | len={}",
+          kind, order_id, client_order_id, participant_id, fill_price, fill_qty, remaining_qty, msg.data.len());
 
     match kind {
         1 => info!("📨 [NEW] Order#{} | Client#{} | Participant#{} | Status=ACCEPTED (进入簿) | ts={}",

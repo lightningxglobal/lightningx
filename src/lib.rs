@@ -12,6 +12,7 @@ pub mod orderbook;
 pub mod orderbook_impl;
 pub mod skiplist;
 pub mod array_orderbook;
+pub mod btree_orderbook;
 pub mod engine;
 pub mod snapshot;
 pub mod recovery;

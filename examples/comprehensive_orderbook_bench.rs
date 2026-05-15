@@ -186,7 +186,7 @@ fn bench_cancel(book_type: OrderBookType, num_orders: usize) -> BenchResult {
 
 fn main() {
     println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║     OrderBook 性能对比基准测试 (SkipList vs Array)        ║");
+    println!("║ OrderBook 性能对比基准测试 (SkipList vs Array vs BTree)   ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
     let tests = vec![
@@ -215,19 +215,33 @@ fn main() {
             _ => unreachable!(),
         };
 
+        let result_btree = match test_name {
+            "Insert 5000 prices" => bench_insert(OrderBookType::BTree, param),
+            "Lookup 1000 snapshots" => bench_lookup(OrderBookType::BTree, param),
+            "Matching 5000 orders" => bench_matching(OrderBookType::BTree, param),
+            "Cancel 1000 orders" => bench_cancel(OrderBookType::BTree, param),
+            _ => unreachable!(),
+        };
+
         println!("\n【SkipList】");
         result_skiplist.print();
 
         println!("\n【ArrayOrderBook】");
         result_array.print();
 
-        let ratio = result_array.ratio(&result_skiplist);
+        println!("\n【BTreeOrderBook】");
+        result_btree.print();
+
         println!("\n【对比结果】");
-        if ratio > 1.0 {
-            println!("  ArrayOrderBook 快 {:.2}x ✓", ratio);
+        let max_tps = result_skiplist.tps.max(result_array.tps).max(result_btree.tps);
+        let winner = if (max_tps - result_skiplist.tps).abs() < 1.0 {
+            "SkipList"
+        } else if (max_tps - result_array.tps).abs() < 1.0 {
+            "Array"
         } else {
-            println!("  SkipList 快 {:.2}x ✓", 1.0 / ratio);
-        }
+            "BTree"
+        };
+        println!("  赢家: {} ({:.2}M TPS)", winner, max_tps / 1_000_000.0);
         println!("└────────────────────────────────────────────────────┘");
     }
 
@@ -235,32 +249,36 @@ fn main() {
     println!("║                    性能汇总表                              ║");
     println!("╚════════════════════════════════════════════════════════════╝\n");
 
-    println!("测试场景              SkipList        ArrayOrderBook    赢家");
-    println!("─────────────────────────────────────────────────────────────");
+    println!("测试场景         SkipList      Array      BTree      赢家");
+    println!("───────────────────────────────────────────────────────────");
 
     let benchmarks = vec![
-        ("Insert", bench_insert(OrderBookType::SkipList, 5000), bench_insert(OrderBookType::Array, 5000)),
-        ("Snapshot", bench_lookup(OrderBookType::SkipList, 1000), bench_lookup(OrderBookType::Array, 1000)),
-        ("Matching", bench_matching(OrderBookType::SkipList, 5000), bench_matching(OrderBookType::Array, 5000)),
-        ("Cancel", bench_cancel(OrderBookType::SkipList, 1000), bench_cancel(OrderBookType::Array, 1000)),
+        ("Insert", bench_insert(OrderBookType::SkipList, 5000), bench_insert(OrderBookType::Array, 5000), bench_insert(OrderBookType::BTree, 5000)),
+        ("Snapshot", bench_lookup(OrderBookType::SkipList, 1000), bench_lookup(OrderBookType::Array, 1000), bench_lookup(OrderBookType::BTree, 1000)),
+        ("Matching", bench_matching(OrderBookType::SkipList, 5000), bench_matching(OrderBookType::Array, 5000), bench_matching(OrderBookType::BTree, 5000)),
+        ("Cancel", bench_cancel(OrderBookType::SkipList, 1000), bench_cancel(OrderBookType::Array, 1000), bench_cancel(OrderBookType::BTree, 1000)),
     ];
 
-    for (name, sl, arr) in benchmarks {
-        let winner = if sl.tps > arr.tps {
-            format!("SkipList ({:.2}x)", sl.tps / arr.tps)
+    for (name, sl, arr, bt) in benchmarks {
+        let max = sl.tps.max(arr.tps).max(bt.tps);
+        let winner = if (max - sl.tps).abs() < 1.0 {
+            "SkipList"
+        } else if (max - arr.tps).abs() < 1.0 {
+            "Array"
         } else {
-            format!("Array ({:.2}x)", arr.tps / sl.tps)
+            "BTree"
         };
 
         println!(
-            "{:<18} {:.2}M           {:.2}M            {}",
+            "{:<12} {:.2}M     {:.2}M    {:.2}M    {}",
             name,
             sl.tps / 1_000_000.0,
             arr.tps / 1_000_000.0,
+            bt.tps / 1_000_000.0,
             winner
         );
     }
 
     println!("\n目标: 7,000,000 TPS");
-    println!("当前最好: SkipList (0.47M TPS in matching scenario)\n");
+    println!("当前最好: TBD\n");
 }

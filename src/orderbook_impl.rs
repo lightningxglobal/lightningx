@@ -1,18 +1,21 @@
 use crate::orderbook::{OrderBook, PriceLevel};
 use crate::skiplist::SkipList;
 use crate::array_orderbook::ArrayOrderBook;
+use crate::btree_orderbook::BTreeOrderBook;
 
 /// OrderBook 实现选择
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderBookType {
     SkipList,
     Array,
+    BTree,
 }
 
 /// OrderBook 包装器，支持不同的实现
 pub enum OrderBookWrapper {
     SkipList(SkipList),
     Array(ArrayOrderBook),
+    BTree(BTreeOrderBook),
 }
 
 impl OrderBookWrapper {
@@ -24,10 +27,15 @@ impl OrderBookWrapper {
         OrderBookWrapper::Array(ArrayOrderBook::new_with_pool(order, pool_capacity))
     }
 
+    pub fn new_btree(order: crate::skiplist::SortOrder, pool_capacity: usize) -> Self {
+        OrderBookWrapper::BTree(BTreeOrderBook::new_with_pool(order, pool_capacity))
+    }
+
     pub fn new(book_type: OrderBookType, order: crate::skiplist::SortOrder, pool_capacity: usize) -> Self {
         match book_type {
             OrderBookType::SkipList => Self::new_skiplist(order, pool_capacity),
             OrderBookType::Array => Self::new_array(order, pool_capacity),
+            OrderBookType::BTree => Self::new_btree(order, pool_capacity),
         }
     }
 
@@ -36,6 +44,7 @@ impl OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => &book.list_pool,
             OrderBookWrapper::Array(book) => &book.list_pool,
+            OrderBookWrapper::BTree(book) => &book.list_pool,
         }
     }
 }
@@ -45,6 +54,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.insert_level(price),
             OrderBookWrapper::Array(book) => book.insert_level(price),
+            OrderBookWrapper::BTree(book) => book.insert_level(price),
         }
     }
 
@@ -52,17 +62,17 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.find_node(price),
             OrderBookWrapper::Array(book) => book.find_node(price),
+            OrderBookWrapper::BTree(book) => book.find_node(price),
         }
     }
 
     fn get_node_at_price(&self, price: f64) -> Option<&PriceLevel> {
         match self {
-            // 两个实现都通过 OrderBook trait 返回正确的类型
             OrderBookWrapper::SkipList(book) => {
-                // book 实现了 OrderBook trait，所以返回的应该是 &PriceLevel
                 <SkipList as OrderBook>::get_node_at_price(book, price)
             }
             OrderBookWrapper::Array(book) => book.get_node_at_price(price),
+            OrderBookWrapper::BTree(book) => book.get_node_at_price(price),
         }
     }
 
@@ -72,6 +82,7 @@ impl OrderBook for OrderBookWrapper {
                 <SkipList as OrderBook>::get_node_mut(book, price)
             }
             OrderBookWrapper::Array(book) => book.get_node_mut(price),
+            OrderBookWrapper::BTree(book) => book.get_node_mut(price),
         }
     }
 
@@ -81,6 +92,7 @@ impl OrderBook for OrderBookWrapper {
                 <SkipList as OrderBook>::best(book)
             }
             OrderBookWrapper::Array(book) => book.best(),
+            OrderBookWrapper::BTree(book) => book.best(),
         }
     }
 
@@ -90,6 +102,7 @@ impl OrderBook for OrderBookWrapper {
                 <SkipList as OrderBook>::best_with_orders(book)
             }
             OrderBookWrapper::Array(book) => book.best_with_orders(),
+            OrderBookWrapper::BTree(book) => book.best_with_orders(),
         }
     }
 
@@ -102,6 +115,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.add_order_at_level(price, order_id, quantity),
             OrderBookWrapper::Array(book) => book.add_order_at_level(price, order_id, quantity),
+            OrderBookWrapper::BTree(book) => book.add_order_at_level(price, order_id, quantity),
         }
     }
 
@@ -109,6 +123,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.remove_order_at_level(price, order_id),
             OrderBookWrapper::Array(book) => book.remove_order_at_level(price, order_id),
+            OrderBookWrapper::BTree(book) => book.remove_order_at_level(price, order_id),
         }
     }
 
@@ -116,6 +131,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.remove_level(price),
             OrderBookWrapper::Array(book) => book.remove_level(price),
+            OrderBookWrapper::BTree(book) => book.remove_level(price),
         }
     }
 
@@ -123,6 +139,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.clear(),
             OrderBookWrapper::Array(book) => book.clear(),
+            OrderBookWrapper::BTree(book) => book.clear(),
         }
     }
 
@@ -130,6 +147,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.get_top_levels(limit),
             OrderBookWrapper::Array(book) => book.get_top_levels(limit),
+            OrderBookWrapper::BTree(book) => book.get_top_levels(limit),
         }
     }
 
@@ -137,6 +155,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.count(),
             OrderBookWrapper::Array(book) => book.count(),
+            OrderBookWrapper::BTree(book) => book.count(),
         }
     }
 
@@ -144,6 +163,7 @@ impl OrderBook for OrderBookWrapper {
         match self {
             OrderBookWrapper::SkipList(book) => book.get_list_pool(),
             OrderBookWrapper::Array(book) => book.get_list_pool(),
+            OrderBookWrapper::BTree(book) => book.get_list_pool(),
         }
     }
 }

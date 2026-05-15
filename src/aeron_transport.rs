@@ -80,7 +80,7 @@ impl AeronOrderSubscriber {
 
         let (tx, rx) = mpsc_channel();
 
-        let mut subscriber = client
+        let subscriber = client
             .add_subscription(
                 channel,
                 stream_id,
@@ -156,6 +156,15 @@ impl AeronOrderUpdatePublisher {
             .add_publication(channel, stream_id)
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
 
+        // Wait for publisher to be connected (similar to subscriber)
+        for _ in 0..100 {
+            client.do_work();
+            if publisher.is_connected() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         Ok(Self { _client: client, publisher })
     }
 }
@@ -220,6 +229,15 @@ impl AeronTradePublisher {
         let publisher = client
             .add_publication(channel, stream_id)
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
+
+        // Wait for publisher to be connected (similar to subscriber)
+        for _ in 0..100 {
+            client.do_work();
+            if publisher.is_connected() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         Ok(Self { _client: client, publisher })
     }
@@ -301,6 +319,15 @@ impl AeronMarketDataPublisher {
         let level2_publisher = client
             .add_publication(channel, level2_stream_id)
             .map_err(|e| format!("Failed to add level2 publication: {:?}", e))?;
+
+        // Wait for all publishers to be connected
+        for _ in 0..100 {
+            client.do_work();
+            if depth_publisher.is_connected() && depth50_publisher.is_connected() && level2_publisher.is_connected() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         Ok(Self {
             _client: client,

@@ -4,6 +4,7 @@
 //! 所有结构都采用64字节对齐，以优化缓存性能。
 
 use crate::order::Side;
+use crossbeam::channel::Receiver;
 
 /// 交易事件 - 实时成交数据（64字节对齐）
 /// 用于匹配引擎和市场数据引擎之间的通信
@@ -397,6 +398,246 @@ impl Default for Statistics24h {
     }
 }
 
+/// 市场数据引擎 - 聚合和维护市场数据状态
+///
+/// 从匹配引擎接收TradeEvent，维护以下状态：
+/// - BBO（最优买卖价）
+/// - Level2深度（前10档）
+/// - 聚合成交数据（时间桶）
+/// - 24小时统计数据
+///
+/// 线程安全：接收方由Crossbeam channel提供线程安全保证
+pub struct MarketDataEngine {
+    /// TradeEvent接收方
+    receiver: Receiver<TradeEvent>,
+    /// 当前BBO快照
+    bbo_snapshot: BBOSnapshot,
+    /// 当前Level2快照
+    level2_snapshot: Level2Snapshot,
+    /// 24小时统计数据
+    statistics_24h: Statistics24h,
+    /// 聚合成交数据（预留，用于任务2.4）
+    aggregate_trades: Vec<AggregateTrade>,
+}
+
+impl MarketDataEngine {
+    /// 创建新的市场数据引擎
+    ///
+    /// # 参数
+    /// - `receiver`: TradeEvent的接收方，来自匹配引擎
+    ///
+    /// # 返回
+    /// 初始化完毕的MarketDataEngine实例
+    pub fn new(receiver: Receiver<TradeEvent>) -> Self {
+        Self {
+            receiver,
+            bbo_snapshot: BBOSnapshot::default(),
+            level2_snapshot: Level2Snapshot::default(),
+            statistics_24h: Statistics24h::default(),
+            aggregate_trades: Vec::new(),
+        }
+    }
+
+    /// 根据交易事件更新BBO状态
+    ///
+    /// 基于交易方向更新最优买卖价格和数量：
+    /// - 买方成交（taker is buyer）：最低卖价可能下降
+    /// - 卖方成交（taker is seller）：最高买价可能上升
+    ///
+    /// # 参数
+    /// - `event`: 交易事件
+    ///
+    /// # 返回
+    /// 如果BBO状态发生变化返回true，否则返回false
+    #[inline]
+    fn update_bbo_from_trade(&mut self, event: TradeEvent) -> bool {
+        let mut changed = false;
+
+        match event.side {
+            Side::Buy => {
+                // 买方成交（taker is buyer）：卖方流动性被消耗
+                // 成交价格成为可能的最低卖价（ask）
+                if self.bbo_snapshot.best_ask_price == 0.0 {
+                    // 初始状态：设置初始ask价格和数量
+                    self.bbo_snapshot.best_ask_price = event.price;
+                    self.bbo_snapshot.best_ask_qty = event.quantity;
+                    changed = true;
+                } else if event.price < self.bbo_snapshot.best_ask_price {
+                    // Ask价格下降（ask improved）
+                    self.bbo_snapshot.best_ask_price = event.price;
+                    self.bbo_snapshot.best_ask_qty = event.quantity;
+                    changed = true;
+                } else if event.price == self.bbo_snapshot.best_ask_price {
+                    // Ask价格相同：成交数量消耗了该档的流动性
+                    self.bbo_snapshot.best_ask_qty -= event.quantity;
+                    if self.bbo_snapshot.best_ask_qty < 0.0 {
+                        self.bbo_snapshot.best_ask_qty = 0.0;
+                    }
+                    changed = true;
+                }
+            }
+            Side::Sell => {
+                // 卖方成交（taker is seller）：买方流动性被消耗
+                // 成交价格成为可能的最高买价（bid）
+                if self.bbo_snapshot.best_bid_price == 0.0 {
+                    // 初始状态：设置初始bid价格和数量
+                    self.bbo_snapshot.best_bid_price = event.price;
+                    self.bbo_snapshot.best_bid_qty = event.quantity;
+                    changed = true;
+                } else if event.price > self.bbo_snapshot.best_bid_price {
+                    // Bid价格上升（bid improved）
+                    self.bbo_snapshot.best_bid_price = event.price;
+                    self.bbo_snapshot.best_bid_qty = event.quantity;
+                    changed = true;
+                } else if event.price == self.bbo_snapshot.best_bid_price {
+                    // Bid价格相同：成交数量消耗了该档的流动性
+                    self.bbo_snapshot.best_bid_qty -= event.quantity;
+                    if self.bbo_snapshot.best_bid_qty < 0.0 {
+                        self.bbo_snapshot.best_bid_qty = 0.0;
+                    }
+                    changed = true;
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// 生成BBO快照
+    ///
+    /// 基于当前的BBO状态创建快照，包括时间戳、序列号和档位数。
+    /// 此方法应在每次交易事件后调用以生成最新的快照。
+    ///
+    /// # 返回
+    /// 当前状态的BBOSnapshot
+    #[allow(dead_code)]
+    #[inline]
+    fn generate_bbo_snapshot(&self) -> BBOSnapshot {
+        BBOSnapshot {
+            timestamp: self.bbo_snapshot.timestamp,
+            sequence: self.bbo_snapshot.sequence,
+            best_bid_price: self.bbo_snapshot.best_bid_price,
+            best_bid_qty: self.bbo_snapshot.best_bid_qty,
+            best_ask_price: self.bbo_snapshot.best_ask_price,
+            best_ask_qty: self.bbo_snapshot.best_ask_qty,
+            bid_level_count: self.bbo_snapshot.bid_level_count,
+            ask_level_count: self.bbo_snapshot.ask_level_count,
+            _padding: [0; 12],
+        }
+    }
+
+    /// 消费交易事件，更新所有内部状态
+    ///
+    /// 此方法在接收到TradeEvent时被调用，用于：
+    /// 1. 更新BBO（最优买卖价）
+    /// 2. 更新Level2深度
+    /// 3. 更新聚合成交数据
+    /// 4. 更新24小时统计
+    ///
+    /// # 参数
+    /// - `event`: 交易事件
+    ///
+    /// # 返回
+    /// 如果所有更新成功返回true，否则返回false
+    pub fn consume_trade_event(&mut self, event: TradeEvent) -> bool {
+        // 更新时间戳和序列号
+        self.bbo_snapshot.timestamp = event.timestamp;
+        self.bbo_snapshot.sequence = event.sequence;
+        self.level2_snapshot.timestamp = event.timestamp;
+        self.level2_snapshot.sequence = event.sequence;
+        self.statistics_24h.timestamp = event.timestamp;
+
+        // 更新24小时统计数据中的BBO信息
+        if event.side == Side::Buy {
+            // 买方成交意味着卖方流动性被消耗
+            self.statistics_24h.ask_price = event.price;
+            // 卖方数量信息可从后续的BBO更新获取
+        } else {
+            // 卖方成交意味着买方流动性被消耗
+            self.statistics_24h.bid_price = event.price;
+            // 买方数量信息可从后续的BBO更新获取
+        }
+
+        // 更新24小时统计的交易相关数据
+        self.statistics_24h.volume_24h += event.quantity;
+        self.statistics_24h.quote_asset_volume_24h += event.price * event.quantity;
+        if self.statistics_24h.trade_count == 0 {
+            self.statistics_24h.first_trade_id = event.order_id;
+        }
+        self.statistics_24h.last_trade_id = event.order_id;
+        self.statistics_24h.trade_count += 1;
+
+        // 更新价格范围
+        self.statistics_24h.update_price_range(event.price);
+
+        // 更新BBO状态 - Task 2.2
+        let _ = self.update_bbo_from_trade(event);
+
+        // TODO: Level2更新逻辑 - Task 2.3
+        // TODO: 聚合成交数据更新逻辑 - Task 2.4
+
+        true
+    }
+
+    /// 获取当前BBO快照
+    ///
+    /// # 返回
+    /// 当前的BBOSnapshot副本
+    #[inline]
+    pub fn get_bbo_snapshot(&self) -> BBOSnapshot {
+        self.bbo_snapshot
+    }
+
+    /// 获取当前Level2快照
+    ///
+    /// # 返回
+    /// 当前的Level2Snapshot副本
+    #[inline]
+    pub fn get_level2_snapshot(&self) -> Level2Snapshot {
+        self.level2_snapshot
+    }
+
+    /// 获取24小时统计数据
+    ///
+    /// # 返回
+    /// 当前的Statistics24h副本
+    #[inline]
+    pub fn get_24h_statistics(&self) -> Statistics24h {
+        self.statistics_24h
+    }
+
+    /// 获取聚合成交数据
+    ///
+    /// # 返回
+    /// 当前聚合成交数据的副本
+    #[inline]
+    pub fn get_aggregate_trades(&self) -> Vec<AggregateTrade> {
+        self.aggregate_trades.clone()
+    }
+
+    /// 主事件循环 - 连续消费来自通道的TradeEvent
+    ///
+    /// 此方法将阻塞并持续消费TradeEvent，直到通道关闭。
+    /// 每接收一个事件，调用consume_trade_event()更新内部状态。
+    ///
+    /// # 返回值
+    /// 当通道关闭时，循环结束并返回
+    pub fn run(&mut self) {
+        loop {
+            match self.receiver.recv() {
+                Ok(event) => {
+                    // 消费事件，更新状态
+                    let _ = self.consume_trade_event(event);
+                }
+                Err(_) => {
+                    // 通道已关闭，结束事件循环
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,5 +1019,632 @@ mod tests {
         // Create a trade event
         let trade_event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.5, 10.0, Side::Buy, 1001, 2001);
         assert_eq!(trade_event.quantity, 10.0);
+    }
+
+    // ===== MarketDataEngine 测试 =====
+
+    use crossbeam::channel;
+
+    #[test]
+    fn test_market_data_engine_creation() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let engine = MarketDataEngine::new(receiver);
+
+        // Verify initial state
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.timestamp, 0);
+        assert_eq!(bbo.sequence, 0);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.timestamp, 0);
+        assert_eq!(l2.sequence, 0);
+        assert_eq!(l2.num_bids, 0);
+        assert_eq!(l2.num_asks, 0);
+
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.timestamp, 0);
+        assert_eq!(stats.trade_count, 0);
+        assert_eq!(stats.volume_24h, 0.0);
+    }
+
+    #[test]
+    fn test_market_data_engine_consume_single_event() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(
+            1,                  // sequence
+            100,                // order_id
+            99,                 // maker_order_id
+            1_000_000_000,      // timestamp
+            50000.0,            // price
+            10.5,               // quantity
+            Side::Buy,          // side
+            1001,               // taker_id
+            2001,               // maker_id
+        );
+
+        assert!(engine.consume_trade_event(event));
+
+        // Verify snapshots updated
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.timestamp, 1_000_000_000);
+        assert_eq!(bbo.sequence, 1);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.timestamp, 1_000_000_000);
+        assert_eq!(l2.sequence, 1);
+
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.timestamp, 1_000_000_000);
+        assert_eq!(stats.trade_count, 1);
+        assert_eq!(stats.volume_24h, 10.5);
+        assert_eq!(stats.quote_asset_volume_24h, 50000.0 * 10.5);
+        assert_eq!(stats.first_trade_id, 100);
+        assert_eq!(stats.last_trade_id, 100);
+    }
+
+    #[test]
+    fn test_market_data_engine_consume_multiple_events() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First event - buy at 50000
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        assert!(engine.consume_trade_event(event1));
+
+        // Second event - sell at 50100
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50100.0, 5.0, Side::Sell, 1002, 2002);
+        assert!(engine.consume_trade_event(event2));
+
+        // Third event - buy at 50050
+        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 50050.0, 8.0, Side::Buy, 1003, 2003);
+        assert!(engine.consume_trade_event(event3));
+
+        // Verify final state
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.sequence, 3);
+        assert_eq!(bbo.timestamp, 3_000_000_000);
+
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 3);
+        assert_eq!(stats.volume_24h, 10.0 + 5.0 + 8.0);
+        assert_eq!(stats.first_trade_id, 100);
+        assert_eq!(stats.last_trade_id, 102);
+
+        // Verify price range tracking
+        assert_eq!(stats.price_24h_high, 50100.0);
+        assert_eq!(stats.price_24h_low, 50000.0);
+    }
+
+    #[test]
+    fn test_market_data_engine_buy_side_event() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+
+        engine.consume_trade_event(event);
+
+        let stats = engine.get_24h_statistics();
+        // Buy side trade updates ask_price
+        assert_eq!(stats.ask_price, 50000.0);
+    }
+
+    #[test]
+    fn test_market_data_engine_sell_side_event() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
+
+        engine.consume_trade_event(event);
+
+        let stats = engine.get_24h_statistics();
+        // Sell side trade updates bid_price
+        assert_eq!(stats.bid_price, 50000.0);
+    }
+
+    #[test]
+    fn test_market_data_engine_get_aggregate_trades() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let engine = MarketDataEngine::new(receiver);
+
+        // Should return empty vector initially
+        let trades = engine.get_aggregate_trades();
+        assert!(trades.is_empty());
+    }
+
+    #[test]
+    fn test_market_data_engine_channel_closure() {
+        let (sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Send one event
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+        sender.send(event).unwrap();
+
+        // Close the sender (which closes the channel)
+        drop(sender);
+
+        // Run should complete without panicking
+        engine.run();
+
+        // Verify the event was processed
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 1);
+    }
+
+    #[test]
+    fn test_market_data_engine_event_loop_with_multiple_events() {
+        let (sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Create a thread to send events
+        std::thread::spawn(move || {
+            for i in 0..5 {
+                let event = TradeEvent::new(
+                    i as u64 + 1,
+                    100 + i as u64,
+                    99 + i as u64,
+                    1_000_000_000 + (i as u64 * 1_000_000),
+                    50000.0 + (i as f64 * 100.0),
+                    10.0,
+                    if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                    1001 + i as u64,
+                    2001 + i as u64,
+                );
+                let _ = sender.send(event);
+            }
+            // Drop sender to close the channel
+            drop(sender);
+        });
+
+        // Run the engine event loop
+        engine.run();
+
+        // Verify all events were processed
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 5);
+        assert_eq!(stats.volume_24h, 50.0); // 5 events * 10.0 qty each
+        assert_eq!(stats.first_trade_id, 100);
+        assert_eq!(stats.last_trade_id, 104);
+
+        // Verify BBO and Level2 were updated
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.sequence, 5);
+
+        let l2 = engine.get_level2_snapshot();
+        assert_eq!(l2.sequence, 5);
+    }
+
+    #[test]
+    fn test_market_data_engine_statistics_accumulation() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Simulate a series of trades with different prices and quantities
+        let trades = vec![
+            (50000.0, 10.0, Side::Buy),
+            (50100.0, 5.0, Side::Sell),
+            (50050.0, 8.0, Side::Buy),
+            (49950.0, 15.0, Side::Sell),
+        ];
+
+        let mut expected_volume = 0.0;
+        let mut expected_quote_volume = 0.0;
+
+        for (idx, (price, qty, side)) in trades.iter().enumerate() {
+            let event = TradeEvent::new(
+                (idx + 1) as u64,
+                100 + idx as u64,
+                99 + idx as u64,
+                1_000_000_000 + (idx as u64 * 1_000_000),
+                *price,
+                *qty,
+                *side,
+                1001 + idx as u64,
+                2001 + idx as u64,
+            );
+            engine.consume_trade_event(event);
+            expected_volume += qty;
+            expected_quote_volume += price * qty;
+        }
+
+        let stats = engine.get_24h_statistics();
+        assert_eq!(stats.trade_count, 4);
+        assert_eq!(stats.volume_24h, expected_volume);
+        assert_eq!(stats.quote_asset_volume_24h, expected_quote_volume);
+        assert_eq!(stats.price_24h_high, 50100.0);
+        assert_eq!(stats.price_24h_low, 49950.0);
+    }
+
+    // ===== BBO 更新逻辑测试 - Task 2.2 =====
+
+    #[test]
+    fn test_bbo_initialization_empty_state() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let engine = MarketDataEngine::new(receiver);
+
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.best_bid_price, 0.0);
+        assert_eq!(bbo.best_bid_qty, 0.0);
+        assert_eq!(bbo.best_ask_price, 0.0);
+        assert_eq!(bbo.best_ask_qty, 0.0);
+        assert_eq!(bbo.timestamp, 0);
+        assert_eq!(bbo.sequence, 0);
+    }
+
+    #[test]
+    fn test_bbo_update_on_first_buy_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
+
+        engine.consume_trade_event(event);
+
+        let bbo = engine.get_bbo_snapshot();
+        // 首次买方成交：初始化ask
+        assert_eq!(bbo.best_ask_price, 50000.0);
+        assert_eq!(bbo.best_ask_qty, 10.0);
+        assert_eq!(bbo.best_bid_price, 0.0); // bid still uninitialized
+        assert_eq!(bbo.timestamp, 1_000_000_000);
+        assert_eq!(bbo.sequence, 1);
+    }
+
+    #[test]
+    fn test_bbo_update_on_first_sell_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
+
+        engine.consume_trade_event(event);
+
+        let bbo = engine.get_bbo_snapshot();
+        // 首次卖方成交：初始化bid
+        assert_eq!(bbo.best_bid_price, 50000.0);
+        assert_eq!(bbo.best_bid_qty, 10.0);
+        assert_eq!(bbo.best_ask_price, 0.0); // ask still uninitialized
+        assert_eq!(bbo.timestamp, 1_000_000_000);
+        assert_eq!(bbo.sequence, 1);
+    }
+
+    #[test]
+    fn test_bbo_ask_price_improvement_on_buy_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade sets initial ask at 50100
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50100.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let bbo1 = engine.get_bbo_snapshot();
+        assert_eq!(bbo1.best_ask_price, 50100.0);
+        assert_eq!(bbo1.best_ask_qty, 10.0);
+
+        // Second trade at lower price: ask price improves (decreases)
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 5.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo2 = engine.get_bbo_snapshot();
+        assert_eq!(bbo2.best_ask_price, 50050.0);
+        assert_eq!(bbo2.best_ask_qty, 5.0);
+        assert_eq!(bbo2.sequence, 2);
+    }
+
+    #[test]
+    fn test_bbo_bid_price_improvement_on_sell_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade sets initial bid at 49900
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 49900.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let bbo1 = engine.get_bbo_snapshot();
+        assert_eq!(bbo1.best_bid_price, 49900.0);
+        assert_eq!(bbo1.best_bid_qty, 10.0);
+
+        // Second trade at higher price: bid price improves (increases)
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 49950.0, 5.0, Side::Sell, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo2 = engine.get_bbo_snapshot();
+        assert_eq!(bbo2.best_bid_price, 49950.0);
+        assert_eq!(bbo2.best_bid_qty, 5.0);
+        assert_eq!(bbo2.sequence, 2);
+    }
+
+    #[test]
+    fn test_bbo_quantity_reduction_on_same_price_buy_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade sets initial ask
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let bbo1 = engine.get_bbo_snapshot();
+        assert_eq!(bbo1.best_ask_price, 50000.0);
+        assert_eq!(bbo1.best_ask_qty, 20.0);
+
+        // Second trade at same price: quantity consumed from the level
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo2 = engine.get_bbo_snapshot();
+        assert_eq!(bbo2.best_ask_price, 50000.0);
+        assert_eq!(bbo2.best_ask_qty, 12.0); // 20 - 8
+        assert_eq!(bbo2.sequence, 2);
+    }
+
+    #[test]
+    fn test_bbo_quantity_reduction_on_same_price_sell_trade() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade sets initial bid
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let bbo1 = engine.get_bbo_snapshot();
+        assert_eq!(bbo1.best_bid_price, 50000.0);
+        assert_eq!(bbo1.best_bid_qty, 20.0);
+
+        // Second trade at same price: quantity consumed from the level
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Sell, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo2 = engine.get_bbo_snapshot();
+        assert_eq!(bbo2.best_bid_price, 50000.0);
+        assert_eq!(bbo2.best_bid_qty, 12.0); // 20 - 8
+        assert_eq!(bbo2.sequence, 2);
+    }
+
+    #[test]
+    fn test_bbo_multiple_consecutive_trades() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Sequence of trades: sell, buy, sell, buy
+        let trades = vec![
+            (50000.0, 10.0, Side::Sell),  // bid = 50000, qty = 10
+            (50050.0, 5.0, Side::Buy),    // ask = 50050, qty = 5
+            (50025.0, 8.0, Side::Sell),   // bid improves to 50025, qty = 8
+            (50040.0, 3.0, Side::Buy),    // ask improves to 50040, qty = 3
+        ];
+
+        for (idx, (price, qty, side)) in trades.iter().enumerate() {
+            let event = TradeEvent::new(
+                (idx + 1) as u64,
+                100 + idx as u64,
+                99 + idx as u64,
+                1_000_000_000 + (idx as u64 * 1_000_000),
+                *price,
+                *qty,
+                *side,
+                1001 + idx as u64,
+                2001 + idx as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.best_bid_price, 50025.0);
+        assert_eq!(bbo.best_bid_qty, 8.0);
+        assert_eq!(bbo.best_ask_price, 50040.0);
+        assert_eq!(bbo.best_ask_qty, 3.0);
+        assert_eq!(bbo.sequence, 4);
+    }
+
+    #[test]
+    fn test_bbo_timestamp_and_sequence_tracking() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        for i in 1..=5 {
+            let event = TradeEvent::new(
+                i as u64,
+                100 + i as u64,
+                99 + i as u64,
+                1_000_000_000 + (i as u64 * 1_000_000),
+                50000.0 + (i as f64 * 10.0),
+                10.0,
+                if i % 2 == 0 { Side::Buy } else { Side::Sell },
+                1001 + i as u64,
+                2001 + i as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.sequence, 5);
+        assert_eq!(bbo.timestamp, 1_000_000_000 + (5 * 1_000_000));
+    }
+
+    #[test]
+    fn test_bbo_market_spread_changes() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Start with sell at 50000 (bid = 50000, ask = 0)
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let bbo1 = engine.get_bbo_snapshot();
+        assert_eq!(bbo1.best_bid_price, 50000.0);
+        assert_eq!(bbo1.best_ask_price, 0.0); // ask not set yet
+
+        // Add buy at 50050 (ask = 50050)
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 5.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo2 = engine.get_bbo_snapshot();
+        assert_eq!(bbo2.best_bid_price, 50000.0);
+        assert_eq!(bbo2.best_ask_price, 50050.0);
+        assert_eq!(bbo2.spread(), 50.0);
+
+        // Bid improves to 50040 (sell at 50040)
+        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 50040.0, 8.0, Side::Sell, 1003, 2003);
+        engine.consume_trade_event(event3);
+
+        let bbo3 = engine.get_bbo_snapshot();
+        assert_eq!(bbo3.best_bid_price, 50040.0);
+        assert_eq!(bbo3.best_ask_price, 50050.0);
+        assert_eq!(bbo3.spread(), 10.0);
+    }
+
+    #[test]
+    fn test_bbo_quantity_goes_negative_protection() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // First trade sets ask at 50000 with qty 10
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let bbo1 = engine.get_bbo_snapshot();
+        assert_eq!(bbo1.best_ask_qty, 10.0);
+
+        // Second trade consumes 15 at same price (more than available)
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 15.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo2 = engine.get_bbo_snapshot();
+        // Quantity should not go negative, should be clamped to 0
+        assert!(bbo2.best_ask_qty >= 0.0);
+        assert_eq!(bbo2.best_ask_qty, 0.0); // 10 - 15 = -5, clamped to 0
+    }
+
+    #[test]
+    fn test_bbo_mid_price_with_active_bid_ask() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Sell at 50000 (bid = 50000)
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        // Buy at 50100 (ask = 50100)
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50100.0, 5.0, Side::Buy, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo = engine.get_bbo_snapshot();
+        let mid = bbo.mid_price();
+        assert_eq!(mid, 50050.0); // (50000 + 50100) / 2
+    }
+
+    #[test]
+    fn test_bbo_after_complex_order_flow() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        // Complex order flow simulating real market
+        let trades = vec![
+            (50000.0, 10.0, Side::Sell),   // bid = 50000, qty = 10
+            (50100.0, 5.0, Side::Buy),     // ask = 50100, qty = 5
+            (50000.0, 3.0, Side::Sell),    // bid qty: 10 - 3 = 7
+            (50100.0, 2.0, Side::Buy),     // ask qty: 5 - 2 = 3
+            (50050.0, 8.0, Side::Sell),    // bid improves to 50050, qty = 8
+            (50080.0, 4.0, Side::Buy),     // ask improves to 50080, qty = 4
+        ];
+
+        for (idx, (price, qty, side)) in trades.iter().enumerate() {
+            let event = TradeEvent::new(
+                (idx + 1) as u64,
+                100 + idx as u64,
+                99 + idx as u64,
+                1_000_000_000 + (idx as u64 * 1_000_000),
+                *price,
+                *qty,
+                *side,
+                1001 + idx as u64,
+                2001 + idx as u64,
+            );
+            engine.consume_trade_event(event);
+        }
+
+        let bbo = engine.get_bbo_snapshot();
+        assert_eq!(bbo.best_bid_price, 50050.0);
+        assert_eq!(bbo.best_bid_qty, 8.0);
+        assert_eq!(bbo.best_ask_price, 50080.0);
+        assert_eq!(bbo.best_ask_qty, 4.0);
+        assert_eq!(bbo.sequence, 6);
+        assert_eq!(bbo.mid_price(), 50065.0);
+    }
+
+    #[test]
+    fn test_bbo_snapshot_independence() {
+        let (_sender, receiver) = channel::unbounded::<TradeEvent>();
+        let mut engine = MarketDataEngine::new(receiver);
+
+        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        engine.consume_trade_event(event1);
+
+        let bbo1 = engine.get_bbo_snapshot();
+        let bid1 = bbo1.best_bid_price;
+
+        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 5.0, Side::Sell, 1002, 2002);
+        engine.consume_trade_event(event2);
+
+        let bbo2 = engine.get_bbo_snapshot();
+        let bid2 = bbo2.best_bid_price;
+
+        // Ensure bbo1 snapshot is independent (snapshot at event 1 time)
+        assert_eq!(bid1, 50000.0);
+        // New snapshot reflects updated bid
+        assert_eq!(bid2, 50050.0);
     }
 }

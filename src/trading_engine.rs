@@ -146,10 +146,9 @@ fn run_matching_thread(
             let now = wall_clock_nanos();
             match msg {
                 InboundMsg::NewOrder(req) => {
-                    // Generate order ID using engine's counter
-                    let next_id = engine.stats().total_orders as u64;
+                    // Create order without assigning ID - engine will assign it in place_order()
                     let order = Order::new(
-                        next_id,
+                        0,  // Placeholder, will be overwritten by engine.place_order()
                         if req.side == 0 { Side::Buy } else { Side::Sell },
                         req.price,
                         req.quantity,
@@ -162,11 +161,12 @@ fn run_matching_thread(
                         now,
                     );
 
-                    let order_id = order.id;
-                    order_info.insert(order_id, (req.client_order_id, req.participant_id, req.quantity, req.price));
-
                     match engine.place_order(order) {
                         Ok(result) => {
+                            // Use order_id from result - this is the definitive ID assigned by engine
+                            let order_id = result.order_id;
+                            order_info.insert(order_id, (req.client_order_id, req.participant_id, req.quantity, req.price));
+
                             // 根据订单状态生成相应的OrderUpdate
                             // 参考ORDER_LIFECYCLE.md了解各状态转换规则
                             match result.status {

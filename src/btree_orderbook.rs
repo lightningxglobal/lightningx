@@ -10,6 +10,7 @@ pub struct BTreeOrderBook {
     order: SortOrder,
     pub list_pool: ListNodePool,
     count: usize,
+    best_price: Option<f64>,
 }
 
 #[repr(C, align(64))]
@@ -36,6 +37,7 @@ impl BTreeOrderBook {
             order,
             list_pool: ListNodePool::new(pool_capacity),
             count: 0,
+            best_price: None,
         }
     }
 
@@ -191,6 +193,7 @@ impl OrderBook for BTreeOrderBook {
     fn clear(&mut self) {
         self.book.clear();
         self.count = 0;
+        self.best_price = None;
     }
 
     fn get_top_levels(&self, limit: usize) -> Vec<(f64, f64)> {
@@ -219,5 +222,41 @@ impl OrderBook for BTreeOrderBook {
 
     fn get_list_pool(&mut self) -> &mut ListNodePool {
         &mut self.list_pool
+    }
+
+    fn get_best_price(&mut self) -> Option<f64> {
+        // Check if cached price is still valid
+        if let Some(price) = self.best_price {
+            if let Some(node) = self.book.get(&OrderedFloat(price)) {
+                if node.total_quantity > 0.0 {
+                    return Some(price);
+                }
+            }
+            // Cache invalid, find next best
+            self.best_price = None;
+        }
+
+        // Find best price with orders
+        let best = match self.order {
+            SortOrder::Ascending => {
+                self.book
+                    .iter()
+                    .find(|(_, node)| node.total_quantity > 0.0)
+                    .map(|(price, _)| price.0)
+            }
+            SortOrder::Descending => {
+                self.book
+                    .iter()
+                    .rev()
+                    .find(|(_, node)| node.total_quantity > 0.0)
+                    .map(|(price, _)| price.0)
+            }
+        };
+        self.best_price = best;
+        best
+    }
+
+    fn invalidate_best_price(&mut self) {
+        self.best_price = None;
     }
 }

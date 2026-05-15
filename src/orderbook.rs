@@ -72,4 +72,10 @@ pub trait OrderBook {
         // 注：这需要可变 self，所以在调用时需要特殊处理
         None
     }
+
+    /// 获取缓存的最优价格（如果有效）或重新计算
+    fn get_best_price(&mut self) -> Option<f64>;
+
+    /// 使缓存失效（调用者在发现价格档位为空时调用）
+    fn invalidate_best_price(&mut self);
 }

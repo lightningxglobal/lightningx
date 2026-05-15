@@ -13,6 +13,7 @@ pub struct ArrayOrderBook {
     order: SortOrder,
     count: usize,
     pub list_pool: ListNodePool,
+    best_price: Option<f64>,
 }
 
 impl ArrayOrderBook {
@@ -23,6 +24,7 @@ impl ArrayOrderBook {
             order,
             count: 0,
             list_pool: ListNodePool::new(pool_capacity),
+            best_price: None,
         }
     }
 
@@ -188,6 +190,32 @@ impl ArrayOrderBook {
         self.levels.clear();
         self.sorted_prices.clear();
         self.count = 0;
+        self.best_price = None;
+    }
+
+    /// 获取缓存的最优价格（如果有效）或重新计算
+    pub fn get_best_price_cached(&mut self) -> Option<f64> {
+        // Check if cached price is still valid
+        if let Some(price) = self.best_price {
+            if let Some(node) = self.get_node_at_price(price) {
+                if node.total_quantity > 0.0 {
+                    return Some(price);
+                }
+            }
+            // Cache invalid, find next best
+            self.best_price = None;
+        }
+
+        // Find best price with orders
+        let best = self.best_with_orders()
+            .map(|node| node.price);
+        self.best_price = best;
+        best
+    }
+
+    /// 使缓存失效
+    pub fn invalidate_best_price_cache(&mut self) {
+        self.best_price = None;
     }
 
     /// 获取前 N 个价格档位
@@ -266,6 +294,14 @@ impl OrderBook for ArrayOrderBook {
 
     fn get_list_pool(&mut self) -> &mut crate::list_pool::ListNodePool {
         &mut self.list_pool
+    }
+
+    fn get_best_price(&mut self) -> Option<f64> {
+        self.get_best_price_cached()
+    }
+
+    fn invalidate_best_price(&mut self) {
+        self.invalidate_best_price_cache()
     }
 }
 

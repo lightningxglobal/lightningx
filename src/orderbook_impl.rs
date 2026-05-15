@@ -166,4 +166,20 @@ impl OrderBook for OrderBookWrapper {
             OrderBookWrapper::BTree(book) => book.get_list_pool(),
         }
     }
+
+    fn get_best_price(&mut self) -> Option<f64> {
+        match self {
+            OrderBookWrapper::SkipList(book) => book.get_best_price(),
+            OrderBookWrapper::Array(book) => book.get_best_price(),
+            OrderBookWrapper::BTree(book) => book.get_best_price(),
+        }
+    }
+
+    fn invalidate_best_price(&mut self) {
+        match self {
+            OrderBookWrapper::SkipList(book) => book.invalidate_best_price(),
+            OrderBookWrapper::Array(book) => book.invalidate_best_price(),
+            OrderBookWrapper::BTree(book) => book.invalidate_best_price(),
+        }
+    }
 }

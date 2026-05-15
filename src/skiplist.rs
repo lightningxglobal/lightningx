@@ -50,6 +50,8 @@ pub struct SkipList {
     pub list_pool: ListNodePool,
     /// Arena - 所有SkipListNode的唯一所有者
     arena: Vec<Box<SkipListNode>>,
+    /// 缓存最优价格
+    best_price: Option<f64>,
 }
 
 impl SkipList {
@@ -74,6 +76,7 @@ impl SkipList {
             order,
             list_pool: ListNodePool::new(pool_capacity),
             arena,
+            best_price: None,
         }
     }
 
@@ -388,6 +391,32 @@ impl SkipList {
         self.arena.truncate(1);
         self.level = 0;
         self.count = 0;
+        self.best_price = None;
+    }
+
+    /// 获取缓存的最优价格（如果有效）或重新计算
+    pub fn get_best_price_cached(&mut self) -> Option<f64> {
+        // Check if cached price is still valid
+        if let Some(price) = self.best_price {
+            if let Some(node) = self.get_node_at_price(price) {
+                if node.total_quantity > 0.0 {
+                    return Some(price);
+                }
+            }
+            // Cache invalid, find next best
+            self.best_price = None;
+        }
+
+        // Find best price with orders
+        let best = self.best_with_orders()
+            .map(|node| node.price);
+        self.best_price = best;
+        best
+    }
+
+    /// 使缓存失效
+    pub fn invalidate_best_price_cache(&mut self) {
+        self.best_price = None;
     }
 
     /// 获取前N个价格档位（用于生成快照）
@@ -484,6 +513,14 @@ impl OrderBook for SkipList {
 
     fn get_list_pool(&mut self) -> &mut crate::list_pool::ListNodePool {
         &mut self.list_pool
+    }
+
+    fn get_best_price(&mut self) -> Option<f64> {
+        self.get_best_price_cached()
+    }
+
+    fn invalidate_best_price(&mut self) {
+        self.invalidate_best_price_cache()
     }
 }
 

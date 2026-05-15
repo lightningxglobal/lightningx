@@ -109,15 +109,19 @@ impl AeronOrderSubscriber {
 
 impl OrderSubscriber for AeronOrderSubscriber {
     fn poll(&mut self) -> Option<InboundMsg> {
-        // 驱动Aeron client
-        self.client.do_work();
-
-        // 轮询订阅者
-        if let Some(ref mut sub) = *self.subscriber.lock() {
-            let _n = sub.poll();
+        // 驱动Aeron client多次以确保网络I/O处理
+        for _ in 0..10 {
+            self.client.do_work();
         }
 
-        // 尝试接收消息
+        // 轮询订阅者多次以获取所有待处理消息
+        if let Some(ref mut sub) = *self.subscriber.lock() {
+            for _ in 0..10 {
+                let _n = sub.poll();
+            }
+        }
+
+        // 尝试接收消息（返回第一条可用消息）
         match self.rx.try_recv() {
             Ok(msg) => Some(msg),
             Err(TryRecvError::Empty) => None,
@@ -158,14 +162,28 @@ impl AeronOrderUpdatePublisher {
 
 impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError> {
+        // 驱动Aeron客户端以处理网络I/O
+        for _ in 0..10 {
+            self._client.do_work();
+        }
+
         let data = unsafe {
             std::slice::from_raw_parts(msg as *const OrderUpdateMsg as *const u8, 64)
         };
 
         loop {
             match self.publisher.send(data) {
-                Ok(()) => return Ok(()),
-                Err(AeronError::BackPressured) => std::hint::spin_loop(),
+                Ok(()) => {
+                    // 驱动客户端确保数据被发送
+                    for _ in 0..5 {
+                        self._client.do_work();
+                    }
+                    return Ok(());
+                }
+                Err(AeronError::BackPressured) => {
+                    self._client.do_work();
+                    std::hint::spin_loop();
+                }
                 Err(AeronError::NotConnected) => return Err(TransportError::Disconnected),
                 Err(AeronError::Closed) => return Err(TransportError::Closed),
                 Err(_) => return Err(TransportError::BackPressured),
@@ -198,14 +216,28 @@ impl AeronTradePublisher {
 
 impl TradePublisher for AeronTradePublisher {
     fn publish(&mut self, msg: &TradeNotification) -> Result<(), TransportError> {
+        // 驱动Aeron客户端以处理网络I/O
+        for _ in 0..10 {
+            self._client.do_work();
+        }
+
         let data = unsafe {
             std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 56)
         };
 
         loop {
             match self.publisher.send(data) {
-                Ok(()) => return Ok(()),
-                Err(AeronError::BackPressured) => std::hint::spin_loop(),
+                Ok(()) => {
+                    // 驱动客户端确保数据被发送
+                    for _ in 0..5 {
+                        self._client.do_work();
+                    }
+                    return Ok(());
+                }
+                Err(AeronError::BackPressured) => {
+                    self._client.do_work();
+                    std::hint::spin_loop();
+                }
                 Err(AeronError::NotConnected) => return Err(TransportError::Disconnected),
                 Err(AeronError::Closed) => return Err(TransportError::Closed),
                 Err(_) => return Err(TransportError::BackPressured),
@@ -259,6 +291,10 @@ impl AeronMarketDataPublisher {
 
 impl MarketDataPublisher for AeronMarketDataPublisher {
     fn publish_depth(&mut self, msg: &DepthSnapshotEvent) -> Result<(), TransportError> {
+        for _ in 0..5 {
+            self._client.do_work();
+        }
+
         let data = unsafe {
             std::slice::from_raw_parts(
                 msg as *const DepthSnapshotEvent as *const u8,
@@ -268,8 +304,16 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
 
         loop {
             match self.depth_publisher.send(data) {
-                Ok(()) => return Ok(()),
-                Err(AeronError::BackPressured) => std::hint::spin_loop(),
+                Ok(()) => {
+                    for _ in 0..3 {
+                        self._client.do_work();
+                    }
+                    return Ok(());
+                }
+                Err(AeronError::BackPressured) => {
+                    self._client.do_work();
+                    std::hint::spin_loop();
+                }
                 Err(AeronError::NotConnected) => return Err(TransportError::Disconnected),
                 Err(AeronError::Closed) => return Err(TransportError::Closed),
                 Err(_) => return Err(TransportError::BackPressured),
@@ -278,6 +322,10 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
     }
 
     fn publish_depth50(&mut self, msg: &Depth50SnapshotEvent) -> Result<(), TransportError> {
+        for _ in 0..5 {
+            self._client.do_work();
+        }
+
         let data = unsafe {
             std::slice::from_raw_parts(
                 msg as *const Depth50SnapshotEvent as *const u8,
@@ -287,8 +335,16 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
 
         loop {
             match self.depth50_publisher.send(data) {
-                Ok(()) => return Ok(()),
-                Err(AeronError::BackPressured) => std::hint::spin_loop(),
+                Ok(()) => {
+                    for _ in 0..3 {
+                        self._client.do_work();
+                    }
+                    return Ok(());
+                }
+                Err(AeronError::BackPressured) => {
+                    self._client.do_work();
+                    std::hint::spin_loop();
+                }
                 Err(AeronError::NotConnected) => return Err(TransportError::Disconnected),
                 Err(AeronError::Closed) => return Err(TransportError::Closed),
                 Err(_) => return Err(TransportError::BackPressured),
@@ -297,6 +353,10 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
     }
 
     fn publish_level2(&mut self, msg: &Level2SnapshotEvent) -> Result<(), TransportError> {
+        for _ in 0..5 {
+            self._client.do_work();
+        }
+
         let data = unsafe {
             std::slice::from_raw_parts(
                 msg as *const Level2SnapshotEvent as *const u8,
@@ -306,8 +366,16 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
 
         loop {
             match self.level2_publisher.send(data) {
-                Ok(()) => return Ok(()),
-                Err(AeronError::BackPressured) => std::hint::spin_loop(),
+                Ok(()) => {
+                    for _ in 0..3 {
+                        self._client.do_work();
+                    }
+                    return Ok(());
+                }
+                Err(AeronError::BackPressured) => {
+                    self._client.do_work();
+                    std::hint::spin_loop();
+                }
                 Err(AeronError::NotConnected) => return Err(TransportError::Disconnected),
                 Err(AeronError::Closed) => return Err(TransportError::Closed),
                 Err(_) => return Err(TransportError::BackPressured),

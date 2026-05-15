@@ -269,7 +269,12 @@ fn run_publishing_thread(
     mut trade_pub: Box<dyn TradePublisher>,
     mut market_data_pub: Box<dyn MarketDataPublisher>,
 ) {
+    use tracing::info;
+    let mut published_count = 0u64;
+
     loop {
+        let mut any_published = false;
+
         // 消费order updates
         while let Ok(evt) = order_update_rx.pop() {
             let msg = OrderUpdateMsg {
@@ -284,7 +289,18 @@ fn run_publishing_thread(
                 remaining_qty: evt.remaining_qty,
                 timestamp: evt.timestamp,
             };
-            let _ = order_update_pub.publish(&msg);
+            match order_update_pub.publish(&msg) {
+                Ok(()) => {
+                    published_count += 1;
+                    any_published = true;
+                    if published_count % 10 == 1 {
+                        info!("📤 发布OrderUpdate #{}", published_count);
+                    }
+                }
+                Err(e) => {
+                    info!("❌ OrderUpdate发布失败: {:?}", e);
+                }
+            }
         }
 
         // 消费trades
@@ -298,21 +314,57 @@ fn run_publishing_thread(
                 side: if evt.side == Side::Buy { 0 } else { 1 },
                 _pad: [0; 7],
             };
-            let _ = trade_pub.publish(&msg);
+            match trade_pub.publish(&msg) {
+                Ok(()) => {
+                    published_count += 1;
+                    any_published = true;
+                    info!("💰 发布Trade #{}", evt.sequence);
+                }
+                Err(e) => {
+                    info!("❌ Trade发布失败: {:?}", e);
+                }
+            }
         }
 
         // 消费depth snapshots
         while let Ok(evt) = depth_rx.pop() {
-            let _ = market_data_pub.publish_depth(&evt);
+            match market_data_pub.publish_depth(&evt) {
+                Ok(()) => {
+                    published_count += 1;
+                    any_published = true;
+                    if published_count % 50 == 1 {
+                        info!("📊 发布Depth20");
+                    }
+                }
+                Err(e) => {
+                    info!("❌ Depth20发布失败: {:?}", e);
+                }
+            }
         }
         while let Ok(evt) = depth50_rx.pop() {
-            let _ = market_data_pub.publish_depth50(&evt);
+            match market_data_pub.publish_depth50(&evt) {
+                Ok(()) => {
+                    any_published = true;
+                }
+                Err(e) => {
+                    info!("❌ Depth50发布失败: {:?}", e);
+                }
+            }
         }
         while let Ok(evt) = level2_rx.pop() {
-            let _ = market_data_pub.publish_level2(&evt);
+            match market_data_pub.publish_level2(&evt) {
+                Ok(()) => {
+                    any_published = true;
+                }
+                Err(e) => {
+                    info!("❌ Level2发布失败: {:?}", e);
+                }
+            }
         }
 
-        std::hint::spin_loop();
+        if !any_published {
+            std::hint::spin_loop();
+        }
     }
 }
 

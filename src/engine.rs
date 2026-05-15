@@ -103,6 +103,37 @@ impl MatchingEngine {
         Ok(result)
     }
 
+    /// 批量下单（支持最多20笔订单，避免堆分配）
+    #[inline]
+    pub fn place_orders(&mut self, mut orders: SmallVec<[Order; 20]>)
+        -> OrderResult<SmallVec<[PlaceOrderResult; 20]>>
+    {
+        let mut results = SmallVec::new();
+
+        // 预分配订单ID并验证
+        for order in orders.iter_mut() {
+            self.validate_order(order)?;
+            if !self.pools.has_space_for_order() {
+                return Err(MatchingEngineError::OrderPoolExhausted);
+            }
+            order.id = self.next_order_id;
+            self.next_order_id += 1;
+        }
+
+        // 批量处理订单（共享order book查询）
+        for order in orders.into_iter() {
+            let result = match order.time_in_force {
+                TimeInForce::PostOnly => self.handle_post_only(order)?,
+                TimeInForce::FOK => self.handle_fok(order)?,
+                TimeInForce::IOC => self.handle_ioc(order)?,
+                TimeInForce::GTC => self.handle_gtc(order)?,
+            };
+            results.push(result);
+        }
+
+        Ok(results)
+    }
+
     /// 处理Post-Only订单
     fn handle_post_only(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         // 检查是否会立即成交

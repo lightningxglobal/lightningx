@@ -415,35 +415,45 @@ fn parse_and_print_message(msg: &RawMessage, stats: &mut Stats) {
 }
 
 fn parse_order_update(msg: &RawMessage) {
-    if msg.data.len() < 64 {
+    if msg.data.len() < 72 {  // 8-byte header + 64-byte body = 72
         return;
     }
 
     let data = &msg.data;
-    let kind = data[0];
-    let order_id = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
-    let client_order_id = u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]));
-    let fill_price = f64::from_le_bytes(data[32..40].try_into().unwrap_or([0; 8]));
-    let fill_qty = f64::from_le_bytes(data[40..48].try_into().unwrap_or([0; 8]));
-    let remaining_qty = f64::from_le_bytes(data[48..56].try_into().unwrap_or([0; 8]));
+    // Skip 8-byte SBE header, OrderUpdateMsg body starts at byte 8
+    let kind = data[8];
+    let reject_reason = data[9];
+    let order_id = u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]));
+    let client_order_id = u64::from_le_bytes(data[24..32].try_into().unwrap_or([0; 8]));
+    let participant_id = u64::from_le_bytes(data[32..40].try_into().unwrap_or([0; 8]));
+    let fill_price = f64::from_le_bytes(data[40..48].try_into().unwrap_or([0; 8]));
+    let fill_qty = f64::from_le_bytes(data[48..56].try_into().unwrap_or([0; 8]));
+    let remaining_qty = f64::from_le_bytes(data[56..64].try_into().unwrap_or([0; 8]));
+    let timestamp = u64::from_le_bytes(data[64..72].try_into().unwrap_or([0; 8]));
 
     match kind {
-        1 => info!("📨 [ACCEPTED] Order#{} Client#{}", order_id, client_order_id),
-        2 => info!("💯 [FILLED] Order#{} @ {} qty={}", order_id, fill_price, fill_qty),
-        3 => info!("⟳ [PARTIAL_FILL] Order#{} @ {} qty={} remaining={}",
-                   order_id, fill_price, fill_qty, remaining_qty),
-        4 => info!("✗ [CANCELLED] Order#{} cancelled_qty={}", order_id, fill_qty),
-        5 => info!("✗ [REJECTED] Client#{} rejected", client_order_id),
-        _ => info!("📨 [UNKNOWN] Order#{}", order_id),
+        1 => info!("📨 [ACCEPTED] Order#{} | Client#{} | Participant#{} | ts={}",
+                   order_id, client_order_id, participant_id, timestamp),
+        2 => info!("💯 [FILLED] Order#{} | Client#{} | Price={:.0} | Qty={:.2} | ts={}",
+                   order_id, client_order_id, fill_price, fill_qty, timestamp),
+        3 => info!("⟳ [PARTIAL] Order#{} | Client#{} | Price={:.0} | Filled={:.2} | Remaining={:.2} | ts={}",
+                   order_id, client_order_id, fill_price, fill_qty, remaining_qty, timestamp),
+        4 => info!("✗ [CANCELLED] Order#{} | Client#{} | Cancelled_qty={:.2} | ts={}",
+                   order_id, client_order_id, fill_qty, timestamp),
+        5 => info!("✗ [REJECTED] Client#{} | Reason={} | ts={}",
+                   client_order_id, reject_reason, timestamp),
+        _ => info!("❓ [UNKNOWN type={}] Order#{} | Client#{} | ts={}",
+                   kind, order_id, client_order_id, timestamp),
     }
 }
 
 fn parse_trade(msg: &RawMessage) {
-    if msg.data.len() < 56 {
+    if msg.data.len() < 64 {  // 8-byte header + 56-byte body = 64
         return;
     }
 
     let data = &msg.data;
+    // Skip 8-byte SBE header, TradeNotification body starts at byte 8
     let sequence = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
     let taker_order_id = u64::from_le_bytes(data[16..24].try_into().unwrap_or([0; 8]));
     let maker_order_id = u64::from_le_bytes(data[24..32].try_into().unwrap_or([0; 8]));
@@ -451,8 +461,8 @@ fn parse_trade(msg: &RawMessage) {
     let quantity = f64::from_le_bytes(data[40..48].try_into().unwrap_or([0; 8]));
     let side = data[48];
 
-    let side_str = if side == 0 { "Buy" } else { "Sell" };
-    info!("💰 [TRADE] Seq#{} {} Taker#{} × Maker#{} @ {} qty={}",
+    let side_str = if side == 0 { "BUY" } else { "SELL" };
+    info!("💰 [TRADE] Seq#{} | Side={} | TakerOrder#{} × MakerOrder#{} | Price={:.0} | Qty={:.2}",
           sequence, side_str, taker_order_id, maker_order_id, price, quantity);
 }
 

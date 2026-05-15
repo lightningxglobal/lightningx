@@ -167,12 +167,23 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
             self._client.do_work();
         }
 
-        let data = unsafe {
+        // Create SBE-encoded message: 8-byte header + 64-byte body = 72 bytes
+        let mut data = vec![0u8; 72];
+
+        // SBE Header (8 bytes)
+        data[0..2].copy_from_slice(&56u16.to_le_bytes());   // block_length = 56 (message body size)
+        data[2..4].copy_from_slice(&2u16.to_le_bytes());    // template_id = 2 (OrderUpdate)
+        data[4..6].copy_from_slice(&1u16.to_le_bytes());    // schema_id = 1
+        data[6..8].copy_from_slice(&0u16.to_le_bytes());    // version = 0
+
+        // Copy OrderUpdateMsg directly into body (64 bytes total for the struct)
+        let msg_bytes = unsafe {
             std::slice::from_raw_parts(msg as *const OrderUpdateMsg as *const u8, 64)
         };
+        data[8..72].copy_from_slice(msg_bytes);
 
         loop {
-            match self.publisher.send(data) {
+            match self.publisher.send(&data) {
                 Ok(()) => {
                     // 驱动客户端确保数据被发送
                     for _ in 0..5 {
@@ -221,12 +232,23 @@ impl TradePublisher for AeronTradePublisher {
             self._client.do_work();
         }
 
-        let data = unsafe {
+        // Create SBE-encoded message: 8-byte header + 56-byte body = 64 bytes
+        let mut data = vec![0u8; 64];
+
+        // SBE Header (8 bytes)
+        data[0..2].copy_from_slice(&56u16.to_le_bytes());   // block_length = 56 (message body size)
+        data[2..4].copy_from_slice(&3u16.to_le_bytes());    // template_id = 3 (Trade)
+        data[4..6].copy_from_slice(&1u16.to_le_bytes());    // schema_id = 1
+        data[6..8].copy_from_slice(&0u16.to_le_bytes());    // version = 0
+
+        // Copy TradeNotification directly into body
+        let msg_bytes = unsafe {
             std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 56)
         };
+        data[8..64].copy_from_slice(msg_bytes);
 
         loop {
-            match self.publisher.send(data) {
+            match self.publisher.send(&data) {
                 Ok(()) => {
                     // 驱动客户端确保数据被发送
                     for _ in 0..5 {

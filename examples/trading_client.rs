@@ -142,14 +142,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut next_order_id = 1000u64;
 
+    // 将接收逻辑放到后台线程
+    // 这样主线程可以快速发送订单，而不用等待poll
+    info!("启动后台接收线程...");
+    info!("");
+
     // 场景1: IOC单（立即返回，无成交）
     info!("═══════════════════════════════════════════════════════════════════");
     info!("场景1: IOC单 (立即成交或取消，不进入簿)");
     info!("═══════════════════════════════════════════════════════════════════");
     send_order(&mut publisher, next_order_id, 1, 45000.0, 10.0, 0, 1)?; // Buy IOC
-    info!("📤 发送 IOC 买单: 10 @ 45000 (无匹配方，应立即返回)");
+    info!("📤 发送 IOC 买单: 10 @ 45000 (应立即REJECTED，然后DELETE)");
     next_order_id += 1;
-    thread::sleep(Duration::from_millis(200));
+    thread::sleep(Duration::from_millis(50));
     info!("");
 
     // 场景2: GTC单进簿
@@ -160,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("📤 发送 GTC 买单: 20 @ 50000 (进入簿)");
     let gtc_buy_id = next_order_id;
     next_order_id += 1;
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(50));
     info!("");
 
     // 场景3: IOC卖单与GTC买单匹配 -> 产生成交
@@ -171,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("📤 发送 IOC 卖单: 15 @ 50000 (应与GTC买单配对)");
     info!("   期望成交: 15 @ 50000 (买单剩余: 5)");
     next_order_id += 1;
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(50));
     info!("");
 
     // 场景4: 新的GTC卖单进簿
@@ -182,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("📤 发送 GTC 卖单: 30 @ 50100 (进入簿)");
     let gtc_sell_id = next_order_id;
     next_order_id += 1;
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(30));
     info!("");
 
     // 场景5: FOK单（全部或取消）
@@ -192,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     send_order(&mut publisher, next_order_id, 1, 50100.0, 100.0, 0, 2)?; // Buy FOK
     info!("📤 发送 FOK 买单: 100 @ 50100 (簿中只有30，应全部取消)");
     next_order_id += 1;
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(30));
     info!("");
 
     // 场景6: 撤单 (Cancel GTC订单)
@@ -201,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("═══════════════════════════════════════════════════════════════════");
     send_cancel_order(&mut publisher, gtc_sell_id)?;
     info!("📤 发送撤单请求: Order#{} (取消GTC卖单)", gtc_sell_id);
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(30));
     info!("");
 
     // 场景7: 继续IOC成交
@@ -211,7 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     send_order(&mut publisher, next_order_id, 1, 50000.0, 5.0, 1, 1)?; // Sell IOC
     info!("📤 发送 IOC 卖单: 5 @ 50000 (与剩余GTC买单成交)");
     next_order_id += 1;
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(30));
     info!("");
 
     // 场景8: PostOnly单（只做市商）
@@ -221,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     send_order(&mut publisher, next_order_id, 1, 49950.0, 25.0, 0, 3)?; // Buy PostOnly
     info!("📤 发送 PostOnly 买单: 25 @ 49950 (不与卖单成交，进入簿)");
     next_order_id += 1;
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(30));
     info!("");
 
     // 场景9: 各种新订单

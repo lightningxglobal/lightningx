@@ -448,7 +448,7 @@ fn parse_order_update(msg: &RawMessage) {
 }
 
 fn parse_trade(msg: &RawMessage) {
-    if msg.data.len() < 64 {  // 8-byte header + 56-byte body = 64
+    if msg.data.len() < 56 {  // 8-byte header + 48-byte body = 56
         return;
     }
 

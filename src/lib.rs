@@ -25,6 +25,8 @@ pub mod transport;
 pub mod order_update;
 pub mod trading_engine;
 pub mod aeron_transport;
+#[cfg(test)]
+mod sbe_tests;
 
 pub use engine::{
     MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult,

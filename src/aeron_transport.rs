@@ -232,20 +232,20 @@ impl TradePublisher for AeronTradePublisher {
             self._client.do_work();
         }
 
-        // Create SBE-encoded message: 8-byte header + 56-byte body = 64 bytes
-        let mut data = vec![0u8; 64];
+        // Create SBE-encoded message: 8-byte header + 48-byte body = 56 bytes
+        let mut data = vec![0u8; 56];
 
         // SBE Header (8 bytes)
-        data[0..2].copy_from_slice(&56u16.to_le_bytes());   // block_length = 56 (message body size)
+        data[0..2].copy_from_slice(&48u16.to_le_bytes());   // block_length = 48 (message body size)
         data[2..4].copy_from_slice(&3u16.to_le_bytes());    // template_id = 3 (Trade)
         data[4..6].copy_from_slice(&1u16.to_le_bytes());    // schema_id = 1
         data[6..8].copy_from_slice(&0u16.to_le_bytes());    // version = 0
 
         // Copy TradeNotification directly into body
         let msg_bytes = unsafe {
-            std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 56)
+            std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 48)
         };
-        data[8..64].copy_from_slice(msg_bytes);
+        data[8..56].copy_from_slice(msg_bytes);
 
         loop {
             match self.publisher.send(&data) {

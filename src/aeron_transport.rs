@@ -92,11 +92,19 @@ impl AeronOrderSubscriber {
             )
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
 
-        // 等待subscription在Media Driver中正确注册
-        for _ in 0..100 {
+        // 无限等待直到subscription连接，遵循官方aeron-wrapper例子模式
+        use tracing::info;
+        info!("⏳ Waiting for order subscriber to connect on stream {}...", stream_id);
+        let mut wait_count = 0u32;
+        loop {
             client.do_work();
             if subscriber.is_connected() {
+                info!("✅ Order subscriber connected (waited {} iterations)", wait_count);
                 break;
+            }
+            wait_count += 1;
+            if wait_count % 1000 == 0 {
+                info!("⏳ Still waiting for order subscriber... ({} iterations)", wait_count);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -162,12 +170,20 @@ impl AeronOrderUpdatePublisher {
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
 
         // Wait for publisher to be connected
-        for _ in 0..100 {
+        use tracing::info;
+        info!("⏳ Waiting for order update publisher to connect on stream {}...", stream_id);
+        let mut wait_count = 0u32;
+        loop {
             client.do_work();
             if publisher.is_connected() {
+                info!("✅ Order update publisher connected (waited {} iterations)", wait_count);
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            wait_count += 1;
+            if wait_count % 1000 == 0 {
+                info!("⏳ Still waiting for order update publisher... ({} iterations)", wait_count);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         Ok(Self { client, publisher })
@@ -225,12 +241,20 @@ impl AeronTradePublisher {
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
 
         // Wait for publisher to be connected
-        for _ in 0..100 {
+        use tracing::info;
+        info!("⏳ Waiting for trade publisher to connect on stream {}...", stream_id);
+        let mut wait_count = 0u32;
+        loop {
             client.do_work();
             if publisher.is_connected() {
+                info!("✅ Trade publisher connected (waited {} iterations)", wait_count);
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            wait_count += 1;
+            if wait_count % 1000 == 0 {
+                info!("⏳ Still waiting for trade publisher... ({} iterations)", wait_count);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         Ok(Self { client, publisher })
@@ -304,12 +328,25 @@ impl AeronMarketDataPublisher {
             .map_err(|e| format!("Failed to add level2 publication: {:?}", e))?;
 
         // Wait for all publishers to be connected
-        for _ in 0..100 {
+        use tracing::info;
+        info!("⏳ Waiting for market data publishers to connect (streams {}, {}, {})...",
+              depth_stream_id, depth50_stream_id, level2_stream_id);
+        let mut wait_count = 0u32;
+        loop {
             client.do_work();
             if depth_publisher.is_connected() && depth50_publisher.is_connected() && level2_publisher.is_connected() {
+                info!("✅ All market data publishers connected (waited {} iterations)", wait_count);
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            wait_count += 1;
+            if wait_count % 1000 == 0 {
+                info!("⏳ Still waiting for market data publishers... ({} iterations, depth={}, depth50={}, level2={})",
+                      wait_count,
+                      depth_publisher.is_connected(),
+                      depth50_publisher.is_connected(),
+                      level2_publisher.is_connected());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
         Ok(Self {

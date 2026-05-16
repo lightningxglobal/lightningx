@@ -474,26 +474,32 @@ fn parse_depth50_snapshot(msg: &RawMessage) {
 
     let data = &msg.data;
     let sequence = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
-    let num_bids = u32::from_le_bytes(data[16..20].try_into().unwrap_or([0; 4])) as usize;
-    let num_asks = u32::from_le_bytes(data[20..24].try_into().unwrap_or([0; 4])) as usize;
+    let num_bids = data[16] as usize;  // u8 at byte 16
+    let num_asks = data[17] as usize;  // u8 at byte 17
+    // data[18..80]: _pad1 [u8; 62]
+    // data[80..]: bids [(f64, f64); 50]
 
     let show_levels = std::cmp::min(10, std::cmp::min(num_bids, num_asks));
     info!("📊 [DEPTH50] Seq#{} | {} bids {} asks | Showing top {} levels",
           sequence, num_bids, num_asks, show_levels);
 
     if show_levels > 0 {
+        // Depth50SnapshotEvent layout: [0..8]=timestamp, [8..16]=sequence, [16]=num_bids, [17]=num_asks,
+        // [18..80]=_pad1, [80..880]=bids, [880..1680]=asks
         let mut bid_str = String::new();
         for i in 0..show_levels {
-            let price = f64::from_le_bytes(data[24 + (i * 16)..32 + (i * 16)].try_into().unwrap_or([0; 8]));
-            let qty = f64::from_le_bytes(data[32 + (i * 16)..40 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let bid_offset = 80 + (i * 16);
+            let price = f64::from_le_bytes(data[bid_offset..bid_offset + 8].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[bid_offset + 8..bid_offset + 16].try_into().unwrap_or([0; 8]));
             if i > 0 { bid_str.push_str(" | "); }
             bid_str.push_str(&format!("{:.2}@{:.0}", qty, price));
         }
-        let bid_offset = 24 + (num_bids * 16);
+        let ask_base = 880;  // bids end at 880, asks start here
         let mut ask_str = String::new();
         for i in 0..show_levels {
-            let price = f64::from_le_bytes(data[bid_offset + (i * 16)..bid_offset + 8 + (i * 16)].try_into().unwrap_or([0; 8]));
-            let qty = f64::from_le_bytes(data[bid_offset + 8 + (i * 16)..bid_offset + 16 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let ask_offset = ask_base + (i * 16);
+            let price = f64::from_le_bytes(data[ask_offset..ask_offset + 8].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[ask_offset + 8..ask_offset + 16].try_into().unwrap_or([0; 8]));
             if i > 0 { ask_str.push_str(" | "); }
             ask_str.push_str(&format!("{:.2}@{:.0}", qty, price));
         }
@@ -509,6 +515,8 @@ fn parse_level2_snapshot(msg: &RawMessage) {
 
     let data = &msg.data;
     let sequence = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
+    // Level2SnapshotEvent: [0..8]=timestamp, [8..16]=sequence, [16..18]=num_bids(u16), [18..20]=num_asks(u16),
+    // [20..80]=_pad1, [80..6480]=bids, [6480..12880]=asks
     let num_bids = u16::from_le_bytes(data[16..18].try_into().unwrap_or([0; 2])) as usize;
     let num_asks = u16::from_le_bytes(data[18..20].try_into().unwrap_or([0; 2])) as usize;
 
@@ -517,18 +525,22 @@ fn parse_level2_snapshot(msg: &RawMessage) {
           sequence, num_bids, num_asks, show_levels);
 
     if show_levels > 0 {
+        // Level2SnapshotEvent layout: [0..8]=timestamp, [8..16]=sequence, [16..18]=num_bids, [18..20]=num_asks,
+        // [20..80]=_pad1, [80..6480]=bids (400*16), [6480..12880]=asks (400*16)
         let mut bid_str = String::new();
         for i in 0..show_levels {
-            let price = f64::from_le_bytes(data[32 + (i * 16)..40 + (i * 16)].try_into().unwrap_or([0; 8]));
-            let qty = f64::from_le_bytes(data[40 + (i * 16)..48 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let bid_offset = 80 + (i * 16);
+            let price = f64::from_le_bytes(data[bid_offset..bid_offset + 8].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[bid_offset + 8..bid_offset + 16].try_into().unwrap_or([0; 8]));
             if i > 0 { bid_str.push_str(" | "); }
             bid_str.push_str(&format!("{:.2}@{:.0}", qty, price));
         }
-        let bid_offset = 32 + (num_bids * 16);
+        let ask_base = 6480;  // bids end at 6480 (80 + 400*16), asks start here
         let mut ask_str = String::new();
         for i in 0..show_levels {
-            let price = f64::from_le_bytes(data[bid_offset + (i * 16)..bid_offset + 8 + (i * 16)].try_into().unwrap_or([0; 8]));
-            let qty = f64::from_le_bytes(data[bid_offset + 8 + (i * 16)..bid_offset + 16 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let ask_offset = ask_base + (i * 16);
+            let price = f64::from_le_bytes(data[ask_offset..ask_offset + 8].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[ask_offset + 8..ask_offset + 16].try_into().unwrap_or([0; 8]));
             if i > 0 { ask_str.push_str(" | "); }
             ask_str.push_str(&format!("{:.2}@{:.0}", qty, price));
         }

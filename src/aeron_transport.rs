@@ -109,8 +109,13 @@ impl AeronOrderSubscriber {
 
 impl OrderSubscriber for AeronOrderSubscriber {
     fn poll(&mut self) -> Option<InboundMsg> {
-        // aeronmd在独立进程处理所有网络I/O，客户端直接读取通道消息
-        // 无需调用do_work()或poll()
+        // Aeron回调需要显式的poll()调用来触发
+        // poll()会调用on_data()回调，回调发送消息到mpsc channel
+        if let Some(ref mut sub) = *self.subscriber.lock() {
+            let _n = sub.poll();  // 触发回调，消息进入channel
+        }
+
+        // 然后从channel读取回调发送的消息
         match self.rx.try_recv() {
             Ok(msg) => Some(msg),
             Err(TryRecvError::Empty) => None,

@@ -85,25 +85,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✓ TradingEngine创建完成");
     info!("");
 
-    // 创建Aeron transport
+    // 创建单一的Aeron客户端，所有pub/sub共享
+    info!("创建单一的Aeron客户端...");
+    let client = std::sync::Arc::new(
+        aeron_wrapper::AeronClient::new(&aeron_dir)
+            .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?
+    );
+    info!("✓ Aeron客户端创建完成");
+
+    // 创建Aeron transport - 所有共享同一个client
     info!("初始化Aeron transport...");
     let subscriber = Box::new(
-        AeronOrderSubscriber::new(&aeron_dir, channel, 1)
+        AeronOrderSubscriber::new(client.clone(), channel, 1)
             .map_err(|e| format!("Failed to create subscriber: {}", e))?
     );
 
     let order_update_pub = Box::new(
-        AeronOrderUpdatePublisher::new(&aeron_dir, channel, 2)
+        AeronOrderUpdatePublisher::new(client.clone(), channel, 2)
             .map_err(|e| format!("Failed to create order update publisher: {}", e))?
     );
 
     let trade_pub = Box::new(
-        AeronTradePublisher::new(&aeron_dir, channel, 3)
+        AeronTradePublisher::new(client.clone(), channel, 3)
             .map_err(|e| format!("Failed to create trade publisher: {}", e))?
     );
 
     let market_data_pub = Box::new(
-        AeronMarketDataPublisher::new(&aeron_dir, channel, 4, 5, 6)
+        AeronMarketDataPublisher::new(client.clone(), channel, 4, 5, 6)
             .map_err(|e| format!("Failed to create market data publisher: {}", e))?
     );
 

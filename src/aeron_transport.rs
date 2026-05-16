@@ -75,15 +75,11 @@ impl PollCallback for OrderInboundCallback {
 pub struct AeronOrderSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>,
     rx: Receiver<InboundMsg>,
-    client: AeronClient,
-    poll_count_for_work: std::sync::atomic::AtomicU64,
+    client: Arc<AeronClient>,
 }
 
 impl AeronOrderSubscriber {
-    pub fn new(aeron_dir: &str, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let client = AeronClient::new(aeron_dir)
-            .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
-
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
         let (tx, rx) = mpsc_channel();
 
         let subscriber = client
@@ -97,7 +93,6 @@ impl AeronOrderSubscriber {
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
 
         // 等待subscription在Media Driver中正确注册
-        // 这与Publisher的做法一致：多次do_work()直到连接建立或超时
         for _ in 0..100 {
             client.do_work();
             if subscriber.is_connected() {
@@ -110,15 +105,12 @@ impl AeronOrderSubscriber {
             subscriber: Arc::new(Mutex::new(subscriber)),
             rx,
             client,
-            poll_count_for_work: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
 
 impl OrderSubscriber for AeronOrderSubscriber {
     fn do_work(&mut self) {
-        // 必须定期调用do_work()来驱动Aeron conductor
-        // 即使有独立的aeronmd，客户端也需要处理heartbeat、连接状态、流控等
         self.client.do_work();
     }
 
@@ -159,20 +151,17 @@ impl OrderSubscriber for AeronOrderSubscriber {
 // ============================================================================
 
 pub struct AeronOrderUpdatePublisher {
-    _client: AeronClient,  // 必须持有client以保持连接活跃
+    client: Arc<AeronClient>,
     publisher: aeron_wrapper::Publisher,
 }
 
 impl AeronOrderUpdatePublisher {
-    pub fn new(aeron_dir: &str, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let client = AeronClient::new(aeron_dir)
-            .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
-
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
         let publisher = client
             .add_publication(channel, stream_id)
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
 
-        // Wait for publisher to be connected (similar to subscriber)
+        // Wait for publisher to be connected
         for _ in 0..100 {
             client.do_work();
             if publisher.is_connected() {
@@ -181,14 +170,13 @@ impl AeronOrderUpdatePublisher {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        Ok(Self { _client: client, publisher })
+        Ok(Self { client, publisher })
     }
 }
 
 impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
     fn do_work(&mut self) {
-        // 定期调用do_work()来维护Publisher的连接状态
-        self._client.do_work();
+        self.client.do_work();
     }
 
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError> {
@@ -226,20 +214,17 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
 // ============================================================================
 
 pub struct AeronTradePublisher {
-    _client: AeronClient,
+    client: Arc<AeronClient>,
     publisher: aeron_wrapper::Publisher,
 }
 
 impl AeronTradePublisher {
-    pub fn new(aeron_dir: &str, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let client = AeronClient::new(aeron_dir)
-            .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
-
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
         let publisher = client
             .add_publication(channel, stream_id)
             .map_err(|e| format!("Failed to add publication: {:?}", e))?;
 
-        // Wait for publisher to be connected (similar to subscriber)
+        // Wait for publisher to be connected
         for _ in 0..100 {
             client.do_work();
             if publisher.is_connected() {
@@ -248,13 +233,13 @@ impl AeronTradePublisher {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        Ok(Self { _client: client, publisher })
+        Ok(Self { client, publisher })
     }
 }
 
 impl TradePublisher for AeronTradePublisher {
     fn do_work(&mut self) {
-        self._client.do_work();
+        self.client.do_work();
     }
 
     fn publish(&mut self, msg: &TradeNotification) -> Result<(), TransportError> {
@@ -292,7 +277,7 @@ impl TradePublisher for AeronTradePublisher {
 // ============================================================================
 
 pub struct AeronMarketDataPublisher {
-    _client: AeronClient,
+    client: Arc<AeronClient>,
     depth_publisher: aeron_wrapper::Publisher,
     depth50_publisher: aeron_wrapper::Publisher,
     level2_publisher: aeron_wrapper::Publisher,
@@ -300,15 +285,12 @@ pub struct AeronMarketDataPublisher {
 
 impl AeronMarketDataPublisher {
     pub fn new(
-        aeron_dir: &str,
+        client: Arc<AeronClient>,
         channel: &str,
         depth_stream_id: i32,
         depth50_stream_id: i32,
         level2_stream_id: i32,
     ) -> Result<Self, String> {
-        let client = AeronClient::new(aeron_dir)
-            .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
-
         let depth_publisher = client
             .add_publication(channel, depth_stream_id)
             .map_err(|e| format!("Failed to add depth publication: {:?}", e))?;
@@ -331,7 +313,7 @@ impl AeronMarketDataPublisher {
         }
 
         Ok(Self {
-            _client: client,
+            client,
             depth_publisher,
             depth50_publisher,
             level2_publisher,
@@ -341,7 +323,7 @@ impl AeronMarketDataPublisher {
 
 impl MarketDataPublisher for AeronMarketDataPublisher {
     fn do_work(&mut self) {
-        self._client.do_work();
+        self.client.do_work();
     }
 
     fn publish_depth(&mut self, msg: &DepthSnapshotEvent) -> Result<(), TransportError> {

@@ -142,10 +142,7 @@ fn run_matching_thread(
     let mut order_info: HashMap<u64, (u64, u64, f64, f64)> = HashMap::new();
 
     let mut is_connected_warned = false;
-    let mut poll_count = 0u64;
     loop {
-        // 轮询订单
-        poll_count += 1;
 
         // 每次poll()前都必须调用do_work()来驱动Aeron conductor
         // 这在aeron-wrapper官方例子中也是这样做的

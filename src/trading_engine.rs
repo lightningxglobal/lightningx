@@ -118,10 +118,10 @@ fn run_matching_thread(
     pool_config: PoolConfig,
     market_data_config: MarketDataConfig,
     mut order_update_tx: Producer<OrderUpdateEvent>,
-    mut trade_tx: Producer<TradeEvent>,
-    mut depth_tx: Producer<DepthSnapshotEvent>,
-    mut depth50_tx: Producer<Depth50SnapshotEvent>,
-    mut level2_tx: Producer<Level2SnapshotEvent>,
+    trade_tx: Producer<TradeEvent>,
+    depth_tx: Producer<DepthSnapshotEvent>,
+    depth50_tx: Producer<Depth50SnapshotEvent>,
+    level2_tx: Producer<Level2SnapshotEvent>,
 ) {
     use tracing::info;
     let mut engine = MatchingEngine::new(pool_config).expect("failed to create engine");

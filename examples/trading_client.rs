@@ -40,23 +40,13 @@ struct EventCallback {
 
 impl PollCallback for EventCallback {
     fn on_data(&mut self, data: &[u8]) {
-        info!("[EventCallback] on_data() called on Stream {} with {} bytes", self.stream_id, data.len());
         if data.len() >= 4 {
             let template_id = u16::from_le_bytes([data[2], data[3]]);
-            match self.tx.send(RawMessage {
+            let _ = self.tx.send(RawMessage {
                 stream_id: self.stream_id,
                 template_id,
                 data: data.to_vec(),
-            }) {
-                Ok(()) => {
-                    info!("[EventCallback] ✅ sent message to channel on Stream {}", self.stream_id);
-                }
-                Err(e) => {
-                    info!("[EventCallback] ❌ failed to send message on Stream {}: {:?}", self.stream_id, e);
-                }
-            }
-        } else {
-            info!("[EventCallback] ❌ data too short: {}", data.len());
+            });
         }
     }
 }

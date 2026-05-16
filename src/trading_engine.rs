@@ -127,16 +127,11 @@ fn run_matching_thread(
     let mut engine = MatchingEngine::new(pool_config).expect("failed to create engine");
     engine.set_market_data_config(market_data_config);
 
-    // 创建rtrb senders
-    let (trade_tx2, mut trade_rx) = RingBuffer::new(1024);
-    let (depth_tx2, mut depth_rx) = RingBuffer::new(256);
-    let (depth50_tx2, mut depth50_rx) = RingBuffer::new(64);
-    let (level2_tx2, mut level2_rx) = RingBuffer::new(16);
-
-    engine.set_trade_event_sender(trade_tx2);
-    engine.set_depth_snapshot_sender(depth_tx2);
-    engine.set_depth50_sender(depth50_tx2);
-    engine.set_level2_sender(level2_tx2);
+    // 直接传入外部的producer，避免内部ringbuffer的堆分配和复制开销
+    engine.set_trade_event_sender(trade_tx);
+    engine.set_depth_snapshot_sender(depth_tx);
+    engine.set_depth50_sender(depth50_tx);
+    engine.set_level2_sender(level2_tx);
 
     // 维护order_id -> (client_order_id, participant_id, quantity, price)的映射
     let mut order_info: HashMap<u64, (u64, u64, f64, f64)> = HashMap::new();
@@ -329,20 +324,6 @@ fn run_matching_thread(
                     // No message available - continue polling
                 }
             }  // match subscriber.poll() 关闭
-
-            // 转发engine生成的事件到跨线程ring buffers（内层loop中）
-            while let Ok(evt) = trade_rx.pop() {
-                let _ = trade_tx.push(evt);
-            }
-            while let Ok(evt) = depth_rx.pop() {
-                let _ = depth_tx.push(evt);
-            }
-            while let Ok(evt) = depth50_rx.pop() {
-                let _ = depth50_tx.push(evt);
-            }
-            while let Ok(evt) = level2_rx.pop() {
-                let _ = level2_tx.push(evt);
-            }
 
             // aeronmd独立运行，无需sleep，让CPU继续轮询消息
             std::hint::spin_loop();

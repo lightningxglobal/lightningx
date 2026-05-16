@@ -147,10 +147,12 @@ fn run_matching_thread(
         // 轮询订单
         poll_count += 1;
 
-        // 定期检查连接状态并调用do_work()来维护连接
-        // 这与aeron-wrapper官方例子的模式一致
+        // 每次poll()前都必须调用do_work()来驱动Aeron conductor
+        // 这在aeron-wrapper官方例子中也是这样做的
+        subscriber.do_work();
+
         if !is_connected_warned && !subscriber.is_connected() {
-            info!("⚠️ WARNING: Subscriber is NOT connected - calling do_work()");
+            info!("⚠️ WARNING: Subscriber is NOT connected!");
             is_connected_warned = true;
         }
 

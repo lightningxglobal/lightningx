@@ -116,6 +116,12 @@ impl AeronOrderSubscriber {
 }
 
 impl OrderSubscriber for AeronOrderSubscriber {
+    fn do_work(&mut self) {
+        // 必须定期调用do_work()来驱动Aeron conductor
+        // 即使有独立的aeronmd，客户端也需要处理heartbeat、连接状态、流控等
+        self.client.do_work();
+    }
+
     fn poll(&mut self) -> Option<InboundMsg> {
         use tracing::info;
         // Aeron回调需要显式的poll()调用来触发
@@ -123,16 +129,11 @@ impl OrderSubscriber for AeronOrderSubscriber {
         static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let poll_count = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // 每1000次poll调用一次do_work()，帮助Aeron检测新的publisher/subscriber
-        if poll_count % 1000 == 0 {
-            self.client.do_work();
-        }
-
         {
             let mut sub = self.subscriber.lock();
             let n = sub.poll();  // 触发回调，消息进入channel
             if poll_count % 100_000 == 0 {
-                info!("[AeronOrderSubscriber] poll #{} returned {} fragments (is_connected={}",
+                info!("[AeronOrderSubscriber] poll #{} returned {} fragments (is_connected={})",
                     poll_count, n, self.is_connected());
             }
         }  // 立即释放lock

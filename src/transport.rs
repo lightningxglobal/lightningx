@@ -138,6 +138,9 @@ impl OrderUpdateMsg {
 pub trait OrderSubscriber: Send {
     fn poll(&mut self) -> Option<InboundMsg>;
     fn is_connected(&self) -> bool;
+    /// Drive the Aeron conductor (heartbeat, connection state, flow control).
+    /// Must be called before poll() in invoker mode.
+    fn do_work(&mut self);
 }
 
 pub trait OrderUpdatePublisher: Send {
@@ -177,6 +180,10 @@ impl OrderSubscriber for MockOrderSubscriber {
 
     fn is_connected(&self) -> bool {
         true
+    }
+
+    fn do_work(&mut self) {
+        // Mock: no-op
     }
 }
 

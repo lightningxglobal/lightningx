@@ -53,7 +53,8 @@ fn benchmark_with_sender(
                 TimeInForce::GTC,
                 0,
             );
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+            let mut affected_makers = SmallVec::<[u64; 64]>::new();
+        engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;
@@ -73,7 +74,8 @@ fn benchmark_with_sender(
                 TimeInForce::GTC,
                 0,
             );
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+            let mut affected_makers = SmallVec::<[u64; 64]>::new();
+        engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;

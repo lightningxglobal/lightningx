@@ -68,7 +68,8 @@ fn benchmark_orderbook(book_type: OrderBookType, impl_name: &str, base_config: &
         // 卖单
         let start_op = Instant::now();
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        let mut affected_makers = SmallVec::<[u64; 64]>::new();
+        engine.place_order(sell, &mut affected_makers)?;
         let elapsed = start_op.elapsed();
         timings.push(elapsed.as_nanos() as u64);
     }

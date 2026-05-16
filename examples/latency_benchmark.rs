@@ -24,12 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
         let start = std::time::Instant::now();
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        let mut affected_makers = SmallVec::<[u64; 64]>::new();
+        engine.place_order(buy, &mut affected_makers)?;
         latencies.push(start.elapsed().as_nanos());
 
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
         let start = std::time::Instant::now();
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        let mut affected_makers = SmallVec::<[u64; 64]>::new();
+        engine.place_order(sell, &mut affected_makers)?;
         latencies.push(start.elapsed().as_nanos());
     }
 

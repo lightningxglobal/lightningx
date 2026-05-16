@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let num_rounds = 50000;
     let total_start = Instant::now();
+    let mut affected_makers = SmallVec::<[u64; 64]>::new();
 
     for i in 0..num_rounds {
         let price = 50000.0 + (i % 100) as f64;
@@ -30,7 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 买单
         let start = Instant::now();
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(buy, &mut affected_makers)?;
         let buy_latency = start.elapsed().as_nanos() as u64;
         if buy_latency <= 10_000_000 { // 只记录 <= 10ms 的延迟
             latencies.record(buy_latency)?;
@@ -39,7 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 卖单
         let start = Instant::now();
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(sell, &mut affected_makers)?;
         let sell_latency = start.elapsed().as_nanos() as u64;
         if sell_latency <= 10_000_000 {
             latencies.record(sell_latency)?;

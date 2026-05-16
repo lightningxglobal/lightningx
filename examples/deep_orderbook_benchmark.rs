@@ -38,19 +38,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     engine.set_trade_event_sender(tx);
 
     let init_start = Instant::now();
+    let mut affected_makers = SmallVec::<[u64; 64]>::new();
 
     // 添加400档买单
     for i in 0..depth {
         let price = base_price - (depth as f64 - i as f64) + 1.0;
         let order = Order::new(i as u64, Side::Buy, price, 100.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(order, &mut affected_makers)?;
     }
 
     // 添加400档卖单
     for i in 0..depth {
         let price = base_price + i as f64;
         let order = Order::new((depth + i) as u64, Side::Sell, price, 100.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(order, &mut affected_makers)?;
     }
 
     let init_elapsed = init_start.elapsed();
@@ -69,21 +72,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     engine.set_trade_event_sender(tx);
 
     // 初始化深度
+    let mut affected_makers = SmallVec::<[u64; 64]>::new();
     for i in 0..depth {
         let price = base_price - (depth as f64 - i as f64) + 1.0;
         let order = Order::new(i as u64, Side::Buy, price, 100.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(order, &mut affected_makers)?;
     }
     for i in 0..depth {
         let price = base_price + i as f64;
         let order = Order::new((depth + i) as u64, Side::Sell, price, 100.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(order, &mut affected_makers)?;
     }
 
     let mut latencies = Histogram::<u64>::new(3)?;
     let num_test_orders = 5000;
 
     let total_start = Instant::now();
+    let mut affected_makers = SmallVec::<[u64; 64]>::new();
 
     for order_id in 0..num_test_orders {
         // 交替买卖单，在深度中进行交易
@@ -94,7 +101,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new((800 + order_id) as u64, Side::Buy, price, qty, TimeInForce::GTC, 0);
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+            affected_makers.clear();
+            engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
         } else {
             // 卖单 - 在委托簿BBO附近
@@ -103,7 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new((800 + order_id) as u64, Side::Sell, price, qty, TimeInForce::GTC, 0);
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+            affected_makers.clear();
+            engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
         }
     }
@@ -138,15 +147,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     engine.set_trade_event_sender(tx);
 
     // 初始化深度
+    let mut affected_makers = SmallVec::<[u64; 64]>::new();
     for i in 0..depth {
         let price = base_price - (depth as f64 - i as f64) + 1.0;
         let order = Order::new(i as u64, Side::Buy, price, 100.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(order, &mut affected_makers)?;
     }
     for i in 0..depth {
         let price = base_price + i as f64;
         let order = Order::new((depth + i) as u64, Side::Sell, price, 100.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+        affected_makers.clear();
+        engine.place_order(order, &mut affected_makers)?;
     }
 
     let mut batch_latencies = Histogram::<u64>::new(3)?;

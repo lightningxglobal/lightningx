@@ -205,6 +205,7 @@ fn run_matching_thread(
                                 crate::engine::OrderStatus::Rejected => {
                                     // IOC无匹配、FOK无法完全成交等情况
                                     let evt = OrderUpdateEvent::rejected(
+                                        order_id,
                                         req.client_order_id,
                                         req.participant_id,
                                         1,  // 拒绝原因：无法成交或不符合条件
@@ -220,6 +221,7 @@ fn run_matching_thread(
                         }
                         Err(_e) => {
                             let evt = OrderUpdateEvent::rejected(
+                                0,  // No order_id assigned (validation failed)
                                 req.client_order_id,
                                 req.participant_id,
                                 1,

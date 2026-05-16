@@ -88,12 +88,12 @@ impl OrderUpdateEvent {
         }
     }
 
-    pub fn rejected(client_order_id: u64, participant_id: u64, reason: u8, ts: u64) -> Self {
+    pub fn rejected(order_id: u64, client_order_id: u64, participant_id: u64, reason: u8, ts: u64) -> Self {
         Self {
             kind: kind::REJECTED,
             reject_reason: reason,
             _pad: [0; 6],
-            order_id: 0,
+            order_id,
             client_order_id,
             participant_id,
             fill_price: 0.0,
@@ -156,8 +156,9 @@ mod tests {
 
     #[test]
     fn test_order_update_rejected() {
-        let evt = OrderUpdateEvent::rejected(2, 3, 5, 1000);
+        let evt = OrderUpdateEvent::rejected(1, 2, 3, 5, 1000);
         assert_eq!(evt.kind, kind::REJECTED);
+        assert_eq!(evt.order_id, 1);
         assert_eq!(evt.reject_reason, 5);
         assert_eq!(evt.client_order_id, 2);
     }

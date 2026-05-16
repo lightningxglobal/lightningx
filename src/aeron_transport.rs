@@ -186,6 +186,7 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
     }
 
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError> {
+        use tracing::info;
         // Create SBE-encoded message: 8-byte header + 64-byte body = 72 bytes
         let mut data = vec![0u8; 72];
 
@@ -201,15 +202,34 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
         };
         data[8..72].copy_from_slice(msg_bytes);
 
+        let mut attempts = 0;
         loop {
+            attempts += 1;
             match self.publisher.send(&data) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if attempts > 1 {
+                        info!("[AeronOrderUpdatePublisher] ✅ sent after {} attempts", attempts);
+                    }
+                    return Ok(());
+                }
                 Err(AeronError::BackPressured) => {
+                    if attempts == 1 {
+                        info!("[AeronOrderUpdatePublisher] ⏳ BackPressured, retrying...");
+                    }
                     std::hint::spin_loop();  // aeronmd会处理，只需让出CPU
                 }
-                Err(AeronError::NotConnected) => return Err(TransportError::Disconnected),
-                Err(AeronError::Closed) => return Err(TransportError::Closed),
-                Err(_) => return Err(TransportError::BackPressured),
+                Err(AeronError::NotConnected) => {
+                    info!("[AeronOrderUpdatePublisher] ❌ NotConnected!");
+                    return Err(TransportError::Disconnected);
+                }
+                Err(AeronError::Closed) => {
+                    info!("[AeronOrderUpdatePublisher] ❌ Publisher Closed!");
+                    return Err(TransportError::Closed);
+                }
+                Err(e) => {
+                    info!("[AeronOrderUpdatePublisher] ❌ Error: {:?}", e);
+                    return Err(TransportError::BackPressured);
+                }
             }
         }
     }

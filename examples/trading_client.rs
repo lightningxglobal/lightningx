@@ -602,14 +602,17 @@ fn receiver_thread_main(aeron_dir: String, channel: String) -> Result<(), String
     let start = Instant::now();
     let mut stats = Stats::new();
 
-    // aeronmd独立处理I/O，回调会自动触发
-    // 只需要持续检查接收的消息即可
+    // CRITICAL: client.do_work() 必须被调用来驱动Aeron事件循环
+    // aeronmd处理底层I/O，但client需要定期调用do_work()来处理消息和触发回调
     while start.elapsed() < Duration::from_secs(45) {
+        client.do_work();  // ← 这是必须的！
+
         while let Ok(msg) = rx.try_recv() {
             parse_and_print_message(&msg, &mut stats);
         }
 
-        thread::sleep(Duration::from_millis(10));
+        // 不要sleep太长——需要频繁调用do_work()
+        thread::sleep(Duration::from_millis(1));
     }
 
     info!("");

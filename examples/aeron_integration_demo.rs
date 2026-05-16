@@ -118,6 +118,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✓ Aeron transport初始化完成");
     info!("");
 
+    // 关键：在启动worker线程前，主线程需要调用几次do_work()
+    // 让所有pub/sub在Media Driver中正式注册
+    info!("⏳ Giving pub/sub time to register with Media Driver...");
+    for i in 0..100 {
+        client.do_work();
+        if i % 20 == 0 {
+            info!("  do_work() #{}", i);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    info!("✓ Pub/Sub registration complete (waited 1 second)");
+    info!("");
+
     // 启动双线程撮合系统
     info!("╔═════════════════════════════════════════════════════════════════╗");
     info!("║          启动双线程撮合系统 (Matching + Publishing)            ║");

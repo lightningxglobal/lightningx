@@ -34,7 +34,7 @@ impl PollCallback for OrderInboundCallback {
 
         // 解析SBE消息：首8字节是header，后续是消息体
         if data.len() < 8 {
-            info!("[OrderInboundCallback] Data too short");
+            info!("[OrderInboundCallback] ❌ Data too short: {}", data.len());
             return;
         }
 
@@ -50,8 +50,13 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const NewOrderRequest
                         );
-                        let _ = self.tx.send(InboundMsg::NewOrder(req));
+                        match self.tx.send(InboundMsg::NewOrder(req)) {
+                            Ok(()) => info!("[OrderInboundCallback] ✅ NewOrder sent to channel"),
+                            Err(e) => info!("[OrderInboundCallback] ❌ Failed to send NewOrder: {:?}", e),
+                        }
                     }
+                } else {
+                    info!("[OrderInboundCallback] ❌ NewOrderRequest too short: {} < 56", data.len());
                 }
             }
             2 => {
@@ -61,12 +66,17 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const CancelOrderRequest
                         );
-                        let _ = self.tx.send(InboundMsg::CancelOrder(req));
+                        match self.tx.send(InboundMsg::CancelOrder(req)) {
+                            Ok(()) => info!("[OrderInboundCallback] ✅ CancelOrder sent to channel"),
+                            Err(e) => info!("[OrderInboundCallback] ❌ Failed to send CancelOrder: {:?}", e),
+                        }
                     }
+                } else {
+                    info!("[OrderInboundCallback] ❌ CancelOrderRequest too short: {} < 16", data.len());
                 }
             }
             _ => {
-                // 未知消息类型，忽略
+                info!("[OrderInboundCallback] ❌ Unknown template_id: {}", template_id);
             }
         }
     }
@@ -120,7 +130,7 @@ impl OrderSubscriber for AeronOrderSubscriber {
         {
             let mut sub = self.subscriber.lock();
             let n = sub.poll();  // 触发回调，消息进入channel
-            if poll_count % 100_000 == 0 {
+            if poll_count % 1_000 == 0 {
                 info!("[AeronOrderSubscriber] poll #{} returned {} fragments (is_connected={})",
                     poll_count, n, self.is_connected());
             }
@@ -129,11 +139,19 @@ impl OrderSubscriber for AeronOrderSubscriber {
         // 然后从channel读取回调发送的消息
         match self.rx.try_recv() {
             Ok(msg) => {
-                info!("[AeronOrderSubscriber] ✓ received message from channel");
+                info!("[AeronOrderSubscriber] ✅ received message from channel");
                 Some(msg)
             }
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => {
+                if poll_count % 100_000 == 0 {
+                    info!("[AeronOrderSubscriber] ℹ️ channel empty on poll #{}", poll_count);
+                }
+                None
+            }
+            Err(TryRecvError::Disconnected) => {
+                info!("[AeronOrderSubscriber] ❌ channel disconnected!");
+                None
+            }
         }
     }
 

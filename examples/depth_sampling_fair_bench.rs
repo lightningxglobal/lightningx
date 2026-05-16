@@ -52,7 +52,7 @@ fn benchmark_with_config(
                 TimeInForce::GTC,
                 0,
             );
-            let result = engine.place_order(order)?;
+            let (result, _affected_makers) = engine.place_order(order)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;
@@ -73,7 +73,7 @@ fn benchmark_with_config(
                 TimeInForce::GTC,
                 0,
             );
-            let result = engine.place_order(order)?;
+            let (result, _affected_makers) = engine.place_order(order)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;

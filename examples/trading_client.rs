@@ -19,7 +19,7 @@
 ///
 /// 运行: AERON_DIR=/tmp/aeron cargo run --release --example trading_client
 
-use std::sync::mpsc::{channel as mpsc_channel, Sender, TryRecvError};
+use std::sync::mpsc::{channel as mpsc_channel, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -75,11 +75,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  • 配对成交 (买单 + 卖单)");
     info!("");
 
+    // 先启动接收线程，让subscriptions准备好
+    // 这样aeronmd能正确建立流的对等关系
+    info!("启动后台接收线程...");
+    let aeron_dir_clone = aeron_dir.clone();
+    let channel_clone = channel.to_string();
+    let receiver_handle = thread::spawn(move || {
+        receiver_thread_main(aeron_dir_clone, channel_clone)
+    });
+
+    // 等待接收线程初始化subscriptions
+    thread::sleep(Duration::from_millis(1000));
+    info!("✓ 接收线程已就绪");
+    info!("");
+
     let client = AeronClient::new(&aeron_dir)
         .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
 
     // 创建Publisher用于发送订单（主线程用）
-    // Subscriptions将在接收线程中创建
     info!("初始化Aeron Publisher...");
     let mut publisher = client.add_publication(channel, 1)?;
     info!("✓ Publisher已初始化");
@@ -90,25 +103,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while start_time.elapsed() < Duration::from_secs(5) {
         client.do_work();
         if publisher.is_connected() {
+            info!("✓ Publisher已连接");
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    info!("✓ 已连接");
+    if !publisher.is_connected() {
+        return Err("Publisher failed to connect after 5 seconds".into());
+    }
     info!("");
-
-    // 启动后台接收线程 - MUST be before sending orders!
-    // 这样subscriptions会准备好接收消息
-    info!("启动后台接收线程...");
-    let aeron_dir_clone = aeron_dir.clone();
-    let channel_clone = channel.to_string();
-    let receiver_handle = thread::spawn(move || {
-        receiver_thread_main(aeron_dir_clone, channel_clone)
-    });
-
-    // Wait for receiver thread to initialize subscriptions
-    thread::sleep(Duration::from_millis(500));
     info!("✓ 接收线程已就绪");
     info!("");
 
@@ -131,7 +135,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("═══════════════════════════════════════════════════════════════════");
     send_order(&mut publisher, next_order_id, 1, 50000.0, 20.0, 0, 0)?; // Buy GTC
     info!("📤 发送 GTC 买单: 20 @ 50000 (进入簿)");
-    let gtc_buy_id = next_order_id;
     next_order_id += 1;
     thread::sleep(Duration::from_millis(50));
     info!("");
@@ -564,31 +567,31 @@ fn receiver_thread_main(aeron_dir: String, channel: String) -> Result<(), String
         tx.clone(),
     );
 
-    let mut sub2 = client.add_subscription(
+    let _sub2 = client.add_subscription(
         &channel, 2, 10_000,
         EventCallback { tx: tx2, stream_id: 2 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub2: {:?}", e))?;
 
-    let mut sub3 = client.add_subscription(
+    let _sub3 = client.add_subscription(
         &channel, 3, 10_000,
         EventCallback { tx: tx3, stream_id: 3 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub3: {:?}", e))?;
 
-    let mut sub4 = client.add_subscription(
+    let _sub4 = client.add_subscription(
         &channel, 4, 10_000,
         EventCallback { tx: tx4, stream_id: 4 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub4: {:?}", e))?;
 
-    let mut sub5 = client.add_subscription(
+    let _sub5 = client.add_subscription(
         &channel, 5, 10_000,
         EventCallback { tx: tx5, stream_id: 5 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub5: {:?}", e))?;
 
-    let mut sub6 = client.add_subscription(
+    let _sub6 = client.add_subscription(
         &channel, 6, 10_000,
         EventCallback { tx: tx6, stream_id: 6 },
         NoopLifecycle,
@@ -601,17 +604,9 @@ fn receiver_thread_main(aeron_dir: String, channel: String) -> Result<(), String
     let start = Instant::now();
     let mut stats = Stats::new();
 
-    // 持续poll 45秒
+    // aeronmd独立处理I/O，回调会自动触发
+    // 只需要持续检查接收的消息即可
     while start.elapsed() < Duration::from_secs(45) {
-        client.do_work();
-
-        // Poll all subscriptions to trigger EventCallback
-        let _n2 = sub2.poll();
-        let _n3 = sub3.poll();
-        let _n4 = sub4.poll();
-        let _n5 = sub5.poll();
-        let _n6 = sub6.poll();
-
         while let Ok(msg) = rx.try_recv() {
             parse_and_print_message(&msg, &mut stats);
         }

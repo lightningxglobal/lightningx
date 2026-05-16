@@ -189,7 +189,7 @@ fn run_matching_thread(
                     );
 
                     match engine.place_order(order) {
-                        Ok(result) => {
+                        Ok((result, affected_makers)) => {
                             // Use order_id from result - this is the definitive ID assigned by engine
                             let order_id = result.order_id;
                             order_info.insert(order_id, (req.client_order_id, req.participant_id, req.quantity, req.price));
@@ -243,6 +243,39 @@ fn run_matching_thread(
                                 crate::engine::OrderStatus::Cancelled => {
                                     // 这通常不会从place_order返回，但保险起见也处理
                                     // Cancelled应该来自cancel_order操作
+                                }
+                            }
+
+                            // 为所有受影响的maker订单生成OrderUpdateEvent
+                            for maker_id in affected_makers.iter() {
+                                if let Some((maker_client_id, maker_participant_id, _maker_qty, maker_price)) = order_info.get(maker_id) {
+                                    // 查询maker订单的当前填充状态
+                                    if let Some((filled, remaining)) = engine.get_order_fill_status(*maker_id) {
+                                        if remaining < 1e-10 {
+                                            // Maker完全成交
+                                            let evt = OrderUpdateEvent::filled(
+                                                *maker_id,
+                                                *maker_client_id,
+                                                *maker_participant_id,
+                                                *maker_price,
+                                                filled,
+                                                now,
+                                            );
+                                            let _ = order_update_tx.push(evt);
+                                        } else {
+                                            // Maker部分成交
+                                            let evt = OrderUpdateEvent::partial_fill(
+                                                *maker_id,
+                                                *maker_client_id,
+                                                *maker_participant_id,
+                                                *maker_price,
+                                                filled,
+                                                remaining,
+                                                now,
+                                            );
+                                            let _ = order_update_tx.push(evt);
+                                        }
+                                    }
                                 }
                             }
                         }

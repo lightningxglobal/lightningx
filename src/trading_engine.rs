@@ -318,6 +318,11 @@ fn run_publishing_thread(
     let mut published_count = 0u64;
 
     loop {
+        // 定期调用do_work()来维护所有Publishers的连接状态
+        order_update_pub.do_work();
+        trade_pub.do_work();
+        market_data_pub.do_work();
+
         let mut any_published = false;
 
         // 消费order updates

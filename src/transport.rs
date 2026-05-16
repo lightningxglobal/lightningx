@@ -145,16 +145,19 @@ pub trait OrderSubscriber: Send {
 
 pub trait OrderUpdatePublisher: Send {
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError>;
+    fn do_work(&mut self);
 }
 
 pub trait TradePublisher: Send {
     fn publish(&mut self, msg: &TradeNotification) -> Result<(), TransportError>;
+    fn do_work(&mut self);
 }
 
 pub trait MarketDataPublisher: Send {
     fn publish_depth(&mut self, msg: &DepthSnapshotEvent) -> Result<(), TransportError>;
     fn publish_depth50(&mut self, msg: &Depth50SnapshotEvent) -> Result<(), TransportError>;
     fn publish_level2(&mut self, msg: &Level2SnapshotEvent) -> Result<(), TransportError>;
+    fn do_work(&mut self);
 }
 
 // ============================================================================
@@ -203,6 +206,10 @@ impl OrderUpdatePublisher for MockOrderUpdatePublisher {
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError> {
         self.tx.send(*msg).map_err(|_| TransportError::Closed)
     }
+
+    fn do_work(&mut self) {
+        // Mock: no-op
+    }
 }
 
 pub struct MockTradePublisher {
@@ -220,6 +227,10 @@ impl MockTradePublisher {
 impl TradePublisher for MockTradePublisher {
     fn publish(&mut self, msg: &TradeNotification) -> Result<(), TransportError> {
         self.tx.send(*msg).map_err(|_| TransportError::Closed)
+    }
+
+    fn do_work(&mut self) {
+        // Mock: no-op
     }
 }
 
@@ -259,6 +270,10 @@ impl MarketDataPublisher for MockMarketDataPublisher {
 
     fn publish_level2(&mut self, msg: &Level2SnapshotEvent) -> Result<(), TransportError> {
         self.level2_tx.send(*msg).map_err(|_| TransportError::Closed)
+    }
+
+    fn do_work(&mut self) {
+        // Mock: no-op
     }
 }
 

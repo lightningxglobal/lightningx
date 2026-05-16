@@ -186,6 +186,11 @@ impl AeronOrderUpdatePublisher {
 }
 
 impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
+    fn do_work(&mut self) {
+        // 定期调用do_work()来维护Publisher的连接状态
+        self._client.do_work();
+    }
+
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError> {
         // Create SBE-encoded message: 8-byte header + 64-byte body = 72 bytes
         let mut data = vec![0u8; 72];
@@ -248,6 +253,10 @@ impl AeronTradePublisher {
 }
 
 impl TradePublisher for AeronTradePublisher {
+    fn do_work(&mut self) {
+        self._client.do_work();
+    }
+
     fn publish(&mut self, msg: &TradeNotification) -> Result<(), TransportError> {
         // Create SBE-encoded message: 8-byte header + 48-byte body = 56 bytes
         let mut data = vec![0u8; 56];
@@ -331,6 +340,10 @@ impl AeronMarketDataPublisher {
 }
 
 impl MarketDataPublisher for AeronMarketDataPublisher {
+    fn do_work(&mut self) {
+        self._client.do_work();
+    }
+
     fn publish_depth(&mut self, msg: &DepthSnapshotEvent) -> Result<(), TransportError> {
         let data = unsafe {
             std::slice::from_raw_parts(

@@ -415,7 +415,7 @@ impl MatchingEngine {
                 status: OrderStatus::Filled,
             })
         } else {
-            // 无法完全成交，拒绝
+            // 无法完全成交，拒绝（不允许部分成交）
             Ok(PlaceOrderResult {
                 order_id: order.id,
                 filled: 0.0,
@@ -428,19 +428,19 @@ impl MatchingEngine {
     fn handle_ioc(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         let (filled_qty, _trades) = self.match_order(order)?;
 
-        if filled_qty > 0.0 {
-            Ok(PlaceOrderResult {
-                order_id: order.id,
-                filled: filled_qty,
-                status: OrderStatus::Filled,
-            })
+        let status = if (filled_qty - order.quantity).abs() < 1e-10 {
+            OrderStatus::Filled
+        } else if filled_qty > 0.0 {
+            OrderStatus::PartiallyFilled
         } else {
-            Ok(PlaceOrderResult {
-                order_id: order.id,
-                filled: 0.0,
-                status: OrderStatus::Rejected,
-            })
-        }
+            OrderStatus::Rejected
+        };
+
+        Ok(PlaceOrderResult {
+            order_id: order.id,
+            filled: filled_qty,
+            status,
+        })
     }
 
     /// 处理GTC订单

@@ -257,7 +257,17 @@ fn run_matching_thread(
                             }
                         }
                         Err(_) => {
-                            // Cancel failed, don't send update
+                            // Cancel failed，若有订单信息则发送OrderRejected
+                            if let Some((client_order_id, participant_id, _qty, _price)) = order_info.get(&order_id) {
+                                let evt = OrderUpdateEvent::rejected(
+                                    order_id,
+                                    *client_order_id,
+                                    *participant_id,
+                                    2,  // 拒绝原因：订单未找到
+                                    now,
+                                );
+                                let _ = order_update_tx.push(evt);
+                            }
                         }
                     }
                 }

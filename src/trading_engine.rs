@@ -141,19 +141,33 @@ fn run_matching_thread(
     // 维护order_id -> (client_order_id, participant_id, quantity, price)的映射
     let mut order_info: HashMap<u64, (u64, u64, f64, f64)> = HashMap::new();
 
-    let mut is_connected_warned = false;
-    loop {
-
-        // 每次poll()前都必须调用do_work()来驱动Aeron conductor
-        // 这在aeron-wrapper官方例子中也是这样做的
+    // 遵循官方aeron-wrapper pattern：两层loop（连接管理 + 消息轮询）
+    info!("⏳ Waiting for inbound order subscriber to connect...");
+    'outer: loop {
+        // 外层：连接管理
         subscriber.do_work();
-
-        if !is_connected_warned && !subscriber.is_connected() {
-            info!("⚠️ WARNING: Subscriber is NOT connected!");
-            is_connected_warned = true;
+        if !subscriber.is_connected() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
         }
 
-        if let Some(msg) = subscriber.poll() {
+        info!("✅ Inbound order subscriber connected!");
+
+        // 内层：消息轮询 (fast path)
+        let mut poll_count = 0u64;
+        loop {
+            subscriber.do_work();
+
+            // 定期检查连接状态（避免无限轮询而错过连接丢失）
+            poll_count += 1;
+            if poll_count % 10000 == 0 {
+                if !subscriber.is_connected() {
+                    info!("⚠️ Subscriber disconnected, returning to outer loop");
+                    continue 'outer;  // 回到外层重新等待连接
+                }
+            }
+
+            if let Some(msg) = subscriber.poll() {
             let now = wall_clock_nanos();
             tracing::info!("recv {:?}", msg);
             match msg {
@@ -276,25 +290,26 @@ fn run_matching_thread(
                     }
                 }
             }
-        }
+            }  // if let Some(msg) 关闭
 
-        // 转发engine生成的事件到跨线程ring buffers
-        while let Ok(evt) = trade_rx.pop() {
-            let _ = trade_tx.push(evt);
-        }
-        while let Ok(evt) = depth_rx.pop() {
-            let _ = depth_tx.push(evt);
-        }
-        while let Ok(evt) = depth50_rx.pop() {
-            let _ = depth50_tx.push(evt);
-        }
-        while let Ok(evt) = level2_rx.pop() {
-            let _ = level2_tx.push(evt);
-        }
+            // 转发engine生成的事件到跨线程ring buffers（内层loop中）
+            while let Ok(evt) = trade_rx.pop() {
+                let _ = trade_tx.push(evt);
+            }
+            while let Ok(evt) = depth_rx.pop() {
+                let _ = depth_tx.push(evt);
+            }
+            while let Ok(evt) = depth50_rx.pop() {
+                let _ = depth50_tx.push(evt);
+            }
+            while let Ok(evt) = level2_rx.pop() {
+                let _ = level2_tx.push(evt);
+            }
 
-        // aeronmd独立运行，无需sleep，让CPU继续轮询消息
-        std::hint::spin_loop();
-    }
+            // aeronmd独立运行，无需sleep，让CPU继续轮询消息
+            std::hint::spin_loop();
+        }  // 内层loop结束
+    }  // 外层loop结束
 }
 
 // ============================================================================

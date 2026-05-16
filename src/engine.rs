@@ -377,7 +377,11 @@ impl MatchingEngine {
             };
 
             if would_match {
-                return Err(MatchingEngineError::InvalidTimeInForce);
+                return Ok(PlaceOrderResult {
+                    order_id: order.id,
+                    filled: 0.0,
+                    status: OrderStatus::Rejected,
+                });
             }
         }
 
@@ -412,7 +416,11 @@ impl MatchingEngine {
             })
         } else {
             // 无法完全成交，拒绝
-            Err(MatchingEngineError::InvalidTimeInForce)
+            Ok(PlaceOrderResult {
+                order_id: order.id,
+                filled: 0.0,
+                status: OrderStatus::Rejected,
+            })
         }
     }
 

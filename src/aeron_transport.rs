@@ -16,6 +16,7 @@ use crate::market_data::{DepthSnapshotEvent, Depth50SnapshotEvent, Level2Snapsho
 
 use aeron_wrapper::{AeronClient, Error as AeronError, NoopLifecycle, Pub, PollCallback};
 use std::sync::Arc;
+use std::collections::VecDeque;
 use parking_lot::Mutex;
 
 // ============================================================================
@@ -23,7 +24,7 @@ use parking_lot::Mutex;
 // ============================================================================
 
 struct OrderInboundCallback {
-    last_message: Arc<Mutex<Option<InboundMsg>>>,
+    message_queue: Arc<Mutex<VecDeque<InboundMsg>>>,
 }
 
 impl PollCallback for OrderInboundCallback {
@@ -57,10 +58,10 @@ impl PollCallback for OrderInboundCallback {
                         info!("[OrderInboundCallback] 📊 NewOrder parsed: client_id={}, participant_id={}, price={}, qty={}",
                               client_id, participant_id, price, qty);
 
-                        // 直接存储到Mutex而不使用mpsc channel
-                        let mut msg = self.last_message.lock();
-                        *msg = Some(InboundMsg::NewOrder(req));
-                        info!("[OrderInboundCallback] ✅ NewOrder stored to mutex");
+                        // 存储到queue而不是覆盖
+                        let mut queue = self.message_queue.lock();
+                        queue.push_back(InboundMsg::NewOrder(req));
+                        info!("[OrderInboundCallback] ✅ NewOrder enqueued (queue size={})", queue.len());
                     }
                 } else {
                     info!("[OrderInboundCallback] ❌ NewOrderRequest too short: {} < 56", data.len());
@@ -73,9 +74,9 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const CancelOrderRequest
                         );
-                        let mut msg = self.last_message.lock();
-                        *msg = Some(InboundMsg::CancelOrder(req));
-                        info!("[OrderInboundCallback] ✅ CancelOrder stored to mutex");
+                        let mut queue = self.message_queue.lock();
+                        queue.push_back(InboundMsg::CancelOrder(req));
+                        info!("[OrderInboundCallback] ✅ CancelOrder enqueued (queue size={})", queue.len());
                     }
                 } else {
                     info!("[OrderInboundCallback] ❌ CancelOrderRequest too short: {} < 16", data.len());
@@ -90,20 +91,20 @@ impl PollCallback for OrderInboundCallback {
 
 pub struct AeronOrderSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>,
-    last_message: Arc<Mutex<Option<InboundMsg>>>,
+    message_queue: Arc<Mutex<VecDeque<InboundMsg>>>,
     client: Arc<AeronClient>,
 }
 
 impl AeronOrderSubscriber {
     pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let last_message = Arc::new(Mutex::new(None));
+        let message_queue = Arc::new(Mutex::new(VecDeque::new()));
 
         let subscriber = client
             .add_subscription(
                 channel,
                 stream_id,
                 10_000,
-                OrderInboundCallback { last_message: last_message.clone() },
+                OrderInboundCallback { message_queue: message_queue.clone() },
                 NoopLifecycle,
             )
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
@@ -115,7 +116,7 @@ impl AeronOrderSubscriber {
 
         Ok(Self {
             subscriber: Arc::new(Mutex::new(subscriber)),
-            last_message,
+            message_queue,
             client,
         })
     }
@@ -133,29 +134,60 @@ impl OrderSubscriber for AeronOrderSubscriber {
         static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let poll_count = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        {
-            let mut sub = self.subscriber.lock();
-            let n = sub.poll();  // 触发回调，消息进入Arc<Mutex<>>
-            if poll_count % 1_000 == 0 {
-                info!("[AeronOrderSubscriber] poll #{} returned {} fragments (is_connected={})",
-                    poll_count, n, self.is_connected());
-            }
-        }  // 立即释放lock
+        if poll_count % 10_000 == 0 {
+            info!("[AeronOrderSubscriber] >>> poll() called, poll_count={}", poll_count);
+        }
 
-        // 然后从Arc<Mutex<>>读取回调写入的消息
-        let mut msg_opt = self.last_message.lock();
-        match msg_opt.take() {
+        if poll_count % 10_000 == 0 {
+            info!("[AeronOrderSubscriber] > acquiring subscriber lock...");
+        }
+
+        let n = {
+            let mut sub = self.subscriber.lock();
+            if poll_count % 10_000 == 0 {
+                info!("[AeronOrderSubscriber] > calling sub.poll()...");
+            }
+            let n = sub.poll();  // 触发回调，消息进入Arc<Mutex<>>
+            if poll_count % 10_000 == 0 {
+                info!("[AeronOrderSubscriber] > sub.poll() returned: {}", n);
+            }
+            n
+        };  // 立即释放lock
+
+        if poll_count % 1_000 == 0 {
+            info!("[AeronOrderSubscriber] poll #{} returned {} fragments (is_connected={})",
+                poll_count, n, self.is_connected());
+        }
+
+        if poll_count % 10_000 == 0 {
+            info!("[AeronOrderSubscriber] > acquiring message_queue lock...");
+        }
+
+        // 从队列中pop回调写入的消息
+        let mut queue = self.message_queue.lock();
+        if poll_count % 10_000 == 0 {
+            info!("[AeronOrderSubscriber] > got message_queue lock, queue size={}", queue.len());
+        }
+        let result = match queue.pop_front() {
             Some(msg) => {
-                info!("[AeronOrderSubscriber] ✅ received message from mutex");
+                if poll_count % 10 == 0 {
+                    info!("[AeronOrderSubscriber] ✅ dequeued message (queue now {})", queue.len());
+                }
                 Some(msg)
             }
             None => {
                 if poll_count % 100_000 == 0 {
-                    info!("[AeronOrderSubscriber] ℹ️ mutex empty on poll #{}", poll_count);
+                    info!("[AeronOrderSubscriber] ℹ️ queue empty on poll #{}", poll_count);
                 }
                 None
             }
+        };
+
+        if poll_count % 10_000 == 0 {
+            info!("[AeronOrderSubscriber] <<< poll() returning {:?}", result.is_some());
         }
+
+        result
     }
 
     fn is_connected(&self) -> bool {
@@ -399,8 +431,8 @@ mod tests {
 
     #[test]
     fn test_order_inbound_callback() {
-        let last_message = Arc::new(Mutex::new(None));
-        let _callback = OrderInboundCallback { last_message };
+        let message_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let _callback = OrderInboundCallback { message_queue };
         // Callback created successfully
     }
 }

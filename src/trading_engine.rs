@@ -271,7 +271,8 @@ fn run_matching_thread(
         }
 
         // 无消息时，给Aeron Media Driver处理时间，防止超时
-        std::thread::sleep(std::time::Duration::from_micros(100));
+        // Aeron需要至少每5秒调用一次do_work()，这里用1ms确保足够频繁
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -418,7 +419,8 @@ fn run_publishing_thread(
 
         if !any_published {
             // 无消息时，给Aeron Media Driver处理时间，防止超时
-            std::thread::sleep(std::time::Duration::from_micros(100));
+            // Aeron需要至少每5秒调用一次do_work()，这里用1ms确保足够频繁
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 }

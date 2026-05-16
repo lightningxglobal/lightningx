@@ -418,7 +418,7 @@ impl MatchingEngine {
     fn handle_fok(&mut self, order: Order) -> OrderResult<(PlaceOrderResult, SmallVec<[u64; 64]>)> {
         // 尝试撮合
         let mut affected_makers = SmallVec::new();
-        let (filled_qty, _trades) = self.match_order(order, &mut affected_makers)?;
+        let filled_qty = self.match_order(order, &mut affected_makers)?;
 
         if (filled_qty - order.quantity).abs() < 1e-10 {
             // 完全成交
@@ -442,7 +442,7 @@ impl MatchingEngine {
     /// 处理IOC订单
     fn handle_ioc(&mut self, order: Order) -> OrderResult<(PlaceOrderResult, SmallVec<[u64; 64]>)> {
         let mut affected_makers = SmallVec::new();
-        let (filled_qty, _trades) = self.match_order(order, &mut affected_makers)?;
+        let filled_qty = self.match_order(order, &mut affected_makers)?;
 
         let status = if (filled_qty - order.quantity).abs() < 1e-10 {
             OrderStatus::Filled
@@ -462,7 +462,7 @@ impl MatchingEngine {
     /// 处理GTC订单
     fn handle_gtc(&mut self, order: Order) -> OrderResult<(PlaceOrderResult, SmallVec<[u64; 64]>)> {
         let mut affected_makers = SmallVec::new();
-        let (filled_qty, _trades) = self.match_order(order, &mut affected_makers)?;
+        let filled_qty = self.match_order(order, &mut affected_makers)?;
 
         // 如果有剩余，加入订单簿
         if filled_qty < order.quantity {
@@ -527,7 +527,7 @@ impl MatchingEngine {
 
     /// 撮合订单（关键热路径，使用持久化缓存优化最优价格查询）
     #[inline]
-    fn match_order(&mut self, order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<(f64, Vec<Trade>)> {
+    fn match_order(&mut self, order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<f64> {
         let mut filled = 0.0;
         let mut trade_indices: SmallVec<[usize; 64]> = SmallVec::new();
         let mut trade_events: SmallVec<[TradeEvent; 128]> = SmallVec::new();
@@ -704,17 +704,12 @@ impl MatchingEngine {
             }
         }
 
-        // 从池中读取Trade对象并构造返回Vec
-        let mut result_trades = Vec::with_capacity(trade_indices.len());
+        // 释放Trade对象回池
         for trade_idx in trade_indices.iter() {
-            if let Some(trade) = self.pools.trades.get(*trade_idx) {
-                result_trades.push(*trade);
-            }
-            // 释放Trade回池
             self.pools.trades.release(*trade_idx);
         }
 
-        Ok((filled, result_trades))
+        Ok(filled)
     }
 
     /// 批量撮合多个订单（最多20个），共享TradeEvent批处理以提升性能

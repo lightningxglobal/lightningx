@@ -58,7 +58,10 @@ impl PollCallback for OrderInboundCallback {
                         info!("[OrderInboundCallback] 📊 NewOrder parsed: client_id={}, participant_id={}, price={}, qty={}",
                               client_id, participant_id, price, qty);
                         match self.tx.send(InboundMsg::NewOrder(req)) {
-                            Ok(()) => info!("[OrderInboundCallback] ✅ NewOrder sent to channel"),
+                            Ok(()) => {
+                                info!("[OrderInboundCallback] ✅ NewOrder sent to channel");
+                                info!("[OrderInboundCallback] 🔍 Sender state: OK, waiting for receiver poll...");
+                            },
                             Err(e) => info!("[OrderInboundCallback] ❌ Failed to send NewOrder: {:?}", e),
                         }
                     }

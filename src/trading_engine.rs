@@ -167,9 +167,10 @@ fn run_matching_thread(
                 }
             }
 
-            if let Some(msg) = subscriber.poll() {
-            let now = wall_clock_nanos();
-            tracing::info!("recv {:?}", msg);
+            match subscriber.poll() {
+                Some(msg) => {
+                    let now = wall_clock_nanos();
+                    tracing::info!("✅ recv {:?}", msg);
             match msg {
                 InboundMsg::NewOrder(req) => {
                     // Create order without assigning ID - engine will assign it in place_order()
@@ -290,7 +291,11 @@ fn run_matching_thread(
                     }
                 }
             }
-            }  // if let Some(msg) 关闭
+                }  // Some(msg) 匹配分支关闭
+                None => {
+                    // No message available - continue polling
+                }
+            }  // match subscriber.poll() 关闭
 
             // 转发engine生成的事件到跨线程ring buffers（内层loop中）
             while let Ok(evt) = trade_rx.pop() {

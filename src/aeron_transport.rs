@@ -16,7 +16,6 @@ use crate::market_data::{DepthSnapshotEvent, Depth50SnapshotEvent, Level2Snapsho
 
 use aeron_wrapper::{AeronClient, Error as AeronError, NoopLifecycle, Pub, PollCallback};
 use std::sync::Arc;
-use std::sync::mpsc::{channel as mpsc_channel, Sender, Receiver, TryRecvError};
 use parking_lot::Mutex;
 
 // ============================================================================
@@ -24,7 +23,7 @@ use parking_lot::Mutex;
 // ============================================================================
 
 struct OrderInboundCallback {
-    tx: Sender<InboundMsg>,
+    last_message: Arc<Mutex<Option<InboundMsg>>>,
 }
 
 impl PollCallback for OrderInboundCallback {
@@ -57,13 +56,11 @@ impl PollCallback for OrderInboundCallback {
                         let qty = req.quantity;
                         info!("[OrderInboundCallback] 📊 NewOrder parsed: client_id={}, participant_id={}, price={}, qty={}",
                               client_id, participant_id, price, qty);
-                        match self.tx.send(InboundMsg::NewOrder(req)) {
-                            Ok(()) => {
-                                info!("[OrderInboundCallback] ✅ NewOrder sent to channel");
-                                info!("[OrderInboundCallback] 🔍 Sender state: OK, waiting for receiver poll...");
-                            },
-                            Err(e) => info!("[OrderInboundCallback] ❌ Failed to send NewOrder: {:?}", e),
-                        }
+
+                        // 直接存储到Mutex而不使用mpsc channel
+                        let mut msg = self.last_message.lock();
+                        *msg = Some(InboundMsg::NewOrder(req));
+                        info!("[OrderInboundCallback] ✅ NewOrder stored to mutex");
                     }
                 } else {
                     info!("[OrderInboundCallback] ❌ NewOrderRequest too short: {} < 56", data.len());
@@ -76,10 +73,9 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const CancelOrderRequest
                         );
-                        match self.tx.send(InboundMsg::CancelOrder(req)) {
-                            Ok(()) => info!("[OrderInboundCallback] ✅ CancelOrder sent to channel"),
-                            Err(e) => info!("[OrderInboundCallback] ❌ Failed to send CancelOrder: {:?}", e),
-                        }
+                        let mut msg = self.last_message.lock();
+                        *msg = Some(InboundMsg::CancelOrder(req));
+                        info!("[OrderInboundCallback] ✅ CancelOrder stored to mutex");
                     }
                 } else {
                     info!("[OrderInboundCallback] ❌ CancelOrderRequest too short: {} < 16", data.len());
@@ -94,20 +90,20 @@ impl PollCallback for OrderInboundCallback {
 
 pub struct AeronOrderSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>,
-    rx: Receiver<InboundMsg>,
+    last_message: Arc<Mutex<Option<InboundMsg>>>,
     client: Arc<AeronClient>,
 }
 
 impl AeronOrderSubscriber {
     pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let (tx, rx) = mpsc_channel();
+        let last_message = Arc::new(Mutex::new(None));
 
         let subscriber = client
             .add_subscription(
                 channel,
                 stream_id,
                 10_000,
-                OrderInboundCallback { tx },
+                OrderInboundCallback { last_message: last_message.clone() },
                 NoopLifecycle,
             )
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
@@ -119,7 +115,7 @@ impl AeronOrderSubscriber {
 
         Ok(Self {
             subscriber: Arc::new(Mutex::new(subscriber)),
-            rx,
+            last_message,
             client,
         })
     }
@@ -133,33 +129,30 @@ impl OrderSubscriber for AeronOrderSubscriber {
     fn poll(&mut self) -> Option<InboundMsg> {
         use tracing::info;
         // Aeron回调需要显式的poll()调用来触发
-        // poll()会调用on_data()回调，回调发送消息到mpsc channel
+        // poll()会调用on_data()回调，回调写入消息到Arc<Mutex<>>
         static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let poll_count = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         {
             let mut sub = self.subscriber.lock();
-            let n = sub.poll();  // 触发回调，消息进入channel
+            let n = sub.poll();  // 触发回调，消息进入Arc<Mutex<>>
             if poll_count % 1_000 == 0 {
                 info!("[AeronOrderSubscriber] poll #{} returned {} fragments (is_connected={})",
                     poll_count, n, self.is_connected());
             }
         }  // 立即释放lock
 
-        // 然后从channel读取回调发送的消息
-        match self.rx.try_recv() {
-            Ok(msg) => {
-                info!("[AeronOrderSubscriber] ✅ received message from channel");
+        // 然后从Arc<Mutex<>>读取回调写入的消息
+        let mut msg_opt = self.last_message.lock();
+        match msg_opt.take() {
+            Some(msg) => {
+                info!("[AeronOrderSubscriber] ✅ received message from mutex");
                 Some(msg)
             }
-            Err(TryRecvError::Empty) => {
+            None => {
                 if poll_count % 100_000 == 0 {
-                    info!("[AeronOrderSubscriber] ℹ️ channel empty on poll #{}", poll_count);
+                    info!("[AeronOrderSubscriber] ℹ️ mutex empty on poll #{}", poll_count);
                 }
-                None
-            }
-            Err(TryRecvError::Disconnected) => {
-                info!("[AeronOrderSubscriber] ❌ channel disconnected!");
                 None
             }
         }
@@ -406,8 +399,8 @@ mod tests {
 
     #[test]
     fn test_order_inbound_callback() {
-        let (tx, _rx) = mpsc_channel();
-        let _callback = OrderInboundCallback { tx };
+        let last_message = Arc::new(Mutex::new(None));
+        let _callback = OrderInboundCallback { last_message };
         // Callback created successfully
     }
 }

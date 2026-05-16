@@ -93,10 +93,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
 
     // 创建Publisher用于发送订单（主线程用）
-    // aeronmd已独立运行，无需调用do_work()
     info!("初始化Aeron Publisher...");
     let mut publisher = client.add_publication(channel, 1)?;
     info!("✓ Publisher已初始化");
+    info!("");
+
+    // 等待Publisher连接（接收线程的subscriber会作为对等方）
+    info!("等待Publisher连接...");
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < std::time::Duration::from_secs(10) {
+        if publisher.is_connected() {
+            info!("✓ Publisher已连接");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    if !publisher.is_connected() {
+        return Err("Publisher failed to connect after 10 seconds".into());
+    }
     info!("");
     info!("✓ 接收线程已就绪");
     info!("");
@@ -267,24 +282,11 @@ fn send_order(
         time_in_force,
     );
 
-    let mut retry_count = 0;
-    let max_retries = 100;  // 1 second worth of retries (10ms each)
-
     loop {
         match publisher.send(&data) {
             Ok(()) => return Ok(()),
             Err(aeron_wrapper::Error::BackPressured) => {
                 std::hint::spin_loop();
-            }
-            Err(aeron_wrapper::Error::NotConnected) => {
-                // Publisher still initializing, retry with delay
-                if retry_count < max_retries {
-                    retry_count += 1;
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                } else {
-                    return Err("Publisher failed to connect after 1 second".into());
-                }
             }
             Err(e) => {
                 return Err(format!("Failed to send: {:?}", e).into());
@@ -557,13 +559,22 @@ fn receiver_thread_main(aeron_dir: String, channel: String) -> Result<(), String
     // 创建接收线程专用的subscriptions
     info!("[接收线程] 初始化subscriptions...");
 
-    let (tx2, tx3, tx4, tx5, tx6) = (
+    let (tx1, tx2, tx3, tx4, tx5, tx6) = (
+        tx.clone(),
         tx.clone(),
         tx.clone(),
         tx.clone(),
         tx.clone(),
         tx.clone(),
     );
+
+    // Stream 1: 订阅主线程的Publisher（让Publisher认为有对等方）
+    // 虽然我们不处理这些消息，但这使得Publisher.is_connected()为true
+    let _sub1 = client.add_subscription(
+        &channel, 1, 10_000,
+        EventCallback { tx: tx1, stream_id: 1 },
+        NoopLifecycle,
+    ).map_err(|e| format!("Failed to add sub1: {:?}", e))?;
 
     let _sub2 = client.add_subscription(
         &channel, 2, 10_000,

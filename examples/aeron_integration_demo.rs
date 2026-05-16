@@ -25,7 +25,7 @@ use tracing::info;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .init();
 
     let aeron_dir = std::env::var("AERON_DIR").unwrap_or_else(|_| "/tmp/aeron".to_string());
@@ -127,6 +127,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✓ 发布线程已启动 (Thread 2)");
     info!("");
 
+    // 定期打印线程存活状态
+    let _monitor_handle = std::thread::spawn(move || {
+        let mut matching_logged = false;
+        let mut publishing_logged = false;
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            if matching_handle.is_finished() && !matching_logged {
+                info!("⚠️ ALERT: Matching thread has finished!");
+                matching_logged = true;
+            }
+            if publishing_handle.is_finished() && !publishing_logged {
+                info!("⚠️ ALERT: Publishing thread has finished!");
+                publishing_logged = true;
+            }
+        }
+    });
+
     // 等待连接建立（多个Aeron客户端需要时间协调）
     info!("等待Aeron连接建立...");
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -140,14 +157,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("按Ctrl+C停止系统");
     info!("");
 
-    // 等待两个线程完成
-    // 注: 线程运行无限循环，所以这会一直阻塞到SIGINT
-    matching_handle.join().ok();
-    publishing_handle.join().ok();
+    // 主线程保持活跃，保持publishers/subscribers存活
+    // 工作线程在无限循环中运行
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
 
-    info!("");
-    info!("═════════════════════════════════════════════════════════════════");
-    info!("✓ 系统已停止");
+    // 以下代码永不执行，但保留以供后续使用
+    #[allow(unreachable_code)]
+    {
+        matching_handle.join().ok();
+        publishing_handle.join().ok();
 
-    Ok(())
+        info!("");
+        info!("═════════════════════════════════════════════════════════════════");
+        info!("✓ 系统已停止");
+        Ok(())
+    }
 }

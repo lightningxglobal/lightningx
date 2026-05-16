@@ -96,12 +96,13 @@ impl AeronOrderSubscriber {
             )
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
 
-        // 给subscription注册足够的时间，但不等待publisher
-        // 在独立aeronmd的情况下，publisher可能在我们之后启动
-        // is_connected()会阻塞，直到有publisher出现
-        // 但我们不能永远等待，所以只做初始化的do_work()
-        for _ in 0..50 {
+        // 等待subscription在Media Driver中正确注册
+        // 这与Publisher的做法一致：多次do_work()直到连接建立或超时
+        for _ in 0..100 {
             client.do_work();
+            if subscriber.is_connected() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 

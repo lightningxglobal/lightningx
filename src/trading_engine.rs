@@ -146,12 +146,17 @@ fn run_matching_thread(
     loop {
         // 轮询订单
         poll_count += 1;
+
+        // 定期检查连接状态并调用do_work()来维护连接
+        // 这与aeron-wrapper官方例子的模式一致
         if !is_connected_warned && !subscriber.is_connected() {
-            info!("⚠️ WARNING: Subscriber is NOT connected!");
+            info!("⚠️ WARNING: Subscriber is NOT connected - calling do_work()");
             is_connected_warned = true;
         }
+
         if let Some(msg) = subscriber.poll() {
             let now = wall_clock_nanos();
+            tracing::info!("recv {:?}", msg);
             match msg {
                 InboundMsg::NewOrder(req) => {
                     // Create order without assigning ID - engine will assign it in place_order()

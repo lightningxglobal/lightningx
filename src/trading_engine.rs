@@ -123,6 +123,7 @@ fn run_matching_thread(
     mut depth50_tx: Producer<Depth50SnapshotEvent>,
     mut level2_tx: Producer<Level2SnapshotEvent>,
 ) {
+    use tracing::info;
     let mut engine = MatchingEngine::new(pool_config).expect("failed to create engine");
     engine.set_market_data_config(market_data_config);
 
@@ -140,8 +141,15 @@ fn run_matching_thread(
     // 维护order_id -> (client_order_id, participant_id, quantity, price)的映射
     let mut order_info: HashMap<u64, (u64, u64, f64, f64)> = HashMap::new();
 
+    let mut is_connected_warned = false;
+    let mut poll_count = 0u64;
     loop {
         // 轮询订单
+        poll_count += 1;
+        if !is_connected_warned && !subscriber.is_connected() {
+            info!("⚠️ WARNING: Subscriber is NOT connected!");
+            is_connected_warned = true;
+        }
         if let Some(msg) = subscriber.poll() {
             let now = wall_clock_nanos();
             match msg {

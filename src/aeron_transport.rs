@@ -29,13 +29,18 @@ struct OrderInboundCallback {
 
 impl PollCallback for OrderInboundCallback {
     fn on_data(&mut self, data: &[u8]) {
+        use tracing::info;
+        info!("[OrderInboundCallback] on_data() called with {} bytes", data.len());
+
         // 解析SBE消息：首8字节是header，后续是消息体
         if data.len() < 8 {
+            info!("[OrderInboundCallback] Data too short");
             return;
         }
 
         // 读取template_id (offset 2, 2字节, little-endian)
         let template_id = u16::from_le_bytes([data[2], data[3]]);
+        info!("[OrderInboundCallback] template_id={}", template_id);
 
         match template_id {
             1 => {
@@ -90,12 +95,12 @@ impl AeronOrderSubscriber {
             )
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
 
-        // 等待连接
-        for _ in 0..100 {
+        // 给subscription注册足够的时间，但不等待publisher
+        // 在独立aeronmd的情况下，publisher可能在我们之后启动
+        // is_connected()会阻塞，直到有publisher出现
+        // 但我们不能永远等待，所以只做初始化的do_work()
+        for _ in 0..50 {
             client.do_work();
-            if subscriber.is_connected() {
-                break;
-            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
@@ -109,21 +114,24 @@ impl AeronOrderSubscriber {
 
 impl OrderSubscriber for AeronOrderSubscriber {
     fn poll(&mut self) -> Option<InboundMsg> {
-        use tracing::debug;
+        use tracing::{debug, info};
         // Aeron回调需要显式的poll()调用来触发
         // poll()会调用on_data()回调，回调发送消息到mpsc channel
+        static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let poll_count = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         {
             let mut sub = self.subscriber.lock();
             let n = sub.poll();  // 触发回调，消息进入channel
-            if n > 0 {
-                debug!("[AeronOrderSubscriber] poll() returned {} fragments", n);
+            if poll_count % 100_000 == 0 {
+                info!("[AeronOrderSubscriber] poll #{} returned {} fragments", poll_count, n);
             }
         }  // 立即释放lock
 
         // 然后从channel读取回调发送的消息
         match self.rx.try_recv() {
             Ok(msg) => {
-                debug!("[AeronOrderSubscriber] received message from channel");
+                info!("[AeronOrderSubscriber] ✓ received message from channel");
                 Some(msg)
             }
             Err(TryRecvError::Empty) => None,

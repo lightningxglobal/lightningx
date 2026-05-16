@@ -270,7 +270,8 @@ fn run_matching_thread(
             let _ = level2_tx.push(evt);
         }
 
-        std::hint::spin_loop();
+        // 无消息时，给Aeron Media Driver处理时间，防止超时
+        std::thread::sleep(std::time::Duration::from_micros(100));
     }
 }
 
@@ -416,7 +417,8 @@ fn run_publishing_thread(
         }
 
         if !any_published {
-            std::hint::spin_loop();
+            // 无消息时，给Aeron Media Driver处理时间，防止超时
+            std::thread::sleep(std::time::Duration::from_micros(100));
         }
     }
 }

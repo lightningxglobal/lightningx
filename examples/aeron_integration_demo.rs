@@ -13,7 +13,7 @@
 ///   - Stream 4-6: 出站行情 (Depth20, Depth50, Level2)
 
 use matching_engine::{
-    MatchingEngine, PoolConfig, MarketDataConfig,
+    PoolConfig, MarketDataConfig,
 };
 use matching_engine::aeron_transport::{
     AeronOrderSubscriber, AeronOrderUpdatePublisher, AeronTradePublisher, AeronMarketDataPublisher,

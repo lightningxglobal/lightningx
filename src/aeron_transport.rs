@@ -68,7 +68,7 @@ impl PollCallback for OrderInboundCallback {
 }
 
 pub struct AeronOrderSubscriber {
-    subscriber: Arc<Mutex<Option<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>>,
+    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>,
     rx: Receiver<InboundMsg>,
     client: AeronClient,
 }
@@ -100,7 +100,7 @@ impl AeronOrderSubscriber {
         }
 
         Ok(Self {
-            subscriber: Arc::new(Mutex::new(Some(subscriber))),
+            subscriber: Arc::new(Mutex::new(subscriber)),
             rx,
             client,
         })
@@ -109,26 +109,30 @@ impl AeronOrderSubscriber {
 
 impl OrderSubscriber for AeronOrderSubscriber {
     fn poll(&mut self) -> Option<InboundMsg> {
+        use tracing::debug;
         // Aeron回调需要显式的poll()调用来触发
         // poll()会调用on_data()回调，回调发送消息到mpsc channel
-        if let Some(ref mut sub) = *self.subscriber.lock() {
-            let _n = sub.poll();  // 触发回调，消息进入channel
-        }
+        {
+            let mut sub = self.subscriber.lock();
+            let n = sub.poll();  // 触发回调，消息进入channel
+            if n > 0 {
+                debug!("[AeronOrderSubscriber] poll() returned {} fragments", n);
+            }
+        }  // 立即释放lock
 
         // 然后从channel读取回调发送的消息
         match self.rx.try_recv() {
-            Ok(msg) => Some(msg),
+            Ok(msg) => {
+                debug!("[AeronOrderSubscriber] received message from channel");
+                Some(msg)
+            }
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => None,
         }
     }
 
     fn is_connected(&self) -> bool {
-        if let Some(ref sub) = *self.subscriber.lock() {
-            sub.is_connected()
-        } else {
-            false
-        }
+        self.subscriber.lock().is_connected()
     }
 }
 

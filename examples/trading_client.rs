@@ -95,39 +95,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
 
     // 创建Publisher用于发送订单（主线程用）
+    // 在Aeron中，Publisher可以立即发送到Media Driver，无需等待Subscriber
+    // Media Driver会缓存消息，供后续订阅者（如服务器）消费
     info!("初始化Aeron Publisher...");
     let mut publisher = client.add_publication(channel, 1)?;
-    info!("✓ Publisher已创建，等待连接...");
-    info!("");
-
-    // 关键：等待Publisher连接（必须等待connected=true后才能发送）
-    // 接收线程的stream 1 subscriber会作为对等方
-    let start_time = std::time::Instant::now();
-    let max_wait = Duration::from_secs(30);
-
-    loop {
-        if publisher.is_connected() {
-            info!("✅ Publisher已连接，可以开始发送");
-            info!("");
-            break;
-        }
-
-        if start_time.elapsed() > max_wait {
-            return Err(format!(
-                "Publisher failed to connect after {:.1} seconds. \
-                 Make sure receiver thread initialized subscriptions and \
-                 Media Driver is running.",
-                max_wait.as_secs_f64()
-            ).into());
-        }
-
-        // 显示进度
-        if start_time.elapsed().as_secs() % 5 == 0 {
-            info!("等待Publisher连接... (已等待 {:.1}s)", start_time.elapsed().as_secs_f64());
-        }
-
-        thread::sleep(Duration::from_millis(100));
-    }
+    info!("✓ Publisher已初始化（无需等待connected）");
+    info!("  Publisher会立即向Media Driver发送，服务器稍后可接收");
     info!("");
     info!("✓ 接收线程已就绪");
     info!("");

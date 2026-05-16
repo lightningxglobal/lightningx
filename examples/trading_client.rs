@@ -426,8 +426,10 @@ fn parse_trade(msg: &RawMessage) {
     let side = data[48];
 
     let side_str = if side == 0 { "BUY" } else { "SELL" };
-    info!("💰 [TRADE] Seq#{} | Side={} | TakerOrder#{} × MakerOrder#{} | Price={:.0} | Qty={:.2}",
-          sequence, side_str, taker_order_id, maker_order_id, price, quantity);
+    let trade_value = price * quantity;
+
+    info!("💰 [TRADE] Seq#{} | Taker({}): Order#{} | Maker: Order#{} | Price={:.0} | Qty={:.2} | Value={:.2}",
+          sequence, side_str, taker_order_id, maker_order_id, price, quantity, trade_value);
 }
 
 fn parse_depth_snapshot(msg: &RawMessage) {
@@ -446,8 +448,30 @@ fn parse_depth_snapshot(msg: &RawMessage) {
         let ask_price = f64::from_le_bytes(data[24 + (num_bids * 16)..32 + (num_bids * 16)].try_into().unwrap_or([0; 8]));
         let ask_qty = f64::from_le_bytes(data[32 + (num_bids * 16)..40 + (num_bids * 16)].try_into().unwrap_or([0; 8]));
 
-        info!("📊 [BBO] Bid {} @ {:.0} | Ask {} @ {:.0} | {} bids {} asks",
-              bid_qty, bid_price, ask_qty, ask_price, num_bids, num_asks);
+        info!("📊 [DEPTH20] Seq#{} | BBO: Bid {:.2}@{:.0} | Ask {:.2}@{:.0} | {} bids {} asks",
+              sequence, bid_qty, bid_price, ask_qty, ask_price, num_bids, num_asks);
+
+        // Show top 5 levels on each side
+        let show_levels = std::cmp::min(5, std::cmp::min(num_bids, num_asks));
+        if show_levels > 0 {
+            let mut bid_str = String::new();
+            for i in 0..show_levels {
+                let price = f64::from_le_bytes(data[24 + (i * 16)..32 + (i * 16)].try_into().unwrap_or([0; 8]));
+                let qty = f64::from_le_bytes(data[32 + (i * 16)..40 + (i * 16)].try_into().unwrap_or([0; 8]));
+                if i > 0 { bid_str.push_str(" | "); }
+                bid_str.push_str(&format!("{:.2}@{:.0}", qty, price));
+            }
+            let bid_offset = 24 + (num_bids * 16);
+            let mut ask_str = String::new();
+            for i in 0..show_levels {
+                let price = f64::from_le_bytes(data[bid_offset + (i * 16)..bid_offset + 8 + (i * 16)].try_into().unwrap_or([0; 8]));
+                let qty = f64::from_le_bytes(data[bid_offset + 8 + (i * 16)..bid_offset + 16 + (i * 16)].try_into().unwrap_or([0; 8]));
+                if i > 0 { ask_str.push_str(" | "); }
+                ask_str.push_str(&format!("{:.2}@{:.0}", qty, price));
+            }
+            info!("  Bids: {}", bid_str);
+            info!("  Asks: {}", ask_str);
+        }
     }
 }
 
@@ -461,7 +485,29 @@ fn parse_depth50_snapshot(msg: &RawMessage) {
     let num_bids = u32::from_le_bytes(data[16..20].try_into().unwrap_or([0; 4])) as usize;
     let num_asks = u32::from_le_bytes(data[20..24].try_into().unwrap_or([0; 4])) as usize;
 
-    info!("📊 [Depth50] Seq#{} {} levels on each side", sequence, std::cmp::min(num_bids, num_asks));
+    let show_levels = std::cmp::min(10, std::cmp::min(num_bids, num_asks));
+    info!("📊 [DEPTH50] Seq#{} | {} bids {} asks | Showing top {} levels",
+          sequence, num_bids, num_asks, show_levels);
+
+    if show_levels > 0 {
+        let mut bid_str = String::new();
+        for i in 0..show_levels {
+            let price = f64::from_le_bytes(data[24 + (i * 16)..32 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[32 + (i * 16)..40 + (i * 16)].try_into().unwrap_or([0; 8]));
+            if i > 0 { bid_str.push_str(" | "); }
+            bid_str.push_str(&format!("{:.2}@{:.0}", qty, price));
+        }
+        let bid_offset = 24 + (num_bids * 16);
+        let mut ask_str = String::new();
+        for i in 0..show_levels {
+            let price = f64::from_le_bytes(data[bid_offset + (i * 16)..bid_offset + 8 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[bid_offset + 8 + (i * 16)..bid_offset + 16 + (i * 16)].try_into().unwrap_or([0; 8]));
+            if i > 0 { ask_str.push_str(" | "); }
+            ask_str.push_str(&format!("{:.2}@{:.0}", qty, price));
+        }
+        info!("  Bids: {}", bid_str);
+        info!("  Asks: {}", ask_str);
+    }
 }
 
 fn parse_level2_snapshot(msg: &RawMessage) {
@@ -471,10 +517,32 @@ fn parse_level2_snapshot(msg: &RawMessage) {
 
     let data = &msg.data;
     let sequence = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8]));
-    let num_bids = u32::from_le_bytes(data[16..20].try_into().unwrap_or([0; 4])) as usize;
-    let num_asks = u32::from_le_bytes(data[20..24].try_into().unwrap_or([0; 4])) as usize;
+    let num_bids = u16::from_le_bytes(data[16..18].try_into().unwrap_or([0; 2])) as usize;
+    let num_asks = u16::from_le_bytes(data[18..20].try_into().unwrap_or([0; 2])) as usize;
 
-    info!("📊 [Level2] Seq#{} {} bids {} asks", sequence, num_bids, num_asks);
+    let show_levels = std::cmp::min(10, std::cmp::min(num_bids, num_asks));
+    info!("📊 [LEVEL2] Seq#{} | {} bids {} asks | Showing top {} levels",
+          sequence, num_bids, num_asks, show_levels);
+
+    if show_levels > 0 {
+        let mut bid_str = String::new();
+        for i in 0..show_levels {
+            let price = f64::from_le_bytes(data[32 + (i * 16)..40 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[40 + (i * 16)..48 + (i * 16)].try_into().unwrap_or([0; 8]));
+            if i > 0 { bid_str.push_str(" | "); }
+            bid_str.push_str(&format!("{:.2}@{:.0}", qty, price));
+        }
+        let bid_offset = 32 + (num_bids * 16);
+        let mut ask_str = String::new();
+        for i in 0..show_levels {
+            let price = f64::from_le_bytes(data[bid_offset + (i * 16)..bid_offset + 8 + (i * 16)].try_into().unwrap_or([0; 8]));
+            let qty = f64::from_le_bytes(data[bid_offset + 8 + (i * 16)..bid_offset + 16 + (i * 16)].try_into().unwrap_or([0; 8]));
+            if i > 0 { ask_str.push_str(" | "); }
+            ask_str.push_str(&format!("{:.2}@{:.0}", qty, price));
+        }
+        info!("  Bids: {}", bid_str);
+        info!("  Asks: {}", ask_str);
+    }
 }
 
 /// 接收线程主函数 - 在单独的线程中运行

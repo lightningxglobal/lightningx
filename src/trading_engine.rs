@@ -347,7 +347,10 @@ fn run_publishing_thread(
                 Ok(()) => {
                     published_count += 1;
                     any_published = true;
-                    info!("💰 发布Trade #{}", evt.sequence);
+                    let side_str = if evt.side == Side::Buy { "BUY" } else { "SELL" };
+                    let trade_value = evt.price * evt.quantity;
+                    info!("💰 Trade #{} | Taker({}): Order#{} | Maker: Order#{} | Price={:.0} | Qty={:.2} | Value={:.2}",
+                          evt.sequence, side_str, evt.taker_id, evt.maker_id, evt.price, evt.quantity, trade_value);
                 }
                 Err(e) => {
                     info!("❌ Trade发布失败: {:?}", e);
@@ -361,8 +364,13 @@ fn run_publishing_thread(
                 Ok(()) => {
                     published_count += 1;
                     any_published = true;
-                    if published_count % 50 == 1 {
-                        info!("📊 发布Depth20");
+                    if evt.num_bids > 0 && evt.num_asks > 0 {
+                        let best_bid = evt.bids[0];
+                        let best_ask = evt.asks[0];
+                        if published_count % 50 == 1 {
+                            info!("📊 Depth20 #{} | BBO: Bid {:.2}@{:.0} | Ask {:.2}@{:.0} | {} bids {} asks",
+                                  evt.sequence, best_bid.1, best_bid.0, best_ask.1, best_ask.0, evt.num_bids, evt.num_asks);
+                        }
                     }
                 }
                 Err(e) => {
@@ -374,6 +382,14 @@ fn run_publishing_thread(
             match market_data_pub.publish_depth50(&evt) {
                 Ok(()) => {
                     any_published = true;
+                    if evt.num_bids > 0 && evt.num_asks > 0 {
+                        let best_bid = evt.bids[0];
+                        let best_ask = evt.asks[0];
+                        if published_count % 100 == 1 {
+                            info!("📊 Depth50 #{} | BBO: Bid {:.2}@{:.0} | Ask {:.2}@{:.0} | {} bids {} asks",
+                                  evt.sequence, best_bid.1, best_bid.0, best_ask.1, best_ask.0, evt.num_bids, evt.num_asks);
+                        }
+                    }
                 }
                 Err(e) => {
                     info!("❌ Depth50发布失败: {:?}", e);
@@ -384,6 +400,14 @@ fn run_publishing_thread(
             match market_data_pub.publish_level2(&evt) {
                 Ok(()) => {
                     any_published = true;
+                    if evt.num_bids > 0 && evt.num_asks > 0 {
+                        let best_bid = evt.bids[0];
+                        let best_ask = evt.asks[0];
+                        if published_count % 200 == 1 {
+                            info!("📊 Level2 #{} | BBO: Bid {:.2}@{:.0} | Ask {:.2}@{:.0} | {} bids {} asks",
+                                  evt.sequence, best_bid.1, best_bid.0, best_ask.1, best_ask.0, evt.num_bids, evt.num_asks);
+                        }
+                    }
                 }
                 Err(e) => {
                     info!("❌ Level2发布失败: {:?}", e);

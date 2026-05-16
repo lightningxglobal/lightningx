@@ -85,7 +85,7 @@ fn main() {
             0,
         );
 
-        let _ = engine.place_order(buy_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         // 卖单 - 触发成交
         let sell_order = Order::new(
@@ -97,7 +97,7 @@ fn main() {
             0,
         );
 
-        let _ = engine.place_order(sell_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         test_trades.push((i, 50000.0 + (i as f64) * 0.1, 10.0));
 

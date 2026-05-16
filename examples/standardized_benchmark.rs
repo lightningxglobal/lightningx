@@ -24,9 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..num_rounds {
         let price = 50000.0 + (i % price_range) as f64;
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(buy)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(sell)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
     }
     let tps1 = (num_rounds as f64 * 2.0) / start.elapsed().as_secs_f64();
     println!("  TPS: {:.0}\n", tps1);
@@ -40,9 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..num_rounds {
         let price = 50000.0 + (i % price_range) as f64;
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(buy)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(sell)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
     }
     let tps2 = (num_rounds as f64 * 2.0) / start.elapsed().as_secs_f64();
     println!("  TPS: {:.0}", tps2);
@@ -58,9 +58,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..num_rounds {
         let price = 50000.0 + (i % price_range) as f64;
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(buy)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(sell)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         
         while let Ok(trade) = rx.pop() {
             market_engine.consume_trade_event(trade);
@@ -79,9 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..num_rounds {
         let price = 50000.0 + (i % price_range) as f64;
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(buy)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(sell)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
     }
     let matching_time = start.elapsed();
 

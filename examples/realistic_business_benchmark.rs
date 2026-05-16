@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new(round as u64 * 1000 + i as u64, Side::Buy, price, qty, TimeInForce::GTC, 0);
-            let result = engine.place_order(order)?;
+            let result = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new(round as u64 * 1000 + 500 + i as u64, Side::Sell, price, qty, TimeInForce::GTC, 0);
-            let result = engine.place_order(order)?;
+            let result = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;

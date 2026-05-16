@@ -46,7 +46,7 @@ fn main() {
     ];
 
     for order in orders {
-        let result = engine.place_order(order);
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
         match result {
             Ok(place_result) => {
                 println!("订单 {} 已下单: {:?}", order.id, place_result.status);

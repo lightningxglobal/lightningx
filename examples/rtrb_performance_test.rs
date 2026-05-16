@@ -25,10 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     for i in 0..num_rounds {
         let buy = Order::new(i as u64 * 2, Side::Buy, 50000.0 + (i % 100) as f64, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(buy)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
 
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, 50000.0 + (i % 100) as f64, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(sell)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
     }
     let duration = start.elapsed();
     let tps = (num_rounds as f64 * 2.0) / duration.as_secs_f64();

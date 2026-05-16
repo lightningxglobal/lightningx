@@ -51,7 +51,7 @@ fn bench_insert(book_type: OrderBookType, num_inserts: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
     let elapsed = start.elapsed();
 
@@ -78,7 +78,7 @@ fn bench_lookup(book_type: OrderBookType, num_lookups: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     // 查询不会改变状态，所以这个测试主要测试引擎内部的快照生成
@@ -115,7 +115,7 @@ fn bench_matching(book_type: OrderBookType, num_orders: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     // 计时：匹配买单
@@ -130,7 +130,7 @@ fn bench_matching(book_type: OrderBookType, num_orders: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
-        if let Ok(result) = engine.place_order(order) {
+        if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             if result.filled > 0.0 {
                 match_count += 1;
             }
@@ -162,7 +162,7 @@ fn bench_cancel(book_type: OrderBookType, num_orders: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
-        match engine.place_order(order) {
+        match let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             Ok(result) => {
                 order_ids.push(result.order_id);
             }

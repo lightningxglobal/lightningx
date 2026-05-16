@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut count = 0;
             for i in 0..10000 {
                 let order = create_test_order(i, Side::Buy, 50000.0 + (i % 100) as f64);
-                if engine.place_order(order).is_ok() {
+                if let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()).is_ok() {
                     count += 1;
                 }
             }
@@ -55,13 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Place 2500 sell orders
             for i in 0..2500 {
                 let order = create_test_order(i, Side::Sell, 50000.0 + (i % 100) as f64);
-                let _ = engine.place_order(order);
+                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             }
 
             // Place 2500 buy orders at high price (will match all sells)
             for i in 2500..5000 {
                 let order = create_test_order(i, Side::Buy, 60000.0);
-                if let Ok(result) = engine.place_order(order) {
+                if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
                     if result.filled > 0.0 {
                         count += 1;
                     }
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Place initial sell orders
             for i in 0..3000 {
                 let order = create_test_order(i, Side::Sell, 50000.0 + (i % 200) as f64);
-                let _ = engine.place_order(order);
+                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             }
 
             // Mixed operations
@@ -92,14 +92,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0..=29 => {
                         // 30% placement
                         let order = create_test_order(3000 + i as u64, Side::Buy, 50000.0 + (i % 200) as f64);
-                        if engine.place_order(order).is_ok() {
+                        if let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()).is_ok() {
                             count += 1;
                         }
                     }
                     30..=89 => {
                         // 60% matching (high price buy)
                         let order = create_test_order(3000 + i as u64, Side::Buy, 60000.0);
-                        if let Ok(result) = engine.place_order(order) {
+                        if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
                             if result.filled > 0.0 {
                                 count += 1;
                             }

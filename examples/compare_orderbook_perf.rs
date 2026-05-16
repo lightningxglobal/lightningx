@@ -23,7 +23,7 @@ fn test_skiplist_matching() -> (u64, f64) {
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     // 计时：放入 2500 个买单进行撮合
@@ -38,7 +38,7 @@ fn test_skiplist_matching() -> (u64, f64) {
             TimeInForce::GTC,
             0,
         );
-        if let Ok(result) = engine.place_order(order) {
+        if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             if result.filled > 0.0 {
                 match_count += 1;
             }

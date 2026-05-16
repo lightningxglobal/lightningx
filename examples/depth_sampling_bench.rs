@@ -40,7 +40,7 @@ fn benchmark_scenario(
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(buy_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     for i in 0..10 {
@@ -52,7 +52,7 @@ fn benchmark_scenario(
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(sell_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     // 性能测试
@@ -91,7 +91,7 @@ fn benchmark_scenario(
                     0,
                 );
 
-                let _ = engine.place_order(order);
+                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             }
         }
     }
@@ -118,7 +118,7 @@ fn main() {
     let mut engine = MatchingEngine::new(PoolConfig::default()).expect("创建引擎失败");
     for i in 0..100 {
         let order = Order::new(i as u64, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
     println!("预热完成\n");
 

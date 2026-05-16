@@ -49,7 +49,7 @@ fn main() {
             0,
         );
 
-        let _ = engine.place_order(buy_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         // 卖单 - 触发成交
         let sell_order = Order::new(
@@ -62,7 +62,7 @@ fn main() {
         );
 
         let trade_start = Instant::now();
-        let _ = engine.place_order(sell_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         // 尝试从通道接收事件
         if let Ok(_trade_event) = receiver.pop() {

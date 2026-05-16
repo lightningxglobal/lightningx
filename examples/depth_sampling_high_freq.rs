@@ -53,7 +53,7 @@ fn benchmark_high_freq(
                 0,
             );
             let t = Instant::now();
-            let _ = engine.place_order(order);
+            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             latencies.record(t.elapsed().as_nanos() as u64)?;
             total_orders += 1;
 
@@ -67,7 +67,7 @@ fn benchmark_high_freq(
                 0,
             );
             let t = Instant::now();
-            let _ = engine.place_order(order);
+            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             latencies.record(t.elapsed().as_nanos() as u64)?;
             total_orders += 1;
 

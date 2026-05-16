@@ -60,7 +60,7 @@ fn main() {
             0,
         );
 
-        let _ = engine.place_order(buy_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         // 卖单 - 触发成交
         let sell_order = Order::new(
@@ -72,7 +72,7 @@ fn main() {
             0,
         );
 
-        let _ = engine.place_order(sell_order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         if i <= 10 || i % 20 == 0 {
             println!("  成交 #{}: 已生成，将被立即发布到Aeron", i);

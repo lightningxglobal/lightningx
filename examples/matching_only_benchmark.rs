@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let t0 = Instant::now();
-        let _buy_result = engine.place_order(buy_order)?;
+        let _buy_result = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let placement_ns = t0.elapsed().as_nanos() as u64;
         placement_latencies.push(placement_ns);
 
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let t1 = Instant::now();
-        let _sell_result = engine.place_order(sell_order)?;
+        let _sell_result = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let matching_ns = t1.elapsed().as_nanos() as u64;
         matching_latencies.push(matching_ns);
 

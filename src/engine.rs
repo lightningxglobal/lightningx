@@ -314,7 +314,7 @@ impl MatchingEngine {
 
     /// 下单（热路径）
     #[inline]
-    pub fn place_order(&mut self, mut order: Order) -> OrderResult<(PlaceOrderResult, SmallVec<[u64; 64]>)> {
+    pub fn place_order(&mut self, mut order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<PlaceOrderResult> {
         // 验证订单
         self.validate_order(&order)?;
 
@@ -328,15 +328,19 @@ impl MatchingEngine {
         self.next_order_id += 1;
 
         // 处理不同的委托类型
-        let (result, affected_makers) = match order.time_in_force {
+        let (result, makers) = match order.time_in_force {
             TimeInForce::PostOnly => self.handle_post_only(order)?,
             TimeInForce::FOK => self.handle_fok(order)?,
             TimeInForce::IOC => self.handle_ioc(order)?,
             TimeInForce::GTC => self.handle_gtc(order)?,
         };
 
+        // 填充受影响的maker列表到调用者提供的缓冲区
+        affected_makers.clear();
+        affected_makers.extend_from_slice(&makers);
+
         self.maybe_sample_depth();
-        Ok((result, affected_makers))
+        Ok(result)
     }
 
     /// 批量下单（支持最多20笔订单，避免堆分配）
@@ -389,7 +393,6 @@ impl MatchingEngine {
                     order_id: order.id,
                     filled: 0.0,
                     status: OrderStatus::Rejected,
-                    affected_maker_ids: SmallVec::new(),
                 }, SmallVec::new()));
             }
         }
@@ -408,7 +411,6 @@ impl MatchingEngine {
             order_id: order.id,
             filled: 0.0,
             status: OrderStatus::Accepted,
-            affected_maker_ids: SmallVec::new(),
         }, SmallVec::new()))
     }
 
@@ -424,7 +426,6 @@ impl MatchingEngine {
                 order_id: order.id,
                 filled: filled_qty,
                 status: OrderStatus::Filled,
-                affected_maker_ids: SmallVec::new(),
             }, affected_makers))
         } else {
             // 无法完全成交，拒绝（不允许部分成交）
@@ -434,7 +435,6 @@ impl MatchingEngine {
                 order_id: order.id,
                 filled: 0.0,
                 status: OrderStatus::Rejected,
-                affected_maker_ids: SmallVec::new(),
             }, affected_makers))
         }
     }
@@ -456,7 +456,6 @@ impl MatchingEngine {
             order_id: order.id,
             filled: filled_qty,
             status,
-            affected_maker_ids: SmallVec::new(),
         }, affected_makers))
     }
 
@@ -484,7 +483,6 @@ impl MatchingEngine {
             order_id: order.id,
             filled: filled_qty,
             status,
-            affected_maker_ids: SmallVec::new(),
         }, affected_makers))
     }
 
@@ -1143,7 +1141,6 @@ pub struct PlaceOrderResult {
     pub order_id: u64,
     pub filled: f64,
     pub status: OrderStatus,
-    pub affected_maker_ids: SmallVec<[u64; 64]>,  // 被此订单匹配影响的 maker 订单 ID 列表
 }
 
 /// 订单状态

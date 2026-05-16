@@ -15,14 +15,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..100 {
         let order = Order::new(i, Side::Sell, 50000.0 + (i % 50) as f64, 1.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     let start = Instant::now();
     let mut match_count = 0;
     for i in 100..200 {
         let order = Order::new(i, Side::Buy, 55000.0, 1.0, TimeInForce::GTC, 0);
-        if let Ok(result) = engine.place_order(order) {
+        if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             if result.filled > 0.0 {
                 match_count += 1;
             }

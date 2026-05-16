@@ -43,7 +43,7 @@ fn test_soft_delete_scenario(
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(order);
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
     let place_time = start.elapsed();
     println!("    放置 {} 个订单: {:.3}ms", total_orders, place_time.as_secs_f64() * 1000.0);
@@ -73,7 +73,7 @@ fn test_soft_delete_scenario(
                 TimeInForce::GTC,
                 0,
             );
-            if let Ok(result) = engine.place_order(order) {
+            if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
                 if result.filled > 0.0 {
                     matched += 1;
                 }

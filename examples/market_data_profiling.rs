@@ -19,10 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // 模拟完整的订单处理来生成TradeEvent
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let result = engine.place_order(buy)?;
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let result = engine.place_order(sell)?;
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         
         // 模拟TradeEvent
         if result.filled > 0.0 {

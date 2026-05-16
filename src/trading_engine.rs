@@ -17,6 +17,7 @@ use crate::time_provider::wall_clock_nanos;
 use rtrb::{RingBuffer, Producer, Consumer};
 use std::thread::{JoinHandle, spawn};
 use std::collections::HashMap;
+use smallvec::SmallVec;
 
 pub struct TradingConfig {
     pub pool_config: PoolConfig,
@@ -135,6 +136,7 @@ fn run_matching_thread(
 
     // 维护order_id -> (client_order_id, participant_id, quantity, price)的映射
     let mut order_info: HashMap<u64, (u64, u64, f64, f64)> = HashMap::new();
+    let mut affected_makers = SmallVec::<[u64; 64]>::new();
 
     // 遵循官方aeron-wrapper pattern：两层loop（连接管理 + 消息轮询）
     info!("⏳ Waiting for inbound order subscriber to connect...");
@@ -183,8 +185,8 @@ fn run_matching_thread(
                         now,
                     );
 
-                    match engine.place_order(order) {
-                        Ok((result, affected_makers)) => {
+                    match engine.place_order(order, &mut affected_makers) {
+                        Ok(result) => {
                             // Use order_id from result - this is the definitive ID assigned by engine
                             let order_id = result.order_id;
                             order_info.insert(order_id, (req.client_order_id, req.participant_id, req.quantity, req.price));

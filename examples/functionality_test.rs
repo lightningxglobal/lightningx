@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let result = engine.place_order(sell_order)?;
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("✓ 卖单已下: id={}, qty={}", result.order_id, 100.0);
 
         // 下买单：50股 @ 100.5（部分成交）
@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let result = engine.place_order(buy_order)?;
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("✓ 买单已下: id={}, qty={}, filled={}", result.order_id, 50.0, result.filled);
         assert_eq!(result.filled, 50.0, "买单应该成交50股");
 
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
-            engine.place_order(order)?;
+            let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         }
 
         for (i, &price) in prices_sell.iter().enumerate() {
@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
-            engine.place_order(order)?;
+            let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         }
 
         println!("✓ 已下5个买单和5个卖单");
@@ -130,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::IOC,
                 0,
             );
-            let _ = engine.place_order(order);
+            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
         }
 
         // 检查depth snapshot
@@ -211,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
-            engine.place_order(buy_order)?;
+            let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
 
             let sell_order = Order::new(
                 2000 + i,
@@ -221,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
-            engine.place_order(sell_order)?;
+            let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         }
 
         println!("✓ 已下30个买单和30个卖单");
@@ -236,7 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
-            let _ = engine.place_order(order);
+            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
         }
 
         // 检查三层事件
@@ -289,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        engine.place_order(sell_order)?;
+        let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("✓ 卖单已下: qty=1000@100.0, id=1");
 
         // 下一个买单
@@ -301,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let result = engine.place_order(buy_order)?;
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("✓ 买单已下: qty=100@100.0, id=2, filled={}", result.filled);
         assert_eq!(result.filled, 100.0, "买单应该完全成交");
 
@@ -334,7 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        engine.place_order(sell_order)?;
+        let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
 
         // 下买单：150股（成交100，剩余50）
         let buy_order = Order::new(
@@ -345,7 +345,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let result = engine.place_order(buy_order)?;
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("✓ 买单: qty=150, filled={}, status={:?}", result.filled, result.status);
         assert_eq!(result.filled, 100.0, "应该成交100");
 
@@ -358,7 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let result2 = engine.place_order(sell_order2)?;
+        let result2 = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order2, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("✓ 卖单2: qty=50, filled={}", result2.filled);
         assert_eq!(result2.filled, 50.0, "应该与剩余买单全部成交");
 

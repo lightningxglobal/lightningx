@@ -30,14 +30,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 买单
         let start = Instant::now();
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(buy)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let buy_latency = start.elapsed().as_micros() as u64;
         latencies.record(buy_latency)?;
 
         // 卖单
         let start = Instant::now();
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let _ = engine.place_order(sell)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         let sell_latency = start.elapsed().as_micros() as u64;
         latencies.record(sell_latency)?;
     }

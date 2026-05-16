@@ -15,12 +15,12 @@ fn benchmark_matching(name: &str, mut engine: MatchingEngine, num_rounds: usize)
     for i in 0..num_rounds {
         // Buy
         let buy_order = Order::new(i as u64 * 2, Side::Buy, 50000.0 + (i % 100) as f64, 10.0, TimeInForce::GTC, 0);
-        let buy_result = engine.place_order(buy_order).unwrap();
+        let buy_result = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new()).unwrap();
         ops += 1;
 
         // Sell at same price (will match)
         let sell_order = Order::new(i as u64 * 2 + 1, Side::Sell, 50000.0 + (i % 100) as f64, 10.0, TimeInForce::GTC, 0);
-        let sell_result = engine.place_order(sell_order).unwrap();
+        let sell_result = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new()).unwrap();
         ops += 1;
 
         if sell_result.filled > 0.0 {

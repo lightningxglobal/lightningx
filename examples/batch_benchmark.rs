@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let _ = engine.place_order(buy)?;
+        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new())?;
 
         // 单笔卖单 - 相同价格以获得更多匹配（测试成交延迟）
         let sell = Order::new(
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let result = engine.place_order(sell)?;
+        let result = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
 
         if result.filled > 0.0 {
             matched_count += 1;

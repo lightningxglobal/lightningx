@@ -428,12 +428,14 @@ impl MatchingEngine {
             }, affected_makers))
         } else {
             // 无法完全成交，拒绝（不允许部分成交）
+            // 注意：match_order已经修改了maker，所以需要返回affected_makers
+            // 让TradingEngine为maker生成OrderUpdateEvent
             Ok((PlaceOrderResult {
                 order_id: order.id,
                 filled: 0.0,
                 status: OrderStatus::Rejected,
                 affected_maker_ids: SmallVec::new(),
-            }, SmallVec::new()))
+            }, affected_makers))
         }
     }
 

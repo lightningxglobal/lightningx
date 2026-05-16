@@ -98,20 +98,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("✓ Publisher已初始化");
     info!("");
 
-    // 等待连接
-    let start_time = Instant::now();
-    while start_time.elapsed() < Duration::from_secs(5) {
+    // Publisher在Aeron中可以在没有Subscriber的情况下发送
+    // 多次调用do_work()确保与aeronmd同步，但不需要等待is_connected()
+    for _ in 0..50 {
         client.do_work();
-        if publisher.is_connected() {
-            info!("✓ Publisher已连接");
-            break;
-        }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(10));
     }
-
-    if !publisher.is_connected() {
-        return Err("Publisher failed to connect after 5 seconds".into());
-    }
+    info!("✓ Publisher已准备");
     info!("");
     info!("✓ 接收线程已就绪");
     info!("");

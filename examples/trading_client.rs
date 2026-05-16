@@ -84,8 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         receiver_thread_main(aeron_dir_clone, channel_clone)
     });
 
-    // 等待接收线程初始化subscriptions
-    thread::sleep(Duration::from_millis(1000));
+    // 等待接收线程完全初始化所有subscriptions
+    // 需要充足的时间让subscriptions在Media Driver中注册
+    info!("等待接收线程完全初始化...");
+    thread::sleep(Duration::from_millis(2000));  // 2秒确保所有subscriptions就绪
     info!("✓ 接收线程已就绪");
     info!("");
 
@@ -95,22 +97,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 创建Publisher用于发送订单（主线程用）
     info!("初始化Aeron Publisher...");
     let mut publisher = client.add_publication(channel, 1)?;
-    info!("✓ Publisher已初始化");
+    info!("✓ Publisher已创建，等待连接...");
     info!("");
 
-    // 等待Publisher连接（接收线程的subscriber会作为对等方）
-    info!("等待Publisher连接...");
+    // 关键：等待Publisher连接（必须等待connected=true后才能发送）
+    // 接收线程的stream 1 subscriber会作为对等方
     let start_time = std::time::Instant::now();
-    while start_time.elapsed() < std::time::Duration::from_secs(10) {
+    let max_wait = Duration::from_secs(30);
+
+    loop {
         if publisher.is_connected() {
-            info!("✓ Publisher已连接");
+            info!("✅ Publisher已连接，可以开始发送");
+            info!("");
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
 
-    if !publisher.is_connected() {
-        return Err("Publisher failed to connect after 10 seconds".into());
+        if start_time.elapsed() > max_wait {
+            return Err(format!(
+                "Publisher failed to connect after {:.1} seconds. \
+                 Make sure receiver thread initialized subscriptions and \
+                 Media Driver is running.",
+                max_wait.as_secs_f64()
+            ).into());
+        }
+
+        // 显示进度
+        if start_time.elapsed().as_secs() % 5 == 0 {
+            info!("等待Publisher连接... (已等待 {:.1}s)", start_time.elapsed().as_secs_f64());
+        }
+
+        thread::sleep(Duration::from_millis(100));
     }
     info!("");
     info!("✓ 接收线程已就绪");

@@ -267,11 +267,24 @@ fn send_order(
         time_in_force,
     );
 
+    let mut retry_count = 0;
+    let max_retries = 100;  // 1 second worth of retries (10ms each)
+
     loop {
         match publisher.send(&data) {
             Ok(()) => return Ok(()),
             Err(aeron_wrapper::Error::BackPressured) => {
                 std::hint::spin_loop();
+            }
+            Err(aeron_wrapper::Error::NotConnected) => {
+                // Publisher still initializing, retry with delay
+                if retry_count < max_retries {
+                    retry_count += 1;
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                } else {
+                    return Err("Publisher failed to connect after 1 second".into());
+                }
             }
             Err(e) => {
                 return Err(format!("Failed to send: {:?}", e).into());

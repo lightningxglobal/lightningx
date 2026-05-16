@@ -207,9 +207,7 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
             attempts += 1;
             match self.publisher.send(&data) {
                 Ok(()) => {
-                    if attempts > 1 {
-                        info!("[AeronOrderUpdatePublisher] ✅ sent after {} attempts", attempts);
-                    }
+                    info!("[AeronOrderUpdatePublisher] ✅ published OrderUpdate (attempts={})", attempts);
                     return Ok(());
                 }
                 Err(AeronError::BackPressured) => {

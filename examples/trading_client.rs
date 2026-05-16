@@ -40,13 +40,23 @@ struct EventCallback {
 
 impl PollCallback for EventCallback {
     fn on_data(&mut self, data: &[u8]) {
+        info!("[EventCallback] on_data() called on Stream {} with {} bytes", self.stream_id, data.len());
         if data.len() >= 4 {
             let template_id = u16::from_le_bytes([data[2], data[3]]);
-            let _ = self.tx.send(RawMessage {
+            match self.tx.send(RawMessage {
                 stream_id: self.stream_id,
                 template_id,
                 data: data.to_vec(),
-            });
+            }) {
+                Ok(()) => {
+                    info!("[EventCallback] ✅ sent message to channel on Stream {}", self.stream_id);
+                }
+                Err(e) => {
+                    info!("[EventCallback] ❌ failed to send message on Stream {}: {:?}", self.stream_id, e);
+                }
+            }
+        } else {
+            info!("[EventCallback] ❌ data too short: {}", data.len());
         }
     }
 }
@@ -87,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 等待接收线程完全初始化所有subscriptions
     // 需要充足的时间让subscriptions在Media Driver中注册
     info!("等待接收线程完全初始化...");
-    thread::sleep(Duration::from_millis(2000));  // 2秒确保所有subscriptions就绪
+    thread::sleep(Duration::from_millis(4000));  // 4秒确保所有subscriptions就绪并与server publishers同步
     info!("✓ 接收线程已就绪");
     info!("");
 
@@ -557,61 +567,84 @@ fn receiver_thread_main(aeron_dir: String, channel: String) -> Result<(), String
         tx.clone(),
     );
 
-    // Stream 1: 订阅主线程的Publisher（让Publisher认为有对等方）
-    // 虽然我们不处理这些消息，但这使得Publisher.is_connected()为true
-    let _sub1 = client.add_subscription(
+    // CRITICAL: 必须保持subscriptions的所有权，否则它们会被dropped和unregistered
+    // 以下订阅对应：1=inbound(echo), 2=OrderUpdate, 3=Trade, 4=Depth20, 5=Depth50, 6=Level2
+    let mut sub1 = client.add_subscription(
         &channel, 1, 10_000,
         EventCallback { tx: tx1, stream_id: 1 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub1: {:?}", e))?;
 
-    let _sub2 = client.add_subscription(
+    let mut sub2 = client.add_subscription(
         &channel, 2, 10_000,
         EventCallback { tx: tx2, stream_id: 2 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub2: {:?}", e))?;
 
-    let _sub3 = client.add_subscription(
+    let mut sub3 = client.add_subscription(
         &channel, 3, 10_000,
         EventCallback { tx: tx3, stream_id: 3 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub3: {:?}", e))?;
 
-    let _sub4 = client.add_subscription(
+    let mut sub4 = client.add_subscription(
         &channel, 4, 10_000,
         EventCallback { tx: tx4, stream_id: 4 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub4: {:?}", e))?;
 
-    let _sub5 = client.add_subscription(
+    let mut sub5 = client.add_subscription(
         &channel, 5, 10_000,
         EventCallback { tx: tx5, stream_id: 5 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub5: {:?}", e))?;
 
-    let _sub6 = client.add_subscription(
+    let mut sub6 = client.add_subscription(
         &channel, 6, 10_000,
         EventCallback { tx: tx6, stream_id: 6 },
         NoopLifecycle,
     ).map_err(|e| format!("Failed to add sub6: {:?}", e))?;
 
-    info!("[接收线程] ✓ Subscriptions已就绪");
+    info!("[接收线程] ✓ Subscriptions已创建");
+    info!("[接收线程] ⏳ 让subscriptions在Media Driver中注册 (2秒)...");
+
+    // CRITICAL: 给subscriptions时间在Media Driver中注册
+    // 这与服务器的Publisher/Subscriber注册方式相同
+    // 更长的等待时间确保完全同步
+    for i in 0..200 {
+        client.do_work();
+        if i % 40 == 0 {
+            info!("[接收线程]   do_work() #{}", i);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    info!("[接收线程] ✓ Subscriptions注册完成（已等待2秒）");
     info!("[接收线程] 开始接收消息...");
     info!("");
 
     let start = Instant::now();
     let mut stats = Stats::new();
 
-    // CRITICAL: client.do_work() 必须被调用来驱动Aeron事件循环
-    // aeronmd处理底层I/O，但client需要定期调用do_work()来处理消息和触发回调
+    // CRITICAL: 遵循aeron-wrapper pong.rs模式
+    // 1. call client.do_work() 来处理网络I/O
+    // 2. call subscriber.poll() 来读取消息和触发callbacks
     while start.elapsed() < Duration::from_secs(45) {
-        client.do_work();  // ← 这是必须的！
+        client.do_work();
 
+        // 显式poll所有subscriptions - 这是关键！
+        sub1.poll();
+        sub2.poll();
+        sub3.poll();
+        sub4.poll();
+        sub5.poll();
+        sub6.poll();
+
+        // 处理从callbacks收到的消息
         while let Ok(msg) = rx.try_recv() {
             parse_and_print_message(&msg, &mut stats);
         }
 
-        // 不要sleep太长——需要频繁调用do_work()
+        // 不要sleep太长——需要频繁调用do_work()和poll()
         thread::sleep(Duration::from_millis(1));
     }
 

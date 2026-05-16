@@ -50,6 +50,13 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const NewOrderRequest
                         );
+                        // 复制字段到局部变量来规避alignment检查
+                        let client_id = req.client_order_id;
+                        let participant_id = req.participant_id;
+                        let price = req.price;
+                        let qty = req.quantity;
+                        info!("[OrderInboundCallback] 📊 NewOrder parsed: client_id={}, participant_id={}, price={}, qty={}",
+                              client_id, participant_id, price, qty);
                         match self.tx.send(InboundMsg::NewOrder(req)) {
                             Ok(()) => info!("[OrderInboundCallback] ✅ NewOrder sent to channel"),
                             Err(e) => info!("[OrderInboundCallback] ❌ Failed to send NewOrder: {:?}", e),

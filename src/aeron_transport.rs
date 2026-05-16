@@ -134,58 +134,20 @@ impl OrderSubscriber for AeronOrderSubscriber {
         static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let poll_count = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if poll_count % 10_000 == 0 {
-            info!("[AeronOrderSubscriber] >>> poll() called, poll_count={}", poll_count);
-        }
-
-        if poll_count % 10_000 == 0 {
-            info!("[AeronOrderSubscriber] > acquiring subscriber lock...");
-        }
-
         let n = {
             let mut sub = self.subscriber.lock();
-            if poll_count % 10_000 == 0 {
-                info!("[AeronOrderSubscriber] > calling sub.poll()...");
-            }
-            let n = sub.poll();  // 触发回调，消息进入Arc<Mutex<>>
-            if poll_count % 10_000 == 0 {
-                info!("[AeronOrderSubscriber] > sub.poll() returned: {}", n);
-            }
-            n
+            sub.poll()  // 触发回调，消息进入VecDeque
         };  // 立即释放lock
-
-        if poll_count % 1_000 == 0 {
-            info!("[AeronOrderSubscriber] poll #{} returned {} fragments (is_connected={})",
-                poll_count, n, self.is_connected());
-        }
-
-        if poll_count % 10_000 == 0 {
-            info!("[AeronOrderSubscriber] > acquiring message_queue lock...");
-        }
 
         // 从队列中pop回调写入的消息
         let mut queue = self.message_queue.lock();
-        if poll_count % 10_000 == 0 {
-            info!("[AeronOrderSubscriber] > got message_queue lock, queue size={}", queue.len());
-        }
         let result = match queue.pop_front() {
             Some(msg) => {
-                if poll_count % 10 == 0 {
-                    info!("[AeronOrderSubscriber] ✅ dequeued message (queue now {})", queue.len());
-                }
+                info!("[AeronOrderSubscriber] ✅ dequeued message (queue now {})", queue.len());
                 Some(msg)
             }
-            None => {
-                if poll_count % 100_000 == 0 {
-                    info!("[AeronOrderSubscriber] ℹ️ queue empty on poll #{}", poll_count);
-                }
-                None
-            }
+            None => None,
         };
-
-        if poll_count % 10_000 == 0 {
-            info!("[AeronOrderSubscriber] <<< poll() returning {:?}", result.is_some());
-        }
 
         result
     }

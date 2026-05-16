@@ -93,18 +93,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to create AeronClient: {:?}", e))?;
 
     // 创建Publisher用于发送订单（主线程用）
+    // aeronmd已独立运行，无需调用do_work()
     info!("初始化Aeron Publisher...");
     let mut publisher = client.add_publication(channel, 1)?;
     info!("✓ Publisher已初始化");
-    info!("");
-
-    // Publisher在Aeron中可以在没有Subscriber的情况下发送
-    // 多次调用do_work()确保与aeronmd同步，但不需要等待is_connected()
-    for _ in 0..50 {
-        client.do_work();
-        thread::sleep(Duration::from_millis(10));
-    }
-    info!("✓ Publisher已准备");
     info!("");
     info!("✓ 接收线程已就绪");
     info!("");

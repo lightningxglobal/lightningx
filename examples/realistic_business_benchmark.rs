@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  基准价: 50000.0");
     println!("  设定1: 先放5个买单 (49998-50000) - 这些会停留在簿中");
     println!("  设定2: 再放5个卖单 (50000-50002) - 这些会与买单成交");
-    println!("  设定3: 重复100次 (产生实际的成交和插入)");
+    println!("  设定3: 重复5000次 (产生实际的成交和插入)");
     println!("  评估指标: 成交率、插入率、TradeEvents数量、TPS、延迟\n");
 
     let num_batches = 5000;
@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_filled = 0.0;
 
     let total_start = Instant::now();
+    let mut affected_makers = SmallVec::<[u64; 64]>::new();
 
     for round in 0..num_batches {
         // 5个买单
@@ -50,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new(round as u64 * 1000 + i as u64, Side::Buy, price, qty, TimeInForce::GTC, 0);
-            let result = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+            let result = engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;
@@ -64,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new(round as u64 * 1000 + 500 + i as u64, Side::Sell, price, qty, TimeInForce::GTC, 0);
-            let result = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
+            let result = engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;

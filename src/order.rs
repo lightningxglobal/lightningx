@@ -29,11 +29,12 @@ pub struct Order {
     pub filled: f64,
     pub time_in_force: TimeInForce,
     pub timestamp: u64,
-    _padding: [u8; 18],
+    pub is_market: bool,
+    _padding: [u8; 17],
 }
 
 impl Order {
-    /// 创建新订单
+    /// 创建新限价订单
     pub fn new(
         id: u64,
         side: Side,
@@ -50,7 +51,28 @@ impl Order {
             filled: 0.0,
             time_in_force,
             timestamp,
-            _padding: [0; 18],
+            is_market: false,
+            _padding: [0; 17],
+        }
+    }
+
+    /// 创建新市价订单
+    pub fn new_market(
+        id: u64,
+        side: Side,
+        quantity: f64,
+        timestamp: u64,
+    ) -> Self {
+        Self {
+            id,
+            side,
+            price: 0.0,
+            quantity,
+            filled: 0.0,
+            time_in_force: TimeInForce::IOC,
+            timestamp,
+            is_market: true,
+            _padding: [0; 17],
         }
     }
 
@@ -69,7 +91,12 @@ impl Order {
     /// 检查订单是否有效
     #[inline(always)]
     pub fn is_valid(&self) -> bool {
-        self.price > 0.0 && self.quantity > 0.0 && !self.price.is_nan() && !self.quantity.is_nan()
+        let price_valid = if self.is_market {
+            true  // 市价单不检查 price
+        } else {
+            self.price > 0.0 && !self.price.is_nan()
+        };
+        price_valid && self.quantity > 0.0 && !self.quantity.is_nan()
     }
 }
 
@@ -83,7 +110,8 @@ impl Default for Order {
             filled: 0.0,
             time_in_force: TimeInForce::GTC,
             timestamp: 0,
-            _padding: [0; 18],
+            is_market: false,
+            _padding: [0; 17],
         }
     }
 }

@@ -109,7 +109,8 @@ impl MatchingEngine {
     /// 验证订单有效性
     #[inline(always)]
     fn validate_order(&self, order: &Order) -> OrderResult<()> {
-        if order.price <= 0.0 || order.price.is_nan() {
+        // 市价单不检查 price，限价单检查
+        if !order.is_market && (order.price <= 0.0 || order.price.is_nan()) {
             return Err(MatchingEngineError::InvalidPrice(order.price));
         }
 
@@ -322,12 +323,17 @@ impl MatchingEngine {
 
         self.affected_makers_buf.clear();
 
-        // 处理不同的委托类型，使用内部affected_makers缓冲区
-        let result = match order.time_in_force {
-            TimeInForce::PostOnly => self.handle_post_only(order)?,
-            TimeInForce::FOK => self.handle_fok(order)?,
-            TimeInForce::IOC => self.handle_ioc(order)?,
-            TimeInForce::GTC => self.handle_gtc(order)?,
+        // 处理市价单或限价单
+        let result = if order.is_market {
+            self.handle_market_order(order)?
+        } else {
+            // 处理限价单：按不同的委托类型
+            match order.time_in_force {
+                TimeInForce::PostOnly => self.handle_post_only(order)?,
+                TimeInForce::FOK => self.handle_fok(order)?,
+                TimeInForce::IOC => self.handle_ioc(order)?,
+                TimeInForce::GTC => self.handle_gtc(order)?,
+            }
         };
 
         self.maybe_sample_depth();
@@ -354,16 +360,40 @@ impl MatchingEngine {
         // 批量处理订单，使用内部affected_makers缓冲区
         for order in orders.into_iter() {
             self.affected_makers_buf.clear();
-            let result = match order.time_in_force {
-                TimeInForce::PostOnly => self.handle_post_only(order)?,
-                TimeInForce::FOK => self.handle_fok(order)?,
-                TimeInForce::IOC => self.handle_ioc(order)?,
-                TimeInForce::GTC => self.handle_gtc(order)?,
+            let result = if order.is_market {
+                self.handle_market_order(order)?
+            } else {
+                match order.time_in_force {
+                    TimeInForce::PostOnly => self.handle_post_only(order)?,
+                    TimeInForce::FOK => self.handle_fok(order)?,
+                    TimeInForce::IOC => self.handle_ioc(order)?,
+                    TimeInForce::GTC => self.handle_gtc(order)?,
+                }
             };
             results.push(result);
         }
 
         Ok(results)
+    }
+
+    /// 处理市价订单（不入盘，立即成交或拒绝）
+    #[inline]
+    fn handle_market_order(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
+        let filled_qty = self.match_order(order)?;
+
+        let status = if (filled_qty - order.quantity).abs() < 1e-10 {
+            OrderStatus::Filled
+        } else if filled_qty > 0.0 {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Rejected
+        };
+
+        Ok(PlaceOrderResult {
+            order_id: order.id,
+            filled: filled_qty,
+            status,
+        })
     }
 
     /// 处理Post-Only订单
@@ -545,7 +575,8 @@ impl MatchingEngine {
                     Some(price) => {
                         // 验证价格级别存在且检查价格是否匹配
                         if opposite_book.get_node_at_price(price).is_some() {
-                            let price_matches = match order.side {
+                            // 市价单直接吃穿所有价位，限价单检查价格匹配
+                            let price_matches = order.is_market || match order.side {
                                 Side::Buy => order.price >= price,
                                 Side::Sell => order.price <= price,
                             };
@@ -1156,6 +1187,71 @@ pub struct CancelOrderResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_market_buy_vs_limit_sell() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // 先放一个卖限价单
+        let sell_order = Order::new(1, Side::Sell, 50000.0, 10.0, TimeInForce::GTC, 0);
+        let _ = engine.place_order(sell_order).unwrap();
+
+        // 买市价单应该成交
+        let buy_market = Order::new_market(2, Side::Buy, 5.0, 0);
+        let result = engine.place_order(buy_market).unwrap();
+
+        assert_eq!(result.status, OrderStatus::Filled);
+        assert_eq!(result.filled, 5.0);
+        assert_eq!(result.order_id, 2);
+    }
+
+    #[test]
+    fn test_market_sell_vs_limit_buy() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // 先放一个买限价单
+        let buy_order = Order::new(1, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
+        let _ = engine.place_order(buy_order).unwrap();
+
+        // 卖市价单应该成交
+        let sell_market = Order::new_market(2, Side::Sell, 5.0, 0);
+        let result = engine.place_order(sell_market).unwrap();
+
+        assert_eq!(result.status, OrderStatus::Filled);
+        assert_eq!(result.filled, 5.0);
+    }
+
+    #[test]
+    fn test_market_order_empty_book() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // 空盘口，市价单应该被拒绝
+        let buy_market = Order::new_market(1, Side::Buy, 10.0, 0);
+        let result = engine.place_order(buy_market).unwrap();
+
+        assert_eq!(result.status, OrderStatus::Rejected);
+        assert_eq!(result.filled, 0.0);
+    }
+
+    #[test]
+    fn test_market_order_partial_fill() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // 放一个 5 个数量的卖限价单
+        let sell_order = Order::new(1, Side::Sell, 50000.0, 5.0, TimeInForce::GTC, 0);
+        let _ = engine.place_order(sell_order).unwrap();
+
+        // 买市价 10 个，但只有 5 个可成交
+        let buy_market = Order::new_market(2, Side::Buy, 10.0, 0);
+        let result = engine.place_order(buy_market).unwrap();
+
+        assert_eq!(result.status, OrderStatus::PartiallyFilled);
+        assert_eq!(result.filled, 5.0);
+    }
 
     #[test]
     fn test_no_trade_event_without_sender() {

@@ -73,7 +73,7 @@ impl ClientMsg {
                     .unwrap_or("limit")
                     .to_owned(),
                 price: v.get("price").and_then(|p| p.as_f64()),
-                qty: v.get("qty")?.as_f64()?,
+                qty: v.get("qty").or_else(|| v.get("quantity"))?.as_f64()?,
             }),
             "cancel_order" => Some(ClientMsg::CancelOrder {
                 order_id: v.get("order_id")?.as_i64()?,
@@ -302,6 +302,13 @@ async fn handle_client_message(
                 }
             };
 
+            // Capture best opposing price before matching (used as fill price for market orders).
+            let best_opposing_price = {
+                let eng = state.engine.lock().unwrap();
+                let levels = eng.get_top_levels(1, engine_side == Side::Sell); // buy side when selling
+                levels.first().map(|(p, _)| *p)
+            };
+
             // Run through matching engine — hold lock briefly.
             let engine_result = {
                 let mut eng = state.engine.lock().unwrap();
@@ -358,10 +365,12 @@ async fn handle_client_message(
 
             // Broadcast trade event if there were fills.
             if result.filled > 0.0 {
+                // Fill price: limit orders use their own price; market orders use best opposing price.
+                let fill_price = price.or(best_opposing_price).unwrap_or(0.0);
                 let trade_msg = json!({
                     "type": "trade",
                     "symbol": symbol,
-                    "price": price.unwrap_or(0.0),
+                    "price": fill_price,
                     "qty": result.filled,
                     "side": side,
                     "ts": ts
@@ -377,7 +386,7 @@ async fn handle_client_message(
                     "order_id": db_order_id,
                     "status": ws_status,
                     "filled_qty": result.filled,
-                    "avg_price": price.unwrap_or(0.0),
+                    "avg_price": fill_price,
                     "ts": ts
                 }).to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {

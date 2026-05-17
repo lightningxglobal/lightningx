@@ -48,9 +48,10 @@ pub async fn register(pool: &PgPool, req: RegisterRequest) -> Result<AuthRespons
     .await
     .map_err(|e| anyhow!("Register failed: {}", e))?;
 
-    // Create default USDT account for new user
+    // Seed test funds: 10,000 USDT + 1 BTC for new users to trade immediately
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1, 'USDT', 0, 0)
+        "INSERT INTO accounts (user_id, asset, balance, frozen)
+         VALUES ($1, 'USDT', 10000, 0), ($1, 'BTC', 1, 0)
          ON CONFLICT DO NOTHING",
     )
     .bind(user.id)

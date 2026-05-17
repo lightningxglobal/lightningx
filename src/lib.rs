@@ -72,7 +72,10 @@ pub mod market_data_server_types {
     pub use crate::market_data_server::{DepthSnapshot, DepthLevel, TradeSnapshot, Statistics, BBO};
 }
 pub use snowflake::SnowflakeIdGenerator;
-pub use desk_server::{DeskServer, DeskConfig, SessionInfo, SessionId};
+pub use desk_server::{
+    DeskServer, DeskConfig, SessionInfo, SessionId,
+    DeskAppState, check_price_risk, desk_ws_handler, desk_market_data_broadcaster,
+};
 
 #[cfg(test)]
 mod tests {

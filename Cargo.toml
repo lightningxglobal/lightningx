@@ -55,3 +55,7 @@ harness = false
 [[bin]]
 name = "exchange-server"
 path = "src/main.rs"
+
+[[bin]]
+name = "desk-server"
+path = "src/bin/desk_server.rs"

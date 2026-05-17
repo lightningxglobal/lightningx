@@ -1,15 +1,3 @@
-/// Desk Server：多柜台服务器，处理客户端委托和行情推送
-///
-/// 职责：
-/// 1. WebSocket /ws/order - 委托上报（buy/sell/cancel）
-/// 2. WebSocket /ws/market - 行情推送（Depth/Trade/BBO）
-/// 3. Rate Limit 检查（本地令牌桶）
-/// 4. 风控检查（本地规则）
-/// 5. 验资验券（Account Service）
-/// 6. 生成 Snowflake Order ID
-/// 7. Aeron 集成（发送委托、接收回报、接收行情）
-/// 8. 会话管理和路由
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -440,5 +428,447 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "Should receive market data broadcast");
+    }
+}
+
+// ─── DeskAppState ─────────────────────────────────────────────────────────────
+
+use std::sync::atomic::AtomicU64;
+use std::sync::Mutex;
+use dashmap::DashMap;
+use sqlx::PgPool;
+use tokio::sync::mpsc;
+
+use crate::engine::MatchingEngine;
+
+#[derive(Clone)]
+pub struct DeskAppState {
+    pub db: Arc<PgPool>,
+    pub engine: Arc<Mutex<MatchingEngine>>,
+    pub market_tx: Arc<broadcast::Sender<String>>,
+    pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
+    pub next_order_id: Arc<AtomicU64>,
+    pub rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
+    pub id_gen: Arc<SnowflakeIdGenerator>,
+}
+
+// ─── Price-deviation risk check ───────────────────────────────────────────────
+
+pub fn check_price_risk(engine: &MatchingEngine, _side: &str, price: f64) -> Result<(), String> {
+    let bids = engine.get_top_levels(1, true);
+    let asks = engine.get_top_levels(1, false);
+    let mid = match (bids.first(), asks.first()) {
+        (Some((b, _)), Some((a, _))) => (b + a) / 2.0,
+        (Some((b, _)), None) => *b,
+        (None, Some((a, _))) => *a,
+        _ => return Ok(()),
+    };
+    if mid > 0.0 && (price - mid).abs() / mid > 0.10 {
+        return Err(format!("Price {:.2} deviates >10% from mid {:.2}", price, mid));
+    }
+    Ok(())
+}
+
+// ─── WebSocket upgrade handler ────────────────────────────────────────────────
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::response::IntoResponse;
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::order::{Order, Side, TimeInForce};
+use crate::engine::OrderStatus;
+use crate::user_service;
+
+fn desk_unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Debug)]
+enum DeskClientMsg {
+    Auth { token: String },
+    Subscribe { channels: Vec<String> },
+    Unsubscribe { channels: Vec<String> },
+    PlaceOrder {
+        client_order_id: String,
+        symbol: String,
+        side: String,
+        order_type: String,
+        price: Option<f64>,
+        qty: f64,
+    },
+    CancelOrder { order_id: i64 },
+    Ping,
+}
+
+impl DeskClientMsg {
+    fn parse(text: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(text).ok()?;
+        let t = v.get("type")?.as_str()?;
+        match t {
+            "auth" => Some(Self::Auth {
+                token: v.get("token")?.as_str()?.to_owned(),
+            }),
+            "subscribe" => {
+                let channels = v.get("channels")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|c| c.as_str().map(|s| s.to_owned()))
+                    .collect();
+                Some(Self::Subscribe { channels })
+            }
+            "unsubscribe" => {
+                let channels = v.get("channels")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|c| c.as_str().map(|s| s.to_owned()))
+                    .collect();
+                Some(Self::Unsubscribe { channels })
+            }
+            "place_order" => Some(Self::PlaceOrder {
+                client_order_id: v.get("client_order_id")?.as_str()?.to_owned(),
+                symbol: v.get("symbol")?.as_str()?.to_owned(),
+                side: v.get("side")?.as_str()?.to_owned(),
+                order_type: v.get("order_type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("limit")
+                    .to_owned(),
+                price: v.get("price").and_then(|p| p.as_f64()),
+                qty: v.get("qty").or_else(|| v.get("quantity"))?.as_f64()?,
+            }),
+            "cancel_order" => Some(Self::CancelOrder {
+                order_id: v.get("order_id")?.as_i64()?,
+            }),
+            "ping" => Some(Self::Ping),
+            _ => None,
+        }
+    }
+}
+
+struct DeskWsSession {
+    user_id: Option<i64>,
+    subscribed: HashSet<String>,
+}
+
+impl DeskWsSession {
+    fn new() -> Self {
+        Self { user_id: None, subscribed: HashSet::new() }
+    }
+}
+
+pub async fn desk_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<DeskAppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| desk_handle_socket(socket, state))
+}
+
+async fn desk_handle_socket(mut socket: WebSocket, state: DeskAppState) {
+    let mut session = DeskWsSession::new();
+    let (personal_tx, mut personal_rx) = mpsc::channel::<String>(64);
+    let mut market_rx = state.market_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Some(reply) = desk_handle_message(
+                            &text, &mut session, &state, personal_tx.clone()
+                        ).await {
+                            if socket.send(Message::Text(reply)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+            Some(msg) = personal_rx.recv() => {
+                if socket.send(Message::Text(msg)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(msg) = market_rx.recv() => {
+                let should_forward = if msg.contains("\"type\":\"depth\"") {
+                    desk_msg_symbol(&msg).map(|sym| {
+                        session.subscribed.contains(&format!("depth.{}", sym))
+                    }).unwrap_or(false)
+                } else if msg.contains("\"type\":\"trade\"") {
+                    desk_msg_symbol(&msg).map(|sym| {
+                        session.subscribed.contains(&format!("trades.{}", sym))
+                    }).unwrap_or(false)
+                } else if msg.contains("\"type\":\"ticker\"") {
+                    desk_msg_symbol(&msg).map(|sym| {
+                        session.subscribed.contains(&format!("ticker.{}", sym))
+                    }).unwrap_or(false)
+                } else if msg.contains("\"type\":\"kline\"") {
+                    desk_msg_symbol(&msg).map(|sym| {
+                        session.subscribed.contains(&format!("kline.{}", sym))
+                    }).unwrap_or(false)
+                } else {
+                    false
+                };
+                if should_forward {
+                    if socket.send(Message::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(uid) = session.user_id {
+        state.user_tx.remove(&uid);
+    }
+}
+
+fn desk_msg_symbol(msg: &str) -> Option<&str> {
+    let key = "\"symbol\":\"";
+    let start = msg.find(key)? + key.len();
+    let end = msg[start..].find('"')? + start;
+    Some(&msg[start..end])
+}
+
+async fn desk_handle_message(
+    text: &str,
+    session: &mut DeskWsSession,
+    state: &DeskAppState,
+    personal_tx: mpsc::Sender<String>,
+) -> Option<String> {
+    let msg = match DeskClientMsg::parse(text) {
+        Some(m) => m,
+        None => return Some(json!({"type": "error", "message": "Invalid message format"}).to_string()),
+    };
+
+    match msg {
+        DeskClientMsg::Auth { token } => {
+            match user_service::verify_token(&token) {
+                Ok(claims) => {
+                    session.user_id = Some(claims.sub);
+                    state.user_tx.insert(claims.sub, personal_tx);
+                    Some(json!({"type": "auth_ok"}).to_string())
+                }
+                Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
+            }
+        }
+
+        DeskClientMsg::Subscribe { channels } => {
+            for ch in channels { session.subscribed.insert(ch); }
+            None
+        }
+
+        DeskClientMsg::Unsubscribe { channels } => {
+            for ch in channels { session.subscribed.remove(&ch); }
+            None
+        }
+
+        DeskClientMsg::Ping => Some(json!({"type": "pong"}).to_string()),
+
+        DeskClientMsg::PlaceOrder { client_order_id, symbol, side, order_type, price, qty } => {
+            let user_id = match session.user_id {
+                Some(id) => id,
+                None => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
+            };
+
+            // Rate limit check (per user)
+            {
+                let mut limiter = state.rate_limiter.lock();
+                if limiter.consume(&user_id.to_string(), 1).is_err() {
+                    return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Rate limit exceeded"}).to_string());
+                }
+            }
+
+            if qty <= 0.0 {
+                return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "qty must be > 0"}).to_string());
+            }
+            if order_type != "market" && price.map(|p| p <= 0.0).unwrap_or(true) {
+                return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "price required for limit orders"}).to_string());
+            }
+
+            let engine_side = match side.as_str() {
+                "buy" => Side::Buy,
+                "sell" => Side::Sell,
+                _ => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Invalid side"}).to_string()),
+            };
+
+            let tif = match order_type.as_str() {
+                "limit" | "gtc" => TimeInForce::GTC,
+                "ioc" => TimeInForce::IOC,
+                "fok" => TimeInForce::FOK,
+                "post_only" => TimeInForce::PostOnly,
+                "market" => TimeInForce::IOC,
+                _ => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Unknown order type"}).to_string()),
+            };
+
+            // Price deviation risk check (limit orders only)
+            if order_type != "market" {
+                if let Some(p) = price {
+                    let eng = state.engine.lock().unwrap();
+                    if let Err(e) = check_price_risk(&eng, &side, p) {
+                        return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e}).to_string());
+                    }
+                }
+            }
+
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+
+            // Use Snowflake ID for engine-level order ID
+            let order_id = state.id_gen.next_id();
+
+            let engine_order = if order_type == "market" {
+                Order::new_market(order_id, engine_side, qty, now_ns)
+            } else {
+                Order::new(order_id, engine_side, price.unwrap_or(0.0), qty, tif, now_ns)
+            };
+
+            // Persist to DB
+            let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
+                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
+                 VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING') RETURNING *",
+            )
+            .bind(user_id)
+            .bind(&symbol)
+            .bind(&side)
+            .bind(&order_type)
+            .bind(price)
+            .bind(qty)
+            .fetch_one(state.db.as_ref())
+            .await;
+
+            let db_order_id = match db_result {
+                Ok(o) => o.id,
+                Err(e) => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": format!("DB error: {}", e)}).to_string()),
+            };
+
+            let best_opposing_price = {
+                let eng = state.engine.lock().unwrap();
+                let levels = eng.get_top_levels(1, engine_side == Side::Sell);
+                levels.first().map(|(p, _)| *p)
+            };
+
+            let engine_result = {
+                let mut eng = state.engine.lock().unwrap();
+                eng.place_order(engine_order)
+            };
+
+            let result = match engine_result {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = sqlx::query("UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1")
+                        .bind(db_order_id)
+                        .execute(state.db.as_ref())
+                        .await;
+                    return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e.to_string()}).to_string());
+                }
+            };
+
+            let (db_status, ws_status) = match result.status {
+                OrderStatus::Accepted => ("TRADING", "OPEN"),
+                OrderStatus::PartiallyFilled => ("TRADING", "PARTIAL_FILL"),
+                OrderStatus::Filled => ("COMPLETED", "FILLED"),
+                OrderStatus::Rejected => ("REJECTED", "REJECTED"),
+                OrderStatus::Cancelled => ("CANCELED", "CANCELED"),
+            };
+
+            let _ = sqlx::query("UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3")
+                .bind(db_status)
+                .bind(result.filled)
+                .bind(db_order_id)
+                .execute(state.db.as_ref())
+                .await;
+
+            if result.status == OrderStatus::Rejected {
+                return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Rejected by matching engine"}).to_string());
+            }
+
+            let ts = desk_unix_now();
+
+            if result.filled > 0.0 {
+                let fill_price = price.or(best_opposing_price).unwrap_or(0.0);
+                let trade_msg = json!({"type": "trade", "symbol": symbol, "price": fill_price, "qty": result.filled, "side": side, "ts": ts}).to_string();
+                let _ = state.market_tx.send(trade_msg);
+                desk_broadcast_depth(state, &symbol);
+                let update_msg = json!({"type": "order_update", "order_id": db_order_id, "status": ws_status, "filled_qty": result.filled, "avg_price": fill_price, "ts": ts}).to_string();
+                if let Some(tx) = state.user_tx.get(&user_id) {
+                    let _ = tx.send(update_msg).await;
+                }
+            }
+
+            Some(json!({"type": "order_accepted", "client_order_id": client_order_id, "order_id": db_order_id, "symbol": symbol, "side": side, "price": price, "qty": qty, "ts": ts}).to_string())
+        }
+
+        DeskClientMsg::CancelOrder { order_id } => {
+            let user_id = match session.user_id {
+                Some(id) => id,
+                None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
+            };
+
+            let db_result = sqlx::query(
+                "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
+                 WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
+            )
+            .bind(order_id)
+            .bind(user_id)
+            .execute(state.db.as_ref())
+            .await;
+
+            match db_result {
+                Ok(r) if r.rows_affected() > 0 => {
+                    let _ = {
+                        let mut eng = state.engine.lock().unwrap();
+                        eng.cancel_order(order_id as u64)
+                    };
+                    Some(json!({"type": "order_update", "order_id": order_id, "status": "CANCELED", "ts": desk_unix_now()}).to_string())
+                }
+                Ok(_) => Some(json!({"type": "error", "message": "Order not found or already closed"}).to_string()),
+                Err(e) => Some(json!({"type": "error", "message": e.to_string()}).to_string()),
+            }
+        }
+    }
+}
+
+fn desk_broadcast_depth(state: &DeskAppState, symbol: &str) {
+    let (bids, asks) = {
+        let eng = state.engine.lock().unwrap();
+        (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
+    };
+    let msg = json!({"type": "depth", "symbol": symbol, "bids": bids, "asks": asks, "ts": desk_unix_now()}).to_string();
+    let _ = state.market_tx.send(msg);
+}
+
+pub async fn desk_market_data_broadcaster(state: DeskAppState) {
+    let mut depth_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut last_price: f64 = 0.0;
+
+    loop {
+        tokio::select! {
+            _ = depth_interval.tick() => {
+                let (bids, asks) = {
+                    let eng = state.engine.lock().unwrap();
+                    (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
+                };
+                if let Some((p, _)) = bids.first() { last_price = *p; }
+                let msg = json!({"type": "depth", "symbol": "BTC_USDT", "bids": bids, "asks": asks, "ts": desk_unix_now()}).to_string();
+                let _ = state.market_tx.send(msg);
+            }
+            _ = kline_interval.tick() => {
+                if last_price > 0.0 {
+                    let now = desk_unix_now();
+                    let bar_time = now - (now % 60);
+                    let msg = json!({"type": "kline", "symbol": "BTC_USDT", "bar": {"time": bar_time, "open": last_price, "high": last_price, "low": last_price, "close": last_price, "volume": 0.0}}).to_string();
+                    let _ = state.market_tx.send(msg);
+                }
+            }
+        }
     }
 }

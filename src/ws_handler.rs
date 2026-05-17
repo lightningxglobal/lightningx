@@ -1,3 +1,4 @@
+use crate::account_repository::AccountRepository;
 use crate::api::AppState;
 use crate::engine::OrderStatus;
 use crate::order::{Order, Side, TimeInForce};
@@ -302,12 +303,40 @@ async fn handle_client_message(
                 }
             };
 
+            // Parse base/quote assets from symbol (e.g. "BTC_USDT" → "BTC", "USDT").
+            let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+
             // Capture best opposing price before matching (used as fill price for market orders).
             let best_opposing_price = {
                 let eng = state.engine.lock().unwrap();
-                let levels = eng.get_top_levels(1, engine_side == Side::Sell); // buy side when selling
+                let levels = eng.get_top_levels(1, engine_side == Side::Sell);
                 levels.first().map(|(p, _)| *p)
             };
+
+            // Freeze funds before sending to engine.
+            let repo = AccountRepository::new(state.db.as_ref());
+            let freeze_result = if side == "buy" {
+                let freeze_price = price.or(best_opposing_price).unwrap_or(0.0);
+                let freeze_amount = freeze_price * qty;
+                if freeze_amount > 0.0 {
+                    repo.freeze_for_buy(user_id, quote_asset, freeze_amount).await
+                } else {
+                    Ok(()) // market buy with no book — will reject after engine
+                }
+            } else {
+                repo.freeze_for_sell(user_id, base_asset, qty).await
+            };
+            if let Err(e) = freeze_result {
+                let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
+                    .bind(db_order_id).execute(state.db.as_ref()).await;
+                return Some(json!({
+                    "type": "order_rejected",
+                    "client_order_id": client_order_id,
+                    "reason": e.to_string()
+                }).to_string());
+            }
 
             // Run through matching engine — hold lock briefly.
             let engine_result = {
@@ -365,32 +394,118 @@ async fn handle_client_message(
 
             // Broadcast trade event if there were fills.
             if result.filled > 0.0 {
-                // Fill price: limit orders use their own price; market orders use best opposing price.
                 let fill_price = price.or(best_opposing_price).unwrap_or(0.0);
+                let filled = result.filled;
+
+                // Settle taker-side balances atomically.
+                let settle_ok = if side == "buy" {
+                    let cost = fill_price * filled;
+                    let over_frozen = price.map(|p| (p - fill_price) * filled).unwrap_or(0.0).max(0.0);
+                    // Release any over-frozen amount (market fills at better price).
+                    if over_frozen > 0.0 {
+                        let _ = repo.release_frozen(user_id, quote_asset, over_frozen).await;
+                    }
+                    let r1 = sqlx::query(
+                        "UPDATE accounts SET balance = balance - $1, frozen = frozen - $1, updated_at = NOW()
+                         WHERE user_id = $2 AND asset = $3",
+                    ).bind(cost).bind(user_id).bind(quote_asset).execute(state.db.as_ref()).await;
+                    let r2 = sqlx::query(
+                        "INSERT INTO accounts (user_id, asset, balance) VALUES ($1, $2, $3)
+                         ON CONFLICT (user_id, asset) DO UPDATE
+                           SET balance = accounts.balance + EXCLUDED.balance, updated_at = NOW()",
+                    ).bind(user_id).bind(base_asset).bind(filled).execute(state.db.as_ref()).await;
+                    r1.is_ok() && r2.is_ok()
+                } else {
+                    let proceeds = fill_price * filled;
+                    let r1 = sqlx::query(
+                        "UPDATE accounts SET balance = balance - $1, frozen = frozen - $1, updated_at = NOW()
+                         WHERE user_id = $2 AND asset = $3",
+                    ).bind(filled).bind(user_id).bind(base_asset).execute(state.db.as_ref()).await;
+                    let r2 = sqlx::query(
+                        "INSERT INTO accounts (user_id, asset, balance) VALUES ($1, $2, $3)
+                         ON CONFLICT (user_id, asset) DO UPDATE
+                           SET balance = accounts.balance + EXCLUDED.balance, updated_at = NOW()",
+                    ).bind(user_id).bind(quote_asset).bind(proceeds).execute(state.db.as_ref()).await;
+                    r1.is_ok() && r2.is_ok()
+                };
+
+                // Insert trade record (taker side only; maker DB ID unknown in MVP).
+                if settle_ok && fill_price > 0.0 {
+                    let (buy_oid, sell_oid): (Option<i64>, Option<i64>) = if side == "buy" {
+                        (Some(db_order_id), None)
+                    } else {
+                        (None, Some(db_order_id))
+                    };
+                    let _ = sqlx::query(
+                        "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+                         VALUES ($1, $2, $3, $4, $5, NOW())",
+                    ).bind(&symbol).bind(buy_oid).bind(sell_oid)
+                     .bind(fill_price).bind(filled).execute(state.db.as_ref()).await;
+                }
+
+                // Release unfilled frozen amount if partially filled or fully rejected after freeze.
+                if result.status == OrderStatus::Cancelled || result.status == OrderStatus::Rejected {
+                    let unfilled = qty - filled;
+                    if unfilled > 0.0 {
+                        let (rel_asset, rel_amount) = if side == "buy" {
+                            (quote_asset, fill_price * unfilled)
+                        } else {
+                            (base_asset, unfilled)
+                        };
+                        let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await;
+                    }
+                }
+
                 let trade_msg = json!({
                     "type": "trade",
                     "symbol": symbol,
                     "price": fill_price,
-                    "qty": result.filled,
+                    "qty": filled,
                     "side": side,
                     "ts": ts
                 }).to_string();
                 let _ = state.market_tx.send(trade_msg);
 
-                // Broadcast updated depth.
                 broadcast_depth(state, &symbol);
 
-                // Send order_update to this user's personal channel.
+                // Push order_update + balance_update to this user's personal channel.
                 let update_msg = json!({
                     "type": "order_update",
                     "order_id": db_order_id,
                     "status": ws_status,
-                    "filled_qty": result.filled,
+                    "filled_qty": filled,
                     "avg_price": fill_price,
                     "ts": ts
                 }).to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {
                     let _ = tx.send(update_msg).await;
+                }
+
+                // Send balance_update so frontend can refresh balances.
+                let (debit_asset, credit_asset) = if side == "buy" { (quote_asset, base_asset) } else { (base_asset, quote_asset) };
+                for asset in [debit_asset, credit_asset] {
+                    if let Ok(acc) = repo.get_account(user_id, asset).await {
+                        let bal_msg = json!({
+                            "type": "balance_update",
+                            "asset": asset,
+                            "available": acc.balance - acc.frozen,
+                            "frozen": acc.frozen
+                        }).to_string();
+                        if let Some(tx) = state.user_tx.get(&user_id) {
+                            let _ = tx.send(bal_msg).await;
+                        }
+                    }
+                }
+            } else {
+                // No fill — release all frozen funds (IOC/FOK fully rejected, market with no book).
+                let (rel_asset, rel_amount) = if side == "buy" {
+                    let p = price.or(best_opposing_price).unwrap_or(0.0);
+                    (quote_asset, p * qty)
+                } else {
+                    (base_asset, qty)
+                };
+                if rel_amount > 0.0 {
+                    let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await;
                 }
             }
 

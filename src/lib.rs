@@ -32,6 +32,8 @@ pub mod snowflake;
 pub mod desk_server;
 #[cfg(test)]
 mod sbe_tests;
+#[cfg(test)]
+mod boundary_tests;
 
 pub use engine::{
     MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult,

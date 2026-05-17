@@ -197,24 +197,34 @@ impl DeskServer {
         // 3. 生成 Snowflake Order ID
         let order_id = self.id_gen.next_id();
 
-        // 4. 验资（暂时简单检查）
+        // 4. 验资验券
         let account_mgr = self.account_mgr.read().await;
-        let required_balance = if request.side == "buy" {
-            request.price * request.quantity
-        } else {
-            0.0
-        };
-
         let account = account_mgr
             .get_account(session.account_id)
             .map_err(|e| format!("Account error: {}", e))?;
 
-        if account.available_balance() < required_balance {
-            return Err(format!(
-                "Insufficient balance: have {}, need {}",
-                account.available_balance(),
-                required_balance
-            ));
+        if request.side == "buy" {
+            let required = request.price * request.quantity;
+            if account.available_balance() < required {
+                return Err(format!(
+                    "Insufficient balance: have {:.8}, need {:.8}",
+                    account.available_balance(),
+                    required
+                ));
+            }
+        } else {
+            // sell: validate position holdings
+            let symbol = request.symbol.split('_').next().unwrap_or(&request.symbol);
+            let position = account.get_position(symbol)
+                .ok_or_else(|| format!("No position in {}", symbol))?;
+            if position.available() < request.quantity {
+                return Err(format!(
+                    "Insufficient position: have {:.8}, need {:.8} {}",
+                    position.available(),
+                    request.quantity,
+                    symbol
+                ));
+            }
         }
         drop(account_mgr);
 

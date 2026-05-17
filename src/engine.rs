@@ -437,29 +437,54 @@ impl MatchingEngine {
         })
     }
 
+    /// Read-only pre-check: can this order be fully filled at acceptable prices?
+    /// Must be called before any state-mutating match_order to avoid FOK book corruption.
+    fn can_fill_fok(&self, order: &Order) -> bool {
+        let opposite_book = match order.side {
+            Side::Buy => &self.sell_book,
+            Side::Sell => &self.buy_book,
+        };
+        // get_top_levels returns (price, total_qty) sorted best-first.
+        // We walk until we've accumulated enough qty or hit an unacceptable price.
+        let levels = opposite_book.get_top_levels(1000);
+        let mut available = 0.0;
+        for (price, qty) in levels {
+            let acceptable = order.is_market || match order.side {
+                Side::Buy => order.price >= price,
+                Side::Sell => order.price <= price,
+            };
+            if !acceptable {
+                break;
+            }
+            available += qty;
+            if available >= order.quantity - 1e-10 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 处理FOK订单
     #[inline]
     fn handle_fok(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
-        // 尝试撮合
-        let filled_qty = self.match_order(order)?;
-
-        if (filled_qty - order.quantity).abs() < 1e-10 {
-            // 完全成交
-            Ok(PlaceOrderResult {
-                order_id: order.id,
-                filled: filled_qty,
-                status: OrderStatus::Filled,
-            })
-        } else {
-            // 无法完全成交，拒绝（不允许部分成交）
-            // 注意：match_order已经修改了maker，所以affected_makers已被填充
-            // 让TradingEngine为maker生成OrderUpdateEvent
-            Ok(PlaceOrderResult {
+        // Pre-check WITHOUT modifying any state. If not fully fillable, reject immediately.
+        // This prevents the book corruption bug where makers were consumed before the
+        // fillability check, leaving the book in an inconsistent state on rejection.
+        if !self.can_fill_fok(&order) {
+            return Ok(PlaceOrderResult {
                 order_id: order.id,
                 filled: 0.0,
                 status: OrderStatus::Rejected,
-            })
+            });
         }
+
+        // Now we know it's fully fillable — commit the fills.
+        let filled_qty = self.match_order(order)?;
+        Ok(PlaceOrderResult {
+            order_id: order.id,
+            filled: filled_qty,
+            status: OrderStatus::Filled,
+        })
     }
 
     /// 处理IOC订单

@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new(round as u64 * 1000, Side::Buy, price, qty, TimeInForce::GTC, 0);
+            let result = engine.place_order(order)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;

@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
+        let result = engine.place_order(sell_order)?;
         println!("✓ 卖单已下: id={}, qty={}", result.order_id, 100.0);
 
         // 下买单：50股 @ 100.5（部分成交）
@@ -47,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
+        let result = engine.place_order(buy_order)?;
         println!("✓ 买单已下: id={}, qty={}, filled={}", result.order_id, 50.0, result.filled);
         assert_eq!(result.filled, 50.0, "买单应该成交50股");
 

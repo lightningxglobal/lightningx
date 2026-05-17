@@ -527,28 +527,62 @@ async fn handle_client_message(
                 None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
             };
 
-            // Update DB first.
-            let db_result = sqlx::query(
-                "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
+            // Fetch order details before cancelling so we know what to unfreeze.
+            let order_row = sqlx::query(
+                "SELECT symbol, side, price, quantity, filled FROM orders
                  WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
             )
             .bind(order_id)
             .bind(user_id)
+            .fetch_optional(state.db.as_ref())
+            .await;
+
+            let order_row = match order_row {
+                Ok(Some(r)) => r,
+                Ok(None) => return Some(json!({"type": "error", "message": "Order not found or already closed"}).to_string()),
+                Err(e) => return Some(json!({"type": "error", "message": e.to_string()}).to_string()),
+            };
+
+            use sqlx::Row;
+            let symbol: String = order_row.get("symbol");
+            let side: String = order_row.get("side");
+            let price: Option<f64> = order_row.get("price");
+            let quantity: f64 = order_row.get("quantity");
+            let filled: f64 = order_row.get("filled");
+            let remaining = quantity - filled;
+
+            // Update DB status.
+            let db_result = sqlx::query(
+                "UPDATE orders SET status = 'CANCELED', updated_at = NOW() WHERE id = $1",
+            )
+            .bind(order_id)
             .execute(state.db.as_ref())
             .await;
 
-            match db_result {
-                Ok(r) if r.rows_affected() > 0 => {
-                    // Best-effort cancel in engine (may not be in engine if already filled).
-                    let _ = {
-                        let mut eng = state.engine.lock().unwrap();
-                        eng.cancel_order(order_id as u64)
-                    };
-                    Some(json!({"type": "order_update", "order_id": order_id, "status": "CANCELED", "ts": unix_now()}).to_string())
-                }
-                Ok(_) => Some(json!({"type": "error", "message": "Order not found or already closed"}).to_string()),
-                Err(e) => Some(json!({"type": "error", "message": e.to_string()}).to_string()),
+            if let Err(e) = db_result {
+                return Some(json!({"type": "error", "message": e.to_string()}).to_string());
             }
+
+            // Best-effort cancel in engine.
+            let _ = { let mut eng = state.engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+
+            // Release frozen funds for the unfilled portion.
+            let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+            let repo = AccountRepository::new(state.db.as_ref());
+            if side == "buy" {
+                let freeze_price = price.unwrap_or(0.0);
+                if freeze_price > 0.0 && remaining > 0.0 {
+                    let _ = repo.release_frozen(user_id, quote_asset, freeze_price * remaining).await;
+                }
+            } else {
+                if remaining > 0.0 {
+                    let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+                }
+            }
+
+            Some(json!({"type": "order_update", "order_id": order_id, "status": "CANCELED", "ts": unix_now()}).to_string())
         }
     }
 }

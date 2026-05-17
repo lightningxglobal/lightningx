@@ -823,23 +823,54 @@ pub async fn market_data_broadcaster(state: AppState) {
             }
 
             _ = kline_interval.tick() => {
-                if last_price > 0.0 {
-                    let now = unix_now();
-                    let bar_time = now - (now % 60);
-                    let msg = json!({
-                        "type": "kline",
-                        "symbol": SYMBOL,
-                        "bar": {
-                            "time": bar_time,
-                            "open": last_price,
-                            "high": last_price,
-                            "low":  last_price,
-                            "close": last_price,
-                            "volume": 0.0
+                // Fetch real OHLCV from the trades table for the last 60 seconds.
+                // Skip the broadcast entirely if there were no trades — sending
+                // a flat candle (open==high==low==close, volume==0) corrupts the
+                // frontend chart with a fake bar.
+                let db = state.db.clone();
+                let mtx = state.market_tx.clone();
+                tokio::spawn(async move {
+                    let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64), _> = sqlx::query_as(
+                        "SELECT
+                           (array_agg(price ORDER BY created_at ASC))[1]  AS open,
+                           MAX(price)                                      AS high,
+                           MIN(price)                                      AS low,
+                           (array_agg(price ORDER BY created_at DESC))[1] AS close,
+                           COALESCE(SUM(quantity), 0.0)                    AS volume
+                         FROM trades
+                         WHERE symbol = $1
+                           AND created_at >= NOW() - INTERVAL '60 seconds'"
+                    )
+                    .bind(SYMBOL)
+                    .fetch_one(db.as_ref())
+                    .await;
+
+                    match row {
+                        Ok((Some(open), Some(high), Some(low), Some(close), volume)) if volume > 0.0 => {
+                            let now = unix_now();
+                            let bar_time = now - (now % 60);
+                            let msg = json!({
+                                "type": "kline",
+                                "symbol": SYMBOL,
+                                "bar": {
+                                    "time": bar_time,
+                                    "open": open,
+                                    "high": high,
+                                    "low":  low,
+                                    "close": close,
+                                    "volume": volume
+                                }
+                            }).to_string();
+                            let _ = mtx.send(msg);
                         }
-                    }).to_string();
-                    let _ = state.market_tx.send(msg);
-                }
+                        Ok(_) => {
+                            // No trades in the last 60s — skip sending kline.
+                        }
+                        Err(e) => {
+                            eprintln!("kline DB query failed: {}", e);
+                        }
+                    }
+                });
             }
         }
     }

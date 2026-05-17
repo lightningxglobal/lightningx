@@ -37,9 +37,6 @@ pub struct MatchingEngine {
 
     // 内部缓冲区：记录每次撮合影响的maker订单ID，避免参数传递开销
     affected_makers_buf: SmallVec<[u64; 64]>,
-    // 复用缓冲区 - 减少SmallVec分配开销
-    trade_indices_buf: SmallVec<[usize; 64]>,
-    trade_events_buf: SmallVec<[TradeEvent; 128]>,
 }
 
 impl MatchingEngine {
@@ -66,8 +63,6 @@ impl MatchingEngine {
             depth50_seq: 0,
             level2_seq: 0,
             affected_makers_buf: SmallVec::new(),
-            trade_indices_buf: SmallVec::new(),
-            trade_events_buf: SmallVec::new(),
         })
     }
 
@@ -540,8 +535,10 @@ impl MatchingEngine {
     fn match_order(&mut self, order: Order) -> OrderResult<f64> {
         let mut filled = 0.0;
         self.affected_makers_buf.clear();
-        self.trade_indices_buf.clear();
-        self.trade_events_buf.clear();
+
+        // 使用本地变量而非大结构体字段(缓存友好)
+        let mut trade_indices: SmallVec<[usize; 64]> = SmallVec::new();
+        let mut trade_events: SmallVec<[TradeEvent; 128]> = SmallVec::new();
 
         // 外层循环：获取最优对手价
         loop {
@@ -662,7 +659,7 @@ impl MatchingEngine {
                 }
 
                 // 存储Trade索引
-                self.trade_indices_buf.push(trade_idx);
+                trade_indices.push(trade_idx);
 
                 self.publish_event(&MatchingEvent::Trade {
                     taker_order_id: order.id,
@@ -685,7 +682,7 @@ impl MatchingEngine {
                     counter_order_id,
                 );
                 self.trade_sequence += 1;
-                self.trade_events_buf.push(trade_event);
+                trade_events.push(trade_event);
 
                 // 检查对手订单是否完全成交
                 if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
@@ -710,13 +707,13 @@ impl MatchingEngine {
 
         // 撮合完成后，批量发送所有交易事件到ring buffer
         if let Some(ref mut sender) = self.trade_event_sender {
-            for trade_event in self.trade_events_buf.iter() {
+            for trade_event in trade_events.iter() {
                 let _ = sender.push(*trade_event);
             }
         }
 
         // 释放Trade对象回池
-        for trade_idx in self.trade_indices_buf.iter() {
+        for trade_idx in trade_indices.iter() {
             self.pools.trades.release(*trade_idx);
         }
 

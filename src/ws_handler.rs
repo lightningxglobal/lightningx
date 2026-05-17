@@ -616,8 +616,9 @@ async fn handle_client_message(
                 "order_id": db_order_id,
                 "symbol": symbol,
                 "side": side,
+                "order_type": order_type,
                 "price": price,
-                "qty": qty,
+                "quantity": qty,
                 "ts": ts
             }).to_string())
         }

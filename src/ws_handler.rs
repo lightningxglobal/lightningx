@@ -469,16 +469,36 @@ async fn handle_client_message(
                         }
                     }
 
-                    // Update maker order status and filled quantity in DB.
-                    let _ = sqlx::query(
+                    // Update maker order status and filled quantity in DB; then push order_update.
+                    let maker_new_status: Option<String> = sqlx::query_scalar(
                         "UPDATE orders SET filled = filled + $1,
                          status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
-                         updated_at = NOW() WHERE id = $2",
+                         updated_at = NOW() WHERE id = $2
+                         RETURNING status",
                     )
                     .bind(fq)
                     .bind(maker_order_id as i64)
-                    .execute(state.db.as_ref())
-                    .await;
+                    .fetch_optional(state.db.as_ref())
+                    .await
+                    .unwrap_or(None);
+
+                    // Notify maker of their order state change.
+                    if let (Some(maker_id), Some(new_status)) = (maker_uid, maker_new_status) {
+                        let ws_maker_status = match new_status.as_str() {
+                            "COMPLETED" => "FILLED",
+                            "TRADING"   => "PARTIAL_FILL",
+                            other        => other,
+                        };
+                        let upd = json!({
+                            "type": "order_update",
+                            "order_id": maker_order_id as i64,
+                            "status": ws_maker_status,
+                            "filled_qty": fq,
+                            "avg_price": fp,
+                            "ts": ts
+                        }).to_string();
+                        if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.send(upd).await; }
+                    }
 
                     // Insert trade record with both sides.
                     let (buy_oid, sell_oid) = if side == "buy" {

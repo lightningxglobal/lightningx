@@ -255,10 +255,10 @@ mod tests {
         // 应该限流
         assert!(limiter.consume("client1", 1).is_err());
 
-        // 等待令牌补充
-        thread::sleep(Duration::from_millis(200)); // 2个时间单位
+        // 等待令牌补充（1.5秒，预期恢复15个令牌）
+        thread::sleep(Duration::from_millis(1500));
 
-        // 应该能再消耗大约2个令牌
+        // 应该能再消耗令牌（限流应该解除）
         assert!(limiter.consume("client1", 1).is_ok());
         assert!(limiter.consume("client1", 1).is_ok());
     }

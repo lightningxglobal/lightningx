@@ -25,6 +25,9 @@ pub mod transport;
 pub mod order_update;
 pub mod trading_engine;
 pub mod aeron_transport;
+pub mod account;
+pub mod rate_limit;
+pub mod market_data_server;
 #[cfg(test)]
 mod sbe_tests;
 
@@ -45,6 +48,19 @@ pub use aeron_publisher::{
     SnapshotPublisher, TradePublisher, AeronConfig, PublisherResult, PublisherError,
     snapshot_to_bytes, bytes_to_snapshot, trade_to_bytes, bytes_to_trade,
 };
+pub use account::{
+    Account, AccountManager, Position, AccountId,
+};
+pub use rate_limit::{
+    RateLimiter, RateLimitPolicy,
+};
+pub use market_data_server::{
+    MarketDataServer, DepthLevel,
+    TradeSnapshot, Statistics, BBO, create_router, start_server,
+};
+pub mod market_data_server_types {
+    pub use crate::market_data_server::{DepthSnapshot, DepthLevel, TradeSnapshot, Statistics, BBO};
+}
 
 #[cfg(test)]
 mod tests {

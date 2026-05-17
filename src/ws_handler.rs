@@ -466,6 +466,31 @@ async fn handle_client_message(
                 }).to_string();
                 let _ = state.market_tx.send(trade_msg);
 
+                // Broadcast ticker update with live last price + 24h change.
+                let sym_clone = symbol.to_string();
+                let db_clone = state.db.clone();
+                let mtx_clone = state.market_tx.clone();
+                tokio::spawn(async move {
+                    let open_24h: Option<f64> = sqlx::query_scalar(
+                        "SELECT price FROM trades WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at ASC LIMIT 1"
+                    )
+                    .bind(&sym_clone)
+                    .fetch_optional(db_clone.as_ref())
+                    .await
+                    .unwrap_or(None);
+                    let change = match open_24h {
+                        Some(o) if o != 0.0 => (fill_price - o) / o * 100.0,
+                        _ => 0.0,
+                    };
+                    let ticker = serde_json::json!({
+                        "type": "ticker",
+                        "symbol": sym_clone,
+                        "last": fill_price,
+                        "change": change,
+                    }).to_string();
+                    let _ = mtx_clone.send(ticker);
+                });
+
                 broadcast_depth(state, &symbol);
 
                 // Push order_update + balance_update to this user's personal channel.
@@ -606,9 +631,12 @@ fn broadcast_depth(state: &AppState, symbol: &str) {
 // ─── Background market data broadcaster ─────────────────────────────────────
 
 pub async fn market_data_broadcaster(state: AppState) {
+    // Use "BTC_USDT" as the primary symbol since the engine manages one book.
+    // Multi-symbol support requires per-symbol engines (Phase 2).
+    const SYMBOL: &str = "BTC_USDT";
     let mut depth_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    // Track last trade price for kline generation when no trades occur.
+    let mut ticker_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut last_price: f64 = 0.0;
 
     loop {
@@ -618,13 +646,12 @@ pub async fn market_data_broadcaster(state: AppState) {
                     let eng = state.engine.lock().unwrap();
                     (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
                 };
-                // Update last_price from best bid.
                 if let Some((p, _)) = bids.first() {
                     last_price = *p;
                 }
                 let msg = json!({
                     "type": "depth",
-                    "symbol": "BTC_USDT",
+                    "symbol": SYMBOL,
                     "bids": bids,
                     "asks": asks,
                     "ts": unix_now()
@@ -632,17 +659,41 @@ pub async fn market_data_broadcaster(state: AppState) {
                 let _ = state.market_tx.send(msg);
             }
 
-            _ = kline_interval.tick() => {
-                // Send a synthetic 1-minute kline bar using the current price.
-                // When trades occur, the WS place_order handler broadcasts individual
-                // trade events; this bar covers quiet periods.
+            _ = ticker_interval.tick() => {
+                // Periodic ticker broadcast so clients always see updated last price.
                 if last_price > 0.0 {
-                    // Round down to the current minute.
+                    let db = state.db.clone();
+                    let mtx = state.market_tx.clone();
+                    tokio::spawn(async move {
+                        let open_24h: Option<f64> = sqlx::query_scalar(
+                            "SELECT price FROM trades WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at ASC LIMIT 1"
+                        )
+                        .bind(SYMBOL)
+                        .fetch_optional(db.as_ref())
+                        .await
+                        .unwrap_or(None);
+                        let change = match open_24h {
+                            Some(o) if o != 0.0 => (last_price - o) / o * 100.0,
+                            _ => 0.0,
+                        };
+                        let msg = serde_json::json!({
+                            "type": "ticker",
+                            "symbol": SYMBOL,
+                            "last": last_price,
+                            "change": change,
+                        }).to_string();
+                        let _ = mtx.send(msg);
+                    });
+                }
+            }
+
+            _ = kline_interval.tick() => {
+                if last_price > 0.0 {
                     let now = unix_now();
                     let bar_time = now - (now % 60);
                     let msg = json!({
                         "type": "kline",
-                        "symbol": "BTC_USDT",
+                        "symbol": SYMBOL,
                         "bar": {
                             "time": bar_time,
                             "open": last_price,

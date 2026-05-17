@@ -117,12 +117,12 @@ pub struct DeskServer {
 }
 
 /// 会话信息
-#[derive(Clone)]
-struct SessionInfo {
-    session_id: SessionId,
-    client_id: String,
-    account_id: u64,
-    subscribed_channels: Vec<String>,
+#[derive(Clone, Debug)]
+pub struct SessionInfo {
+    pub session_id: SessionId,
+    pub client_id: String,
+    pub account_id: u64,
+    pub subscribed_channels: Vec<String>,
 }
 
 /// 行情更新（用于广播给WebSocket客户端）
@@ -257,6 +257,30 @@ impl DeskServer {
     /// 广播行情数据
     pub async fn broadcast_market_data(&self, update: MarketDataUpdate) {
         let _ = self.market_broadcast_tx.send(update);
+    }
+
+    /// 处理订单 WebSocket 连接（简化版：返回委托回报）
+    pub async fn handle_order_ws(&self, session_id: SessionId, req: OrderRequest) -> ServerMessage {
+        let client_id = format!("order_{}", uuid::Uuid::new_v4());
+        match self.process_order_request(session_id, client_id, req).await {
+            Ok(order_id) => ServerMessage::OrderAccepted { order_id },
+            Err(e) => ServerMessage::Error { message: e },
+        }
+    }
+
+    /// 处理取消委托请求
+    pub async fn handle_cancel_ws(&self, session_id: SessionId, req: CancelRequest) -> ServerMessage {
+        match self.process_cancel_request(session_id, req.clone()).await {
+            Ok(()) => ServerMessage::OrderCancelled {
+                order_id: req.order_id,
+            },
+            Err(e) => ServerMessage::Error { message: e },
+        }
+    }
+
+    /// 获取市场数据订阅接收器
+    pub fn subscribe_market_data(&self) -> broadcast::Receiver<MarketDataUpdate> {
+        self.market_broadcast_tx.subscribe()
     }
 }
 

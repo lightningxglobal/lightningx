@@ -7,9 +7,9 @@ pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
         .await
 }
 
-/// Run all migrations from the migrations/ directory.
+/// Run all migrations. Uses raw_sql to support multi-statement migration files.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(include_str!("../migrations/001_initial.sql"))
+    sqlx::raw_sql(include_str!("../migrations/001_initial.sql"))
         .execute(pool)
         .await?;
     Ok(())

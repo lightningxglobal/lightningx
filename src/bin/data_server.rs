@@ -207,7 +207,7 @@ async fn handle_orders(
             "SELECT * FROM orders
              WHERE user_id = $1
                AND ($2::text IS NULL OR symbol = $2)
-             ORDER BY created_at DESC LIMIT $4",
+             ORDER BY created_at DESC LIMIT $3",
         )
         .bind(user_id)
         .bind(&q.symbol)

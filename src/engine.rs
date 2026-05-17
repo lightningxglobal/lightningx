@@ -37,6 +37,8 @@ pub struct MatchingEngine {
 
     // 内部缓冲区：记录每次撮合影响的maker订单ID，避免参数传递开销
     affected_makers_buf: SmallVec<[u64; 64]>,
+    // 每次撮合产生的逐笔成交记录 (maker_order_id, price, qty)，供调用方做结算
+    fills_buf: SmallVec<[(u64, f64, f64); 16]>,
 }
 
 // Safety: MatchingEngine is accessed only through Mutex<MatchingEngine>; the raw
@@ -68,6 +70,7 @@ impl MatchingEngine {
             depth50_seq: 0,
             level2_seq: 0,
             affected_makers_buf: SmallVec::new(),
+            fills_buf: SmallVec::new(),
         })
     }
 
@@ -398,6 +401,7 @@ impl MatchingEngine {
             order_id: order.id,
             filled: filled_qty,
             status,
+            fills: self.fills_buf.clone(),
         })
     }
 
@@ -421,6 +425,7 @@ impl MatchingEngine {
                     order_id: order.id,
                     filled: 0.0,
                     status: OrderStatus::Rejected,
+                    fills: SmallVec::new(),
                 });
             }
         }
@@ -439,6 +444,7 @@ impl MatchingEngine {
             order_id: order.id,
             filled: 0.0,
             status: OrderStatus::Accepted,
+            fills: SmallVec::new(),
         })
     }
 
@@ -480,6 +486,7 @@ impl MatchingEngine {
                 order_id: order.id,
                 filled: 0.0,
                 status: OrderStatus::Rejected,
+                fills: SmallVec::new(),
             });
         }
 
@@ -489,6 +496,7 @@ impl MatchingEngine {
             order_id: order.id,
             filled: filled_qty,
             status: OrderStatus::Filled,
+            fills: self.fills_buf.clone(),
         })
     }
 
@@ -509,6 +517,7 @@ impl MatchingEngine {
             order_id: order.id,
             filled: filled_qty,
             status,
+            fills: self.fills_buf.clone(),
         })
     }
 
@@ -536,6 +545,7 @@ impl MatchingEngine {
             order_id: order.id,
             filled: filled_qty,
             status,
+            fills: self.fills_buf.clone(),
         })
     }
 
@@ -583,6 +593,7 @@ impl MatchingEngine {
     fn match_order(&mut self, order: Order) -> OrderResult<f64> {
         let mut filled = 0.0;
         self.affected_makers_buf.clear();
+        self.fills_buf.clear();
 
         // 使用本地变量而非大结构体字段(缓存友好)
         let mut trade_indices: SmallVec<[usize; 64]> = SmallVec::new();
@@ -674,8 +685,9 @@ impl MatchingEngine {
                 let counter_remaining = counter_order.remaining();
                 let trade_qty = order_remaining.min(counter_remaining);
 
-                // 收集被修改的 maker ID
+                // 收集被修改的 maker ID 及成交明细
                 self.affected_makers_buf.push(counter_order_id);
+                self.fills_buf.push((counter_order_id, best_price, trade_qty));
 
                 // 更新订单状态
                 {
@@ -1193,6 +1205,8 @@ pub struct PlaceOrderResult {
     pub order_id: u64,
     pub filled: f64,
     pub status: OrderStatus,
+    /// Individual fills produced by this order: (maker_order_id, fill_price, fill_qty).
+    pub fills: SmallVec<[(u64, f64, f64); 16]>,
 }
 
 /// 订单状态

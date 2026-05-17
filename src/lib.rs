@@ -29,6 +29,7 @@ pub mod account;
 pub mod rate_limit;
 pub mod market_data_server;
 pub mod snowflake;
+pub mod desk_server;
 #[cfg(test)]
 mod sbe_tests;
 

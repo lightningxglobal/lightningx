@@ -340,11 +340,32 @@ async fn handle_trades(
     }
 }
 
+// Returns every symbol that has ever had an order. Used by the frontend
+// SymbolList as a fallback when /api/tickers is empty (e.g. fresh deploy
+// with orders posted but no trades yet).
+async fn handle_symbols(State(s): State<AppState>) -> impl IntoResponse {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT symbol FROM orders ORDER BY symbol",
+    )
+    .fetch_all(s.db.as_ref())
+    .await;
+
+    match rows {
+        Ok(symbols) => (StatusCode::OK, Json(json!(symbols))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/tickers", get(handle_tickers))
+        .route("/api/symbols", get(handle_symbols))
         .route("/api/klines", get(handle_klines))
         .route("/api/orders", get(handle_orders))
         .route("/api/orders/:id", get(handle_order))

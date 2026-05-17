@@ -565,6 +565,7 @@ async fn handle_client_message(
                         let bal_msg = json!({
                             "type": "balance_update",
                             "asset": asset,
+                            "balance": acc.balance,
                             "available": acc.balance - acc.frozen,
                             "frozen": acc.frozen
                         }).to_string();

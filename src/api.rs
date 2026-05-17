@@ -1,12 +1,12 @@
-/// REST API layer: auth, accounts, orders
+/// REST API layer: auth, accounts, orders, user profile, KYC
 use crate::account_repository::AccountRepository;
-use crate::models::DbOrder;
+use crate::models::{DbOrder, User};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -21,12 +21,19 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        // Auth
         .route("/api/auth/register", post(handle_register))
         .route("/api/auth/login", post(handle_login))
+        // User profile & KYC
+        .route("/api/user/profile", get(handle_get_profile).patch(handle_update_profile))
+        .route("/api/kyc", post(handle_submit_kyc))
+        // Accounts / balances
         .route("/api/accounts", get(handle_accounts))
-        .route("/api/balances", get(handle_accounts)) // alias for frontend
+        .route("/api/balances", get(handle_accounts))
+        // Orders
         .route("/api/orders", get(handle_orders).post(handle_place_order))
         .route("/api/orders/:order_id", get(handle_order).delete(handle_cancel_order))
+        // Trades & tickers
         .route("/api/trades", get(handle_trades))
         .route("/api/tickers", get(handle_tickers))
         .with_state(state)
@@ -285,6 +292,93 @@ async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
             })).collect();
             (StatusCode::OK, Json(json!(tickers))).into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ─── User profile ─────────────────────────────────────────────────────────────
+
+async fn handle_get_profile(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(s.db.as_ref())
+        .await
+    {
+        Ok(Some(u)) => (StatusCode::OK, Json(json!(u))).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "User not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateProfileRequest {
+    full_name: Option<String>,
+}
+
+async fn handle_update_profile(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateProfileRequest>,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    match sqlx::query_as::<_, User>(
+        "UPDATE users SET full_name = COALESCE($1, full_name), updated_at = NOW()
+         WHERE id = $2 RETURNING *",
+    )
+    .bind(&req.full_name)
+    .bind(user_id)
+    .fetch_optional(s.db.as_ref())
+    .await
+    {
+        Ok(Some(u)) => (StatusCode::OK, Json(json!(u))).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "User not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ─── KYC ─────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct KycRequest {
+    full_name: String,
+}
+
+async fn handle_submit_kyc(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<KycRequest>,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    if req.full_name.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "full_name required"}))).into_response();
+    }
+    match sqlx::query_as::<_, User>(
+        "UPDATE users SET full_name = $1, kyc_status = 'PENDING', updated_at = NOW()
+         WHERE id = $2 AND kyc_status = 'NONE' RETURNING *",
+    )
+    .bind(req.full_name.trim())
+    .bind(user_id)
+    .fetch_optional(s.db.as_ref())
+    .await
+    {
+        Ok(Some(u)) => (StatusCode::OK, Json(json!({
+            "kyc_status": u.kyc_status,
+            "message": "KYC submitted, pending review"
+        }))).into_response(),
+        Ok(None) => (StatusCode::BAD_REQUEST, Json(json!({"error": "KYC already submitted or user not found"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

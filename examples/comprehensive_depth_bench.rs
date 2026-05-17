@@ -98,8 +98,7 @@ fn benchmark_scenario(
                     TimeInForce::GTC,
                     0,
                 );
-                let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(order, &mut affected_makers)?;
+        engine.place_order(order)?;
                 latencies.record(start.elapsed().as_nanos() as u64)?;
 
                 total_orders += 1;
@@ -119,8 +118,7 @@ fn benchmark_scenario(
                     TimeInForce::GTC,
                     0,
                 );
-                let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(order, &mut affected_makers)?;
+        engine.place_order(order)?;
                 latencies.record(start.elapsed().as_nanos() as u64)?;
 
                 total_orders += 1;
@@ -151,7 +149,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = MatchingEngine::new(PoolConfig::default())?;
     for i in 0..100 {
         let order = Order::new(i as u64, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
     println!("预热完成\n");
 

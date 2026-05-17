@@ -17,7 +17,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("Placing sell order: price={}, qty={}", sell_order.price, sell_order.quantity);
-    let result = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
     println!("Result: status={:?}, filled={}\n", result.status, result.filled);
 
     // 创建一个买单来撮合
@@ -31,7 +30,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("Placing buy order: price={}, qty={}", buy_order.price, buy_order.quantity);
-    let result = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
     println!("Result: status={:?}, filled={}\n", result.status, result.filled);
 
     // 获取统计信息

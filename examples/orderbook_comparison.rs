@@ -46,7 +46,6 @@ fn benchmark_orderbook(book_type: OrderBookType, impl_name: &str, base_config: &
     for i in 0..100 {
         let price = 50000.0 + (i % price_range) as f64;
         let order = Order::new(i as u64, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     // 重置引擎进行真实测试
@@ -61,15 +60,13 @@ fn benchmark_orderbook(book_type: OrderBookType, impl_name: &str, base_config: &
         // 买单
         let start_op = Instant::now();
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new());
         let elapsed = start_op.elapsed();
         timings.push(elapsed.as_nanos() as u64);
 
         // 卖单
         let start_op = Instant::now();
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(sell, &mut affected_makers)?;
+        engine.place_order(sell)?;
         let elapsed = start_op.elapsed();
         timings.push(elapsed.as_nanos() as u64);
     }

@@ -16,12 +16,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..10 {
             let order_idx = batch_idx * 10 + i;
             let buy = Order::new(order_idx as u64 * 2, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
-            let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(buy, &mut affected_makers)?;
+        engine.place_order(buy)?;
 
             let sell = Order::new(order_idx as u64 * 2 + 1, Side::Sell, 50000.0, 10.0, TimeInForce::GTC, 0);
-            let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(sell, &mut affected_makers)?;
+        engine.place_order(sell)?;
         }
     }
     let single_tps = (num_rounds as f64 * 20.0) / start.elapsed().as_secs_f64();

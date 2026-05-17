@@ -26,8 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(order, &mut affected_makers)?;
+        engine.place_order(order)?;
     }
     let place_duration = place_start.elapsed();
     let place_tps = 10_000.0 / place_duration.as_secs_f64();

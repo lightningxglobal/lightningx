@@ -20,7 +20,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let price = 50000.0 + i as f64;
         let qty = (i + 1) as f64;
         let order = create_test_order(i, Side::Sell, price, qty);
-        let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("  Sell #{} at price {} qty {}", i, price, qty);
     }
 
@@ -30,7 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let price = 49999.0 - i as f64;
         let qty = (5 - i) as f64;
         let order = create_test_order(10 + i, Side::Buy, price, qty);
-        let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         println!("  Buy #{} at price {} qty {}", 10 + i, price, qty);
     }
 
@@ -57,7 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Testing Partial Fill ===");
     println!("Placing buy order at 50004.5 (should match with sell orders)");
     let match_order = create_test_order(20, Side::Buy, 50004.5, 3.0);
-    let result = let mut affected_makers = SmallVec::new(); engine.place_order(match_order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
     println!("Matched {} units, status: {:?}", result.filled, result.status);
 
     // Generate snapshot after match

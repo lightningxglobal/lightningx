@@ -44,7 +44,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
-            if let Err(e) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
                 println!("Error placing order {}: {:?}", total_orders, e);
                 break;
             }

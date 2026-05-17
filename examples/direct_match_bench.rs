@@ -32,7 +32,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 现在用卖单与这些买单匹配
     let mut latencies = Histogram::<u64>::new(3)?;
-    let mut affected_makers = SmallVec::<[u64; 64]>::new();
 
     let start = Instant::now();
 
@@ -47,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let begin = Instant::now();
-        let _result = engine.place_order(order, &mut affected_makers)?;
+        let _result = engine.place_order(order)?;
         latencies.record(begin.elapsed().as_nanos() as u64)?;
     }
 

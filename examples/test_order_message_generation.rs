@@ -19,7 +19,6 @@ fn main() {
 
         let next_id = engine.stats().total_orders as u64;
         let order = Order::new(next_id, Side::Buy, 100.0, 10.0, TimeInForce::IOC, now);
-        match let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             Ok(result) => {
                 if matches!(result.status, matching_engine::engine::OrderStatus::Rejected) {
                     let evt = OrderUpdateEvent::rejected(123, 456, 1, now);
@@ -44,7 +43,6 @@ fn main() {
 
         let next_id = engine.stats().total_orders as u64;
         let order = Order::new(next_id, Side::Buy, 100.0, 10.0, TimeInForce::GTC, now);
-        match let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             Ok(result) => {
                 if matches!(result.status, matching_engine::engine::OrderStatus::Accepted) {
                     let evt = OrderUpdateEvent::accepted(2, 123, 456, now);
@@ -70,12 +68,10 @@ fn main() {
         // First GTC sell order
         let id1 = engine.stats().total_orders as u64;
         let sell_order = Order::new(id1, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         // IOC buy order matching it
         let id2 = engine.stats().total_orders as u64;
         let buy_order = Order::new(id2, Side::Buy, 100.0, 10.0, TimeInForce::IOC, now);
-        match let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             Ok(result) => {
                 if matches!(result.status, matching_engine::engine::OrderStatus::Filled) {
                     let evt = OrderUpdateEvent::filled(4, 123, 456, 100.0, 10.0, now);
@@ -103,12 +99,10 @@ fn main() {
         // GTC sell 10
         let id1 = engine.stats().total_orders as u64;
         let sell_order = Order::new(id1, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         // GTC buy 20 (larger than sell)
         let id2 = engine.stats().total_orders as u64;
         let buy_order = Order::new(id2, Side::Buy, 100.0, 20.0, TimeInForce::GTC, now);
-        match let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             Ok(result) => {
                 if matches!(result.status, matching_engine::engine::OrderStatus::PartiallyFilled) {
                     let evt = OrderUpdateEvent::partial_fill(6, 123, 456, 100.0, result.filled, 20.0 - result.filled, now);

@@ -36,7 +36,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,
             );
             let t = Instant::now();
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             latencies.record(t.elapsed().as_nanos() as u64)?;
             total_orders += 1;
         }
@@ -78,7 +77,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0,
                 );
                 let t = Instant::now();
-                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
                 latencies.record(t.elapsed().as_nanos() as u64)?;
                 total_orders += 1;
 
@@ -91,7 +89,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0,
                 );
                 let t = Instant::now();
-                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
                 latencies.record(t.elapsed().as_nanos() as u64)?;
                 total_orders += 1;
             }
@@ -126,7 +123,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         let mut latencies = Histogram::<u64>::new(3)?;
         let mut total_orders = 1u64;
@@ -143,7 +139,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,
             );
             let t = Instant::now();
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             latencies.record(t.elapsed().as_nanos() as u64)?;
             total_orders += 1;
         }

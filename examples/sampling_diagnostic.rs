@@ -38,7 +38,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new())?;
         total_orders += 1;
 
         // Try to consume events

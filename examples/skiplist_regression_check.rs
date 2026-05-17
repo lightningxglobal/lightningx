@@ -56,7 +56,6 @@ fn test_matching_engine() {
             TimeInForce::GTC,
             0,
         );
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     // 计时：5000 个买单匹配
@@ -71,7 +70,6 @@ fn test_matching_engine() {
             TimeInForce::GTC,
             0,
         );
-        if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             if result.filled > 0.0 {
                 match_count += 1;
             }
@@ -100,10 +98,8 @@ fn test_perfect_matching() {
     let mut match_count = 0;
     for i in 0..10000 {
         let buy = Order::new(i as u64 * 2, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy, &mut affected_makers, &mut smallvec::SmallVec::new());
 
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, 50000.0, 10.0, TimeInForce::GTC, 0);
-        if let Ok(result) = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new()) {
             if result.filled > 0.0 {
                 match_count += 1;
             }

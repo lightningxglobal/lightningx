@@ -29,8 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(buy, &mut affected_makers)?;
+        engine.place_order(buy)?;
 
         // 卖单 - 以同样价格成交
         let sell = Order::new(
@@ -41,7 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
-        let result = let mut affected_makers = SmallVec::new(); engine.place_order(sell, &mut affected_makers, &mut smallvec::SmallVec::new())?;
 
         if result.filled > 0.0 {
             matched_count += 1;
@@ -71,8 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..num_rounds {
         let price = 50000.0 + (i % 100) as f64;
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(buy, &mut affected_makers)?;
+        engine.place_order(buy)?;
     }
 
     // 然后测量卖单延迟
@@ -81,8 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
 
         let start_op = Instant::now();
-        let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(sell, &mut affected_makers)?;
+        engine.place_order(sell)?;
         let elapsed = start_op.elapsed();
 
         latencies.push(elapsed.as_nanos() as u64);

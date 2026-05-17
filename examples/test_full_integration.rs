@@ -65,7 +65,6 @@ fn main() {
         0,
     );
 
-    match let mut affected_makers = SmallVec::new(); engine.place_order(order1, &mut affected_makers, &mut smallvec::SmallVec::new()) {
         Ok(result) => {
             println!("✓ GTC买单已接受 - Status: {:?}", result.status);
             println!("  订单ID: 1, 价格: 50000.0, 数量: 10.0");
@@ -90,7 +89,6 @@ fn main() {
         0,
     );
 
-    match let mut affected_makers = SmallVec::new(); engine.place_order(order2, &mut affected_makers, &mut smallvec::SmallVec::new()) {
         Ok(result) => {
             println!("✓ IOC卖单已处理 - Status: {:?}", result.status);
             println!("  订单ID: 2, 价格: 50000.0, 数量: 15.0");

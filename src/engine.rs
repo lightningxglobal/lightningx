@@ -34,6 +34,9 @@ pub struct MatchingEngine {
     depth_snapshot_seq: u64,
     depth50_seq: u64,
     level2_seq: u64,
+
+    // 内部缓冲区：记录每次撮合影响的maker订单ID，避免参数传递开销
+    affected_makers_buf: SmallVec<[u64; 64]>,
 }
 
 impl MatchingEngine {
@@ -59,6 +62,7 @@ impl MatchingEngine {
             depth_snapshot_seq: 0,
             depth50_seq: 0,
             level2_seq: 0,
+            affected_makers_buf: SmallVec::new(),
         })
     }
 
@@ -85,6 +89,11 @@ impl MatchingEngine {
     /// 设置行情配置
     pub fn set_market_data_config(&mut self, config: MarketDataConfig) {
         self.market_data_config = config;
+    }
+
+    /// 获取最后一次撮合影响的maker订单ID列表
+    pub fn last_affected_makers(&self) -> &[u64] {
+        &self.affected_makers_buf
     }
 
     /// 获取指定数量的顶层价位（用于性能测试）
@@ -314,7 +323,7 @@ impl MatchingEngine {
 
     /// 下单（热路径）
     #[inline]
-    pub fn place_order(&mut self, mut order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<PlaceOrderResult> {
+    pub fn place_order(&mut self, mut order: Order) -> OrderResult<PlaceOrderResult> {
         // 验证订单
         self.validate_order(&order)?;
 
@@ -327,14 +336,14 @@ impl MatchingEngine {
         order.id = self.next_order_id;
         self.next_order_id += 1;
 
-        affected_makers.clear();
+        self.affected_makers_buf.clear();
 
-        // 处理不同的委托类型，直接传递affected_makers
+        // 处理不同的委托类型，使用内部affected_makers缓冲区
         let result = match order.time_in_force {
-            TimeInForce::PostOnly => self.handle_post_only(order, affected_makers)?,
-            TimeInForce::FOK => self.handle_fok(order, affected_makers)?,
-            TimeInForce::IOC => self.handle_ioc(order, affected_makers)?,
-            TimeInForce::GTC => self.handle_gtc(order, affected_makers)?,
+            TimeInForce::PostOnly => self.handle_post_only(order)?,
+            TimeInForce::FOK => self.handle_fok(order)?,
+            TimeInForce::IOC => self.handle_ioc(order)?,
+            TimeInForce::GTC => self.handle_gtc(order)?,
         };
 
         self.maybe_sample_depth();
@@ -358,15 +367,14 @@ impl MatchingEngine {
             self.next_order_id += 1;
         }
 
-        // 批量处理订单
-        let mut affected_makers = SmallVec::new();
+        // 批量处理订单，使用内部affected_makers缓冲区
         for order in orders.into_iter() {
-            affected_makers.clear();
+            self.affected_makers_buf.clear();
             let result = match order.time_in_force {
-                TimeInForce::PostOnly => self.handle_post_only(order, &mut affected_makers)?,
-                TimeInForce::FOK => self.handle_fok(order, &mut affected_makers)?,
-                TimeInForce::IOC => self.handle_ioc(order, &mut affected_makers)?,
-                TimeInForce::GTC => self.handle_gtc(order, &mut affected_makers)?,
+                TimeInForce::PostOnly => self.handle_post_only(order)?,
+                TimeInForce::FOK => self.handle_fok(order)?,
+                TimeInForce::IOC => self.handle_ioc(order)?,
+                TimeInForce::GTC => self.handle_gtc(order)?,
             };
             results.push(result);
         }
@@ -375,7 +383,7 @@ impl MatchingEngine {
     }
 
     /// 处理Post-Only订单
-    fn handle_post_only(&mut self, order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<PlaceOrderResult> {
+    fn handle_post_only(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         // 检查是否会立即成交
         let opposite_book = match order.side {
             Side::Buy => &self.sell_book,
@@ -415,9 +423,9 @@ impl MatchingEngine {
     }
 
     /// 处理FOK订单
-    fn handle_fok(&mut self, order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<PlaceOrderResult> {
+    fn handle_fok(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         // 尝试撮合
-        let filled_qty = self.match_order(order, affected_makers)?;
+        let filled_qty = self.match_order(order)?;
 
         if (filled_qty - order.quantity).abs() < 1e-10 {
             // 完全成交
@@ -439,8 +447,8 @@ impl MatchingEngine {
     }
 
     /// 处理IOC订单
-    fn handle_ioc(&mut self, order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<PlaceOrderResult> {
-        let filled_qty = self.match_order(order, affected_makers)?;
+    fn handle_ioc(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
+        let filled_qty = self.match_order(order)?;
 
         let status = if (filled_qty - order.quantity).abs() < 1e-10 {
             OrderStatus::Filled
@@ -458,8 +466,8 @@ impl MatchingEngine {
     }
 
     /// 处理GTC订单
-    fn handle_gtc(&mut self, order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<PlaceOrderResult> {
-        let filled_qty = self.match_order(order, affected_makers)?;
+    fn handle_gtc(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
+        let filled_qty = self.match_order(order)?;
 
         // 如果有剩余，加入订单簿
         if filled_qty < order.quantity {
@@ -524,7 +532,7 @@ impl MatchingEngine {
 
     /// 撮合订单（关键热路径，使用持久化缓存优化最优价格查询）
     #[inline]
-    fn match_order(&mut self, order: Order, affected_makers: &mut SmallVec<[u64; 64]>) -> OrderResult<f64> {
+    fn match_order(&mut self, order: Order) -> OrderResult<f64> {
         let mut filled = 0.0;
         let mut trade_indices: SmallVec<[usize; 64]> = SmallVec::new();
         let mut trade_events: SmallVec<[TradeEvent; 128]> = SmallVec::new();
@@ -615,7 +623,7 @@ impl MatchingEngine {
                 let trade_qty = order_remaining.min(counter_remaining);
 
                 // 收集被修改的 maker ID
-                affected_makers.push(counter_order_id);
+                self.affected_makers_buf.push(counter_order_id);
 
                 // 更新订单状态
                 {

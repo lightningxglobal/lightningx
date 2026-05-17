@@ -30,7 +30,6 @@ fn main() {
                 TimeInForce::GTC,
                 0,
             );
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
         }
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         let tps = 5000.0 / (elapsed / 1000.0);

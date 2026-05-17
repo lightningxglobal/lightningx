@@ -74,12 +74,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let price = 50000.0 + (i % 100) as f64;
 
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(buy, &mut affected_makers)?;
+        engine.place_order(buy)?;
 
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        let mut affected_makers = SmallVec::<[u64; 64]>::new();
-        engine.place_order(sell, &mut affected_makers)?;
+        engine.place_order(sell)?;
     }
     let single_order_tps = (num_rounds as f64 * 20.0) / start.elapsed().as_secs_f64();
     println!("  TPS: {:.0}\n", single_order_tps);

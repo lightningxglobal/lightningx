@@ -71,7 +71,6 @@ fn main() {
 
             {
                 let mut engine = engine_trade.lock();
-                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(buy_order, &mut affected_makers, &mut smallvec::SmallVec::new());
             }
 
             // 卖单 - 触发成交
@@ -86,7 +85,6 @@ fn main() {
 
             {
                 let mut engine = engine_trade.lock();
-                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(sell_order, &mut affected_makers, &mut smallvec::SmallVec::new());
             }
 
             // 稍微延迟以允许引擎处理

@@ -60,7 +60,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0,
             );
             let t = Instant::now();
-            let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
             latencies.record(t.elapsed().as_nanos() as u64)?;
 
             // 消费OrderUpdate事件 (如果有的话，IOC可能会产生Rejected)
@@ -136,7 +135,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0,
                 );
                 let t = Instant::now();
-                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
                 latencies.record(t.elapsed().as_nanos() as u64)?;
                 total_orders += 1;
 
@@ -149,7 +147,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0,
                 );
                 let t = Instant::now();
-                let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
                 latencies.record(t.elapsed().as_nanos() as u64)?;
                 total_orders += 1;
             }

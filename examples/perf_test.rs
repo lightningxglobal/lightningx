@@ -23,7 +23,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..500 {
         let order = create_test_order(i, Side::Buy, 50000.0 + (i % 100) as f64);
-        if let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()).is_ok() {
             success_count += 1;
         }
     }
@@ -44,7 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-fill with sell orders
     for i in 0..250 {
         let order = create_test_order(i, Side::Sell, 50000.0 + (i % 50) as f64);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     let start = Instant::now();
@@ -52,7 +50,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 250..500 {
         let order = create_test_order(i, Side::Buy, 55000.0);
-        if let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new()).is_ok() {
             match_count += 1;
         }
     }
@@ -73,7 +70,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Place some orders
     for i in 0..100 {
         let order = create_test_order(i, Side::Buy, 50000.0);
-        let _ = let mut affected_makers = SmallVec::new(); engine.place_order(order, &mut affected_makers, &mut smallvec::SmallVec::new());
     }
 
     let start = Instant::now();

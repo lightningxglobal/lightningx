@@ -470,11 +470,13 @@ async fn handle_client_message(
                     }
 
                     // Update maker order status and filled quantity in DB; then push order_update.
-                    let maker_new_status: Option<String> = sqlx::query_scalar(
+                    // RETURNING `filled` gives the post-update cumulative qty so the WS payload
+                    // matches taker semantics — frontend treats `filled_qty` as cumulative.
+                    let maker_row: Option<(String, f64)> = sqlx::query_as(
                         "UPDATE orders SET filled = filled + $1,
                          status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
                          updated_at = NOW() WHERE id = $2
-                         RETURNING status",
+                         RETURNING status, filled",
                     )
                     .bind(fq)
                     .bind(maker_order_id as i64)
@@ -483,7 +485,7 @@ async fn handle_client_message(
                     .unwrap_or(None);
 
                     // Notify maker of their order state change.
-                    if let (Some(maker_id), Some(new_status)) = (maker_uid, maker_new_status) {
+                    if let (Some(maker_id), Some((new_status, new_filled))) = (maker_uid, maker_row) {
                         let ws_maker_status = match new_status.as_str() {
                             "COMPLETED" => "FILLED",
                             "TRADING"   => "PARTIAL_FILL",
@@ -493,7 +495,8 @@ async fn handle_client_message(
                             "type": "order_update",
                             "order_id": maker_order_id as i64,
                             "status": ws_maker_status,
-                            "filled_qty": fq,
+                            "filled_qty": new_filled,
+                            "fill_delta": fq,
                             "avg_price": fp,
                             "ts": ts
                         }).to_string();

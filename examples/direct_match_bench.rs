@@ -47,7 +47,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let begin = Instant::now();
-        affected_makers.clear();
         let _result = engine.place_order(order, &mut affected_makers)?;
         latencies.record(begin.elapsed().as_nanos() as u64)?;
     }

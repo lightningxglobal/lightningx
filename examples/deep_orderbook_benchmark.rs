@@ -44,7 +44,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..depth {
         let price = base_price - (depth as f64 - i as f64) + 1.0;
         let order = Order::new(i as u64, Side::Buy, price, 100.0, TimeInForce::GTC, 0);
-        affected_makers.clear();
         engine.place_order(order, &mut affected_makers)?;
     }
 
@@ -52,7 +51,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..depth {
         let price = base_price + i as f64;
         let order = Order::new((depth + i) as u64, Side::Sell, price, 100.0, TimeInForce::GTC, 0);
-        affected_makers.clear();
         engine.place_order(order, &mut affected_makers)?;
     }
 
@@ -76,13 +74,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..depth {
         let price = base_price - (depth as f64 - i as f64) + 1.0;
         let order = Order::new(i as u64, Side::Buy, price, 100.0, TimeInForce::GTC, 0);
-        affected_makers.clear();
         engine.place_order(order, &mut affected_makers)?;
     }
     for i in 0..depth {
         let price = base_price + i as f64;
         let order = Order::new((depth + i) as u64, Side::Sell, price, 100.0, TimeInForce::GTC, 0);
-        affected_makers.clear();
         engine.place_order(order, &mut affected_makers)?;
     }
 
@@ -101,7 +97,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new((800 + order_id) as u64, Side::Buy, price, qty, TimeInForce::GTC, 0);
-            affected_makers.clear();
             engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
         } else {
@@ -111,7 +106,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new((800 + order_id) as u64, Side::Sell, price, qty, TimeInForce::GTC, 0);
-            affected_makers.clear();
             engine.place_order(order, &mut affected_makers)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
         }
@@ -151,13 +145,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..depth {
         let price = base_price - (depth as f64 - i as f64) + 1.0;
         let order = Order::new(i as u64, Side::Buy, price, 100.0, TimeInForce::GTC, 0);
-        affected_makers.clear();
         engine.place_order(order, &mut affected_makers)?;
     }
     for i in 0..depth {
         let price = base_price + i as f64;
         let order = Order::new((depth + i) as u64, Side::Sell, price, 100.0, TimeInForce::GTC, 0);
-        affected_makers.clear();
         engine.place_order(order, &mut affected_makers)?;
     }
 

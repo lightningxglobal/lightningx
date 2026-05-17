@@ -484,13 +484,23 @@ async fn upstream_user_task(
     mut cmd_rx: mpsc::Receiver<String>,
     personal_tx: mpsc::Sender<String>,
 ) {
+    // Exponential backoff for reconnect attempts: 1s, 2s, 4s, ..., capped at 30s.
+    // Resets to 1s once a connection successfully authenticates so a flaky network
+    // doesn't keep the user permanently at the 30s ceiling.
+    const MAX_BACKOFF_SECS: u64 = 30;
+    let mut backoff_secs: u64 = 1;
+
     loop {
         let ws_result = connect_async(&upstream_url).await;
         let ws = match ws_result {
             Ok((ws, _)) => ws,
             Err(e) => {
-                tracing::warn!("upstream_user_task: connect error: {}; retrying in 2s", e);
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tracing::warn!(
+                    "upstream_user_task: connect error: {}; retrying in {}s",
+                    e, backoff_secs
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                 continue;
             }
         };
@@ -499,7 +509,8 @@ async fn upstream_user_task(
         // Authenticate
         let auth = json!({"type": "auth", "token": token}).to_string();
         if tx.send(WsMsg::Text(auth)).await.is_err() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             continue;
         }
 
@@ -515,10 +526,17 @@ async fn upstream_user_task(
             }
         }
         if !authed {
-            tracing::warn!("upstream_user_task: auth failed; retrying in 2s");
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tracing::warn!(
+                "upstream_user_task: auth failed; retrying in {}s",
+                backoff_secs
+            );
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             continue;
         }
+
+        // Healthy connection — reset backoff so the next outage starts at 1s.
+        backoff_secs = 1;
 
         // Relay loop: forward commands upstream, relay responses to client
         let upstream_dropped = loop {
@@ -545,8 +563,12 @@ async fn upstream_user_task(
             }
         };
         if upstream_dropped {
-            tracing::warn!("upstream_user_task: upstream dropped; reconnecting in 1s");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tracing::warn!(
+                "upstream_user_task: upstream dropped; reconnecting in {}s",
+                backoff_secs
+            );
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
         }
     }
 }

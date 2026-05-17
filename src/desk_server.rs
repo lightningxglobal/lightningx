@@ -792,6 +792,28 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
     let upstream_url = state.upstream_ws_url.as_str();
 
     loop {
+        // Query active symbols from DB; fall back to BTC_USDT if none found
+        let symbols: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT symbol FROM orders UNION SELECT DISTINCT symbol FROM trades ORDER BY 1",
+        )
+        .fetch_all(state.db.as_ref())
+        .await
+        .unwrap_or_default();
+        let symbols = if symbols.is_empty() {
+            vec!["BTC_USDT".to_string()]
+        } else {
+            symbols
+        };
+
+        let channels: Vec<String> = symbols
+            .iter()
+            .flat_map(|s| {
+                ["depth", "trades", "ticker", "kline"]
+                    .iter()
+                    .map(move |ch| format!("{}.{}", ch, s))
+            })
+            .collect();
+
         match connect_async(upstream_url).await {
             Err(e) => {
                 tracing::warn!("desk broadcaster: cannot connect to upstream {}: {}; retrying in 3s", upstream_url, e);
@@ -799,12 +821,13 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                 continue;
             }
             Ok((mut ws, _)) => {
-                tracing::info!("desk broadcaster: connected to upstream {}", upstream_url);
+                tracing::info!("desk broadcaster: connected to upstream {}, subscribing {} channels for {} symbols",
+                    upstream_url, channels.len(), symbols.len());
 
                 // Subscribe to market channels — no auth needed for market data
                 let sub = json!({
                     "type": "subscribe",
-                    "channels": ["depth.BTC_USDT", "trades.BTC_USDT", "ticker.BTC_USDT", "kline.BTC_USDT"]
+                    "channels": channels,
                 }).to_string();
                 if ws.send(WsMsg::Text(sub)).await.is_err() {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;

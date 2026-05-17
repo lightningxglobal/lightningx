@@ -64,7 +64,8 @@ async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
                 MAX(price) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS high_24h,
                 MIN(price) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS low_24h,
                 SUM(quantity) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS vol_24h,
-                (SELECT price FROM trades t2 WHERE t2.symbol = t.symbol ORDER BY created_at DESC LIMIT 1) AS last_price
+                (SELECT price FROM trades t2 WHERE t2.symbol = t.symbol ORDER BY created_at DESC LIMIT 1) AS last_price,
+                (SELECT price FROM trades t3 WHERE t3.symbol = t.symbol AND t3.created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at ASC LIMIT 1) AS open_24h
          FROM trades t GROUP BY symbol ORDER BY symbol",
     )
     .fetch_all(s.db.as_ref())
@@ -76,12 +77,19 @@ async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
             let tickers: Vec<Value> = rows
                 .iter()
                 .map(|r| {
+                    let last: Option<f64> = r.get("last_price");
+                    let open: Option<f64> = r.get("open_24h");
+                    let change = match (last, open) {
+                        (Some(l), Some(o)) if o != 0.0 => (l - o) / o * 100.0,
+                        _ => 0.0,
+                    };
                     json!({
                         "symbol": r.get::<String, _>("symbol"),
-                        "last":   r.get::<Option<f64>, _>("last_price"),
+                        "last":   last,
                         "high":   r.get::<Option<f64>, _>("high_24h"),
                         "low":    r.get::<Option<f64>, _>("low_24h"),
                         "volume": r.get::<Option<f64>, _>("vol_24h"),
+                        "change": change,
                     })
                 })
                 .collect();

@@ -180,20 +180,41 @@ async fn handle_orders(
     };
     let limit = q.limit.unwrap_or(50).min(500);
 
+    // Translate frontend virtual status aliases to DB status values.
+    let status_filter: Option<Vec<&str>> = match q.status.as_deref() {
+        Some("open")    => Some(vec!["PENDING", "TRADING"]),
+        Some("history") => Some(vec!["COMPLETED", "CANCELED", "REJECTED"]),
+        Some(s)         => Some(vec![s]),
+        None            => None,
+    };
+
     use lightning_exchange::models::DbOrder;
-    let orders = sqlx::query_as::<_, DbOrder>(
-        "SELECT * FROM orders
-         WHERE user_id = $1
-           AND ($2::text IS NULL OR symbol = $2)
-           AND ($3::text IS NULL OR status = $3)
-         ORDER BY created_at DESC LIMIT $4",
-    )
-    .bind(user_id)
-    .bind(&q.symbol)
-    .bind(&q.status)
-    .bind(limit)
-    .fetch_all(s.db.as_ref())
-    .await;
+    let orders = match status_filter {
+        Some(statuses) => sqlx::query_as::<_, DbOrder>(
+            "SELECT * FROM orders
+             WHERE user_id = $1
+               AND ($2::text IS NULL OR symbol = $2)
+               AND status = ANY($3)
+             ORDER BY created_at DESC LIMIT $4",
+        )
+        .bind(user_id)
+        .bind(&q.symbol)
+        .bind(&statuses)
+        .bind(limit)
+        .fetch_all(s.db.as_ref())
+        .await,
+        None => sqlx::query_as::<_, DbOrder>(
+            "SELECT * FROM orders
+             WHERE user_id = $1
+               AND ($2::text IS NULL OR symbol = $2)
+             ORDER BY created_at DESC LIMIT $4",
+        )
+        .bind(user_id)
+        .bind(&q.symbol)
+        .bind(limit)
+        .fetch_all(s.db.as_ref())
+        .await,
+    };
 
     match orders {
         Ok(rows) => (StatusCode::OK, Json(json!(rows))).into_response(),

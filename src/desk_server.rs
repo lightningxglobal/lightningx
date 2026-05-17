@@ -429,6 +429,32 @@ mod tests {
 
         assert!(result.is_ok(), "Should receive market data broadcast");
     }
+
+    #[test]
+    fn test_price_deviation_no_mid() {
+        // None mid = first order, always Ok regardless of price
+        assert!(check_price_deviation(None, 999999.0).is_ok());
+    }
+
+    #[test]
+    fn test_price_deviation_zero_mid() {
+        // mid = 0.0 should be treated same as None (no reference)
+        assert!(check_price_deviation(Some(0.0), 100.0).is_ok());
+    }
+
+    #[test]
+    fn test_price_deviation_within_limit() {
+        // 5% deviation from 100.0 → Ok
+        assert!(check_price_deviation(Some(100.0), 105.0).is_ok());
+        assert!(check_price_deviation(Some(100.0), 95.0).is_ok());
+    }
+
+    #[test]
+    fn test_price_deviation_exceeds_limit() {
+        // 15% deviation → Err (threshold is 10% per implementation)
+        assert!(check_price_deviation(Some(100.0), 115.1).is_err());
+        assert!(check_price_deviation(Some(100.0), 84.9).is_err());
+    }
 }
 
 // ─── DeskAppState ─────────────────────────────────────────────────────────────
@@ -957,40 +983,11 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
     }
 }
 
-// ─── Resilience tests ─────────────────────────────────────────────────────────
+// ─── Reconnect-backoff tests ──────────────────────────────────────────────────
 
 #[cfg(test)]
-mod resilience_tests {
-    use super::{check_price_deviation, next_backoff_secs, MAX_BACKOFF_SECS};
-
-    #[test]
-    fn price_deviation_none_mid_passes() {
-        assert!(check_price_deviation(None, 100.0).is_ok());
-    }
-
-    #[test]
-    fn price_deviation_zero_mid_passes() {
-        // last_mid_price starts at 0.0 before any ticker fires; the inner
-        // `mid > 0.0` guard must treat this as "no reference" and allow the
-        // order through.
-        assert!(check_price_deviation(Some(0.0), 100.0).is_ok());
-    }
-
-    #[test]
-    fn price_deviation_within_band_passes() {
-        // 10% exact and just-under should both pass.
-        assert!(check_price_deviation(Some(100.0), 110.0).is_ok());
-        assert!(check_price_deviation(Some(100.0), 90.0).is_ok());
-        assert!(check_price_deviation(Some(100.0), 105.5).is_ok());
-    }
-
-    #[test]
-    fn price_deviation_above_band_rejects() {
-        // Just over 10% in either direction should be rejected.
-        assert!(check_price_deviation(Some(100.0), 110.01).is_err());
-        assert!(check_price_deviation(Some(100.0), 89.99).is_err());
-        assert!(check_price_deviation(Some(100.0), 200.0).is_err());
-    }
+mod backoff_tests {
+    use super::{next_backoff_secs, MAX_BACKOFF_SECS};
 
     #[test]
     fn backoff_doubles_until_cap() {

@@ -131,13 +131,10 @@ impl OrderSubscriber for AeronOrderSubscriber {
         use tracing::info;
         // Aeron回调需要显式的poll()调用来触发
         // poll()会调用on_data()回调，回调写入消息到Arc<Mutex<>>
-        static POLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let poll_count = POLL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let n = {
+        {
             let mut sub = self.subscriber.lock();
-            sub.poll()  // 触发回调，消息进入VecDeque
-        };  // 立即释放lock
+            let _ = sub.poll();  // 触发回调，消息进入VecDeque
+        }  // 立即释放lock
 
         // 从队列中pop回调写入的消息
         let mut queue = self.message_queue.lock();

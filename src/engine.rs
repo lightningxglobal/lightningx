@@ -152,22 +152,10 @@ impl MatchingEngine {
         let now_ns = time_provider::monotonic_nanos();
         let cfg = self.market_data_config;
 
-        // DEBUG: Log first few and periodic calls
-        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        if std::env::var("DEBUG_ENGINE").is_ok() && (call_num < 20 || call_num % 1_000_000 == 0) {
-            eprintln!("[CALL #{}] now_ns={}", call_num, now_ns);
-        }
-
         // Initialize sampling timestamps on first call
         if !self.depth_sampling_initialized {
             self.depth_sampling_initialized = true;
             self.last_shallow_sample_ns = now_ns;
-
-            if std::env::var("DEBUG_ENGINE").is_ok() {
-                eprintln!("[INIT] last_shallow_sample_ns set to {}", now_ns);
-            }
             if cfg.enable_depth_increments {
                 self.last_depth50_sample_ns = now_ns;
                 self.last_level2_sample_ns = now_ns;
@@ -208,10 +196,6 @@ impl MatchingEngine {
 
         // BBO + Depth-20 快照
         let threshold = self.last_shallow_sample_ns.saturating_add(cfg.shallow_sample_interval_ns);
-        if std::env::var("DEBUG_ENGINE").is_ok() && call_num < 50 {
-            eprintln!("[CHECK #{}] now={}, threshold={}, trigger={}", call_num, now_ns, threshold, now_ns >= threshold);
-        }
-
         if now_ns >= threshold {
             if let Some(ref mut sender) = self.depth_snapshot_sender {
                 let mut event = DepthSnapshotEvent::new(now_ns, self.depth_snapshot_seq);

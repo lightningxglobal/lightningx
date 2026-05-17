@@ -1,0 +1,16 @@
+# Local environment (contains secrets — never commit)
+.env
+
+# Build artifacts
+target/
+liblist_pool.rlib
+
+# Logs
+*.log
+server.log
+
+# Aeron media driver
+/aeron-dir/
+
+# OS
+.DS_Store

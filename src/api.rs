@@ -21,7 +21,8 @@ use tokio::sync::{broadcast, mpsc};
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<PgPool>,
-    pub engine: Arc<Mutex<MatchingEngine>>,
+    /// Per-symbol matching engines keyed by symbol (e.g. "BTC_USDT").
+    pub engines: Arc<DashMap<String, Arc<Mutex<MatchingEngine>>>>,
     /// Broadcast market data (depth snapshots, trades) to all subscribed connections.
     pub market_tx: Arc<broadcast::Sender<String>>,
     /// Per-user personal update channel (order fills, balance changes).

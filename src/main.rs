@@ -24,13 +24,20 @@ async fn main() -> anyhow::Result<()> {
     db::run_migrations(&pool).await?;
     tracing::info!("Migrations applied");
 
-    let engine = MatchingEngine::new(PoolConfig::default())
-        .expect("Failed to create matching engine");
+    let symbols = ["BTC_USDT", "ETH_USDT", "SOL_USDT"];
+    let engines: DashMap<String, Arc<Mutex<MatchingEngine>>> = symbols
+        .iter()
+        .map(|s| {
+            let eng = MatchingEngine::new(PoolConfig::default())
+                .expect("Failed to create matching engine");
+            (s.to_string(), Arc::new(Mutex::new(eng)))
+        })
+        .collect();
     let (market_tx, _) = broadcast::channel::<String>(1024);
 
     let state = AppState {
         db: Arc::new(pool),
-        engine: Arc::new(Mutex::new(engine)),
+        engines: Arc::new(engines),
         market_tx: Arc::new(market_tx),
         user_tx: Arc::new(DashMap::new()),
         next_order_id: Arc::new(AtomicU64::new(1)),

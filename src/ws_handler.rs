@@ -230,7 +230,9 @@ async fn handle_client_message(
                 session.subscribed.insert(ch);
             }
             for sym in depth_symbols {
-                let _ = personal_tx.send(build_depth_json(&state.engine, &sym)).await;
+                if let Some(engine) = state.engines.get(&sym) {
+                    let _ = personal_tx.send(build_depth_json(engine.value(), &sym)).await;
+                }
             }
             None
         }
@@ -271,6 +273,16 @@ async fn handle_client_message(
                 "post_only" => TimeInForce::PostOnly,
                 "market" => TimeInForce::IOC, // market orders use IOC semantics internally
                 _ => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Unknown order type"}).to_string()),
+            };
+
+            // Look up the matching engine for this symbol; reject unknown symbols up front.
+            let engine = match state.engines.get(&symbol) {
+                Some(e) => e.value().clone(),
+                None => return Some(json!({
+                    "type": "order_rejected",
+                    "client_order_id": client_order_id,
+                    "reason": format!("Unknown symbol: {}", symbol)
+                }).to_string()),
             };
 
             let now_ns = std::time::SystemTime::now()
@@ -319,7 +331,7 @@ async fn handle_client_message(
 
             // Capture best opposing price before matching (used as fill price for market orders).
             let best_opposing_price = {
-                let eng = state.engine.lock().unwrap();
+                let eng = engine.lock().unwrap();
                 let levels = eng.get_top_levels(1, engine_side == Side::Sell);
                 levels.first().map(|(p, _)| *p)
             };
@@ -364,7 +376,7 @@ async fn handle_client_message(
 
             // Run through matching engine — hold lock briefly.
             let engine_result = {
-                let mut eng = state.engine.lock().unwrap();
+                let mut eng = engine.lock().unwrap();
                 eng.place_order(engine_order)
             };
 
@@ -702,8 +714,10 @@ async fn handle_client_message(
                 return Some(json!({"type": "error", "message": e.to_string()}).to_string());
             }
 
-            // Best-effort cancel in engine.
-            let _ = { let mut eng = state.engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+            // Best-effort cancel in engine for this symbol.
+            if let Some(engine) = state.engines.get(&symbol) {
+                let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+            }
 
             // Release frozen funds for the unfilled portion.
             let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
@@ -760,7 +774,9 @@ fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
 
 /// Build and broadcast a depth snapshot for the given symbol.
 fn broadcast_depth(state: &AppState, symbol: &str) {
-    let _ = state.market_tx.send(build_depth_json(&state.engine, symbol));
+    if let Some(engine) = state.engines.get(symbol) {
+        let _ = state.market_tx.send(build_depth_json(engine.value(), symbol));
+    }
 }
 
 // ─── Background market data broadcaster ─────────────────────────────────────
@@ -777,8 +793,10 @@ pub async fn market_data_broadcaster(state: AppState) {
     loop {
         tokio::select! {
             _ = depth_interval.tick() => {
+                // TODO(multi-symbol): iterate all engines and broadcast per-symbol depth.
                 let (bids, asks) = {
-                    let eng = state.engine.lock().unwrap();
+                    let engine = state.engines.get(SYMBOL).unwrap();
+                    let eng = engine.lock().unwrap();
                     (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
                 };
                 if let Some((p, _)) = bids.first() {

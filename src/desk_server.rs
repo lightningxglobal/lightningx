@@ -469,6 +469,16 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use futures_util::{SinkExt, StreamExt};
 
+/// Reconnect-backoff cap (seconds). Shared by upstream_user_task and
+/// desk_market_data_broadcaster.
+pub(crate) const MAX_BACKOFF_SECS: u64 = 30;
+
+/// Double the current backoff, capped at `MAX_BACKOFF_SECS`. Extracted so the
+/// cap behavior is testable without spinning up a WS server.
+pub(crate) fn next_backoff_secs(curr: u64) -> u64 {
+    curr.saturating_mul(2).min(MAX_BACKOFF_SECS)
+}
+
 /// Persistent per-user upstream connection task.
 ///
 /// When a desk client authenticates, this task is spawned. It maintains a
@@ -484,10 +494,9 @@ async fn upstream_user_task(
     mut cmd_rx: mpsc::Receiver<String>,
     personal_tx: mpsc::Sender<String>,
 ) {
-    // Exponential backoff for reconnect attempts: 1s, 2s, 4s, ..., capped at 30s.
-    // Resets to 1s once a connection successfully authenticates so a flaky network
-    // doesn't keep the user permanently at the 30s ceiling.
-    const MAX_BACKOFF_SECS: u64 = 30;
+    // Exponential backoff for reconnect attempts: 1s, 2s, 4s, ..., capped at
+    // MAX_BACKOFF_SECS. Resets to 1s once a connection successfully
+    // authenticates so a flaky network doesn't pin the user at the ceiling.
     let mut backoff_secs: u64 = 1;
 
     loop {
@@ -500,7 +509,7 @@ async fn upstream_user_task(
                     e, backoff_secs
                 );
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                backoff_secs = next_backoff_secs(backoff_secs);
                 continue;
             }
         };
@@ -510,7 +519,7 @@ async fn upstream_user_task(
         let auth = json!({"type": "auth", "token": token}).to_string();
         if tx.send(WsMsg::Text(auth)).await.is_err() {
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            backoff_secs = next_backoff_secs(backoff_secs);
             continue;
         }
 
@@ -531,7 +540,7 @@ async fn upstream_user_task(
                 backoff_secs
             );
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            backoff_secs = next_backoff_secs(backoff_secs);
             continue;
         }
 
@@ -568,7 +577,7 @@ async fn upstream_user_task(
                 backoff_secs
             );
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            backoff_secs = next_backoff_secs(backoff_secs);
         }
     }
 }
@@ -861,9 +870,8 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
     let upstream_url = state.upstream_ws_url.as_str();
 
     // Exponential backoff matching upstream_user_task: 1s, 2s, 4s, ..., capped
-    // at 30s. Resets to 1s after a successful subscribe so transient blips
-    // don't pin the broadcaster at the ceiling.
-    const MAX_BACKOFF_SECS: u64 = 30;
+    // at MAX_BACKOFF_SECS. Resets to 1s after a successful subscribe so
+    // transient blips don't pin the broadcaster at the ceiling.
     let mut backoff_secs: u64 = 1;
 
     loop {
@@ -896,7 +904,7 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                     upstream_url, e, backoff_secs
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                backoff_secs = next_backoff_secs(backoff_secs);
                 continue;
             }
             Ok((mut ws, _)) => {
@@ -910,7 +918,7 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                 }).to_string();
                 if ws.send(WsMsg::Text(sub)).await.is_err() {
                     tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    backoff_secs = next_backoff_secs(backoff_secs);
                     continue;
                 }
 
@@ -943,8 +951,64 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                     backoff_secs
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                backoff_secs = next_backoff_secs(backoff_secs);
             }
         }
+    }
+}
+
+// ─── Resilience tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::{check_price_deviation, next_backoff_secs, MAX_BACKOFF_SECS};
+
+    #[test]
+    fn price_deviation_none_mid_passes() {
+        assert!(check_price_deviation(None, 100.0).is_ok());
+    }
+
+    #[test]
+    fn price_deviation_zero_mid_passes() {
+        // last_mid_price starts at 0.0 before any ticker fires; the inner
+        // `mid > 0.0` guard must treat this as "no reference" and allow the
+        // order through.
+        assert!(check_price_deviation(Some(0.0), 100.0).is_ok());
+    }
+
+    #[test]
+    fn price_deviation_within_band_passes() {
+        // 10% exact and just-under should both pass.
+        assert!(check_price_deviation(Some(100.0), 110.0).is_ok());
+        assert!(check_price_deviation(Some(100.0), 90.0).is_ok());
+        assert!(check_price_deviation(Some(100.0), 105.5).is_ok());
+    }
+
+    #[test]
+    fn price_deviation_above_band_rejects() {
+        // Just over 10% in either direction should be rejected.
+        assert!(check_price_deviation(Some(100.0), 110.01).is_err());
+        assert!(check_price_deviation(Some(100.0), 89.99).is_err());
+        assert!(check_price_deviation(Some(100.0), 200.0).is_err());
+    }
+
+    #[test]
+    fn backoff_doubles_until_cap() {
+        assert_eq!(next_backoff_secs(1), 2);
+        assert_eq!(next_backoff_secs(2), 4);
+        assert_eq!(next_backoff_secs(4), 8);
+        assert_eq!(next_backoff_secs(8), 16);
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        // 16 → 30 (clamped, not 32).
+        assert_eq!(next_backoff_secs(16), MAX_BACKOFF_SECS);
+        // Already at the cap → stays there.
+        assert_eq!(next_backoff_secs(MAX_BACKOFF_SECS), MAX_BACKOFF_SECS);
+        // Way past the cap (defensive) → still clamped.
+        assert_eq!(next_backoff_secs(1_000), MAX_BACKOFF_SECS);
+        // saturating_mul guards against overflow at u64::MAX.
+        assert_eq!(next_backoff_secs(u64::MAX), MAX_BACKOFF_SECS);
     }
 }

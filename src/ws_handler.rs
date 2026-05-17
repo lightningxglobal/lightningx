@@ -628,6 +628,22 @@ async fn handle_client_message(
                 if let Some(tx) = state.user_tx.get(&user_id) {
                     let _ = tx.send(cancel_msg).await;
                 }
+
+                // Refresh frontend balance for the released asset (frozen → available).
+                if rel_amount > 0.0 {
+                    if let Ok(acc) = repo.get_account(user_id, rel_asset).await {
+                        let bal_msg = json!({
+                            "type": "balance_update",
+                            "asset": rel_asset,
+                            "balance": acc.balance,
+                            "available": acc.balance - acc.frozen,
+                            "frozen": acc.frozen
+                        }).to_string();
+                        if let Some(tx) = state.user_tx.get(&user_id) {
+                            let _ = tx.send(bal_msg).await;
+                        }
+                    }
+                }
             }
 
             Some(json!({

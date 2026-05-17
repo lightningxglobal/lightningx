@@ -608,6 +608,18 @@ async fn handle_client_message(
                 if rel_amount > 0.0 {
                     let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await;
                 }
+
+                // Notify user the order is CANCELED so frontend can drop it from openOrders.
+                let cancel_msg = json!({
+                    "type": "order_update",
+                    "order_id": db_order_id,
+                    "status": "CANCELED",
+                    "filled_qty": 0.0,
+                    "ts": ts
+                }).to_string();
+                if let Some(tx) = state.user_tx.get(&user_id) {
+                    let _ = tx.send(cancel_msg).await;
+                }
             }
 
             Some(json!({

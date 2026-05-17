@@ -465,9 +465,92 @@ pub fn check_price_deviation(mid: Option<f64>, price: f64) -> Result<(), String>
 
 // ─── Upstream proxy helpers ───────────────────────────────────────────────────
 
+use std::time::Duration;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use futures_util::{SinkExt, StreamExt};
+
+/// Persistent per-user upstream connection task.
+///
+/// When a desk client authenticates, this task is spawned. It maintains a
+/// long-lived WS connection to exchange-server (with reconnect on drop) and:
+///   • forwards order/cancel commands from `cmd_rx` upstream
+///   • relays ALL personal responses (order_update, balance_update, etc.) to
+///     the desk client via `personal_tx`
+///
+/// Exits when `cmd_rx` is closed, i.e. when the desk client disconnects.
+async fn upstream_user_task(
+    upstream_url: String,
+    token: String,
+    mut cmd_rx: mpsc::Receiver<String>,
+    personal_tx: mpsc::Sender<String>,
+) {
+    loop {
+        let ws_result = connect_async(&upstream_url).await;
+        let ws = match ws_result {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                tracing::warn!("upstream_user_task: connect error: {}; retrying in 2s", e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        let (mut tx, mut rx) = ws.split();
+
+        // Authenticate
+        let auth = json!({"type": "auth", "token": token}).to_string();
+        if tx.send(WsMsg::Text(auth)).await.is_err() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Wait for auth_ok before processing commands
+        let mut authed = false;
+        loop {
+            match rx.next().await {
+                Some(Ok(WsMsg::Text(t))) => {
+                    if t.contains("auth_ok") { authed = true; break; }
+                    if t.contains("auth_error") { break; }
+                }
+                _ => break,
+            }
+        }
+        if !authed {
+            tracing::warn!("upstream_user_task: auth failed; retrying in 2s");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
+        // Relay loop: forward commands upstream, relay responses to client
+        let upstream_dropped = loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(msg) => {
+                            if tx.send(WsMsg::Text(msg)).await.is_err() {
+                                break true; // upstream dropped
+                            }
+                        }
+                        None => return, // cmd_rx closed = desk client disconnected
+                    }
+                }
+                frame = rx.next() => {
+                    match frame {
+                        Some(Ok(WsMsg::Text(t))) => {
+                            let _ = personal_tx.send(t).await;
+                        }
+                        Some(Ok(WsMsg::Ping(_))) | Some(Ok(WsMsg::Pong(_))) => {}
+                        _ => break true, // upstream dropped
+                    }
+                }
+            }
+        };
+        if upstream_dropped {
+            tracing::warn!("upstream_user_task: upstream dropped; reconnecting in 1s");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
 
 /// Open a fresh WS connection to the upstream exchange-server, authenticate with
 /// the user's JWT token, send `payload`, then read and return the first
@@ -595,11 +678,13 @@ struct DeskWsSession {
     user_id: Option<i64>,
     token: Option<String>,
     subscribed: HashSet<String>,
+    /// Command channel to the persistent upstream WS task (spawned on auth).
+    upstream_cmd_tx: Option<mpsc::Sender<String>>,
 }
 
 impl DeskWsSession {
     fn new() -> Self {
-        Self { user_id: None, token: None, subscribed: HashSet::new() }
+        Self { user_id: None, token: None, subscribed: HashSet::new(), upstream_cmd_tx: None }
     }
 }
 
@@ -694,8 +779,14 @@ async fn desk_handle_message(
             match user_service::verify_token(&token) {
                 Ok(claims) => {
                     session.user_id = Some(claims.sub);
-                    session.token = Some(token);
-                    state.user_tx.insert(claims.sub, personal_tx);
+                    session.token = Some(token.clone());
+                    // Spawn a persistent upstream connection for this user.
+                    // All order responses and personal pushes (balance_update, etc.)
+                    // arrive via personal_tx — no more single-shot proxy calls.
+                    let (cmd_tx, cmd_rx) = mpsc::channel::<String>(64);
+                    session.upstream_cmd_tx = Some(cmd_tx);
+                    let url = state.upstream_ws_url.as_ref().clone();
+                    tokio::spawn(upstream_user_task(url, token, cmd_rx, personal_tx));
                     Some(json!({"type": "auth_ok"}).to_string())
                 }
                 Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
@@ -738,23 +829,25 @@ async fn desk_handle_message(
                 return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "price required for limit orders"}).to_string());
             }
 
-            // Price deviation risk check — ask upstream for current depth to get mid price
+            // Price deviation risk check (best-effort, no mid available without caching)
             if order_type != "market" {
                 if let Some(p) = price {
-                    // Quick best-effort risk check: query upstream REST depth endpoint would be ideal,
-                    // but to keep it simple we just validate that price is positive and non-zero.
-                    // A full implementation would cache the last known mid from the market broadcaster.
                     if let Err(e) = check_price_deviation(None, p) {
                         return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e}).to_string());
                     }
                 }
             }
 
-            // Forward to upstream exchange-server via WebSocket proxy
-            let token = session.token.as_deref().unwrap_or("");
-            match proxy_to_upstream(&state.upstream_ws_url, token, text).await {
-                Ok(response) => Some(response),
-                Err(e) => Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": format!("Upstream error: {}", e)}).to_string()),
+            // Forward via persistent upstream connection; response arrives via personal_rx
+            match &session.upstream_cmd_tx {
+                Some(tx) => {
+                    if tx.send(text.to_string()).await.is_err() {
+                        Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Upstream connection unavailable"}).to_string())
+                    } else {
+                        None // response will arrive asynchronously via personal_rx
+                    }
+                }
+                None => Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
             }
         }
 
@@ -772,11 +865,16 @@ async fn desk_handle_message(
                 }
             }
 
-            // Forward to upstream exchange-server
-            let token = session.token.as_deref().unwrap_or("");
-            match proxy_to_upstream(&state.upstream_ws_url, token, text).await {
-                Ok(response) => Some(response),
-                Err(e) => Some(json!({"type": "error", "order_id": order_id, "message": format!("Upstream error: {}", e)}).to_string()),
+            // Forward via persistent upstream connection
+            match &session.upstream_cmd_tx {
+                Some(tx) => {
+                    if tx.send(text.to_string()).await.is_err() {
+                        Some(json!({"type": "error", "order_id": order_id, "message": "Upstream connection unavailable"}).to_string())
+                    } else {
+                        None // response will arrive asynchronously via personal_rx
+                    }
+                }
+                None => Some(json!({"type": "error", "order_id": order_id, "message": "Not authenticated"}).to_string()),
             }
         }
     }

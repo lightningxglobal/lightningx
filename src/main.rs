@@ -1,9 +1,14 @@
-use matching_engine::{
+use dashmap::DashMap;
+use lightning_exchange::{
     api::{router, AppState},
     db,
+    engine::{MatchingEngine, PoolConfig},
+    ws_handler::market_data_broadcaster,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
 #[tokio::main]
@@ -19,7 +24,19 @@ async fn main() -> anyhow::Result<()> {
     db::run_migrations(&pool).await?;
     tracing::info!("Migrations applied");
 
-    let state = AppState { db: Arc::new(pool) };
+    let engine = MatchingEngine::new(PoolConfig::default())
+        .expect("Failed to create matching engine");
+    let (market_tx, _) = broadcast::channel::<String>(1024);
+
+    let state = AppState {
+        db: Arc::new(pool),
+        engine: Arc::new(Mutex::new(engine)),
+        market_tx: Arc::new(market_tx),
+        user_tx: Arc::new(DashMap::new()),
+        next_order_id: Arc::new(AtomicU64::new(1)),
+    };
+
+    tokio::spawn(market_data_broadcaster(state.clone()));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

@@ -1,5 +1,6 @@
 /// REST API layer: auth, accounts, orders, user profile, KYC
 use crate::account_repository::AccountRepository;
+use crate::engine::MatchingEngine;
 use crate::models::{DbOrder, User};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
@@ -9,18 +10,31 @@ use axum::{
     routing::{delete, get, patch, post},
     Json, Router,
 };
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicU64;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<PgPool>,
+    pub engine: Arc<Mutex<MatchingEngine>>,
+    /// Broadcast market data (depth snapshots, trades) to all subscribed connections.
+    pub market_tx: Arc<broadcast::Sender<String>>,
+    /// Per-user personal update channel (order fills, balance changes).
+    pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
+    /// Monotonically increasing order ID counter (separate from engine's internal counter).
+    pub next_order_id: Arc<AtomicU64>,
 }
 
 pub fn router(state: AppState) -> Router {
+    use crate::ws_handler::ws_handler;
     Router::new()
+        // WebSocket endpoint
+        .route("/ws", get(ws_handler))
         // Auth
         .route("/api/auth/register", post(handle_register))
         .route("/api/auth/login", post(handle_login))
@@ -36,6 +50,8 @@ pub fn router(state: AppState) -> Router {
         // Trades & tickers
         .route("/api/trades", get(handle_trades))
         .route("/api/tickers", get(handle_tickers))
+        // K-lines
+        .route("/api/klines", get(handle_klines))
         .route("/api/user/password", patch(handle_change_password))
         .with_state(state)
 }
@@ -431,6 +447,57 @@ async fn handle_change_password(
         .await
     {
         Ok(_) => (StatusCode::OK, Json(json!({"message": "Password updated"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ─── K-lines ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct KlinesQuery {
+    symbol: String,
+    interval: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn handle_klines(
+    State(s): State<AppState>,
+    Query(params): Query<KlinesQuery>,
+) -> impl IntoResponse {
+    let _interval = params.interval.unwrap_or_else(|| "1m".to_string()); // reserved for future intervals
+    let limit = params.limit.unwrap_or(200).min(1000);
+    let rows = sqlx::query(
+        "SELECT
+           extract(epoch FROM date_trunc('minute', created_at))::bigint AS time,
+           (array_agg(price ORDER BY created_at ASC))[1] AS open,
+           max(price) AS high,
+           min(price) AS low,
+           (array_agg(price ORDER BY created_at DESC))[1] AS close,
+           sum(quantity) AS volume
+         FROM trades
+         WHERE symbol = $1
+         GROUP BY date_trunc('minute', created_at)
+         ORDER BY time ASC
+         LIMIT $2",
+    )
+    .bind(&params.symbol)
+    .bind(limit)
+    .fetch_all(s.db.as_ref())
+    .await;
+
+    match rows {
+        Ok(rows) => {
+            use sqlx::Row;
+            let candles: Vec<Value> = rows.iter().map(|r| json!({
+                "time":   r.get::<i64, _>("time"),
+                "open":   r.get::<f64, _>("open"),
+                "high":   r.get::<f64, _>("high"),
+                "low":    r.get::<f64, _>("low"),
+                "close":  r.get::<f64, _>("close"),
+                "volume": r.get::<f64, _>("volume"),
+            })).collect();
+            (StatusCode::OK, Json(json!(candles))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

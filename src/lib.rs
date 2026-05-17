@@ -35,6 +35,7 @@ pub mod models;
 pub mod user_service;
 pub mod account_repository;
 pub mod api;
+pub mod ws_handler;
 #[cfg(test)]
 mod sbe_tests;
 #[cfg(test)]

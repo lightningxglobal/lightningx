@@ -156,6 +156,13 @@ impl DeskServer {
         }
     }
 
+    /// Authenticate a JWT token and create a session. Returns Err if the token is invalid.
+    pub async fn authenticate_and_create_session(&self, token: &str) -> Result<SessionId, String> {
+        let claims = crate::user_service::verify_token(token)
+            .map_err(|e| format!("Auth failed: {}", e))?;
+        Ok(self.create_session(claims.email.clone(), claims.sub as u64).await)
+    }
+
     /// 创建新会话
     pub async fn create_session(&self, client_id: String, account_id: u64) -> SessionId {
         let session_id = SessionId::new();

@@ -92,9 +92,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ✓ TradeEvents: {}", single_events);
     println!("  ✓ 总耗时: {:.3}s\n", total_elapsed.as_secs_f64());
 
-    // ===== 测试2: 批量模式（10个委托） =====
-    println!("【测试2】批量模式 - 10个委托/批处理");
-    println!("  测试轮次: {}\n", num_batches);
+    // ===== 测试2: 批量模式（20个委托 - 与Deep OB保持一致） =====
+    println!("【测试2】批量模式 - 20个委托/批处理 (OKX标准)");
+    let batch_size = 20;
+    let batch_rounds = (num_batches * 10 + batch_size - 1) / batch_size;
+    println!("  批次大小: {} 委托/批", batch_size);
+    println!("  批次数: {}\n", batch_rounds);
 
     let mut engine = MatchingEngine::new(PoolConfig::default())?;
     let (tx, mut rx) = RingBuffer::<TradeEvent>::new(1_000_000);
@@ -107,27 +110,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let total_start = Instant::now();
 
-    for batch_idx in 0..num_batches {
+    for batch_idx in 0..batch_rounds {
         let mut batch: SmallVec<[Order; 20]> = SmallVec::new();
 
-        // 5个买单
-        for i in 0..5 {
-            let order_idx = batch_idx * 10 + i;
-            let price = base_price - 2.0 + i as f64;
+        // 10个买单 (而不是5个)
+        for i in 0..10 {
+            let order_idx = batch_idx * batch_size + i;
+            if order_idx >= num_batches * 10 { break; }
+            let price = base_price - 5.0 + (i % 10) as f64; // 扩大价格范围
             let qty = 10.0;
             let buy = Order::new(order_idx as u64 * 2, Side::Buy, price, qty, TimeInForce::GTC, 0);
             batch.push(buy);
         }
 
-        // 5个卖单
-        for i in 0..5 {
-            let order_idx = batch_idx * 10 + i;
-            let price = base_price + i as f64;
+        // 10个卖单 (而不是5个)
+        for i in 0..10 {
+            let order_idx = batch_idx * batch_size + 10 + i;
+            if order_idx >= num_batches * 10 { break; }
+            let price = base_price + (i % 10) as f64; // 扩大价格范围
             let qty = 10.0;
             let sell = Order::new(order_idx as u64 * 2 + 1, Side::Sell, price, qty, TimeInForce::GTC, 0);
             batch.push(sell);
         }
 
+        let batch_len = batch.len();
         let start = Instant::now();
         let results = engine.match_orders_batch(batch)?;
         let batch_latency = start.elapsed().as_nanos() as u64;
@@ -136,11 +142,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (filled, _trades) in results.iter() {
             batch_total_filled += filled;
         }
-        batch_total_orders += 10;
+        batch_total_orders += batch_len;
 
-        // 将批处理延迟分配给10个委托
-        let per_order_latency = batch_latency / 10;
-        for _ in 0..10 {
+        // 将批处理延迟分配给所有委托 (20个而不是10个)
+        let per_order_latency = batch_latency / batch_len as u64;
+        for _ in 0..batch_len {
             batch_latencies.record(per_order_latency)?;
         }
     }

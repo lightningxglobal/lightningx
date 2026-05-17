@@ -51,3 +51,6 @@ inherits = "release"
 [[bench]]
 name = "matching_bench"
 harness = false
+[[bin]]
+name = "exchange-server"
+path = "src/main.rs"

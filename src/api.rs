@@ -418,7 +418,7 @@ async fn handle_change_password(
         Err(e) => return e.into_response(),
     };
     if req.new_password.len() < 8 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "New password must be at least 8 characters"}))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "new_password must be at least 8 characters"}))).into_response();
     }
     // Fetch current hash
     let row = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
@@ -433,7 +433,7 @@ async fn handle_change_password(
     // Verify current password
     match bcrypt::verify(&req.current_password, &user.password_hash) {
         Ok(true) => {},
-        _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Current password incorrect"}))).into_response(),
+        _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Current password is incorrect"}))).into_response(),
     }
     // Hash and save new password
     let new_hash = match bcrypt::hash(&req.new_password, bcrypt::DEFAULT_COST) {

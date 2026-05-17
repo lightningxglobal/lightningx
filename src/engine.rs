@@ -367,6 +367,7 @@ impl MatchingEngine {
     }
 
     /// 处理Post-Only订单
+    #[inline]
     fn handle_post_only(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         // 检查是否会立即成交
         let opposite_book = match order.side {
@@ -407,6 +408,7 @@ impl MatchingEngine {
     }
 
     /// 处理FOK订单
+    #[inline]
     fn handle_fok(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         // 尝试撮合
         let filled_qty = self.match_order(order)?;
@@ -431,6 +433,7 @@ impl MatchingEngine {
     }
 
     /// 处理IOC订单
+    #[inline]
     fn handle_ioc(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         let filled_qty = self.match_order(order)?;
 
@@ -450,6 +453,7 @@ impl MatchingEngine {
     }
 
     /// 处理GTC订单
+    #[inline]
     fn handle_gtc(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         let filled_qty = self.match_order(order)?;
 

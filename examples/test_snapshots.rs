@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Testing Partial Fill ===");
     println!("Placing buy order at 50004.5 (should match with sell orders)");
     let match_order = create_test_order(20, Side::Buy, 50004.5, 3.0);
+    let result = engine.place_order(match_order)?;
     println!("Matched {} units, status: {:?}", result.filled, result.status);
 
     // Generate snapshot after match

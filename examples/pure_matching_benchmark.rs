@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0,
         );
 
+        let result = engine.place_order(sell)?;
         if result.filled > 0.0 {
             matched_count += 1;
         }

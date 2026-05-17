@@ -28,6 +28,7 @@ pub mod aeron_transport;
 pub mod account;
 pub mod rate_limit;
 pub mod market_data_server;
+pub mod snowflake;
 #[cfg(test)]
 mod sbe_tests;
 
@@ -61,6 +62,7 @@ pub use market_data_server::{
 pub mod market_data_server_types {
     pub use crate::market_data_server::{DepthSnapshot, DepthLevel, TradeSnapshot, Statistics, BBO};
 }
+pub use snowflake::SnowflakeIdGenerator;
 
 #[cfg(test)]
 mod tests {

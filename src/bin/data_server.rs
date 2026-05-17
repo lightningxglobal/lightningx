@@ -293,12 +293,20 @@ async fn handle_trades(
     };
     let limit = q.limit.unwrap_or(50).min(500);
 
+    // DISTINCT ON (t.id) collapses self-trades (same user on both sides) to a
+    // single row; the inner ORDER BY t.id, o.id picks deterministically.
     let trades = sqlx::query(
-        "SELECT t.* FROM trades t
-         JOIN orders o ON o.id = t.buy_order_id OR o.id = t.sell_order_id
-         WHERE o.user_id = $1
-           AND ($2::text IS NULL OR t.symbol = $2)
-         ORDER BY t.created_at DESC LIMIT $3",
+        "SELECT * FROM (
+             SELECT DISTINCT ON (t.id)
+                 t.id, t.symbol, t.price, t.quantity, t.created_at,
+                 CASE WHEN o.id = t.buy_order_id THEN 'buy' ELSE 'sell' END AS side
+             FROM trades t
+             JOIN orders o ON o.id = t.buy_order_id OR o.id = t.sell_order_id
+             WHERE o.user_id = $1
+               AND ($2::text IS NULL OR t.symbol = $2)
+             ORDER BY t.id, o.id
+         ) sub
+         ORDER BY created_at DESC LIMIT $3",
     )
     .bind(user_id)
     .bind(&q.symbol)
@@ -318,6 +326,7 @@ async fn handle_trades(
                         "price": r.get::<f64, _>("price"),
                         "quantity": r.get::<f64, _>("quantity"),
                         "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                        "side": r.get::<String, _>("side"),
                     })
                 })
                 .collect();

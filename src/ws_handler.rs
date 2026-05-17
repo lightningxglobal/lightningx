@@ -220,8 +220,16 @@ async fn handle_client_message(
         }
 
         ClientMsg::Subscribe { channels } => {
+            // Collect depth symbols before moving `channels` into the subscribed set,
+            // so we can push an immediate snapshot for each new depth.* channel.
+            let depth_symbols: Vec<String> = channels.iter()
+                .filter_map(|c| c.strip_prefix("depth.").map(str::to_string))
+                .collect();
             for ch in channels {
                 session.subscribed.insert(ch);
+            }
+            for sym in depth_symbols {
+                let _ = personal_tx.send(build_depth_json(state, &sym)).await;
             }
             None
         }
@@ -718,20 +726,24 @@ async fn handle_client_message(
     }
 }
 
-/// Build and broadcast a depth snapshot for the given symbol.
-fn broadcast_depth(state: &AppState, symbol: &str) {
+/// Build a depth snapshot JSON for the given symbol.
+fn build_depth_json(state: &AppState, symbol: &str) -> String {
     let (bids, asks) = {
         let eng = state.engine.lock().unwrap();
         (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
     };
-    let msg = json!({
+    json!({
         "type": "depth",
         "symbol": symbol,
         "bids": bids,
         "asks": asks,
         "ts": unix_now()
-    }).to_string();
-    let _ = state.market_tx.send(msg);
+    }).to_string()
+}
+
+/// Build and broadcast a depth snapshot for the given symbol.
+fn broadcast_depth(state: &AppState, symbol: &str) {
+    let _ = state.market_tx.send(build_depth_json(state, symbol));
 }
 
 // ─── Background market data broadcaster ─────────────────────────────────────

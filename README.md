@@ -1,4 +1,4 @@
-# Matching Engine — Exchange Backend
+# Lightning Exchange — Backend
 
 High-performance crypto exchange backend written in Rust. Targets 6–9M TPS on a single core using a lock-free SkipList order book, SBE binary encoding, and Aeron transport.
 

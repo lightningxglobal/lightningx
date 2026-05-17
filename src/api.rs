@@ -36,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         // Trades & tickers
         .route("/api/trades", get(handle_trades))
         .route("/api/tickers", get(handle_tickers))
+        .route("/api/user/password", patch(handle_change_password))
         .with_state(state)
 }
 
@@ -379,6 +380,57 @@ async fn handle_submit_kyc(
             "message": "KYC submitted, pending review"
         }))).into_response(),
         Ok(None) => (StatusCode::BAD_REQUEST, Json(json!({"error": "KYC already submitted or user not found"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ─── Password change ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+async fn handle_change_password(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    if req.new_password.len() < 8 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "New password must be at least 8 characters"}))).into_response();
+    }
+    // Fetch current hash
+    let row = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(s.db.as_ref())
+        .await;
+    let user = match row {
+        Ok(Some(u)) => u,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "User not found"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    // Verify current password
+    match bcrypt::verify(&req.current_password, &user.password_hash) {
+        Ok(true) => {},
+        _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Current password incorrect"}))).into_response(),
+    }
+    // Hash and save new password
+    let new_hash = match bcrypt::hash(&req.new_password, bcrypt::DEFAULT_COST) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    match sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
+        .bind(&new_hash)
+        .bind(user_id)
+        .execute(s.db.as_ref())
+        .await
+    {
+        Ok(_) => (StatusCode::OK, Json(json!({"message": "Password updated"}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

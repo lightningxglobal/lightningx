@@ -463,13 +463,6 @@ pub fn check_price_deviation(mid: Option<f64>, price: f64) -> Result<(), String>
     Ok(())
 }
 
-// ─── Internal service token ───────────────────────────────────────────────────
-
-fn internal_token() -> String {
-    std::env::var("INTERNAL_TOKEN")
-        .unwrap_or_else(|_| "internal_service_token_for_desk".to_string())
-}
-
 // ─── Upstream proxy helpers ───────────────────────────────────────────────────
 
 use tokio_tungstenite::connect_async;
@@ -477,19 +470,17 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use futures_util::{SinkExt, StreamExt};
 
 /// Open a fresh WS connection to the upstream exchange-server, authenticate with
-/// the internal service token, send `payload`, then read and return the first
+/// the user's JWT token, send `payload`, then read and return the first
 /// non-auth response message as a String.
-///
-/// Returns Err if the connection fails or the upstream sends no response.
-async fn proxy_to_upstream(upstream_url: &str, payload: &str) -> Result<String, String> {
+async fn proxy_to_upstream(upstream_url: &str, user_token: &str, payload: &str) -> Result<String, String> {
     let (mut ws, _) = connect_async(upstream_url)
         .await
         .map_err(|e| format!("Cannot connect to upstream: {}", e))?;
 
-    // Authenticate as internal service
+    // Authenticate with the user's own JWT so exchange-server sees the correct identity
     let auth_msg = serde_json::json!({
         "type": "auth",
-        "token": internal_token()
+        "token": user_token
     })
     .to_string();
     ws.send(WsMsg::Text(auth_msg))
@@ -602,12 +593,13 @@ impl DeskClientMsg {
 
 struct DeskWsSession {
     user_id: Option<i64>,
+    token: Option<String>,
     subscribed: HashSet<String>,
 }
 
 impl DeskWsSession {
     fn new() -> Self {
-        Self { user_id: None, subscribed: HashSet::new() }
+        Self { user_id: None, token: None, subscribed: HashSet::new() }
     }
 }
 
@@ -702,6 +694,7 @@ async fn desk_handle_message(
             match user_service::verify_token(&token) {
                 Ok(claims) => {
                     session.user_id = Some(claims.sub);
+                    session.token = Some(token);
                     state.user_tx.insert(claims.sub, personal_tx);
                     Some(json!({"type": "auth_ok"}).to_string())
                 }
@@ -758,7 +751,8 @@ async fn desk_handle_message(
             }
 
             // Forward to upstream exchange-server via WebSocket proxy
-            match proxy_to_upstream(&state.upstream_ws_url, text).await {
+            let token = session.token.as_deref().unwrap_or("");
+            match proxy_to_upstream(&state.upstream_ws_url, token, text).await {
                 Ok(response) => Some(response),
                 Err(e) => Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": format!("Upstream error: {}", e)}).to_string()),
             }
@@ -779,7 +773,8 @@ async fn desk_handle_message(
             }
 
             // Forward to upstream exchange-server
-            match proxy_to_upstream(&state.upstream_ws_url, text).await {
+            let token = session.token.as_deref().unwrap_or("");
+            match proxy_to_upstream(&state.upstream_ws_url, token, text).await {
                 Ok(response) => Some(response),
                 Err(e) => Some(json!({"type": "error", "order_id": order_id, "message": format!("Upstream error: {}", e)}).to_string()),
             }
@@ -806,32 +801,7 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
             Ok((mut ws, _)) => {
                 tracing::info!("desk broadcaster: connected to upstream {}", upstream_url);
 
-                // Authenticate
-                let auth = json!({"type": "auth", "token": internal_token()}).to_string();
-                if ws.send(WsMsg::Text(auth)).await.is_err() {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-
-                // Wait for auth_ok
-                let mut authed = false;
-                while let Some(frame) = ws.next().await {
-                    match frame {
-                        Ok(WsMsg::Text(t)) if t.contains("auth_ok") => { authed = true; break; }
-                        Ok(WsMsg::Text(t)) if t.contains("auth_error") => {
-                            tracing::error!("desk broadcaster: upstream auth rejected: {}", t);
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(e) => { tracing::warn!("desk broadcaster: auth read error: {}", e); break; }
-                    }
-                }
-                if !authed {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    continue;
-                }
-
-                // Subscribe to all market channels for BTC_USDT (expand as needed)
+                // Subscribe to market channels — no auth needed for market data
                 let sub = json!({
                     "type": "subscribe",
                     "channels": ["depth.BTC_USDT", "trades.BTC_USDT", "ticker.BTC_USDT", "kline.BTC_USDT"]

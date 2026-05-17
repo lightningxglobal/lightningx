@@ -39,6 +39,11 @@ pub struct MatchingEngine {
     affected_makers_buf: SmallVec<[u64; 64]>,
 }
 
+// Safety: MatchingEngine is accessed only through Mutex<MatchingEngine>; the raw
+// pointers inside SkipList are valid for the lifetime of the engine and never
+// shared across threads without the mutex.
+unsafe impl Send for MatchingEngine {}
+
 impl MatchingEngine {
     /// 创建新的撮合引擎
     pub fn new(pool_config: PoolConfig) -> OrderResult<Self> {

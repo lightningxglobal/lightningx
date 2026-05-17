@@ -2,12 +2,10 @@ use dashmap::DashMap;
 use lightning_exchange::{
     db,
     desk_server::{DeskAppState, desk_market_data_broadcaster, desk_ws_handler},
-    engine::{MatchingEngine, PoolConfig},
     rate_limit::{RateLimiter, RateLimitPolicy},
     snowflake::SnowflakeIdGenerator,
 };
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
@@ -24,22 +22,21 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+    let upstream_ws_url = std::env::var("UPSTREAM_WS_URL")
+        .unwrap_or_else(|_| "ws://127.0.0.1:3000/ws".to_string());
 
     tracing::info!("Connecting to database…");
     let pool = db::create_pool(&database_url).await?;
     db::run_migrations(&pool).await?;
     tracing::info!("Migrations applied");
 
-    let engine = MatchingEngine::new(PoolConfig::default())
-        .expect("Failed to create matching engine");
     let (market_tx, _) = broadcast::channel::<String>(1024);
 
     let state = DeskAppState {
         db: Arc::new(pool),
-        engine: Arc::new(Mutex::new(engine)),
+        upstream_ws_url: Arc::new(upstream_ws_url),
         market_tx: Arc::new(market_tx),
         user_tx: Arc::new(DashMap::new()),
-        next_order_id: Arc::new(AtomicU64::new(1)),
         rate_limiter: Arc::new(parking_lot::Mutex::new(
             RateLimiter::new(RateLimitPolicy::default_trading()),
         )),
@@ -59,7 +56,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", port);
-    tracing::info!("Desk Server listening on {}", addr);
+    tracing::info!("Desk Server listening on {} (upstream: {})",
+        addr,
+        std::env::var("UPSTREAM_WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:3000/ws".to_string())
+    );
     let listener = TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

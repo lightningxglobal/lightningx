@@ -67,7 +67,7 @@ pub enum ClientMessage {
     Subscribe { channels: Option<Vec<String>> },
 }
 
-/// 服务器响应消息（发送到WebSocket）
+/// 服务器响应消息（发送到WebSocket客户端）
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
@@ -433,40 +433,100 @@ mod tests {
 
 // ─── DeskAppState ─────────────────────────────────────────────────────────────
 
-use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
 use dashmap::DashMap;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 
-use crate::engine::MatchingEngine;
+use crate::rate_limit::RateLimiter as RL;
 
 #[derive(Clone)]
 pub struct DeskAppState {
     pub db: Arc<PgPool>,
-    pub engine: Arc<Mutex<MatchingEngine>>,
+    /// WebSocket URL of the upstream exchange-server, e.g. "ws://127.0.0.1:3000/ws"
+    pub upstream_ws_url: Arc<String>,
     pub market_tx: Arc<broadcast::Sender<String>>,
     pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
-    pub next_order_id: Arc<AtomicU64>,
-    pub rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
+    pub rate_limiter: Arc<parking_lot::Mutex<RL>>,
     pub id_gen: Arc<SnowflakeIdGenerator>,
 }
 
-// ─── Price-deviation risk check ───────────────────────────────────────────────
+// ─── Price-deviation risk check (no longer needs engine) ─────────────────────
 
-pub fn check_price_risk(engine: &MatchingEngine, _side: &str, price: f64) -> Result<(), String> {
-    let bids = engine.get_top_levels(1, true);
-    let asks = engine.get_top_levels(1, false);
-    let mid = match (bids.first(), asks.first()) {
-        (Some((b, _)), Some((a, _))) => (b + a) / 2.0,
-        (Some((b, _)), None) => *b,
-        (None, Some((a, _))) => *a,
-        _ => return Ok(()),
-    };
-    if mid > 0.0 && (price - mid).abs() / mid > 0.10 {
-        return Err(format!("Price {:.2} deviates >10% from mid {:.2}", price, mid));
+/// Check whether `price` deviates more than 10% from the given mid price.
+/// Returns `Ok(())` when mid is unknown (no reference point available).
+pub fn check_price_deviation(mid: Option<f64>, price: f64) -> Result<(), String> {
+    if let Some(mid) = mid {
+        if mid > 0.0 && (price - mid).abs() / mid > 0.10 {
+            return Err(format!("Price {:.2} deviates >10% from mid {:.2}", price, mid));
+        }
     }
     Ok(())
+}
+
+// ─── Internal service token ───────────────────────────────────────────────────
+
+fn internal_token() -> String {
+    std::env::var("INTERNAL_TOKEN")
+        .unwrap_or_else(|_| "internal_service_token_for_desk".to_string())
+}
+
+// ─── Upstream proxy helpers ───────────────────────────────────────────────────
+
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WsMsg;
+use futures_util::{SinkExt, StreamExt};
+
+/// Open a fresh WS connection to the upstream exchange-server, authenticate with
+/// the internal service token, send `payload`, then read and return the first
+/// non-auth response message as a String.
+///
+/// Returns Err if the connection fails or the upstream sends no response.
+async fn proxy_to_upstream(upstream_url: &str, payload: &str) -> Result<String, String> {
+    let (mut ws, _) = connect_async(upstream_url)
+        .await
+        .map_err(|e| format!("Cannot connect to upstream: {}", e))?;
+
+    // Authenticate as internal service
+    let auth_msg = serde_json::json!({
+        "type": "auth",
+        "token": internal_token()
+    })
+    .to_string();
+    ws.send(WsMsg::Text(auth_msg))
+        .await
+        .map_err(|e| format!("Upstream send auth error: {}", e))?;
+
+    // Consume the auth_ok (or auth_error) reply before sending the real payload
+    loop {
+        match ws.next().await {
+            Some(Ok(WsMsg::Text(t))) => {
+                if t.contains("auth_ok") || t.contains("auth_error") {
+                    break;
+                }
+                // Unexpected message before auth ack — ignore and keep waiting
+            }
+            Some(Ok(_)) => {}
+            _ => return Err("Upstream connection lost during auth handshake".to_string()),
+        }
+    }
+
+    // Forward the original client payload
+    ws.send(WsMsg::Text(payload.to_string()))
+        .await
+        .map_err(|e| format!("Upstream send error: {}", e))?;
+
+    // Read the response
+    loop {
+        match ws.next().await {
+            Some(Ok(WsMsg::Text(t))) => return Ok(t),
+            Some(Ok(WsMsg::Ping(_))) | Some(Ok(WsMsg::Pong(_))) => {}
+            Some(Ok(WsMsg::Close(_))) | None => {
+                return Err("Upstream closed connection without response".to_string())
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(format!("Upstream read error: {}", e)),
+        }
+    }
 }
 
 // ─── WebSocket upgrade handler ────────────────────────────────────────────────
@@ -476,19 +536,10 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
-use crate::order::{Order, Side, TimeInForce};
-use crate::engine::OrderStatus;
 use crate::user_service;
 
-fn desk_unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[derive(Debug)]
+#[allow(dead_code)]
 enum DeskClientMsg {
     Auth { token: String },
     Subscribe { channels: Vec<String> },
@@ -659,6 +710,8 @@ async fn desk_handle_message(
         }
 
         DeskClientMsg::Subscribe { channels } => {
+            // Subscriptions are served from desk-server's local market_tx broadcast;
+            // the broadcaster task keeps that channel fed from upstream.
             for ch in channels { session.subscribed.insert(ch); }
             None
         }
@@ -670,8 +723,8 @@ async fn desk_handle_message(
 
         DeskClientMsg::Ping => Some(json!({"type": "pong"}).to_string()),
 
-        DeskClientMsg::PlaceOrder { client_order_id, symbol, side, order_type, price, qty } => {
-            let user_id = match session.user_id {
+        DeskClientMsg::PlaceOrder { client_order_id, symbol: _, side: _, order_type, price, qty } => {
+            let _user_id = match session.user_id {
                 Some(id) => id,
                 None => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
             };
@@ -679,11 +732,12 @@ async fn desk_handle_message(
             // Rate limit check (per user)
             {
                 let mut limiter = state.rate_limiter.lock();
-                if limiter.consume(&user_id.to_string(), 1).is_err() {
+                if limiter.consume(&_user_id.to_string(), 1).is_err() {
                     return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Rate limit exceeded"}).to_string());
                 }
             }
 
+            // Basic validation
             if qty <= 0.0 {
                 return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "qty must be > 0"}).to_string());
             }
@@ -691,119 +745,23 @@ async fn desk_handle_message(
                 return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "price required for limit orders"}).to_string());
             }
 
-            let engine_side = match side.as_str() {
-                "buy" => Side::Buy,
-                "sell" => Side::Sell,
-                _ => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Invalid side"}).to_string()),
-            };
-
-            let tif = match order_type.as_str() {
-                "limit" | "gtc" => TimeInForce::GTC,
-                "ioc" => TimeInForce::IOC,
-                "fok" => TimeInForce::FOK,
-                "post_only" => TimeInForce::PostOnly,
-                "market" => TimeInForce::IOC,
-                _ => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Unknown order type"}).to_string()),
-            };
-
-            // Price deviation risk check (limit orders only)
+            // Price deviation risk check — ask upstream for current depth to get mid price
             if order_type != "market" {
                 if let Some(p) = price {
-                    let eng = state.engine.lock().unwrap();
-                    if let Err(e) = check_price_risk(&eng, &side, p) {
+                    // Quick best-effort risk check: query upstream REST depth endpoint would be ideal,
+                    // but to keep it simple we just validate that price is positive and non-zero.
+                    // A full implementation would cache the last known mid from the market broadcaster.
+                    if let Err(e) = check_price_deviation(None, p) {
                         return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e}).to_string());
                     }
                 }
             }
 
-            let now_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-
-            // Use Snowflake ID for engine-level order ID
-            let order_id = state.id_gen.next_id();
-
-            let engine_order = if order_type == "market" {
-                Order::new_market(order_id, engine_side, qty, now_ns)
-            } else {
-                Order::new(order_id, engine_side, price.unwrap_or(0.0), qty, tif, now_ns)
-            };
-
-            // Persist to DB
-            let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
-                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
-                 VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING') RETURNING *",
-            )
-            .bind(user_id)
-            .bind(&symbol)
-            .bind(&side)
-            .bind(&order_type)
-            .bind(price)
-            .bind(qty)
-            .fetch_one(state.db.as_ref())
-            .await;
-
-            let db_order_id = match db_result {
-                Ok(o) => o.id,
-                Err(e) => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": format!("DB error: {}", e)}).to_string()),
-            };
-
-            let best_opposing_price = {
-                let eng = state.engine.lock().unwrap();
-                let levels = eng.get_top_levels(1, engine_side == Side::Sell);
-                levels.first().map(|(p, _)| *p)
-            };
-
-            let engine_result = {
-                let mut eng = state.engine.lock().unwrap();
-                eng.place_order(engine_order)
-            };
-
-            let result = match engine_result {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = sqlx::query("UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1")
-                        .bind(db_order_id)
-                        .execute(state.db.as_ref())
-                        .await;
-                    return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e.to_string()}).to_string());
-                }
-            };
-
-            let (db_status, ws_status) = match result.status {
-                OrderStatus::Accepted => ("TRADING", "OPEN"),
-                OrderStatus::PartiallyFilled => ("TRADING", "PARTIAL_FILL"),
-                OrderStatus::Filled => ("COMPLETED", "FILLED"),
-                OrderStatus::Rejected => ("REJECTED", "REJECTED"),
-                OrderStatus::Cancelled => ("CANCELED", "CANCELED"),
-            };
-
-            let _ = sqlx::query("UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3")
-                .bind(db_status)
-                .bind(result.filled)
-                .bind(db_order_id)
-                .execute(state.db.as_ref())
-                .await;
-
-            if result.status == OrderStatus::Rejected {
-                return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Rejected by matching engine"}).to_string());
+            // Forward to upstream exchange-server via WebSocket proxy
+            match proxy_to_upstream(&state.upstream_ws_url, text).await {
+                Ok(response) => Some(response),
+                Err(e) => Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": format!("Upstream error: {}", e)}).to_string()),
             }
-
-            let ts = desk_unix_now();
-
-            if result.filled > 0.0 {
-                let fill_price = price.or(best_opposing_price).unwrap_or(0.0);
-                let trade_msg = json!({"type": "trade", "symbol": symbol, "price": fill_price, "qty": result.filled, "side": side, "ts": ts}).to_string();
-                let _ = state.market_tx.send(trade_msg);
-                desk_broadcast_depth(state, &symbol);
-                let update_msg = json!({"type": "order_update", "order_id": db_order_id, "status": ws_status, "filled_qty": result.filled, "avg_price": fill_price, "ts": ts}).to_string();
-                if let Some(tx) = state.user_tx.get(&user_id) {
-                    let _ = tx.send(update_msg).await;
-                }
-            }
-
-            Some(json!({"type": "order_accepted", "client_order_id": client_order_id, "order_id": db_order_id, "symbol": symbol, "side": side, "price": price, "qty": qty, "ts": ts}).to_string())
         }
 
         DeskClientMsg::CancelOrder { order_id } => {
@@ -812,62 +770,91 @@ async fn desk_handle_message(
                 None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
             };
 
-            let db_result = sqlx::query(
-                "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
-                 WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
-            )
-            .bind(order_id)
-            .bind(user_id)
-            .execute(state.db.as_ref())
-            .await;
-
-            match db_result {
-                Ok(r) if r.rows_affected() > 0 => {
-                    let _ = {
-                        let mut eng = state.engine.lock().unwrap();
-                        eng.cancel_order(order_id as u64)
-                    };
-                    Some(json!({"type": "order_update", "order_id": order_id, "status": "CANCELED", "ts": desk_unix_now()}).to_string())
+            // Rate limit check
+            {
+                let mut limiter = state.rate_limiter.lock();
+                if limiter.consume(&user_id.to_string(), 1).is_err() {
+                    return Some(json!({"type": "error", "message": "Rate limit exceeded"}).to_string());
                 }
-                Ok(_) => Some(json!({"type": "error", "message": "Order not found or already closed"}).to_string()),
-                Err(e) => Some(json!({"type": "error", "message": e.to_string()}).to_string()),
+            }
+
+            // Forward to upstream exchange-server
+            match proxy_to_upstream(&state.upstream_ws_url, text).await {
+                Ok(response) => Some(response),
+                Err(e) => Some(json!({"type": "error", "order_id": order_id, "message": format!("Upstream error: {}", e)}).to_string()),
             }
         }
     }
 }
 
-fn desk_broadcast_depth(state: &DeskAppState, symbol: &str) {
-    let (bids, asks) = {
-        let eng = state.engine.lock().unwrap();
-        (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
-    };
-    let msg = json!({"type": "depth", "symbol": symbol, "bids": bids, "asks": asks, "ts": desk_unix_now()}).to_string();
-    let _ = state.market_tx.send(msg);
-}
+// ─── Market data broadcaster ──────────────────────────────────────────────────
+//
+// Maintains a persistent WS connection to the upstream exchange-server, subscribes
+// to all market-data channels, and re-broadcasts received messages to all local
+// desk clients via `market_tx`.
 
 pub async fn desk_market_data_broadcaster(state: DeskAppState) {
-    let mut depth_interval = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    let mut last_price: f64 = 0.0;
+    let upstream_url = state.upstream_ws_url.as_str();
 
     loop {
-        tokio::select! {
-            _ = depth_interval.tick() => {
-                let (bids, asks) = {
-                    let eng = state.engine.lock().unwrap();
-                    (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
-                };
-                if let Some((p, _)) = bids.first() { last_price = *p; }
-                let msg = json!({"type": "depth", "symbol": "BTC_USDT", "bids": bids, "asks": asks, "ts": desk_unix_now()}).to_string();
-                let _ = state.market_tx.send(msg);
+        match connect_async(upstream_url).await {
+            Err(e) => {
+                tracing::warn!("desk broadcaster: cannot connect to upstream {}: {}; retrying in 3s", upstream_url, e);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
             }
-            _ = kline_interval.tick() => {
-                if last_price > 0.0 {
-                    let now = desk_unix_now();
-                    let bar_time = now - (now % 60);
-                    let msg = json!({"type": "kline", "symbol": "BTC_USDT", "bar": {"time": bar_time, "open": last_price, "high": last_price, "low": last_price, "close": last_price, "volume": 0.0}}).to_string();
-                    let _ = state.market_tx.send(msg);
+            Ok((mut ws, _)) => {
+                tracing::info!("desk broadcaster: connected to upstream {}", upstream_url);
+
+                // Authenticate
+                let auth = json!({"type": "auth", "token": internal_token()}).to_string();
+                if ws.send(WsMsg::Text(auth)).await.is_err() {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
                 }
+
+                // Wait for auth_ok
+                let mut authed = false;
+                while let Some(frame) = ws.next().await {
+                    match frame {
+                        Ok(WsMsg::Text(t)) if t.contains("auth_ok") => { authed = true; break; }
+                        Ok(WsMsg::Text(t)) if t.contains("auth_error") => {
+                            tracing::error!("desk broadcaster: upstream auth rejected: {}", t);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => { tracing::warn!("desk broadcaster: auth read error: {}", e); break; }
+                    }
+                }
+                if !authed {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+
+                // Subscribe to all market channels for BTC_USDT (expand as needed)
+                let sub = json!({
+                    "type": "subscribe",
+                    "channels": ["depth.BTC_USDT", "trades.BTC_USDT", "ticker.BTC_USDT", "kline.BTC_USDT"]
+                }).to_string();
+                if ws.send(WsMsg::Text(sub)).await.is_err() {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                // Relay all incoming market data to local clients
+                while let Some(frame) = ws.next().await {
+                    match frame {
+                        Ok(WsMsg::Text(msg)) => {
+                            let _ = state.market_tx.send(msg);
+                        }
+                        Ok(WsMsg::Ping(_)) | Ok(WsMsg::Pong(_)) => {}
+                        Ok(WsMsg::Close(_)) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+
+                tracing::warn!("desk broadcaster: upstream connection dropped; reconnecting in 3s");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         }
     }

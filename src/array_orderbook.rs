@@ -10,6 +10,9 @@ pub use crate::skiplist::SortOrder;
 pub struct ArrayOrderBook {
     levels: HashMap<u64, OrderBookPriceLevel>,  // price as u64 bits -> level
     sorted_prices: Vec<u64>,                    // 已排序的价格（u64 bits 表示）
+    // Retained so callers can construct asc/desc books symmetrically with SkipList;
+    // used by should_insert below for future sort-aware insertion paths.
+    #[allow(dead_code)]
     order: SortOrder,
     count: usize,
     pub list_pool: ListNodePool,
@@ -38,6 +41,9 @@ impl ArrayOrderBook {
         f64::from_bits(bits)
     }
 
+    // Kept for parity with the SkipList implementation; future sort-aware
+    // insertion paths will need this comparator.
+    #[allow(dead_code)]
     #[inline(always)]
     fn should_insert(&self, new_price: f64, existing_price: f64) -> bool {
         match self.order {

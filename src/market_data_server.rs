@@ -7,8 +7,7 @@
 /// - 延迟 < 50ms
 
 use axum::{
-    extract::State,
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::get,
     Router,
 };

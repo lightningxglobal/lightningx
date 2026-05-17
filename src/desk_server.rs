@@ -236,7 +236,7 @@ impl DeskServer {
     pub async fn process_cancel_request(
         &self,
         session_id: SessionId,
-        request: CancelRequest,
+        _request: CancelRequest,
     ) -> Result<(), String> {
         // 1. 获取会话
         let session = self

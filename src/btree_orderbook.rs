@@ -41,6 +41,9 @@ impl BTreeOrderBook {
         }
     }
 
+    // Kept for parity with the SkipList implementation; future sort-aware
+    // traversal paths will need this comparator.
+    #[allow(dead_code)]
     fn is_less(&self, a: f64, b: f64) -> bool {
         match self.order {
             SortOrder::Ascending => a < b,

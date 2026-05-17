@@ -67,7 +67,7 @@ pub trait OrderBook {
     fn get_list_pool(&mut self) -> &mut crate::list_pool::ListNodePool;
 
     /// 获取指定索引的链表节点
-    fn get_list_node(&self, index: usize) -> Option<&crate::list_pool::ListNode> {
+    fn get_list_node(&self, _index: usize) -> Option<&crate::list_pool::ListNode> {
         // 默认实现通过获取 list_pool 和获取节点
         // 注：这需要可变 self，所以在调用时需要特殊处理
         None

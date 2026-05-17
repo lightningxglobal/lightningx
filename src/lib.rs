@@ -30,6 +30,11 @@ pub mod rate_limit;
 pub mod market_data_server;
 pub mod snowflake;
 pub mod desk_server;
+pub mod db;
+pub mod models;
+pub mod user_service;
+pub mod account_repository;
+pub mod api;
 #[cfg(test)]
 mod sbe_tests;
 #[cfg(test)]

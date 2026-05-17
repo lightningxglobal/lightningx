@@ -1,6 +1,6 @@
 use crate::account_repository::AccountRepository;
 use crate::api::AppState;
-use crate::engine::OrderStatus;
+use crate::engine::{MatchingEngine, OrderStatus};
 use crate::order::{Order, Side, TimeInForce};
 use crate::user_service;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -9,6 +9,7 @@ use axum::response::IntoResponse;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -229,7 +230,7 @@ async fn handle_client_message(
                 session.subscribed.insert(ch);
             }
             for sym in depth_symbols {
-                let _ = personal_tx.send(build_depth_json(state, &sym)).await;
+                let _ = personal_tx.send(build_depth_json(&state.engine, &sym)).await;
             }
             None
         }
@@ -742,10 +743,10 @@ async fn handle_client_message(
     }
 }
 
-/// Build a depth snapshot JSON for the given symbol.
-fn build_depth_json(state: &AppState, symbol: &str) -> String {
+/// Build a depth snapshot JSON for the given symbol from the matching engine.
+fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
     let (bids, asks) = {
-        let eng = state.engine.lock().unwrap();
+        let eng = engine.lock().unwrap();
         (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
     };
     json!({
@@ -759,7 +760,7 @@ fn build_depth_json(state: &AppState, symbol: &str) -> String {
 
 /// Build and broadcast a depth snapshot for the given symbol.
 fn broadcast_depth(state: &AppState, symbol: &str) {
-    let _ = state.market_tx.send(build_depth_json(state, symbol));
+    let _ = state.market_tx.send(build_depth_json(&state.engine, symbol));
 }
 
 // ─── Background market data broadcaster ─────────────────────────────────────
@@ -841,5 +842,59 @@ pub async fn market_data_broadcaster(state: AppState) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_depth_json;
+    use crate::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    fn empty_engine() -> Mutex<MatchingEngine> {
+        Mutex::new(MatchingEngine::new(PoolConfig::default()).unwrap())
+    }
+
+    #[test]
+    fn build_depth_json_empty_book_has_empty_sides() {
+        let engine = empty_engine();
+        let v: Value = serde_json::from_str(&build_depth_json(&engine, "BTC_USDT")).unwrap();
+
+        assert_eq!(v["type"], "depth");
+        assert_eq!(v["symbol"], "BTC_USDT");
+        assert!(v["bids"].as_array().unwrap().is_empty());
+        assert!(v["asks"].as_array().unwrap().is_empty());
+        assert!(v["ts"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn build_depth_json_includes_resting_orders() {
+        let engine = empty_engine();
+        {
+            let mut eng = engine.lock().unwrap();
+            // Resting bid at 100, resting ask at 101 — won't cross.
+            eng.place_order(Order::new(1, Side::Buy, 100.0, 2.0, TimeInForce::GTC, 0)).unwrap();
+            eng.place_order(Order::new(2, Side::Sell, 101.0, 3.0, TimeInForce::GTC, 0)).unwrap();
+        }
+
+        let v: Value = serde_json::from_str(&build_depth_json(&engine, "BTC_USDT")).unwrap();
+        let bids = v["bids"].as_array().unwrap();
+        let asks = v["asks"].as_array().unwrap();
+
+        assert_eq!(bids.len(), 1);
+        assert_eq!(asks.len(), 1);
+        // Each level is serialized as a [price, qty] tuple.
+        assert_eq!(bids[0][0].as_f64().unwrap(), 100.0);
+        assert_eq!(bids[0][1].as_f64().unwrap(), 2.0);
+        assert_eq!(asks[0][0].as_f64().unwrap(), 101.0);
+        assert_eq!(asks[0][1].as_f64().unwrap(), 3.0);
+    }
+
+    #[test]
+    fn build_depth_json_propagates_symbol_argument() {
+        let engine = empty_engine();
+        let v: Value = serde_json::from_str(&build_depth_json(&engine, "ETH_USDT")).unwrap();
+        assert_eq!(v["symbol"], "ETH_USDT");
     }
 }

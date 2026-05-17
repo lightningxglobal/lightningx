@@ -433,7 +433,6 @@ mod tests {
 
 // ─── DeskAppState ─────────────────────────────────────────────────────────────
 
-use dashmap::DashMap;
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 
@@ -445,9 +444,9 @@ pub struct DeskAppState {
     /// WebSocket URL of the upstream exchange-server, e.g. "ws://127.0.0.1:3000/ws"
     pub upstream_ws_url: Arc<String>,
     pub market_tx: Arc<broadcast::Sender<String>>,
-    pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
     pub rate_limiter: Arc<parking_lot::Mutex<RL>>,
     pub id_gen: Arc<SnowflakeIdGenerator>,
+    pub last_mid_price: Arc<parking_lot::RwLock<f64>>,
 }
 
 // ─── Price-deviation risk check (no longer needs engine) ─────────────────────
@@ -548,57 +547,6 @@ async fn upstream_user_task(
         if upstream_dropped {
             tracing::warn!("upstream_user_task: upstream dropped; reconnecting in 1s");
             tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-}
-
-/// Open a fresh WS connection to the upstream exchange-server, authenticate with
-/// the user's JWT token, send `payload`, then read and return the first
-/// non-auth response message as a String.
-async fn proxy_to_upstream(upstream_url: &str, user_token: &str, payload: &str) -> Result<String, String> {
-    let (mut ws, _) = connect_async(upstream_url)
-        .await
-        .map_err(|e| format!("Cannot connect to upstream: {}", e))?;
-
-    // Authenticate with the user's own JWT so exchange-server sees the correct identity
-    let auth_msg = serde_json::json!({
-        "type": "auth",
-        "token": user_token
-    })
-    .to_string();
-    ws.send(WsMsg::Text(auth_msg))
-        .await
-        .map_err(|e| format!("Upstream send auth error: {}", e))?;
-
-    // Consume the auth_ok (or auth_error) reply before sending the real payload
-    loop {
-        match ws.next().await {
-            Some(Ok(WsMsg::Text(t))) => {
-                if t.contains("auth_ok") || t.contains("auth_error") {
-                    break;
-                }
-                // Unexpected message before auth ack — ignore and keep waiting
-            }
-            Some(Ok(_)) => {}
-            _ => return Err("Upstream connection lost during auth handshake".to_string()),
-        }
-    }
-
-    // Forward the original client payload
-    ws.send(WsMsg::Text(payload.to_string()))
-        .await
-        .map_err(|e| format!("Upstream send error: {}", e))?;
-
-    // Read the response
-    loop {
-        match ws.next().await {
-            Some(Ok(WsMsg::Text(t))) => return Ok(t),
-            Some(Ok(WsMsg::Ping(_))) | Some(Ok(WsMsg::Pong(_))) => {}
-            Some(Ok(WsMsg::Close(_))) | None => {
-                return Err("Upstream closed connection without response".to_string())
-            }
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(format!("Upstream read error: {}", e)),
         }
     }
 }
@@ -751,9 +699,6 @@ async fn desk_handle_socket(mut socket: WebSocket, state: DeskAppState) {
         }
     }
 
-    if let Some(uid) = session.user_id {
-        state.user_tx.remove(&uid);
-    }
 }
 
 fn desk_msg_symbol(msg: &str) -> Option<&str> {
@@ -829,10 +774,14 @@ async fn desk_handle_message(
                 return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "price required for limit orders"}).to_string());
             }
 
-            // Price deviation risk check (best-effort, no mid available without caching)
+            // Price deviation risk check against last known mid price
             if order_type != "market" {
                 if let Some(p) = price {
-                    if let Err(e) = check_price_deviation(None, p) {
+                    let mid = {
+                        let v = *state.last_mid_price.read();
+                        if v > 0.0 { Some(v) } else { None }
+                    };
+                    if let Err(e) = check_price_deviation(mid, p) {
                         return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e}).to_string());
                     }
                 }
@@ -936,6 +885,15 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                 while let Some(frame) = ws.next().await {
                     match frame {
                         Ok(WsMsg::Text(msg)) => {
+                            if msg.contains("\"type\":\"ticker\"") {
+                                if let Ok(v) = serde_json::from_str::<Value>(&msg) {
+                                    if let Some(last) = v.get("last").and_then(|x| x.as_f64()) {
+                                        if last > 0.0 {
+                                            *state.last_mid_price.write() = last;
+                                        }
+                                    }
+                                }
+                            }
                             let _ = state.market_tx.send(msg);
                         }
                         Ok(WsMsg::Ping(_)) | Ok(WsMsg::Pong(_)) => {}

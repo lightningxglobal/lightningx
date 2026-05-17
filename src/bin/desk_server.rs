@@ -1,4 +1,3 @@
-use dashmap::DashMap;
 use lightning_exchange::{
     db,
     desk_server::{DeskAppState, desk_market_data_broadcaster, desk_ws_handler},
@@ -36,11 +35,11 @@ async fn main() -> anyhow::Result<()> {
         db: Arc::new(pool),
         upstream_ws_url: Arc::new(upstream_ws_url),
         market_tx: Arc::new(market_tx),
-        user_tx: Arc::new(DashMap::new()),
         rate_limiter: Arc::new(parking_lot::Mutex::new(
             RateLimiter::new(RateLimitPolicy::default_trading()),
         )),
         id_gen: Arc::new(SnowflakeIdGenerator::new(desk_id)),
+        last_mid_price: Arc::new(parking_lot::RwLock::new(0.0)),
     };
 
     tokio::spawn(desk_market_data_broadcaster(state.clone()));

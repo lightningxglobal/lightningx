@@ -860,6 +860,12 @@ async fn desk_handle_message(
 pub async fn desk_market_data_broadcaster(state: DeskAppState) {
     let upstream_url = state.upstream_ws_url.as_str();
 
+    // Exponential backoff matching upstream_user_task: 1s, 2s, 4s, ..., capped
+    // at 30s. Resets to 1s after a successful subscribe so transient blips
+    // don't pin the broadcaster at the ceiling.
+    const MAX_BACKOFF_SECS: u64 = 30;
+    let mut backoff_secs: u64 = 1;
+
     loop {
         // Query active symbols from DB; fall back to BTC_USDT if none found
         let symbols: Vec<String> = sqlx::query_scalar(
@@ -885,8 +891,12 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
 
         match connect_async(upstream_url).await {
             Err(e) => {
-                tracing::warn!("desk broadcaster: cannot connect to upstream {}: {}; retrying in 3s", upstream_url, e);
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tracing::warn!(
+                    "desk broadcaster: cannot connect to upstream {}: {}; retrying in {}s",
+                    upstream_url, e, backoff_secs
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                 continue;
             }
             Ok((mut ws, _)) => {
@@ -899,9 +909,13 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                     "channels": channels,
                 }).to_string();
                 if ws.send(WsMsg::Text(sub)).await.is_err() {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     continue;
                 }
+
+                // Healthy connection — reset backoff so the next outage starts at 1s.
+                backoff_secs = 1;
 
                 // Relay all incoming market data to local clients
                 while let Some(frame) = ws.next().await {
@@ -924,8 +938,12 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                     }
                 }
 
-                tracing::warn!("desk broadcaster: upstream connection dropped; reconnecting in 3s");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tracing::warn!(
+                    "desk broadcaster: upstream connection dropped; reconnecting in {}s",
+                    backoff_secs
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             }
         }
     }

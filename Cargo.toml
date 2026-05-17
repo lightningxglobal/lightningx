@@ -59,3 +59,7 @@ path = "src/main.rs"
 [[bin]]
 name = "desk-server"
 path = "src/bin/desk_server.rs"
+
+[[bin]]
+name = "lightning-data"
+path = "src/bin/data_server.rs"

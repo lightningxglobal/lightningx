@@ -596,14 +596,31 @@ async fn handle_client_message(
             let base_asset = sym_parts.first().copied().unwrap_or("BTC");
             let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
             let repo = AccountRepository::new(state.db.as_ref());
-            if side == "buy" {
+            let released_asset = if side == "buy" {
                 let freeze_price = price.unwrap_or(0.0);
                 if freeze_price > 0.0 && remaining > 0.0 {
                     let _ = repo.release_frozen(user_id, quote_asset, freeze_price * remaining).await;
                 }
+                quote_asset
             } else {
                 if remaining > 0.0 {
                     let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+                }
+                base_asset
+            };
+
+            // Push balance_update so the frontend OrderForm reflects freed-up funds.
+            if let Some(tx) = state.user_tx.get(&user_id) {
+                for asset in [released_asset, if released_asset == base_asset { quote_asset } else { base_asset }] {
+                    if let Ok(acc) = repo.get_account(user_id, asset).await {
+                        let _ = tx.send(json!({
+                            "type": "balance_update",
+                            "asset": acc.asset,
+                            "balance": acc.balance,
+                            "available": acc.balance - acc.frozen,
+                            "frozen": acc.frozen,
+                        }).to_string()).await;
+                    }
                 }
             }
 

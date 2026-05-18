@@ -1,4 +1,4 @@
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, Order, Side, TimeInForce, PoolConfig,
 };
 

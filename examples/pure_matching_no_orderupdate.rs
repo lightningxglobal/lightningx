@@ -1,6 +1,6 @@
 //! 纯撮合基准 - 不生成OrderUpdate，直接测量核心撮合性能
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use std::time::Instant;
 use rtrb::RingBuffer;
 use smallvec::SmallVec;

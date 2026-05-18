@@ -1,4 +1,4 @@
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent,
 };

@@ -1,5 +1,5 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
-use matching_engine::orderbook_impl::OrderBookType;
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::orderbook_impl::OrderBookType;
 use std::time::Instant;
 
 struct BenchResult {
@@ -51,6 +51,7 @@ fn bench_insert(book_type: OrderBookType, num_inserts: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
+        let _ = engine.place_order(order);
     }
     let elapsed = start.elapsed();
 
@@ -77,6 +78,7 @@ fn bench_lookup(book_type: OrderBookType, num_lookups: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
+        let _ = engine.place_order(order);
     }
 
     // 查询不会改变状态，所以这个测试主要测试引擎内部的快照生成
@@ -113,6 +115,7 @@ fn bench_matching(book_type: OrderBookType, num_orders: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
+        let _ = engine.place_order(order);
     }
 
     // 计时：匹配买单
@@ -127,6 +130,7 @@ fn bench_matching(book_type: OrderBookType, num_orders: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
+        if let Ok(result) = engine.place_order(order) {
             if result.filled > 0.0 {
                 match_count += 1;
             }
@@ -158,6 +162,7 @@ fn bench_cancel(book_type: OrderBookType, num_orders: usize) -> BenchResult {
             TimeInForce::GTC,
             0,
         );
+        match engine.place_order(order) {
             Ok(result) => {
                 order_ids.push(result.order_id);
             }

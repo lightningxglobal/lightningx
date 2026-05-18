@@ -1,6 +1,6 @@
 /// 高频采样性能测试 - 1秒内，无人为延迟，能采样100+次
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent,
 };

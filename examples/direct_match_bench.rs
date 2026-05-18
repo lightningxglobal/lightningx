@@ -1,8 +1,7 @@
 //! 直接调用match_order - 隔离核心撮合性能
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use std::time::Instant;
-use smallvec::SmallVec;
 use hdrhistogram::Histogram;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,8 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 先预放100个买单进簿
     for i in 0..100 {
         let order = Order::new(i as u64, Side::Buy, 50000.0 - (i % 10) as f64, 10.0, TimeInForce::GTC, 0);
-        let mut affected = SmallVec::new();
-        let _ = engine.place_order(order, &mut affected)?;
+        let _ = engine.place_order(order)?;
     }
 
     // 现在用卖单与这些买单匹配

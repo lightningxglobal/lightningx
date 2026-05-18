@@ -1,6 +1,6 @@
 //! 最终性能基准测试 - 展示优化后的性能
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use std::time::Instant;
 use rtrb::RingBuffer;
 use smallvec::SmallVec;

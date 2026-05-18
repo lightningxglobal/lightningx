@@ -1,6 +1,6 @@
 //! 标准化基准测试 - 所有场景用完全相同条件
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
 use std::time::Instant;
 use rtrb::RingBuffer;
 

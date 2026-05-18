@@ -1,4 +1,4 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
 use std::time::Instant;
 
 fn create_test_order(id: u64, side: Side, price: f64) -> Order {
@@ -24,7 +24,7 @@ fn benchmark(name: &str, f: impl FnOnce() -> usize) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Comprehensive Performance Benchmarks ===\n");
 
-    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let config = PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 200_000,
         queue_capacity: 20_000,
     };
@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut count = 0;
             for i in 0..10000 {
                 let order = create_test_order(i, Side::Buy, 50000.0 + (i % 100) as f64);
+                if engine.place_order(order).is_ok() {
                     count += 1;
                 }
             }
@@ -54,11 +55,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Place 2500 sell orders
             for i in 0..2500 {
                 let order = create_test_order(i, Side::Sell, 50000.0 + (i % 100) as f64);
+                let _ = engine.place_order(order);
             }
 
             // Place 2500 buy orders at high price (will match all sells)
             for i in 2500..5000 {
                 let order = create_test_order(i, Side::Buy, 60000.0);
+                if let Ok(result) = engine.place_order(order) {
                     if result.filled > 0.0 {
                         count += 1;
                     }
@@ -80,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Place initial sell orders
             for i in 0..3000 {
                 let order = create_test_order(i, Side::Sell, 50000.0 + (i % 200) as f64);
+                let _ = engine.place_order(order);
             }
 
             // Mixed operations
@@ -88,12 +92,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0..=29 => {
                         // 30% placement
                         let order = create_test_order(3000 + i as u64, Side::Buy, 50000.0 + (i % 200) as f64);
+                        if engine.place_order(order).is_ok() {
                             count += 1;
                         }
                     }
                     30..=89 => {
                         // 60% matching (high price buy)
                         let order = create_test_order(3000 + i as u64, Side::Buy, 60000.0);
+                        if let Ok(result) = engine.place_order(order) {
                             if result.filled > 0.0 {
                                 count += 1;
                             }

@@ -1,6 +1,6 @@
 /// 行情数据 Web 服务演示
 /// 展示如何通过 HTTP API 查询行情数据
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, MarketDataServer,
     create_router,
     market_data_server_types::{DepthSnapshot, DepthLevel, TradeSnapshot, BBO},

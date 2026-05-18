@@ -6,7 +6,7 @@
 /// - 再放入5个卖单(价格 50000-50004) - 这些会与买单成交
 /// - 重复多次，产生实际的成交和插入
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig,
 };
@@ -52,6 +52,7 @@ fn benchmark_with_config(
                 TimeInForce::GTC,
                 0,
             );
+            let result = engine.place_order(order)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;
@@ -72,6 +73,7 @@ fn benchmark_with_config(
                 TimeInForce::GTC,
                 0,
             );
+            let result = engine.place_order(order)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;

@@ -1,7 +1,7 @@
 /// 真实深度采样性能测试 - 带实际延迟来验证采样
 /// 模拟真实交易环境：订单之间有微小延迟（模拟网络/处理延迟）
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent,
 };

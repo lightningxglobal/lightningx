@@ -1,7 +1,7 @@
 //! 市场数据处理性能分析
 //! 测量consume_trade_event()各个子操作的成本
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,23 +19,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         
         // 模拟完整的订单处理来生成TradeEvent
         let buy = Order::new(i as u64 * 2, Side::Buy, price, 10.0, TimeInForce::GTC, 0);
-        
+        let _ = engine.place_order(buy);
+
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, price, 10.0, TimeInForce::GTC, 0);
-        
+
         // 模拟TradeEvent
-        if result.filled > 0.0 {
-            let trade = TradeEvent::new(
-                i as u64,
-                i as u64 * 2 + 1,
-                i as u64 * 2,
-                1000000 + (i as u64 * 1000),
-                price,
-                result.filled,
-                Side::Sell,
-                1,
-                2,
-            );
-            trades.push(trade);
+        if let Ok(result) = engine.place_order(sell) {
+            if result.filled > 0.0 {
+                let trade = TradeEvent::new(
+                    i as u64,
+                    i as u64 * 2 + 1,
+                    i as u64 * 2,
+                    1000000 + (i as u64 * 1000),
+                    price,
+                    result.filled,
+                    Side::Sell,
+                    1,
+                    2,
+                );
+                trades.push(trade);
+            }
         }
     }
     

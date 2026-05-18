@@ -7,7 +7,7 @@
 ///
 /// 使用真实业务场景参数（GTC订单，~50%成交 + ~50%插入）
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig,
 };

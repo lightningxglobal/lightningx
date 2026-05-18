@@ -1,6 +1,6 @@
 /// 长时间运行的采样测试 - 验证CLOCK_MONOTONIC是否有效工作
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent,
 };

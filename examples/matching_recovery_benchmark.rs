@@ -1,13 +1,13 @@
 //! 原始性能复现基准测试
 //! 方式: 先批量放置，再批量成交（不交替）
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 匹配引擎性能复现测试 ===\n");
 
-    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let config = PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 500_000,
         queue_capacity: 50_000,
     };

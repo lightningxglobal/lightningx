@@ -8,7 +8,7 @@
 /// 5. GTC order full fill → FILLED
 /// 6. GTC order cancel → CANCELLED
 
-use matching_engine::{
+use lightning_exchange::{
     engine::{MatchingEngine, PoolConfig, OrderStatus},
     order::{Order, Side, TimeInForce},
     orderbook_impl::OrderBookType,
@@ -46,6 +46,7 @@ fn test_ioc_no_match() {
         1000,
     );
 
+    match engine.place_order(order) {
         Ok(result) => {
             println!("Order status: {:?}", result.status);
             match result.status {
@@ -79,6 +80,7 @@ fn test_ioc_with_match() {
         1000,
     );
 
+    match engine.place_order(sell_order) {
         Ok(result) => println!("Sell order status: {:?}", result.status),
         Err(e) => println!("Sell order error: {:?}", e),
     }
@@ -93,6 +95,7 @@ fn test_ioc_with_match() {
         2000,
     );
 
+    match engine.place_order(buy_order) {
         Ok(result) => {
             println!("Buy order status: {:?}", result.status);
             match result.status {
@@ -125,6 +128,7 @@ fn test_gtc_accepted() {
         1000,
     );
 
+    match engine.place_order(order) {
         Ok(result) => {
             println!("Order status: {:?}", result.status);
             match result.status {
@@ -158,6 +162,7 @@ fn test_gtc_partial_fill() {
         1000,
     );
 
+    match engine.place_order(sell_order) {
         Ok(result) => println!("Sell order status: {:?}", result.status),
         Err(e) => println!("Sell order error: {:?}", e),
     }
@@ -172,6 +177,7 @@ fn test_gtc_partial_fill() {
         2000,
     );
 
+    match engine.place_order(buy_order) {
         Ok(result) => {
             println!("Buy order status: {:?}", result.status);
             match result.status {
@@ -205,6 +211,7 @@ fn test_gtc_full_fill() {
         1000,
     );
 
+    match engine.place_order(sell_order) {
         Ok(result) => println!("Sell order status: {:?}", result.status),
         Err(e) => println!("Sell order error: {:?}", e),
     }
@@ -219,6 +226,7 @@ fn test_gtc_full_fill() {
         2000,
     );
 
+    match engine.place_order(buy_order) {
         Ok(result) => {
             println!("Buy order status: {:?}", result.status);
             match result.status {
@@ -252,6 +260,7 @@ fn test_gtc_cancel() {
         1000,
     );
 
+    match engine.place_order(order) {
         Ok(result) => println!("Order accepted with status: {:?}", result.status),
         Err(e) => println!("Order placement error: {:?}", e),
     }

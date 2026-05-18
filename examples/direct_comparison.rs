@@ -1,7 +1,7 @@
 //! 直接对比: 仅撮合 vs 撮合+市场数据处理
 //! 这次用相同的循环结构，看看真正的瓶颈在哪
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
 use std::time::Instant;
 use std::sync::Arc;
 use parking_lot::Mutex;

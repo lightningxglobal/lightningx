@@ -6,7 +6,7 @@
 //! - 买卖力量不对等
 //! - 价格分布更广泛
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use std::time::Instant;
 use rtrb::RingBuffer;
 use smallvec::SmallVec;
@@ -89,6 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let start = Instant::now();
             let order = Order::new(round as u64 * 1000 + 1, Side::Sell, price, qty, TimeInForce::GTC, 0);
+            let result = engine.place_order(order)?;
             latencies.record(start.elapsed().as_nanos() as u64)?;
 
             total_orders += 1;

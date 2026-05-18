@@ -5,7 +5,7 @@
 /// 3. 启用increment + 1笔委托
 /// 4. 启用increment + 20笔委托（批量）
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig,
 };

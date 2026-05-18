@@ -1,7 +1,7 @@
 //! rtrb ring buffer 性能测试
 //! 对比使用rtrb vs crossbeam的撮合引擎性能
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use std::time::Instant;
 use rtrb::RingBuffer;
 

@@ -6,7 +6,7 @@
 //! - 其他订单则需要插入簿
 //! - 真实比例: ~50%成交 + ~50%插入
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use std::time::Instant;
 use rtrb::RingBuffer;
 use smallvec::SmallVec;

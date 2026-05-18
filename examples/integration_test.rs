@@ -13,7 +13,7 @@
 //! - 验证市场数据的准确性
 //! - 测量系统延迟
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent,
     MarketDataEngine, SnapshotTimer, SnapshotPublisherThread, TradePublisherThread,
     AeronConfig, PublishedSnapshot,

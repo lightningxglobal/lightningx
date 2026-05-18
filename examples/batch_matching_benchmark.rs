@@ -1,6 +1,6 @@
 //! 批量订单撮合基准测试 - 对比单订单vs批量(20个)撮合
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use std::time::Instant;
 use rtrb::RingBuffer;
 use smallvec::SmallVec;

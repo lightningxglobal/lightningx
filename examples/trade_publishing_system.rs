@@ -9,7 +9,7 @@
 //! 4. 成交事件不缓冲、立即发布（逐笔成交）
 //! 5. 验证消息顺序保证
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, TradePublisherThread,
 };
 use std::time::Instant;
@@ -33,7 +33,7 @@ fn main() {
     println!("✓ 设置交易事件发送器");
 
     // 4. 配置Aeron发布器（使用Stream 11用于成交，不同于快照的Stream 10）
-    let aeron_config = matching_engine::AeronConfig {
+    let aeron_config = lightning_exchange::AeronConfig {
         aeron_dir: "/dev/shm/aeron".to_string(),
         channel: "aeron:ipc".to_string(),
         stream_id: 11,  // 成交事件的专用流ID

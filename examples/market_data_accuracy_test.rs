@@ -1,6 +1,6 @@
 /// 市场数据准确性验证
 /// 验证深度采样、聚合交易、24h统计的准确性
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, MarketDataConfig,
     MarketDataEngine, TradeEvent,
 };

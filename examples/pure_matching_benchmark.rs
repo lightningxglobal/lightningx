@@ -1,7 +1,7 @@
 //! 纯撮合性能基准 - 测试极限TPS和延迟
 //! 场景：完全匹配的买卖对，没有任何订单簿积压
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -6,7 +6,7 @@
 //! - 单个委托模式 vs 批量模式(20个委托/批)
 //! - 评估: TPS、延迟、在深度委托薄中的性能
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, orderbook_impl};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, orderbook_impl};
 use std::time::Instant;
 use rtrb::RingBuffer;
 use smallvec::SmallVec;

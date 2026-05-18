@@ -8,7 +8,7 @@
 //! 3. 测量端到端延迟
 //! 4. 验证延迟 < 1微秒目标
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent,
 };
 use std::time::Instant;

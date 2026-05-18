@@ -7,7 +7,7 @@
 //! 4. 完整快照生成延迟
 //! 5. 端到端延迟 (order → match → market data → snapshot)
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent,
     MarketDataEngine,
 };
@@ -103,6 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let t0 = Instant::now();
+        let buy_result = engine.place_order(buy_order)?;
         let placement_ns = t0.elapsed().as_nanos() as u64;
         placement_latencies.push(placement_ns);
 
@@ -117,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let t1 = Instant::now();
+        let sell_result = engine.place_order(sell_order)?;
         let matching_ns = t1.elapsed().as_nanos() as u64;
         matching_latencies.push(matching_ns);
 

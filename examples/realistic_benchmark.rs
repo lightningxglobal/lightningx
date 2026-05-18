@@ -1,7 +1,7 @@
 //! 真实场景基准测试
 //! 包含完整的成交→行情处理流程（模拟生产环境）
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
 use std::time::Instant;
 use rtrb::RingBuffer;
 

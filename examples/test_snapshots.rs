@@ -1,4 +1,4 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
 
 fn create_test_order(id: u64, side: Side, price: f64, qty: f64) -> Order {
     Order::new(id, side, price, qty, TimeInForce::GTC, 0)
@@ -7,7 +7,7 @@ fn create_test_order(id: u64, side: Side, price: f64, qty: f64) -> Order {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Depth Snapshot Test ===\n");
 
-    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let config = PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 5_000,
         queue_capacity: 500,
     };

@@ -1,5 +1,5 @@
 /// 简化性能测试 - 最纯净的匹配场景
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

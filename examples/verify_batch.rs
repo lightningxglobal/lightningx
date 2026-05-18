@@ -1,6 +1,6 @@
 //! 验证batch matching是否正确处理订单
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use rtrb::RingBuffer;
 use smallvec::SmallVec;
 

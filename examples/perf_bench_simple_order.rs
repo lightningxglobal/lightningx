@@ -1,6 +1,6 @@
 /// 简单性能基准 - 逐个下单 vs 批量下单，对标之前的5M/10M结果
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
 };
 use std::time::Instant;
@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let pool_config = PoolConfig {
             order_capacity: 10_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 1_000_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let pool_config = PoolConfig {
             order_capacity: 10_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 1_000_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let pool_config = PoolConfig {
             order_capacity: 10_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 1_000_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;

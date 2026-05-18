@@ -1,6 +1,6 @@
 /// 全面的功能正确性测试
 /// 覆盖复杂场景：取消、部分填充、快速匹配、流动性变化
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent,
 };
 use rtrb::RingBuffer;

@@ -1,4 +1,4 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 创建撮合引擎
@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("Placing sell order: price={}, qty={}", sell_order.price, sell_order.quantity);
+    let result = engine.place_order(sell_order)?;
     println!("Result: status={:?}, filled={}\n", result.status, result.filled);
 
     // 创建一个买单来撮合
@@ -30,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("Placing buy order: price={}, qty={}", buy_order.price, buy_order.quantity);
+    let result = engine.place_order(buy_order)?;
     println!("Result: status={:?}, filled={}\n", result.status, result.filled);
 
     // 获取统计信息

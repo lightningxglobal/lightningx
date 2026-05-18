@@ -1,4 +1,4 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

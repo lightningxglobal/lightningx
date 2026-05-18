@@ -1,7 +1,7 @@
 /// 撮合引擎功能继承测试
 /// 验证：trades、depth snapshots、level change events 的生成和内容正确性
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, MarketDataConfig,
 };
 use rtrb::RingBuffer;
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pool_config = PoolConfig {
             order_capacity: 1_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 10_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pool_config = PoolConfig {
             order_capacity: 1_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 10_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -170,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pool_config = PoolConfig {
             order_capacity: 1_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 10_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -269,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pool_config = PoolConfig {
             order_capacity: 1_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 10_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -283,6 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
+        let _ = engine.place_order(sell_order)?;
         println!("✓ 卖单已下: qty=1000@100.0, id=1");
 
         // 下一个买单
@@ -294,6 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
+        let result = engine.place_order(buy_order)?;
         println!("✓ 买单已下: qty=100@100.0, id=2, filled={}", result.filled);
         assert_eq!(result.filled, 100.0, "买单应该完全成交");
 
@@ -312,7 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pool_config = PoolConfig {
             order_capacity: 1_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 10_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -326,6 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
+        let _ = engine.place_order(sell_order)?;
 
         // 下买单：150股（成交100，剩余50）
         let buy_order = Order::new(
@@ -336,6 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
+        let result = engine.place_order(buy_order)?;
         println!("✓ 买单: qty=150, filled={}, status={:?}", result.filled, result.status);
         assert_eq!(result.filled, 100.0, "应该成交100");
 
@@ -348,6 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeInForce::GTC,
             0,
         );
+        let result2 = engine.place_order(sell_order2)?;
         println!("✓ 卖单2: qty=50, filled={}", result2.filled);
         assert_eq!(result2.filled, 50.0, "应该与剩余买单全部成交");
 

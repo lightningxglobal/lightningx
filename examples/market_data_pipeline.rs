@@ -1,7 +1,7 @@
 /// 市场数据管道集成示例
 /// 演示撮合引擎 → 市场数据引擎的深度采样和增量计算流程
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     DepthSnapshotEvent, MarketDataConfig,
     MarketDataEngine,

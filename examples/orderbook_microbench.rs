@@ -1,5 +1,5 @@
-use matching_engine::array_orderbook::{ArrayOrderBook, SortOrder as ArraySortOrder};
-use matching_engine::skiplist::{SkipList, SortOrder as SkipListSortOrder};
+use lightning_exchange::array_orderbook::{ArrayOrderBook, SortOrder as ArraySortOrder};
+use lightning_exchange::skiplist::{SkipList, SortOrder as SkipListSortOrder};
 use std::time::Instant;
 
 const NUM_INSERTS: usize = 5000;

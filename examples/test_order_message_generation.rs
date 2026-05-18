@@ -2,7 +2,7 @@
 ///
 /// Direct verification of the matching engine behavior without Aeron complexity
 
-use matching_engine::{
+use lightning_exchange::{
     engine::{MatchingEngine, PoolConfig},
     order::{Order, Side, TimeInForce},
     orderbook_impl::OrderBookType,
@@ -19,9 +19,10 @@ fn main() {
 
         let next_id = engine.stats().total_orders as u64;
         let order = Order::new(next_id, Side::Buy, 100.0, 10.0, TimeInForce::IOC, now);
+        match engine.place_order(order) {
             Ok(result) => {
-                if matches!(result.status, matching_engine::engine::OrderStatus::Rejected) {
-                    let evt = OrderUpdateEvent::rejected(123, 456, 1, now);
+                if matches!(result.status, lightning_exchange::engine::OrderStatus::Rejected) {
+                    let evt = OrderUpdateEvent::rejected(123, 456, 1, 0, now);
                     assert_eq!(evt.kind, kind::REJECTED);
                     println!("✓ OrderUpdateEvent::rejected() creates REJECTED message");
                     true
@@ -43,8 +44,9 @@ fn main() {
 
         let next_id = engine.stats().total_orders as u64;
         let order = Order::new(next_id, Side::Buy, 100.0, 10.0, TimeInForce::GTC, now);
+        match engine.place_order(order) {
             Ok(result) => {
-                if matches!(result.status, matching_engine::engine::OrderStatus::Accepted) {
+                if matches!(result.status, lightning_exchange::engine::OrderStatus::Accepted) {
                     let evt = OrderUpdateEvent::accepted(2, 123, 456, now);
                     assert_eq!(evt.kind, kind::ACCEPTED);
                     println!("✓ OrderUpdateEvent::accepted() creates ACCEPTED message");
@@ -68,12 +70,14 @@ fn main() {
         // First GTC sell order
         let id1 = engine.stats().total_orders as u64;
         let sell_order = Order::new(id1, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
+        let _ = engine.place_order(sell_order);
 
         // IOC buy order matching it
         let id2 = engine.stats().total_orders as u64;
         let buy_order = Order::new(id2, Side::Buy, 100.0, 10.0, TimeInForce::IOC, now);
+        match engine.place_order(buy_order) {
             Ok(result) => {
-                if matches!(result.status, matching_engine::engine::OrderStatus::Filled) {
+                if matches!(result.status, lightning_exchange::engine::OrderStatus::Filled) {
                     let evt = OrderUpdateEvent::filled(4, 123, 456, 100.0, 10.0, now);
                     assert_eq!(evt.kind, kind::FILLED);
                     assert_eq!(evt.fill_price, 100.0);
@@ -99,12 +103,14 @@ fn main() {
         // GTC sell 10
         let id1 = engine.stats().total_orders as u64;
         let sell_order = Order::new(id1, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
+        let _ = engine.place_order(sell_order);
 
         // GTC buy 20 (larger than sell)
         let id2 = engine.stats().total_orders as u64;
         let buy_order = Order::new(id2, Side::Buy, 100.0, 20.0, TimeInForce::GTC, now);
+        match engine.place_order(buy_order) {
             Ok(result) => {
-                if matches!(result.status, matching_engine::engine::OrderStatus::PartiallyFilled) {
+                if matches!(result.status, lightning_exchange::engine::OrderStatus::PartiallyFilled) {
                     let evt = OrderUpdateEvent::partial_fill(6, 123, 456, 100.0, result.filled, 20.0 - result.filled, now);
                     assert_eq!(evt.kind, kind::PARTIAL_FILL);
                     assert_eq!(evt.fill_qty, 10.0);

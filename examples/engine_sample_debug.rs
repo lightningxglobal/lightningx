@@ -1,4 +1,4 @@
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent,
 };
@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool_config = PoolConfig {
         order_capacity: 1_000_000,
         queue_capacity: 1_000_000,
-        orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+        orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
     };
     let mut engine = MatchingEngine::new(pool_config)?;
 
@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
+            match engine.place_order(order) {
                 Ok(_) => {
                     total_orders += 1;
                 },

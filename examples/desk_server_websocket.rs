@@ -5,7 +5,7 @@
 /// 3. Rate Limit 检查
 /// 4. 行情推送
 
-use matching_engine::{DeskConfig, DeskServer, desk_server::{OrderRequest, CancelRequest}};
+use lightning_exchange::{DeskConfig, DeskServer, desk_server::{OrderRequest, CancelRequest}};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -18,7 +18,7 @@ async fn main() {
     let config = DeskConfig {
         desk_id: 1,
         addr: "127.0.0.1:3000".to_string(),
-        rate_limit_policy: matching_engine::RateLimitPolicy::default_trading(),
+        rate_limit_policy: lightning_exchange::RateLimitPolicy::default_trading(),
     };
 
     let desk = Arc::new(DeskServer::new(config));
@@ -58,11 +58,11 @@ async fn main() {
     for i in 0..3 {
         let response = desk.handle_order_ws(session_id, buy_order.clone()).await;
         match response {
-            matching_engine::desk_server::ServerMessage::OrderAccepted { .. } => {
+            lightning_exchange::desk_server::ServerMessage::OrderAccepted { .. } => {
                 success_count += 1;
                 println!("  ✓ 委托 {}: 被接受", i + 1);
             }
-            matching_engine::desk_server::ServerMessage::Error { message } => {
+            lightning_exchange::desk_server::ServerMessage::Error { message } => {
                 println!("  ✗ 委托 {}: 被拒绝 - {}", i + 1, message);
             }
             _ => {}
@@ -85,7 +85,7 @@ async fn main() {
                 50000.0 + i as f64 + 1.0
             );
             desk_clone
-                .broadcast_market_data(matching_engine::desk_server::MarketDataUpdate::Depth {
+                .broadcast_market_data(lightning_exchange::desk_server::MarketDataUpdate::Depth {
                     symbol: "BTC".to_string(),
                     data: depth_data,
                 })
@@ -104,7 +104,7 @@ async fn main() {
             .await
             {
                 match update {
-                    Ok(matching_engine::desk_server::MarketDataUpdate::Depth { symbol, data }) => {
+                    Ok(lightning_exchange::desk_server::MarketDataUpdate::Depth { symbol, data }) => {
                         println!("  ✓ 行情推送: {} depth={}", symbol, data);
                     }
                     _ => {}

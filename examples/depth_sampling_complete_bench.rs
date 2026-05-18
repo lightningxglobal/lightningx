@@ -1,7 +1,7 @@
 /// 完全的深度采样性能测试 - 所有三层sender都设置
 /// 这次真的测试启用increments的真实成本
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent,
 };
@@ -64,6 +64,7 @@ fn benchmark_complete(
                     TimeInForce::GTC,
                     0,
                 );
+                let _ = engine.place_order(order);
                 latencies.record(start.elapsed().as_nanos() as u64)?;
 
                 total_orders += 1;

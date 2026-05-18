@@ -1,6 +1,6 @@
 //! 瓶颈精确定位分析 - 修正版（无不必要的Mutex）
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
 use std::time::Instant;
 use rtrb::RingBuffer;
 

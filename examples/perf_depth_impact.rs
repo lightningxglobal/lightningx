@@ -1,10 +1,10 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 订单簿深度对性能的影响 ===\n");
 
-    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let config = PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 50_000,
         queue_capacity: 5_000,
     };
@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
+            let _ = engine.place_order(order);
         }
 
         // 测量买单匹配性能
@@ -39,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
+            if let Ok(result) = engine.place_order(order) {
                 if result.filled > 0.0 {
                     matches += 1;
                 }

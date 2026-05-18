@@ -8,9 +8,9 @@
 /// 如果这个测试通过，说明核心逻辑正确，问题在Aeron集成上
 /// 如果这个测试失败，说明核心逻辑有问题
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, MarketDataConfig};
-use matching_engine::transport::InboundMsg;
-use matching_engine::sbe::{NewOrderRequest, CancelOrderRequest};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, MarketDataConfig};
+use lightning_exchange::transport::InboundMsg;
+use lightning_exchange::sbe::{NewOrderRequest, CancelOrderRequest};
 use std::time::Duration;
 use std::thread;
 
@@ -23,7 +23,7 @@ fn main() {
     // 创建引擎
     let pool_config = PoolConfig {
         order_capacity: 1_000_000,
-        orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+        orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         queue_capacity: 10_000,
     };
 
@@ -65,6 +65,7 @@ fn main() {
         0,
     );
 
+    match engine.place_order(order1) {
         Ok(result) => {
             println!("✓ GTC买单已接受 - Status: {:?}", result.status);
             println!("  订单ID: 1, 价格: 50000.0, 数量: 10.0");
@@ -89,6 +90,7 @@ fn main() {
         0,
     );
 
+    match engine.place_order(order2) {
         Ok(result) => {
             println!("✓ IOC卖单已处理 - Status: {:?}", result.status);
             println!("  订单ID: 2, 价格: 50000.0, 数量: 15.0");

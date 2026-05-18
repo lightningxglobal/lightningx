@@ -6,7 +6,7 @@
 //! 3. 测量快照的生成和发送延迟
 //! 4. 验证1ms的定时器精度
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, MarketDataEngine, PublishedSnapshot, SnapshotTimer, PoolConfig,
     Order, Side, TimeInForce, TradeEvent,
 };

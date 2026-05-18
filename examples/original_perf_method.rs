@@ -1,8 +1,8 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let config = PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 50_000,
         queue_capacity: 5_000,
     };
@@ -15,12 +15,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..100 {
         let order = Order::new(i, Side::Sell, 50000.0 + (i % 50) as f64, 1.0, TimeInForce::GTC, 0);
+        let _ = engine.place_order(order);
     }
 
     let start = Instant::now();
     let mut match_count = 0;
     for i in 100..200 {
         let order = Order::new(i, Side::Buy, 55000.0, 1.0, TimeInForce::GTC, 0);
+        if let Ok(result) = engine.place_order(order) {
             if result.filled > 0.0 {
                 match_count += 1;
             }

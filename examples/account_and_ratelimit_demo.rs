@@ -1,6 +1,6 @@
 /// 账户管理和限流演示
 /// 展示如何集成账户验证和请求限流到交易引擎
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     AccountManager, RateLimiter, RateLimitPolicy,
 };

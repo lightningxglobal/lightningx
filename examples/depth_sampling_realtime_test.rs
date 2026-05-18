@@ -1,6 +1,6 @@
 /// CLOCK_REALTIME采样验证 - 10秒高频无延迟
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent,
 };

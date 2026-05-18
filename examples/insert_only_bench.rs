@@ -1,5 +1,5 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
-use matching_engine::orderbook_impl::OrderBookType;
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::orderbook_impl::OrderBookType;
 use std::time::Instant;
 
 fn main() {
@@ -30,6 +30,7 @@ fn main() {
                 TimeInForce::GTC,
                 0,
             );
+            let _ = engine.place_order(order);
         }
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
         let tps = 5000.0 / (elapsed / 1000.0);

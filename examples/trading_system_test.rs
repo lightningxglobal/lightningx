@@ -6,7 +6,7 @@
 /// - 验证TradePublisher接收到成交通知
 /// - 验证MarketDataPublisher接收到深度快照
 
-use matching_engine::transport::{
+use lightning_exchange::transport::{
     InboundMsg, NewOrderRequest, CancelOrderRequest, mock_transport_with_parts,
     OrderUpdateMsg,
 };
@@ -110,10 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mock_transport_with_parts();
 
         // 验证trait对象可以创建
-        let _sub: Box<dyn matching_engine::transport::OrderSubscriber> = Box::new(subscriber);
-        let _ou: Box<dyn matching_engine::transport::OrderUpdatePublisher> = Box::new(order_update_pub);
-        let _tr: Box<dyn matching_engine::transport::TradePublisher> = Box::new(trade_pub);
-        let _md: Box<dyn matching_engine::transport::MarketDataPublisher> = Box::new(market_data_pub);
+        let _sub: Box<dyn lightning_exchange::transport::OrderSubscriber> = Box::new(subscriber);
+        let _ou: Box<dyn lightning_exchange::transport::OrderUpdatePublisher> = Box::new(order_update_pub);
+        let _tr: Box<dyn lightning_exchange::transport::TradePublisher> = Box::new(trade_pub);
+        let _md: Box<dyn lightning_exchange::transport::MarketDataPublisher> = Box::new(market_data_pub);
 
         println!("✓ 所有Transport trait对象创建成功\n");
     }

@@ -1,7 +1,7 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
-use matching_engine::skiplist::{SkipList, SortOrder};
-use matching_engine::orderbook::OrderBook;
-use matching_engine::orderbook_impl::OrderBookType;
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::skiplist::{SkipList, SortOrder};
+use lightning_exchange::orderbook::OrderBook;
+use lightning_exchange::orderbook_impl::OrderBookType;
 use std::time::Instant;
 
 /// 测试1: 直接使用原始SkipList（无trait wrapper）
@@ -56,6 +56,7 @@ fn test_matching_engine() {
             TimeInForce::GTC,
             0,
         );
+        let _ = engine.place_order(order);
     }
 
     // 计时：5000 个买单匹配
@@ -70,6 +71,7 @@ fn test_matching_engine() {
             TimeInForce::GTC,
             0,
         );
+        if let Ok(result) = engine.place_order(order) {
             if result.filled > 0.0 {
                 match_count += 1;
             }
@@ -98,8 +100,10 @@ fn test_perfect_matching() {
     let mut match_count = 0;
     for i in 0..10000 {
         let buy = Order::new(i as u64 * 2, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
+        let _ = engine.place_order(buy);
 
         let sell = Order::new(i as u64 * 2 + 1, Side::Sell, 50000.0, 10.0, TimeInForce::GTC, 0);
+        if let Ok(result) = engine.place_order(sell) {
             if result.filled > 0.0 {
                 match_count += 1;
             }

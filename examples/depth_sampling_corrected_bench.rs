@@ -4,7 +4,7 @@
 /// 2. 设置实际的sender
 /// 3. 在现实的订单间隔下测试（10us ~ 100us）
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent,
 };

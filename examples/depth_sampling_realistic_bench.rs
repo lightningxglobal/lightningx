@@ -1,7 +1,7 @@
 /// 真实深度采样性能测试 - 启用实际的event sender
 /// 对比：禁用vs启用深度采样，使用realistic参数，WITH实际的rtrb sender
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent,
 };

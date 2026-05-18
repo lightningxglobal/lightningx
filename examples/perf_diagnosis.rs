@@ -1,6 +1,6 @@
 //! 性能诊断工具 - 逐个测试各个组件的开销
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use std::time::Instant;
 use std::collections::HashMap;
 
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n【测试4】匹配引擎 - 纯放置 (无成交)");
     println!("{}", "=".repeat(50));
 
-    let mut engine = MatchingEngine::new(PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let mut engine = MatchingEngine::new(PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 500_000,
         queue_capacity: 50_000,
     })? ;
@@ -112,6 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TimeInForce::GTC,
                 0,
             );
+            if let Ok(_) = engine.place_order(order) {
                 count += 1;
             }
         }
@@ -122,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n【测试5】匹配引擎 - 成交匹配");
     println!("{}", "=".repeat(50));
 
-    let mut engine2 = MatchingEngine::new(PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let mut engine2 = MatchingEngine::new(PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 500_000,
         queue_capacity: 50_000,
     })?;

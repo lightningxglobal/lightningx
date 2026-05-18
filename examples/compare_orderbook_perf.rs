@@ -1,4 +1,4 @@
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, Order, Side, TimeInForce, PoolConfig,
     array_orderbook::{ArrayOrderBook, SortOrder as ArraySortOrder},
     order::Side as OrderSide,
@@ -6,7 +6,7 @@ use matching_engine::{
 use std::time::Instant;
 
 fn test_skiplist_matching() -> (u64, f64) {
-    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let config = PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 50_000,
         queue_capacity: 5_000,
     };
@@ -23,6 +23,7 @@ fn test_skiplist_matching() -> (u64, f64) {
             TimeInForce::GTC,
             0,
         );
+        let _ = engine.place_order(order);
     }
 
     // 计时：放入 2500 个买单进行撮合
@@ -37,6 +38,7 @@ fn test_skiplist_matching() -> (u64, f64) {
             TimeInForce::GTC,
             0,
         );
+        if let Ok(result) = engine.place_order(order) {
             if result.filled > 0.0 {
                 match_count += 1;
             }

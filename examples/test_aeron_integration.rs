@@ -6,7 +6,7 @@
 //! 3. SnapshotPublisherThread可以启动和停止
 //! 4. 背压处理有效
 
-use matching_engine::{
+use lightning_exchange::{
     AeronConfig, PublishedSnapshot, SnapshotPublisherThread,
     aeron_publisher::{snapshot_to_bytes, bytes_to_snapshot, SnapshotPublisher},
 };

@@ -1,6 +1,6 @@
 /// 深度采样性能基准 - 对比4种配置的TPS和延迟
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent,
 };
@@ -14,7 +14,7 @@ fn benchmark_scenario(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool_config = PoolConfig {
         order_capacity: 10_000_000,
-        orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+        orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         queue_capacity: 1_000_000,
     };
     let mut engine = MatchingEngine::new(pool_config)?;
@@ -41,9 +41,9 @@ fn benchmark_scenario(
                 0,
             );
             let t = Instant::now();
-                latencies.record(t.elapsed().as_nanos() as u64)?;
-                total_orders += 1;
-            }
+            let _ = engine.place_order(order);
+            latencies.record(t.elapsed().as_nanos() as u64)?;
+            total_orders += 1;
 
             // 卖单
             let order = Order::new(
@@ -55,9 +55,9 @@ fn benchmark_scenario(
                 0,
             );
             let t = Instant::now();
-                latencies.record(t.elapsed().as_nanos() as u64)?;
-                total_orders += 1;
-            }
+            let _ = engine.place_order(order);
+            latencies.record(t.elapsed().as_nanos() as u64)?;
+            total_orders += 1;
         }
     }
 

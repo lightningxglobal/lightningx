@@ -1,7 +1,7 @@
 /// Micro benchmark - 测试 get_top_levels() 的成本
 /// 看Vec分配对性能的影响
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

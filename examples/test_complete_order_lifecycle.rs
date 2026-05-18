@@ -8,7 +8,7 @@
 ///
 /// Expected transitions verified against ORDER_LIFECYCLE.md
 
-use matching_engine::{
+use lightning_exchange::{
     engine::{MatchingEngine, PoolConfig},
     order::{Order, Side, TimeInForce},
     orderbook_impl::OrderBookType,
@@ -40,8 +40,9 @@ fn test_ioc_orders() {
     println!("Scenario 1: IOC with no matching counterparty");
     let id1 = engine.stats().total_orders as u64;
     let order = Order::new(id1, Side::Buy, 100.0, 10.0, TimeInForce::IOC, now);
+    match engine.place_order(order) {
         Ok(result) => {
-            if matches!(result.status, matching_engine::engine::OrderStatus::Rejected) {
+            if matches!(result.status, lightning_exchange::engine::OrderStatus::Rejected) {
                 println!("  ✓ Status: REJECTED (correct for no match)");
             }
         }
@@ -54,12 +55,14 @@ fn test_ioc_orders() {
     // First place GTC sell order
     let id2 = engine.stats().total_orders as u64;
     let sell = Order::new(id2, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
+    let _ = engine.place_order(sell);
 
     // Then IOC buy matching it
     let id3 = engine.stats().total_orders as u64;
     let buy = Order::new(id3, Side::Buy, 100.0, 10.0, TimeInForce::IOC, now);
+    match engine.place_order(buy) {
         Ok(result) => {
-            if matches!(result.status, matching_engine::engine::OrderStatus::Filled) {
+            if matches!(result.status, lightning_exchange::engine::OrderStatus::Filled) {
                 println!("  ✓ Status: FILLED (matched entire order)");
                 println!("  ✓ Filled quantity: {}", result.filled);
             }
@@ -81,8 +84,9 @@ fn test_gtc_orders() {
     println!("Scenario 1: GTC order entering book (no immediate match)");
     let id1 = engine.stats().total_orders as u64;
     let order = Order::new(id1, Side::Buy, 100.0, 10.0, TimeInForce::GTC, now);
+    match engine.place_order(order) {
         Ok(result) => {
-            if matches!(result.status, matching_engine::engine::OrderStatus::Accepted) {
+            if matches!(result.status, lightning_exchange::engine::OrderStatus::Accepted) {
                 println!("  ✓ Status: ACCEPTED (entered order book)");
             }
         }
@@ -95,6 +99,7 @@ fn test_gtc_orders() {
     // Place GTC sell for 10
     let id2 = engine.stats().total_orders as u64;
     let sell = Order::new(id2, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
+    match engine.place_order(sell) {
         Ok(r) => println!("  Sell order: {:?}", r.status),
         Err(e) => println!("  Sell error: {:?}", e),
     }
@@ -102,9 +107,10 @@ fn test_gtc_orders() {
     // Place GTC buy for 20 (more than available)
     let id3 = engine.stats().total_orders as u64;
     let buy = Order::new(id3, Side::Buy, 100.0, 20.0, TimeInForce::GTC, now);
+    match engine.place_order(buy) {
         Ok(result) => {
             match result.status {
-                matching_engine::engine::OrderStatus::PartiallyFilled => {
+                lightning_exchange::engine::OrderStatus::PartiallyFilled => {
                     println!("  ✓ Status: PARTIALLY_FILLED");
                     println!("  ✓ Filled: {} | Remaining: {}", result.filled, 20.0 - result.filled);
                 }
@@ -119,15 +125,17 @@ fn test_gtc_orders() {
 
     let id4 = engine.stats().total_orders as u64;
     let sell = Order::new(id4, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
+    match engine.place_order(sell) {
         Ok(r) => println!("  Sell order: {:?}", r.status),
         Err(e) => println!("  Sell error: {:?}", e),
     }
 
     let id5 = engine.stats().total_orders as u64;
     let buy = Order::new(id5, Side::Buy, 100.0, 10.0, TimeInForce::GTC, now);
+    match engine.place_order(buy) {
         Ok(result) => {
             match result.status {
-                matching_engine::engine::OrderStatus::Filled => {
+                lightning_exchange::engine::OrderStatus::Filled => {
                     println!("  ✓ Status: FILLED (complete match)");
                 }
                 _ => println!("  ✗ Expected Filled, got {:?}", result.status),
@@ -150,8 +158,9 @@ fn test_fok_orders() {
     println!("Scenario 1: FOK unable to fill completely");
     let id1 = engine.stats().total_orders as u64;
     let order = Order::new(id1, Side::Buy, 100.0, 10.0, TimeInForce::FOK, now);
+    match engine.place_order(order) {
         Ok(result) => {
-            if matches!(result.status, matching_engine::engine::OrderStatus::Rejected) {
+            if matches!(result.status, lightning_exchange::engine::OrderStatus::Rejected) {
                 println!("  ✓ Status: REJECTED (can't fill completely)");
             }
         }
@@ -163,11 +172,13 @@ fn test_fok_orders() {
 
     let id2 = engine.stats().total_orders as u64;
     let sell = Order::new(id2, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
+    let _ = engine.place_order(sell);
 
     let id3 = engine.stats().total_orders as u64;
     let buy = Order::new(id3, Side::Buy, 100.0, 10.0, TimeInForce::FOK, now);
+    match engine.place_order(buy) {
         Ok(result) => {
-            if matches!(result.status, matching_engine::engine::OrderStatus::Filled) {
+            if matches!(result.status, lightning_exchange::engine::OrderStatus::Filled) {
                 println!("  ✓ Status: FILLED (complete fill achieved)");
             }
         }
@@ -188,8 +199,9 @@ fn test_postonly_orders() {
     println!("Scenario 1: PostOnly enters order book");
     let id1 = engine.stats().total_orders as u64;
     let order = Order::new(id1, Side::Buy, 100.0, 10.0, TimeInForce::PostOnly, now);
+    match engine.place_order(order) {
         Ok(result) => {
-            if matches!(result.status, matching_engine::engine::OrderStatus::Accepted) {
+            if matches!(result.status, lightning_exchange::engine::OrderStatus::Accepted) {
                 println!("  ✓ Status: ACCEPTED (enters book, no execution)");
             }
         }
@@ -201,11 +213,13 @@ fn test_postonly_orders() {
 
     let id2 = engine.stats().total_orders as u64;
     let post_only = Order::new(id2, Side::Buy, 100.0, 10.0, TimeInForce::PostOnly, now);
+    let _ = engine.place_order(post_only);
 
     let id3 = engine.stats().total_orders as u64;
     let sell = Order::new(id3, Side::Sell, 100.0, 10.0, TimeInForce::GTC, now);
+    match engine.place_order(sell) {
         Ok(result) => {
-            if matches!(result.status, matching_engine::engine::OrderStatus::Filled) {
+            if matches!(result.status, lightning_exchange::engine::OrderStatus::Filled) {
                 println!("  ✓ Status: FILLED (matched with PostOnly order)");
             }
         }

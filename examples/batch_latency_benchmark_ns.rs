@@ -1,6 +1,6 @@
 //! 批量撮合延迟基准测试（纳秒精度） - 1个vs20个委托的TPS/延迟
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
 use std::time::Instant;
 use rtrb::RingBuffer;
 use smallvec::SmallVec;

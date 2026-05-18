@@ -7,7 +7,7 @@
 //! 4. 生成交易事件以填充快照数据
 //! 5. 验证消息格式兼容性
 
-use matching_engine::{
+use lightning_exchange::{
     AeronConfig, MatchingEngine, MarketDataEngine, Order, PoolConfig, PublishedSnapshot,
     Side, SnapshotPublisherThread, SnapshotTimer, TimeInForce, TradeEvent,
 };
@@ -71,6 +71,7 @@ fn main() {
 
             {
                 let mut engine = engine_trade.lock();
+                let _ = engine.place_order(buy_order);
             }
 
             // 卖单 - 触发成交
@@ -85,6 +86,7 @@ fn main() {
 
             {
                 let mut engine = engine_trade.lock();
+                let _ = engine.place_order(sell_order);
             }
 
             // 稍微延迟以允许引擎处理
@@ -124,13 +126,13 @@ fn main() {
     println!("=== 消息格式验证 ===\n");
 
     let sample_snapshot = PublishedSnapshot::default();
-    match matching_engine::aeron_publisher::snapshot_to_bytes(&sample_snapshot) {
+    match lightning_exchange::aeron_publisher::snapshot_to_bytes(&sample_snapshot) {
         Ok(bytes) => {
             println!("✓ 快照序列化成功");
             println!("  序列化字节数: {}", bytes.len());
             println!("  预期字节数: {}", std::mem::size_of::<PublishedSnapshot>());
 
-            match matching_engine::aeron_publisher::bytes_to_snapshot(&bytes) {
+            match lightning_exchange::aeron_publisher::bytes_to_snapshot(&bytes) {
                 Ok(deserialized) => {
                     println!("✓ 快照反序列化成功");
                     println!("  时间戳: {}", deserialized.timestamp);

@@ -12,13 +12,13 @@
 ///   - Stream 3: 出站成交 (TradeNotification)
 ///   - Stream 4-6: 出站行情 (Depth20, Depth50, Level2)
 
-use matching_engine::{
+use lightning_exchange::{
     PoolConfig, MarketDataConfig,
 };
-use matching_engine::aeron_transport::{
+use lightning_exchange::aeron_transport::{
     AeronOrderSubscriber, AeronOrderUpdatePublisher, AeronTradePublisher, AeronMarketDataPublisher,
 };
-use matching_engine::trading_engine::{TradingEngine, TradingConfig};
+use lightning_exchange::trading_engine::{TradingEngine, TradingConfig};
 use std::time::Duration;
 use tracing::info;
 
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("初始化撮合引擎配置...");
     let pool_config = PoolConfig {
         order_capacity: 1_000_000,
-        orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+        orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         queue_capacity: 10_000,
     };
 

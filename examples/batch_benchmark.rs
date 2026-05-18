@@ -1,6 +1,6 @@
 //! 批量下单性能基准 - 对比单个vs批量下单，使用不同价格
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use smallvec::SmallVec;
 use std::time::Instant;
 
@@ -41,8 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0,
         );
 
-        if result.filled > 0.0 {
-            matched_count += 1;
+        if let Ok(result) = engine.place_order(sell) {
+            if result.filled > 0.0 {
+                matched_count += 1;
+            }
         }
     }
 

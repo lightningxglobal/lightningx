@@ -1,7 +1,7 @@
 //! 市场数据对撮合引擎的性能影响分析
 //! 逐步添加市场数据处理，观察性能变化
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
 use std::time::Instant;
 use std::sync::Arc;
 use parking_lot::Mutex;
@@ -15,13 +15,15 @@ fn benchmark_matching(name: &str, mut engine: MatchingEngine, num_rounds: usize)
     for i in 0..num_rounds {
         // Buy
         let buy_order = Order::new(i as u64 * 2, Side::Buy, 50000.0 + (i % 100) as f64, 10.0, TimeInForce::GTC, 0);
+        let _ = engine.place_order(buy_order);
         ops += 1;
 
         // Sell at same price (will match)
         let sell_order = Order::new(i as u64 * 2 + 1, Side::Sell, 50000.0 + (i % 100) as f64, 10.0, TimeInForce::GTC, 0);
+        let sell_filled = engine.place_order(sell_order).map(|r| r.filled).unwrap_or(0.0);
         ops += 1;
 
-        if sell_result.filled > 0.0 {
+        if sell_filled > 0.0 {
             matched += 1;
         }
     }

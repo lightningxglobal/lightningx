@@ -1,6 +1,6 @@
 /// 改进的深度采样性能基准 - 无调试开销，专注TPS和延迟
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     MarketDataConfig, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent,
 };
@@ -15,7 +15,7 @@ fn benchmark_scenario(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool_config = PoolConfig {
         order_capacity: 10_000_000,
-        orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+        orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         queue_capacity: 1_000_000,
     };
     let mut engine = MatchingEngine::new(pool_config)?;

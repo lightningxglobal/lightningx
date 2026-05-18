@@ -1,6 +1,6 @@
 //! 精确定位瓶颈 - 对比不同场景的性能
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent, MarketDataEngine};
 use std::sync::Arc;
 use std::time::Instant;
 use parking_lot::Mutex;

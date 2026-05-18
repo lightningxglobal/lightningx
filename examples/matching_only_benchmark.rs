@@ -1,7 +1,7 @@
 //! 纯匹配引擎性能基准测试 (不含市场数据处理)
 //! 目的: 测量原始匹配引擎性能，不受市场数据引擎影响
 
-use matching_engine::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
+use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce};
 use std::time::Instant;
 
 struct LatencyStats {

@@ -1,7 +1,7 @@
 //! OrderBook 实现对比 - SkipList vs BTree vs Array
 //! 测量三个实现的性能和延迟
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce,
     orderbook_impl::OrderBookType,
 };

@@ -2,7 +2,7 @@
 ///
 /// 测试两个场景并显示详细的延迟统计
 
-use matching_engine::{
+use lightning_exchange::{
     MatchingEngine, PoolConfig, Order, Side, TimeInForce, MarketDataConfig,
     order_update::OrderUpdateEvent,
     market_data::{TradeEvent, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent},
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pool_config = PoolConfig {
             order_capacity: 10_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 1_000_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;
@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pool_config = PoolConfig {
             order_capacity: 10_000_000,
-            orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+            orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
             queue_capacity: 1_000_000,
         };
         let mut engine = MatchingEngine::new(pool_config)?;

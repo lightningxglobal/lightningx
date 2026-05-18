@@ -1,4 +1,4 @@
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
 use std::time::Instant;
 
 fn create_test_order(id: u64, side: Side, price: f64) -> Order {
@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Matching Engine Performance Test V2 ===\n");
 
     // Use smaller pool sizes to avoid allocation issues
-    let config = PoolConfig { orderbook_type: matching_engine::orderbook_impl::OrderBookType::SkipList,
+    let config = PoolConfig { orderbook_type: lightning_exchange::orderbook_impl::OrderBookType::SkipList,
         order_capacity: 50_000,
         queue_capacity: 5_000,
     };
@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..1000 {
         let order = create_test_order(i, Side::Buy, 50000.0 + (i % 100) as f64);
+        if engine.place_order(order).is_ok() {
             success_count += 1;
         }
     }
@@ -43,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-fill with sell orders at different prices
     for i in 0..100 {
         let order = create_test_order(i, Side::Sell, 50000.0 + (i % 50) as f64);
+        let _ = engine.place_order(order);
     }
 
     let start = Instant::now();
@@ -51,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Buy orders that should match with sell orders
     for i in 100..200 {
         let order = create_test_order(i, Side::Buy, 55000.0);
+        if let Ok(result) = engine.place_order(order) {
             if result.filled > 0.0 {
                 match_count += 1;
             }
@@ -73,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Place some orders
     for i in 0..100 {
         let order = create_test_order(i, Side::Buy, 50000.0);
+        let _ = engine.place_order(order);
     }
 
     let start = Instant::now();

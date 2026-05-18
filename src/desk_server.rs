@@ -477,7 +477,7 @@ pub struct DeskAppState {
     /// and consulted by the price-deviation risk check. Per-symbol so a 50k
     /// BTC mid doesn't reject a 3k ETH limit. Missing symbol or stored 0.0
     /// both signal "no reference" and the deviation check is skipped.
-    pub last_mid_price: Arc<DashMap<String, f64>>,
+    pub last_mid_prices: Arc<DashMap<String, f64>>,
 }
 
 /// Look up the per-symbol mid price for the deviation check. Returns None
@@ -849,7 +849,7 @@ async fn desk_handle_message(
             // lookup_mid handles both "never seen" and "stored 0.0" as None.
             if order_type != "market" {
                 if let Some(p) = price {
-                    let mid = lookup_mid(&state.last_mid_price, &symbol);
+                    let mid = lookup_mid(&state.last_mid_prices, &symbol);
                     if let Err(e) = check_price_deviation(mid, p) {
                         return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e}).to_string());
                     }
@@ -969,11 +969,11 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                         Ok(WsMsg::Text(msg)) => {
                             if msg.contains("\"type\":\"ticker\"") {
                                 if let Ok(v) = serde_json::from_str::<Value>(&msg) {
-                                    let symbol = v.get("symbol").and_then(|x| x.as_str());
-                                    let last = v.get("last").and_then(|x| x.as_f64());
-                                    if let (Some(sym), Some(price)) = (symbol, last) {
-                                        if price > 0.0 {
-                                            state.last_mid_price.insert(sym.to_string(), price);
+                                    if let Some(last) = v.get("last").and_then(|x| x.as_f64()) {
+                                        if last > 0.0 {
+                                            if let Some(sym) = v.get("symbol").and_then(|s| s.as_str()) {
+                                                state.last_mid_prices.insert(sym.to_string(), last);
+                                            }
                                         }
                                     }
                                 }

@@ -40,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
             RateLimiter::new(RateLimitPolicy::default_trading()),
         )),
         id_gen: Arc::new(SnowflakeIdGenerator::new(desk_id)),
-        last_mid_price: Arc::new(DashMap::new()),
+        last_mid_prices: Arc::new(DashMap::new()),
     };
 
     tokio::spawn(desk_market_data_broadcaster(state.clone()));

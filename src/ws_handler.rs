@@ -847,6 +847,8 @@ pub async fn market_data_broadcaster(state: AppState) {
                 // frontend chart with a fake bar.
                 let db = state.db.clone();
                 let mtx = state.market_tx.clone();
+                let now = unix_now();
+                let bar_time = now - (now % 60); // start of current minute (UTC)
                 tokio::spawn(async move {
                     let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64), _> = sqlx::query_as(
                         "SELECT
@@ -857,16 +859,17 @@ pub async fn market_data_broadcaster(state: AppState) {
                            COALESCE(SUM(quantity), 0.0)                    AS volume
                          FROM trades
                          WHERE symbol = $1
-                           AND created_at >= NOW() - INTERVAL '60 seconds'"
+                           AND created_at >= to_timestamp($2)
+                           AND created_at <  to_timestamp($3)"
                     )
                     .bind(SYMBOL)
+                    .bind(bar_time as f64)
+                    .bind((bar_time + 60) as f64)
                     .fetch_one(db.as_ref())
                     .await;
 
                     match row {
                         Ok((Some(open), Some(high), Some(low), Some(close), volume)) if volume > 0.0 => {
-                            let now = unix_now();
-                            let bar_time = now - (now % 60);
                             let msg = json!({
                                 "type": "kline",
                                 "symbol": SYMBOL,

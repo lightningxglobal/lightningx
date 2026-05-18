@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use lightning_exchange::{
     db,
     desk_server::{DeskAppState, desk_market_data_broadcaster, desk_ws_handler},
@@ -39,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
             RateLimiter::new(RateLimitPolicy::default_trading()),
         )),
         id_gen: Arc::new(SnowflakeIdGenerator::new(desk_id)),
-        last_mid_price: Arc::new(parking_lot::RwLock::new(0.0)),
+        last_mid_price: Arc::new(DashMap::new()),
     };
 
     tokio::spawn(desk_market_data_broadcaster(state.clone()));

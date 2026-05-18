@@ -461,6 +461,7 @@ mod tests {
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use dashmap::DashMap;
 
 use crate::rate_limit::RateLimiter as RL;
 
@@ -472,7 +473,20 @@ pub struct DeskAppState {
     pub market_tx: Arc<broadcast::Sender<String>>,
     pub rate_limiter: Arc<parking_lot::Mutex<RL>>,
     pub id_gen: Arc<SnowflakeIdGenerator>,
-    pub last_mid_price: Arc<parking_lot::RwLock<f64>>,
+    /// Per-symbol last-known mid price, updated from upstream ticker frames
+    /// and consulted by the price-deviation risk check. Per-symbol so a 50k
+    /// BTC mid doesn't reject a 3k ETH limit. Missing symbol or stored 0.0
+    /// both signal "no reference" and the deviation check is skipped.
+    pub last_mid_price: Arc<DashMap<String, f64>>,
+}
+
+/// Look up the per-symbol mid price for the deviation check. Returns None
+/// when the symbol has never had a ticker OR the stored value is non-positive,
+/// matching the "treat as no reference" contract of `check_price_deviation`.
+/// Extracted as a free function so the per-symbol routing is unit-testable
+/// without spinning up a full DeskAppState.
+pub(crate) fn lookup_mid(map: &DashMap<String, f64>, symbol: &str) -> Option<f64> {
+    map.get(symbol).map(|v| *v).filter(|&v| v > 0.0)
 }
 
 // ─── Price-deviation risk check (no longer needs engine) ─────────────────────
@@ -809,7 +823,7 @@ async fn desk_handle_message(
 
         DeskClientMsg::Ping => Some(json!({"type": "pong"}).to_string()),
 
-        DeskClientMsg::PlaceOrder { client_order_id, symbol: _, side: _, order_type, price, qty } => {
+        DeskClientMsg::PlaceOrder { client_order_id, symbol, side: _, order_type, price, qty } => {
             let _user_id = match session.user_id {
                 Some(id) => id,
                 None => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
@@ -831,13 +845,11 @@ async fn desk_handle_message(
                 return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "price required for limit orders"}).to_string());
             }
 
-            // Price deviation risk check against last known mid price
+            // Price deviation risk check against the per-symbol last known mid.
+            // lookup_mid handles both "never seen" and "stored 0.0" as None.
             if order_type != "market" {
                 if let Some(p) = price {
-                    let mid = {
-                        let v = *state.last_mid_price.read();
-                        if v > 0.0 { Some(v) } else { None }
-                    };
+                    let mid = lookup_mid(&state.last_mid_price, &symbol);
                     if let Err(e) = check_price_deviation(mid, p) {
                         return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": e}).to_string());
                     }
@@ -957,9 +969,11 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                         Ok(WsMsg::Text(msg)) => {
                             if msg.contains("\"type\":\"ticker\"") {
                                 if let Ok(v) = serde_json::from_str::<Value>(&msg) {
-                                    if let Some(last) = v.get("last").and_then(|x| x.as_f64()) {
-                                        if last > 0.0 {
-                                            *state.last_mid_price.write() = last;
+                                    let symbol = v.get("symbol").and_then(|x| x.as_str());
+                                    let last = v.get("last").and_then(|x| x.as_f64());
+                                    if let (Some(sym), Some(price)) = (symbol, last) {
+                                        if price > 0.0 {
+                                            state.last_mid_price.insert(sym.to_string(), price);
                                         }
                                     }
                                 }
@@ -980,6 +994,46 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
                 backoff_secs = next_backoff_secs(backoff_secs);
             }
         }
+    }
+}
+
+// ─── Per-symbol mid-price lookup tests ───────────────────────────────────────
+
+#[cfg(test)]
+mod mid_price_tests {
+    use super::lookup_mid;
+    use dashmap::DashMap;
+
+    #[test]
+    fn missing_symbol_returns_none() {
+        let map: DashMap<String, f64> = DashMap::new();
+        assert!(lookup_mid(&map, "BTC_USDT").is_none());
+    }
+
+    #[test]
+    fn stored_zero_treated_as_no_reference() {
+        let map: DashMap<String, f64> = DashMap::new();
+        map.insert("BTC_USDT".to_string(), 0.0);
+        assert!(lookup_mid(&map, "BTC_USDT").is_none());
+    }
+
+    #[test]
+    fn stored_positive_returned() {
+        let map: DashMap<String, f64> = DashMap::new();
+        map.insert("BTC_USDT".to_string(), 50000.0);
+        assert_eq!(lookup_mid(&map, "BTC_USDT"), Some(50000.0));
+    }
+
+    #[test]
+    fn other_symbols_do_not_leak() {
+        // The bug this commit fixes: a 50k BTC mid must NOT be consulted when
+        // checking an ETH limit order. With per-symbol storage, the ETH lookup
+        // returns None and the deviation check is correctly skipped.
+        let map: DashMap<String, f64> = DashMap::new();
+        map.insert("BTC_USDT".to_string(), 50000.0);
+        assert!(lookup_mid(&map, "ETH_USDT").is_none());
+        // And the BTC lookup is still intact.
+        assert_eq!(lookup_mid(&map, "BTC_USDT"), Some(50000.0));
     }
 }
 

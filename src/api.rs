@@ -272,18 +272,64 @@ async fn handle_cancel_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let r = sqlx::query(
+
+    // Fetch order details before cancelling so we know what to unfreeze.
+    let order_row = sqlx::query(
+        "SELECT symbol, side, price, quantity, filled FROM orders
+         WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
+    )
+    .bind(order_id)
+    .bind(user_id)
+    .fetch_optional(s.db.as_ref())
+    .await;
+
+    let order_row = match order_row {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Order not found or already closed"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+
+    use sqlx::Row;
+    let symbol: String = order_row.get("symbol");
+    let side: String = order_row.get("side");
+    let price: Option<f64> = order_row.get("price");
+    let quantity: f64 = order_row.get("quantity");
+    let filled: f64 = order_row.get("filled");
+    let remaining = quantity - filled;
+
+    let upd = sqlx::query(
         "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
          WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
     )
     .bind(order_id).bind(user_id)
     .execute(s.db.as_ref()).await;
 
-    match r {
-        Ok(r) if r.rows_affected() > 0 => (StatusCode::OK, Json(json!({"cancelled": order_id}))).into_response(),
-        Ok(_) => (StatusCode::NOT_FOUND, Json(json!({"error": "Order not found or already closed"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    match upd {
+        Ok(r) if r.rows_affected() > 0 => {}
+        Ok(_) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Order not found or already closed"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
+
+    // Best-effort cancel in engine for this symbol.
+    if let Some(engine) = s.engines.get(&symbol) {
+        let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+    }
+
+    // Release frozen funds for the unfilled portion.
+    let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+    let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+    let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+    let repo = AccountRepository::new(&s.db);
+    if side == "buy" {
+        let freeze_price = price.unwrap_or(0.0);
+        if freeze_price > 0.0 && remaining > 0.0 {
+            let _ = repo.release_frozen(user_id, quote_asset, freeze_price * remaining).await;
+        }
+    } else if remaining > 0.0 {
+        let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+    }
+
+    (StatusCode::OK, Json(json!({"cancelled": order_id}))).into_response()
 }
 
 // ─── Tickers ──────────────────────────────────────────────────────────────────

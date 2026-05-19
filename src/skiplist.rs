@@ -13,7 +13,7 @@ pub struct SkipListNode {
     pub level: usize,
     /// 指向各级下一个节点的原始指针数组
     /// 安全性保证：所有指针都指向arena中的节点，在SkipList的生命周期内有效
-    forward: [*mut SkipListNode; MAX_LEVEL],
+    pub forward: [*mut SkipListNode; MAX_LEVEL],
 }
 
 impl SkipListNode {
@@ -39,7 +39,7 @@ pub enum SortOrder {
 /// 跳表实现 - 使用arena存储所有节点，raw pointers实现多级链接
 pub struct SkipList {
     /// 指向head sentinel节点的原始指针（在arena中）
-    head: *mut SkipListNode,
+    pub head: *mut SkipListNode,
     /// 当前跳表的最大层级
     level: usize,
     /// 节点总数（不含head sentinel）

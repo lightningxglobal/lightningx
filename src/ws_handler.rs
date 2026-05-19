@@ -6,10 +6,11 @@ use crate::user_service;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
+use dashmap::DashMap;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -781,47 +782,63 @@ fn broadcast_depth(state: &AppState, symbol: &str) {
 
 // ─── Background market data broadcaster ─────────────────────────────────────
 
+/// Snapshot every engine's top-of-book under brief per-engine locks.
+/// Returned as owned data so the caller can build/send messages without
+/// holding any DashMap shard or engine lock.
+fn snapshot_all_engines(
+    engines: &DashMap<String, Arc<Mutex<MatchingEngine>>>,
+) -> Vec<(String, Vec<(f64, f64)>, Vec<(f64, f64)>)> {
+    engines
+        .iter()
+        .map(|entry| {
+            let symbol = entry.key().clone();
+            let eng = entry.value().lock().unwrap();
+            let bids = eng.get_top_levels(10, true);
+            let asks = eng.get_top_levels(10, false);
+            (symbol, bids, asks)
+        })
+        .collect()
+}
+
 pub async fn market_data_broadcaster(state: AppState) {
-    // Use "BTC_USDT" as the primary symbol since the engine manages one book.
-    // Multi-symbol support requires per-symbol engines (Phase 2).
-    const SYMBOL: &str = "BTC_USDT";
     let mut depth_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut ticker_interval = tokio::time::interval(std::time::Duration::from_secs(5));
-    let mut last_price: f64 = 0.0;
+    // Last-seen top-bid price per symbol — drives ticker broadcasts and the
+    // 24h-change calc. Keyed by symbol so a new symbol picked up at runtime
+    // gets its own entry on first non-empty depth tick.
+    let mut last_prices: HashMap<String, f64> = HashMap::new();
 
     loop {
         tokio::select! {
             _ = depth_interval.tick() => {
-                // TODO(multi-symbol): iterate all engines and broadcast per-symbol depth.
-                let (bids, asks) = {
-                    let engine = state.engines.get(SYMBOL).unwrap();
-                    let eng = engine.lock().unwrap();
-                    (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
-                };
-                if let Some((p, _)) = bids.first() {
-                    last_price = *p;
+                for (symbol, bids, asks) in snapshot_all_engines(&state.engines) {
+                    if let Some((p, _)) = bids.first() {
+                        last_prices.insert(symbol.clone(), *p);
+                    }
+                    let msg = json!({
+                        "type": "depth",
+                        "symbol": symbol,
+                        "bids": bids,
+                        "asks": asks,
+                        "ts": unix_now()
+                    }).to_string();
+                    let _ = state.market_tx.send(msg);
                 }
-                let msg = json!({
-                    "type": "depth",
-                    "symbol": SYMBOL,
-                    "bids": bids,
-                    "asks": asks,
-                    "ts": unix_now()
-                }).to_string();
-                let _ = state.market_tx.send(msg);
             }
 
             _ = ticker_interval.tick() => {
-                // Periodic ticker broadcast so clients always see updated last price.
-                if last_price > 0.0 {
+                // Periodic ticker per symbol that has a known last price.
+                for (symbol, &last_price) in last_prices.iter() {
+                    if last_price <= 0.0 { continue; }
+                    let symbol = symbol.clone();
                     let db = state.db.clone();
                     let mtx = state.market_tx.clone();
                     tokio::spawn(async move {
                         let open_24h: Option<f64> = sqlx::query_scalar(
                             "SELECT price FROM trades WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at ASC LIMIT 1"
                         )
-                        .bind(SYMBOL)
+                        .bind(&symbol)
                         .fetch_optional(db.as_ref())
                         .await
                         .unwrap_or(None);
@@ -831,7 +848,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                         };
                         let msg = serde_json::json!({
                             "type": "ticker",
-                            "symbol": SYMBOL,
+                            "symbol": symbol,
                             "last": last_price,
                             "change": change,
                         }).to_string();
@@ -841,57 +858,59 @@ pub async fn market_data_broadcaster(state: AppState) {
             }
 
             _ = kline_interval.tick() => {
-                // Fetch real OHLCV from the trades table for the last 60 seconds.
-                // Skip the broadcast entirely if there were no trades — sending
-                // a flat candle (open==high==low==close, volume==0) corrupts the
-                // frontend chart with a fake bar.
-                let db = state.db.clone();
-                let mtx = state.market_tx.clone();
+                // Fetch real OHLCV from the trades table for the last 60 seconds,
+                // per active symbol. Skip when the bar has no trades so we don't
+                // corrupt the chart with a fake flat candle.
                 let now = unix_now();
-                let bar_time = now - (now % 60); // start of current minute (UTC)
-                tokio::spawn(async move {
-                    let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64), _> = sqlx::query_as(
-                        "SELECT
-                           (array_agg(price ORDER BY created_at ASC))[1]  AS open,
-                           MAX(price)                                      AS high,
-                           MIN(price)                                      AS low,
-                           (array_agg(price ORDER BY created_at DESC))[1] AS close,
-                           COALESCE(SUM(quantity), 0.0)                    AS volume
-                         FROM trades
-                         WHERE symbol = $1
-                           AND created_at >= to_timestamp($2)
-                           AND created_at <  to_timestamp($3)"
-                    )
-                    .bind(SYMBOL)
-                    .bind(bar_time as f64)
-                    .bind((bar_time + 60) as f64)
-                    .fetch_one(db.as_ref())
-                    .await;
+                let bar_time = now - (now % 60);
+                let symbols: Vec<String> = state.engines.iter().map(|e| e.key().clone()).collect();
+                for symbol in symbols {
+                    let db = state.db.clone();
+                    let mtx = state.market_tx.clone();
+                    tokio::spawn(async move {
+                        let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64), _> = sqlx::query_as(
+                            "SELECT
+                               (array_agg(price ORDER BY created_at ASC))[1]  AS open,
+                               MAX(price)                                      AS high,
+                               MIN(price)                                      AS low,
+                               (array_agg(price ORDER BY created_at DESC))[1] AS close,
+                               COALESCE(SUM(quantity), 0.0)                    AS volume
+                             FROM trades
+                             WHERE symbol = $1
+                               AND created_at >= to_timestamp($2)
+                               AND created_at <  to_timestamp($3)"
+                        )
+                        .bind(&symbol)
+                        .bind(bar_time as f64)
+                        .bind((bar_time + 60) as f64)
+                        .fetch_one(db.as_ref())
+                        .await;
 
-                    match row {
-                        Ok((Some(open), Some(high), Some(low), Some(close), volume)) if volume > 0.0 => {
-                            let msg = json!({
-                                "type": "kline",
-                                "symbol": SYMBOL,
-                                "bar": {
-                                    "time": bar_time,
-                                    "open": open,
-                                    "high": high,
-                                    "low":  low,
-                                    "close": close,
-                                    "volume": volume
-                                }
-                            }).to_string();
-                            let _ = mtx.send(msg);
+                        match row {
+                            Ok((Some(open), Some(high), Some(low), Some(close), volume)) if volume > 0.0 => {
+                                let msg = json!({
+                                    "type": "kline",
+                                    "symbol": symbol,
+                                    "bar": {
+                                        "time": bar_time,
+                                        "open": open,
+                                        "high": high,
+                                        "low":  low,
+                                        "close": close,
+                                        "volume": volume
+                                    }
+                                }).to_string();
+                                let _ = mtx.send(msg);
+                            }
+                            Ok(_) => {
+                                // No trades in the last 60s — skip sending kline.
+                            }
+                            Err(e) => {
+                                eprintln!("kline DB query failed for {}: {}", symbol, e);
+                            }
                         }
-                        Ok(_) => {
-                            // No trades in the last 60s — skip sending kline.
-                        }
-                        Err(e) => {
-                            eprintln!("kline DB query failed: {}", e);
-                        }
-                    }
-                });
+                    });
+                }
             }
         }
     }
@@ -899,13 +918,18 @@ pub async fn market_data_broadcaster(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::build_depth_json;
+    use super::{build_depth_json, snapshot_all_engines};
     use crate::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
+    use dashmap::DashMap;
     use serde_json::Value;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     fn empty_engine() -> Mutex<MatchingEngine> {
         Mutex::new(MatchingEngine::new(PoolConfig::default()).unwrap())
+    }
+
+    fn engine_arc() -> Arc<Mutex<MatchingEngine>> {
+        Arc::new(Mutex::new(MatchingEngine::new(PoolConfig::default()).unwrap()))
     }
 
     #[test]

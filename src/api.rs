@@ -535,10 +535,10 @@ async fn handle_test_funds(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "You already have funds. Test funds can only be claimed when USDT balance is below 100."}))).into_response();
     }
 
-    // Credit 10,000 USDT and 1 BTC
+    // Credit 10,000 USDT, 1 BTC, 10 ETH, 100 SOL
     let result = sqlx::query(
         "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 10000, 0), ($1, 'BTC', 1, 0)
+         VALUES ($1, 'USDT', 10000, 0), ($1, 'BTC', 1, 0), ($1, 'ETH', 10, 0), ($1, 'SOL', 100, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
          SET balance = accounts.balance + EXCLUDED.balance, updated_at = NOW()",
     )
@@ -547,7 +547,7 @@ async fn handle_test_funds(
     .await;
 
     match result {
-        Ok(_) => (StatusCode::OK, Json(json!({"message": "Test funds granted: 10,000 USDT + 1 BTC", "usdt": 10000, "btc": 1}))).into_response(),
+        Ok(_) => (StatusCode::OK, Json(json!({"message": "Test funds granted: 10,000 USDT + 1 BTC + 10 ETH + 100 SOL", "usdt": 10000, "btc": 1, "eth": 10, "sol": 100}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

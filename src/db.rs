@@ -15,5 +15,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(include_str!("../migrations/002_nullable_trade_order_ids.sql"))
         .execute(pool)
         .await?;
+    sqlx::raw_sql(include_str!("../migrations/003_symbols.sql"))
+        .execute(pool)
+        .await?;
     Ok(())
 }

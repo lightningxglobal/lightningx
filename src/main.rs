@@ -33,6 +33,22 @@ async fn main() -> anyhow::Result<()> {
             (s.to_string(), Arc::new(Mutex::new(eng)))
         })
         .collect();
+
+    // Upsert configured symbols into DB so data_server can discover them.
+    for sym in &symbols {
+        let parts: Vec<&str> = sym.split('_').collect();
+        let (base, quote): (&str, &str) = if parts.len() == 2 { (parts[0], parts[1]) } else { (sym, "") };
+        let _ = sqlx::query(
+            "INSERT INTO symbols (symbol, base_asset, quote_asset) VALUES ($1, $2, $3)
+             ON CONFLICT (symbol) DO NOTHING",
+        )
+        .bind(sym)
+        .bind(base)
+        .bind(quote)
+        .execute(&pool)
+        .await;
+    }
+
     let (market_tx, _) = broadcast::channel::<String>(1024);
 
     let state = AppState {

@@ -913,9 +913,14 @@ pub async fn desk_market_data_broadcaster(state: DeskAppState) {
     let mut backoff_secs: u64 = 1;
 
     loop {
-        // Query active symbols from DB; fall back to BTC_USDT if none found
+        // Query active symbols: canonical symbols table first, fall back to order history.
         let symbols: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT symbol FROM orders UNION SELECT DISTINCT symbol FROM trades ORDER BY 1",
+            "SELECT symbol FROM symbols WHERE active = TRUE
+             UNION
+             SELECT DISTINCT symbol FROM orders
+             UNION
+             SELECT DISTINCT symbol FROM trades
+             ORDER BY 1",
         )
         .fetch_all(state.db.as_ref())
         .await

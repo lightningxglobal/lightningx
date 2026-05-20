@@ -60,13 +60,16 @@ fn auth_user(headers: &HeaderMap, secret: &str) -> Result<i64, (StatusCode, Json
 
 async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
     let rows = sqlx::query(
-        "SELECT symbol,
-                MAX(price) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS high_24h,
-                MIN(price) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS low_24h,
-                SUM(quantity) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS vol_24h,
-                (SELECT price FROM trades t2 WHERE t2.symbol = t.symbol ORDER BY created_at DESC LIMIT 1) AS last_price,
-                (SELECT price FROM trades t3 WHERE t3.symbol = t.symbol AND t3.created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at ASC LIMIT 1) AS open_24h
-         FROM trades t GROUP BY symbol ORDER BY symbol",
+        "SELECT s.symbol,
+                MAX(t.price) FILTER (WHERE t.created_at > NOW() - INTERVAL '24 hours') AS high_24h,
+                MIN(t.price) FILTER (WHERE t.created_at > NOW() - INTERVAL '24 hours') AS low_24h,
+                SUM(t.quantity) FILTER (WHERE t.created_at > NOW() - INTERVAL '24 hours') AS vol_24h,
+                (SELECT price FROM trades t2 WHERE t2.symbol = s.symbol ORDER BY created_at DESC LIMIT 1) AS last_price,
+                (SELECT price FROM trades t3 WHERE t3.symbol = s.symbol AND t3.created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at ASC LIMIT 1) AS open_24h
+         FROM symbols s
+         LEFT JOIN trades t ON t.symbol = s.symbol
+         WHERE s.active = TRUE
+         GROUP BY s.symbol ORDER BY s.symbol",
     )
     .fetch_all(s.db.as_ref())
     .await;

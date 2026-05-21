@@ -1,6 +1,6 @@
 /// REST API layer: auth, accounts, orders, user profile, KYC
 use crate::account_repository::AccountRepository;
-use crate::engine::MatchingEngine;
+use crate::engine::{MatchingEngine, OrderStatus};
 use crate::models::{DbOrder, User};
 use crate::order::{Order, Side, TimeInForce};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone)]
@@ -251,7 +251,67 @@ async fn handle_place_order(
     if req.order_type != "market" && req.price.map(|p| p <= 0.0).unwrap_or(true) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "price required for non-market orders"}))).into_response();
     }
-    let order = sqlx::query_as::<_, DbOrder>(
+
+    let engine_side = match req.side.as_str() {
+        "buy"  => Side::Buy,
+        "sell" => Side::Sell,
+        _      => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid side"}))).into_response(),
+    };
+    let tif = match req.order_type.as_str() {
+        "limit" | "gtc"   => TimeInForce::GTC,
+        "ioc"             => TimeInForce::IOC,
+        "fok"             => TimeInForce::FOK,
+        "post_only"       => TimeInForce::PostOnly,
+        "market"          => TimeInForce::IOC,
+        _                 => return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown order_type"}))).into_response(),
+    };
+
+    let engine = match s.engines.get(&req.symbol) {
+        Some(e) => e.value().clone(),
+        None    => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown symbol: {}", req.symbol)}))).into_response(),
+    };
+
+    let sym_parts: Vec<&str> = req.symbol.splitn(2, '_').collect();
+    let base_asset  = sym_parts.first().copied().unwrap_or("BTC");
+    let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+
+    // Best opposing price (for market orders that need a freeze estimate).
+    let best_opposing = {
+        let eng = engine.lock().unwrap();
+        let levels = eng.get_top_levels(1, engine_side == Side::Sell);
+        levels.first().map(|(p, _)| *p)
+    };
+
+    // Freeze funds before touching the engine.
+    let repo = AccountRepository::new(s.db.as_ref());
+    let freeze_result = if req.side == "buy" {
+        let freeze_price = req.price.or(best_opposing).unwrap_or(0.0);
+        if freeze_price > 0.0 {
+            repo.freeze_for_buy(user_id, quote_asset, freeze_price * req.quantity).await
+        } else {
+            Ok(())
+        }
+    } else {
+        repo.freeze_for_sell(user_id, base_asset, req.quantity).await
+    };
+    if let Err(e) = freeze_result {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+    }
+
+    // Allocate engine order ID (stays in sync with DB sequence since both start at the same max+1).
+    let order_id = s.next_order_id.fetch_add(1, Ordering::Relaxed);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let engine_order = if req.order_type == "market" {
+        Order::new_market(order_id, engine_side, req.quantity, now_ns)
+    } else {
+        Order::new(order_id, engine_side, req.price.unwrap_or(0.0), req.quantity, tif, now_ns)
+    };
+
+    // Insert into DB as PENDING.
+    let db_order = sqlx::query_as::<_, DbOrder>(
         "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
          VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING') RETURNING *",
     )
@@ -259,9 +319,129 @@ async fn handle_place_order(
     .bind(&req.order_type).bind(req.price).bind(req.quantity)
     .fetch_one(s.db.as_ref()).await;
 
-    match order {
+    let db_order = match db_order {
+        Ok(o) => o,
+        Err(e) => {
+            // Roll back freeze.
+            if req.side == "buy" {
+                let p = req.price.or(best_opposing).unwrap_or(0.0);
+                if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+            } else {
+                let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
+    let db_order_id = db_order.id;
+
+    // Run through matching engine.
+    let engine_result = {
+        let mut eng = engine.lock().unwrap();
+        eng.place_order(engine_order)
+    };
+
+    let result = match engine_result {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
+                .bind(db_order_id).execute(s.db.as_ref()).await;
+            if req.side == "buy" {
+                let p = req.price.or(best_opposing).unwrap_or(0.0);
+                if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+            } else {
+                let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
+            }
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        }
+    };
+
+    let db_status = match result.status {
+        OrderStatus::Accepted        => "PENDING",
+        OrderStatus::PartiallyFilled => "TRADING",
+        OrderStatus::Filled          => "COMPLETED",
+        OrderStatus::Rejected        => "REJECTED",
+        OrderStatus::Cancelled       => "CANCELED",
+    };
+
+    let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
+        .bind(db_status).bind(result.filled).bind(db_order_id)
+        .execute(s.db.as_ref()).await;
+
+    if result.status == OrderStatus::Rejected {
+        if req.side == "buy" {
+            let p = req.price.or(best_opposing).unwrap_or(0.0);
+            if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+        } else {
+            let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
+        }
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Rejected by matching engine"}))).into_response();
+    }
+
+    // Settle fills: record trades and update maker orders.
+    for &(maker_order_id, fp, fq) in &result.fills {
+        if fp <= 0.0 || fq <= 0.0 { continue; }
+
+        let maker_uid: Option<i64> = sqlx::query_scalar("SELECT user_id FROM orders WHERE id=$1")
+            .bind(maker_order_id as i64).fetch_optional(s.db.as_ref()).await.unwrap_or(None);
+
+        let (buyer_id, seller_id) = if req.side == "buy" {
+            (user_id, maker_uid.unwrap_or(0))
+        } else {
+            (maker_uid.unwrap_or(0), user_id)
+        };
+
+        if buyer_id > 0 && seller_id > 0 {
+            if req.side == "buy" {
+                let over = req.price.map(|lp| (lp - fp) * fq).unwrap_or(0.0).max(0.0);
+                if over > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, over).await; }
+            }
+            let _ = repo.settle_trade(buyer_id, seller_id, base_asset, quote_asset, fp, fq, 0.0, 0.0).await;
+        }
+
+        // Update maker order status in DB.
+        let _ = sqlx::query(
+            "UPDATE orders SET filled = filled + $1,
+             status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
+             updated_at = NOW() WHERE id = $2",
+        )
+        .bind(fq).bind(maker_order_id as i64).execute(s.db.as_ref()).await;
+
+        // Record trade.
+        let (buy_oid, sell_oid): (Option<i64>, Option<i64>) = if req.side == "buy" {
+            (Some(db_order_id), Some(maker_order_id as i64))
+        } else {
+            (Some(maker_order_id as i64), Some(db_order_id))
+        };
+        let _ = sqlx::query(
+            "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())",
+        )
+        .bind(&req.symbol).bind(buy_oid).bind(sell_oid).bind(fp).bind(fq)
+        .execute(s.db.as_ref()).await;
+    }
+
+    // Release frozen for IOC/market with partial or zero fill.
+    if result.status == OrderStatus::Cancelled {
+        let unfilled = req.quantity - result.filled;
+        if unfilled > 0.0 {
+            let (rel_asset, rel_amount) = if req.side == "buy" {
+                (quote_asset, req.price.or(best_opposing).unwrap_or(0.0) * unfilled)
+            } else {
+                (base_asset, unfilled)
+            };
+            if rel_amount > 0.0 { let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await; }
+        }
+    }
+
+    // Broadcast depth update.
+    crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
+
+    // Re-fetch final order state from DB and return it.
+    match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
+        .bind(db_order_id).fetch_one(s.db.as_ref()).await
+    {
         Ok(o) => (StatusCode::CREATED, Json(json!(o))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(_) => (StatusCode::CREATED, Json(json!({"id": db_order_id}))).into_response(),
     }
 }
 

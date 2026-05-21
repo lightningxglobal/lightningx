@@ -588,7 +588,7 @@ async fn handle_client_message(
                     let _ = mtx_clone.send(ticker);
                 });
 
-                broadcast_depth(state, &symbol);
+                broadcast_depth_pub(state, &symbol);
 
                 // Push order_update + balance_update to this user's personal channel.
                 let update_msg = json!({
@@ -774,7 +774,7 @@ fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
 }
 
 /// Build and broadcast a depth snapshot for the given symbol.
-fn broadcast_depth(state: &AppState, symbol: &str) {
+pub fn broadcast_depth_pub(state: &AppState, symbol: &str) {
     if let Some(engine) = state.engines.get(symbol) {
         let _ = state.market_tx.send(build_depth_json(engine.value(), symbol));
     }

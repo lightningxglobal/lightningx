@@ -3,6 +3,8 @@ use lightning_exchange::{
     api::{router, AppState},
     db,
     engine::{MatchingEngine, PoolConfig},
+    models::DbOrder,
+    order::{Order, Side, TimeInForce},
     ws_handler::market_data_broadcaster,
 };
 use std::sync::{Arc, Mutex};
@@ -49,6 +51,43 @@ async fn main() -> anyhow::Result<()> {
         .await;
     }
 
+    // Recover active orders from DB back into engines so book state survives restarts.
+    let max_order_id: u64 = {
+        let rows = sqlx::query_as::<_, DbOrder>(
+            "SELECT * FROM orders WHERE status IN ('PENDING', 'TRADING') ORDER BY id ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let mut max_id: u64 = 0;
+        for db_order in &rows {
+            let order_id = db_order.id as u64;
+            if order_id > max_id { max_id = order_id; }
+
+            let remaining = db_order.quantity - db_order.filled;
+            if remaining <= 0.0 { continue; }
+
+            let side = if db_order.side == "buy" { Side::Buy } else { Side::Sell };
+            // Only GTC orders can survive in the book; restore everything as GTC.
+            let order = Order::new(
+                order_id,
+                side,
+                db_order.price.unwrap_or(0.0),
+                remaining,
+                TimeInForce::GTC,
+                0,
+            );
+
+            if let Some(eng_ref) = engines.get(&db_order.symbol) {
+                let mut eng = eng_ref.lock().unwrap();
+                let _ = eng.add_to_book(order);
+            }
+        }
+        tracing::info!("Restored {} active orders from DB", rows.len());
+        max_id
+    };
+
     let (market_tx, _) = broadcast::channel::<String>(1024);
 
     let state = AppState {
@@ -56,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         engines: Arc::new(engines),
         market_tx: Arc::new(market_tx),
         user_tx: Arc::new(DashMap::new()),
-        next_order_id: Arc::new(AtomicU64::new(1)),
+        next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

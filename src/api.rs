@@ -2,6 +2,7 @@
 use crate::account_repository::AccountRepository;
 use crate::engine::MatchingEngine;
 use crate::models::{DbOrder, User};
+use crate::order::{Order, Side, TimeInForce};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
     extract::{Path, Query, State},
@@ -55,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/klines", get(handle_klines))
         .route("/api/user/password", patch(handle_change_password))
         .route("/api/test-funds", post(handle_test_funds))
+        .route("/api/seed-demo", post(handle_seed_demo))
         .with_state(state)
 }
 
@@ -601,4 +603,112 @@ async fn handle_klines(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
+}
+
+// ─── Seed demo ────────────────────────────────────────────────────────────────
+
+/// Plant demo limit orders for ETH_USDT and SOL_USDT so the exchange has
+/// live order books for demos. Idempotent: skips if ETH_USDT already has
+/// active orders.
+async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
+    // Idempotency check: if any ETH_USDT order is already active, bail out.
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM orders WHERE symbol = 'ETH_USDT' AND status IN ('PENDING','TRADING') LIMIT 1",
+    )
+    .fetch_optional(s.db.as_ref())
+    .await
+    .unwrap_or(None);
+
+    if existing.is_some() {
+        return (StatusCode::OK, Json(json!({"status": "already_seeded"}))).into_response();
+    }
+
+    // Find or create the demo user.
+    let demo_user_id: i64 = match sqlx::query_scalar::<_, i64>(
+        "INSERT INTO users (email, password_hash, full_name, kyc_status)
+         VALUES ('demo@lightning.exchange', 'x', 'Demo User', 'verified')
+         ON CONFLICT (email) DO UPDATE SET id = users.id RETURNING id",
+    )
+    .fetch_one(s.db.as_ref())
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+
+    // Upsert demo balances.
+    let _ = sqlx::query(
+        "INSERT INTO accounts (user_id, asset, balance, frozen)
+         VALUES ($1, 'USDT', 20000, 0), ($1, 'ETH', 5, 0), ($1, 'SOL', 100, 0)
+         ON CONFLICT (user_id, asset) DO UPDATE
+         SET balance = GREATEST(accounts.balance, EXCLUDED.balance), updated_at = NOW()",
+    )
+    .bind(demo_user_id)
+    .execute(s.db.as_ref())
+    .await;
+
+    // (symbol, side, prices, qty, base, quote)
+    let plans: Vec<(&str, &str, Vec<f64>, f64, &str, &str)> = vec![
+        ("ETH_USDT", "buy",  vec![2990.0, 2980.0, 2970.0, 2960.0, 2950.0], 0.5, "ETH", "USDT"),
+        ("ETH_USDT", "sell", vec![3010.0, 3020.0, 3030.0, 3040.0, 3050.0], 0.5, "ETH", "USDT"),
+        ("SOL_USDT", "buy",  vec![149.0,  148.0,  147.0,  146.0,  145.0],  10.0, "SOL", "USDT"),
+        ("SOL_USDT", "sell", vec![151.0,  152.0,  153.0,  154.0,  155.0],  10.0, "SOL", "USDT"),
+    ];
+
+    let repo = AccountRepository::new(&s.db);
+    let mut placed = 0usize;
+
+    for (symbol, side, prices, qty, base, quote) in plans {
+        let engine = match s.engines.get(symbol) {
+            Some(e) => e.value().clone(),
+            None => continue,
+        };
+        let engine_side = if side == "buy" { Side::Buy } else { Side::Sell };
+
+        for price in prices {
+            // Freeze the appropriate funds first (best-effort).
+            let freeze = if side == "buy" {
+                repo.freeze_for_buy(demo_user_id, quote, price * qty).await
+            } else {
+                repo.freeze_for_sell(demo_user_id, base, qty).await
+            };
+            if let Err(e) = freeze {
+                tracing::warn!("seed-demo freeze failed for {} {} @ {}: {}", symbol, side, price, e);
+                continue;
+            }
+
+            // Insert the order row, getting a fresh id from the sequence.
+            let inserted = sqlx::query_as::<_, DbOrder>(
+                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
+                 VALUES (nextval('orders_id_seq'), $1, $2, $3, 'limit', $4, $5, 0, 'PENDING') RETURNING *",
+            )
+            .bind(demo_user_id)
+            .bind(symbol)
+            .bind(side)
+            .bind(price)
+            .bind(qty)
+            .fetch_one(s.db.as_ref())
+            .await;
+
+            let db_order = match inserted {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!("seed-demo insert failed for {} {} @ {}: {}", symbol, side, price, e);
+                    // Roll back the freeze we just did.
+                    let asset = if side == "buy" { quote } else { base };
+                    let amount = if side == "buy" { price * qty } else { qty };
+                    let _ = repo.release_frozen(demo_user_id, asset, amount).await;
+                    continue;
+                }
+            };
+
+            // Place into the engine book directly (no matching, no fund effects).
+            let order = Order::new(db_order.id as u64, engine_side, price, qty, TimeInForce::GTC, 0);
+            let mut eng = engine.lock().unwrap();
+            let _ = eng.add_to_book(order);
+            placed += 1;
+        }
+    }
+
+    (StatusCode::OK, Json(json!({"status": "seeded", "orders_placed": placed, "demo_user_id": demo_user_id}))).into_response()
 }

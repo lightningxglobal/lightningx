@@ -550,7 +550,7 @@ impl MatchingEngine {
     }
 
     /// 将订单加入订单簿
-    fn add_to_book(&mut self, order: Order) -> OrderResult<()> {
+    pub fn add_to_book(&mut self, order: Order) -> OrderResult<()> {
         // 从对象池获取Order（减少allocation）
         let pool_idx = self.pools.orders.acquire()
             .ok_or(MatchingEngineError::OrderPoolExhausted)?;

@@ -97,6 +97,15 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
         }
     }
     tracing::info!("Demo data seeded: {} orders placed for ETH_USDT and SOL_USDT", placed);
+
+    // Insert seed trades so tickers have a `last` price immediately.
+    let _ = sqlx::query(
+        "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee)
+         VALUES ('ETH_USDT', 3000.0, 0.001, 0.0, 0.0),
+                ('SOL_USDT', 150.0,  0.01,  0.0, 0.0)",
+    )
+    .execute(pool)
+    .await;
 }
 
 #[tokio::main]

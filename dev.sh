@@ -16,11 +16,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 tmux new-session  -d -s "$SESSION" -n matching \
-  "cd '$SCRIPT_DIR' && cargo watch -q -w src -x 'run --bin exchange-server'; read"
+  "cd '$SCRIPT_DIR' && DATABASE_URL=postgres://user:password@localhost:5432/mydb JWT_SECRET=change_me_in_production PORT=3000 cargo watch -q -w src -x 'run --bin exchange-server'; read"
 tmux new-window   -t "$SESSION" -n desk \
-  "cd '$SCRIPT_DIR' && cargo watch -q -w src -x 'run --bin desk-server'; read"
+  "cd '$SCRIPT_DIR' && DATABASE_URL=postgres://user:password@localhost:5432/mydb DESK_PORT=3003 UPSTREAM_WS_URL=ws://127.0.0.1:3000/ws cargo watch -q -w src -x 'run --bin desk-server'; read"
 tmux new-window   -t "$SESSION" -n data \
-  "cd '$SCRIPT_DIR' && cargo watch -q -w src -x 'run --bin lightning-data'; read"
+  "cd '$SCRIPT_DIR' && DATABASE_URL=postgres://user:password@localhost:5432/mydb DATA_PORT=3002 cargo watch -q -w src -x 'run --bin lightning-data'; read"
 tmux new-window   -t "$SESSION" -n frontend \
   "cd '$SCRIPT_DIR/../exchange-frontend' && npm run dev; read"
 

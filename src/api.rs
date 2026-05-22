@@ -298,19 +298,12 @@ async fn handle_place_order(
         return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
     }
 
-    // Allocate engine order ID (stays in sync with DB sequence since both start at the same max+1).
-    let order_id = s.next_order_id.fetch_add(1, Ordering::Relaxed);
+    // Insert into DB first to get a stable ID, then use that same ID for the engine order.
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let engine_order = if req.order_type == "market" {
-        Order::new_market(order_id, engine_side, req.quantity, now_ns)
-    } else {
-        Order::new(order_id, engine_side, req.price.unwrap_or(0.0), req.quantity, tif, now_ns)
-    };
 
-    // Insert into DB as PENDING.
     let db_order = sqlx::query_as::<_, DbOrder>(
         "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
          VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING') RETURNING *",
@@ -333,6 +326,15 @@ async fn handle_place_order(
         }
     };
     let db_order_id = db_order.id;
+
+    // Build engine order using the DB-assigned ID so engine and DB stay in sync.
+    let engine_order = if req.order_type == "market" {
+        Order::new_market(db_order_id as u64, engine_side, req.quantity, now_ns)
+    } else {
+        Order::new(db_order_id as u64, engine_side, req.price.unwrap_or(0.0), req.quantity, tif, now_ns)
+    };
+    // Keep the atomic counter in sync so WS orders don't collide.
+    s.next_order_id.fetch_max(db_order_id as u64 + 1, Ordering::Relaxed);
 
     // Run through matching engine.
     let engine_result = {
@@ -787,22 +789,9 @@ async fn handle_klines(
 
 // ─── Seed demo ────────────────────────────────────────────────────────────────
 
-/// Plant demo limit orders for ETH_USDT and SOL_USDT so the exchange has
-/// live order books for demos. Idempotent: skips if ETH_USDT already has
-/// active orders.
+/// Plant demo limit orders for ETH_USDT, SOL_USDT, and BTC_USDT so the exchange has
+/// live order books for demos. Idempotent per symbol.
 async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
-    // Idempotency check: if any ETH_USDT order is already active, bail out.
-    let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM orders WHERE symbol = 'ETH_USDT' AND status IN ('PENDING','TRADING') LIMIT 1",
-    )
-    .fetch_optional(s.db.as_ref())
-    .await
-    .unwrap_or(None);
-
-    if existing.is_some() {
-        return (StatusCode::OK, Json(json!({"status": "already_seeded"}))).into_response();
-    }
-
     // Find or create the demo user.
     let demo_user_id: i64 = match sqlx::query_scalar::<_, i64>(
         "INSERT INTO users (email, password_hash, full_name, kyc_status)
@@ -816,10 +805,10 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
 
-    // Upsert demo balances.
+    // Upsert demo balances (including BTC).
     let _ = sqlx::query(
         "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 20000, 0), ($1, 'ETH', 5, 0), ($1, 'SOL', 100, 0)
+         VALUES ($1, 'USDT', 100000, 0), ($1, 'BTC', 5, 0), ($1, 'ETH', 50, 0), ($1, 'SOL', 1000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
          SET balance = GREATEST(accounts.balance, EXCLUDED.balance), updated_at = NOW()",
     )
@@ -833,12 +822,22 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
         ("ETH_USDT", "sell", vec![3010.0, 3020.0, 3030.0, 3040.0, 3050.0], 0.5, "ETH", "USDT"),
         ("SOL_USDT", "buy",  vec![149.0,  148.0,  147.0,  146.0,  145.0],  10.0, "SOL", "USDT"),
         ("SOL_USDT", "sell", vec![151.0,  152.0,  153.0,  154.0,  155.0],  10.0, "SOL", "USDT"),
+        ("BTC_USDT", "buy",  vec![50800.0, 50700.0, 50600.0, 50500.0, 50400.0], 0.1, "BTC", "USDT"),
+        ("BTC_USDT", "sell", vec![51200.0, 51300.0, 51400.0, 51500.0, 51600.0], 0.1, "BTC", "USDT"),
     ];
 
     let repo = AccountRepository::new(&s.db);
     let mut placed = 0usize;
 
     for (symbol, side, prices, qty, base, quote) in plans {
+        // Per-symbol idempotency: skip this symbol if it already has active orders.
+        let already: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM orders WHERE symbol = $1 AND user_id = $2 AND status IN ('PENDING','TRADING') LIMIT 1",
+        )
+        .bind(symbol).bind(demo_user_id)
+        .fetch_optional(s.db.as_ref()).await.unwrap_or(None);
+        if already.is_some() { continue; }
+
         let engine = match s.engines.get(symbol) {
             Some(e) => e.value().clone(),
             None => continue,

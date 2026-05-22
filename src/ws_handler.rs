@@ -780,6 +780,45 @@ pub fn broadcast_depth_pub(state: &AppState, symbol: &str) {
     }
 }
 
+/// Build and broadcast the current-minute k-line for `symbol` after a REST trade.
+pub async fn broadcast_kline_pub(state: &AppState, symbol: &str) {
+    let row = sqlx::query(
+        "SELECT
+           extract(epoch FROM date_trunc('minute', created_at))::bigint AS time,
+           (array_agg(price ORDER BY created_at ASC))[1]  AS open,
+           max(price)  AS high,
+           min(price)  AS low,
+           (array_agg(price ORDER BY created_at DESC))[1] AS close,
+           sum(quantity) AS volume
+         FROM trades
+         WHERE symbol = $1
+           AND created_at >= date_trunc('minute', NOW())
+         GROUP BY date_trunc('minute', created_at)
+         LIMIT 1",
+    )
+    .bind(symbol)
+    .fetch_optional(state.db.as_ref())
+    .await;
+
+    if let Ok(Some(row)) = row {
+        use sqlx::Row;
+        let msg = serde_json::json!({
+            "type": "kline",
+            "symbol": symbol,
+            "bar": {
+                "time":   row.get::<i64, _>("time"),
+                "open":   row.get::<f64, _>("open"),
+                "high":   row.get::<f64, _>("high"),
+                "low":    row.get::<f64, _>("low"),
+                "close":  row.get::<f64, _>("close"),
+                "volume": row.get::<f64, _>("volume"),
+            }
+        })
+        .to_string();
+        let _ = state.market_tx.send(msg);
+    }
+}
+
 // ─── Background market data broadcaster ─────────────────────────────────────
 
 /// Snapshot every engine's top-of-book under brief per-engine locks.

@@ -380,6 +380,7 @@ async fn handle_place_order(
     }
 
     // Settle fills: record trades and update maker orders.
+    let mut notified_maker_uids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for &(maker_order_id, fp, fq) in &result.fills {
         if fp <= 0.0 || fq <= 0.0 { continue; }
 
@@ -420,6 +421,8 @@ async fn handle_place_order(
         )
         .bind(&req.symbol).bind(buy_oid).bind(sell_oid).bind(fp).bind(fq)
         .execute(s.db.as_ref()).await;
+
+        if let Some(uid) = maker_uid { notified_maker_uids.insert(uid); }
     }
 
     // Release frozen for IOC/market with partial or zero fill.
@@ -435,8 +438,52 @@ async fn handle_place_order(
         }
     }
 
-    // Broadcast depth update.
+    // Push balance_update to taker and all makers that were involved in fills.
+    let all_notify: Vec<i64> = std::iter::once(user_id)
+        .chain(notified_maker_uids.into_iter())
+        .collect();
+    for uid in all_notify {
+        if let Some(tx) = s.user_tx.get(&uid) {
+            let repo2 = AccountRepository::new(s.db.as_ref());
+            if let Ok(accounts) = repo2.get_all_accounts(uid).await {
+                for acc in accounts {
+                    let msg = serde_json::json!({
+                        "type": "balance_update",
+                        "asset": acc.asset,
+                        "balance": acc.balance,
+                        "available": acc.balance - acc.frozen,
+                        "frozen": acc.frozen,
+                    }).to_string();
+                    let _ = tx.send(msg).await;
+                }
+            }
+        }
+    }
+
+    // Broadcast depth update and current-minute kline.
     crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
+    crate::ws_handler::broadcast_kline_pub(&s, &req.symbol).await;
+
+    // Push order_update to the user's personal WS channel so the Exchange page
+    // shows a fill / partial-fill toast even for REST-placed orders.
+    if result.status != OrderStatus::Accepted {
+        let ws_status = match result.status {
+            OrderStatus::Filled          => "FILLED",
+            OrderStatus::PartiallyFilled => "PARTIAL",
+            OrderStatus::Cancelled       => "CANCELED",
+            _                            => db_status,
+        };
+        if let Some(tx) = s.user_tx.get(&user_id) {
+            let msg = serde_json::json!({
+                "type": "order_update",
+                "order_id": db_order_id,
+                "status": ws_status,
+                "filled": result.filled,
+                "filled_qty": result.filled,
+            }).to_string();
+            let _ = tx.send(msg).await;
+        }
+    }
 
     // Re-fetch final order state from DB and return it.
     match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")

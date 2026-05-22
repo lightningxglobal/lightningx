@@ -15,17 +15,25 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
-/// Plant limit orders for ETH_USDT and SOL_USDT on first startup.
-/// No-ops if ETH_USDT already has active orders (idempotent).
+/// Plant limit orders for ETH_USDT, SOL_USDT and BTC_USDT on first startup.
+/// Idempotent per symbol: skips ETH/SOL if ETH_USDT already has active orders,
+/// skips BTC if BTC_USDT already has active orders.
 async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<MatchingEngine>>>) {
-    let already: Option<i64> = sqlx::query_scalar(
+    let eth_already: Option<i64> = sqlx::query_scalar(
         "SELECT id FROM orders WHERE symbol='ETH_USDT' AND status IN ('PENDING','TRADING') LIMIT 1",
     )
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
 
-    if already.is_some() {
+    let btc_already: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM orders WHERE symbol='BTC_USDT' AND status IN ('PENDING','TRADING') LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    if eth_already.is_some() && btc_already.is_some() {
         tracing::info!("Demo data already present, skipping seed");
         return;
     }
@@ -44,7 +52,7 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
 
     let _ = sqlx::query(
         "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1,'USDT',20000,0),($1,'ETH',5,0),($1,'SOL',100,0)
+         VALUES ($1,'USDT',20000,0),($1,'ETH',5,0),($1,'SOL',100,0),($1,'BTC',5,0)
          ON CONFLICT (user_id, asset) DO UPDATE
          SET balance = GREATEST(accounts.balance, EXCLUDED.balance), updated_at=NOW()",
     )
@@ -57,12 +65,18 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
         ("ETH_USDT","sell",&[3010.,3020.,3030.,3040.,3050.], 0.5, "ETH","USDT"),
         ("SOL_USDT","buy", &[149.,148.,147.,146.,145.],     10.0, "SOL","USDT"),
         ("SOL_USDT","sell",&[151.,152.,153.,154.,155.],     10.0, "SOL","USDT"),
+        ("BTC_USDT","buy", &[50900.,50800.,50700.,50600.,50500.], 0.01, "BTC","USDT"),
+        ("BTC_USDT","sell",&[51100.,51200.,51300.,51400.,51500.], 0.01, "BTC","USDT"),
     ];
 
     let repo = AccountRepository::new(pool);
     let mut placed = 0usize;
 
     for (symbol, side, prices, qty, base, quote) in plans {
+        // Skip symbols whose demo orders are already present.
+        let symbol_already = if *symbol == "BTC_USDT" { btc_already.is_some() } else { eth_already.is_some() };
+        if symbol_already { continue; }
+
         let Some(eng_ref) = engines.get(*symbol) else { continue };
         let engine = eng_ref.value().clone();
         let engine_side = if *side == "buy" { Side::Buy } else { Side::Sell };
@@ -96,16 +110,26 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
             placed += 1;
         }
     }
-    tracing::info!("Demo data seeded: {} orders placed for ETH_USDT and SOL_USDT", placed);
+    tracing::info!("Demo data seeded: {} orders placed", placed);
 
     // Insert seed trades so tickers have a `last` price immediately.
-    let _ = sqlx::query(
-        "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee)
-         VALUES ('ETH_USDT', 3000.0, 0.001, 0.0, 0.0),
-                ('SOL_USDT', 150.0,  0.01,  0.0, 0.0)",
-    )
-    .execute(pool)
-    .await;
+    if eth_already.is_none() {
+        let _ = sqlx::query(
+            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee)
+             VALUES ('ETH_USDT', 3000.0, 0.001, 0.0, 0.0),
+                    ('SOL_USDT', 150.0,  0.01,  0.0, 0.0)",
+        )
+        .execute(pool)
+        .await;
+    }
+    if btc_already.is_none() {
+        let _ = sqlx::query(
+            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee)
+             VALUES ('BTC_USDT', 51000.0, 0.001, 0.0, 0.0)",
+        )
+        .execute(pool)
+        .await;
+    }
 }
 
 #[tokio::main]

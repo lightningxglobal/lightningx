@@ -409,13 +409,17 @@ async fn handle_client_message(
                 }
             };
 
-            // Map engine status to DB status string.
-            let (db_status, ws_status) = match result.status {
-                OrderStatus::Accepted => ("TRADING", "OPEN"),
-                OrderStatus::PartiallyFilled => ("TRADING", "PARTIAL_FILL"),
-                OrderStatus::Filled => ("COMPLETED", "FILLED"),
-                OrderStatus::Rejected => ("REJECTED", "REJECTED"),
-                OrderStatus::Cancelled => ("CANCELED", "CANCELED"),
+            // Map engine status to (DB, WS) status strings. IOC/FOK that
+            // partially fill come back as Cancelled with filled>0 — the
+            // meaningful event for the trader is the partial fill, not the
+            // trailing cancel of the remainder, so surface PARTIAL_FILL.
+            let (db_status, ws_status) = match (result.status, result.filled > 0.0) {
+                (OrderStatus::Accepted, _)          => ("TRADING",  "OPEN"),
+                (OrderStatus::PartiallyFilled, _)   => ("TRADING",  "PARTIAL_FILL"),
+                (OrderStatus::Filled, _)            => ("COMPLETED","FILLED"),
+                (OrderStatus::Rejected, _)          => ("REJECTED", "REJECTED"),
+                (OrderStatus::Cancelled, true)      => ("CANCELED", "PARTIAL_FILL"),
+                (OrderStatus::Cancelled, false)     => ("CANCELED", "CANCELED"),
             };
 
             // Update DB with fill info.
@@ -637,8 +641,26 @@ async fn handle_client_message(
                         let _ = tx.send(pos_msg).await;
                     }
                 }
+            } else if result.status == OrderStatus::Accepted {
+                // GTC limit order resting in the book. Frozen funds STAY frozen
+                // until it fills or the user cancels — releasing here would
+                // double-spend when the maker fills later.
+                let open_msg = json!({
+                    "type": "order_update",
+                    "order_id": db_order_id,
+                    "status": "OPEN",
+                    "filled_qty": 0.0,
+                    "ts": ts
+                }).to_string();
+                if let Some(tx) = state.user_tx.get(&user_id) {
+                    let _ = tx.send(open_msg).await;
+                }
+                // New resting order changes the book — push depth so the
+                // frontend reflects it without waiting for the 2s tick.
+                broadcast_depth_pub(state, &symbol);
             } else {
-                // No fill — release all frozen funds (IOC/FOK fully rejected, market with no book).
+                // No fill, not resting — IOC/FOK fully rejected, market with no
+                // matchable book. Release all frozen funds and notify CANCELED.
                 let (rel_asset, rel_amount) = if side == "buy" {
                     let p = price.or(best_opposing_price).unwrap_or(0.0);
                     (quote_asset, p * qty)
@@ -782,6 +804,8 @@ fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
         let eng = engine.lock().unwrap();
         (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
     };
+    let bids: Vec<_> = bids.into_iter().filter(|(_, q)| *q > 0.0).collect();
+    let asks: Vec<_> = asks.into_iter().filter(|(_, q)| *q > 0.0).collect();
     json!({
         "type": "depth",
         "symbol": symbol,
@@ -850,8 +874,8 @@ fn snapshot_all_engines(
         .map(|entry| {
             let symbol = entry.key().clone();
             let eng = entry.value().lock().unwrap();
-            let bids = eng.get_top_levels(10, true);
-            let asks = eng.get_top_levels(10, false);
+            let bids: Vec<_> = eng.get_top_levels(10, true).into_iter().filter(|(_, q)| *q > 0.0).collect();
+            let asks: Vec<_> = eng.get_top_levels(10, false).into_iter().filter(|(_, q)| *q > 0.0).collect();
             (symbol, bids, asks)
         })
         .collect()

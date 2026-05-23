@@ -1281,6 +1281,53 @@ mod tests {
     }
 
     #[test]
+    fn test_market_sell_empty_book_rejected() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // Sell-side mirror of test_market_order_empty_book. QA needed this path
+        // verified directly because the seeded SOL_USDT book is too deep to
+        // drain from a normal test account.
+        let sell_market = Order::new_market(1, Side::Sell, 10.0, 0);
+        let result = engine.place_order(sell_market).unwrap();
+
+        assert_eq!(result.status, OrderStatus::Rejected);
+        assert_eq!(result.filled, 0.0);
+    }
+
+    #[test]
+    fn test_market_buy_with_only_bids_rejected() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // Same-side liquidity must not satisfy a market order: a buy needs asks.
+        let resting_bid = Order::new(1, Side::Buy, 50_000.0, 10.0, TimeInForce::GTC, 0);
+        engine.place_order(resting_bid).unwrap();
+
+        let buy_market = Order::new_market(2, Side::Buy, 5.0, 0);
+        let result = engine.place_order(buy_market).unwrap();
+
+        assert_eq!(result.status, OrderStatus::Rejected);
+        assert_eq!(result.filled, 0.0);
+    }
+
+    #[test]
+    fn test_market_sell_with_only_asks_rejected() {
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        // Mirror of the above: a sell needs bids, not asks.
+        let resting_ask = Order::new(1, Side::Sell, 50_000.0, 10.0, TimeInForce::GTC, 0);
+        engine.place_order(resting_ask).unwrap();
+
+        let sell_market = Order::new_market(2, Side::Sell, 5.0, 0);
+        let result = engine.place_order(sell_market).unwrap();
+
+        assert_eq!(result.status, OrderStatus::Rejected);
+        assert_eq!(result.filled, 0.0);
+    }
+
+    #[test]
     fn test_market_order_partial_fill() {
         let pool_config = PoolConfig::default();
         let mut engine = MatchingEngine::new(pool_config).unwrap();

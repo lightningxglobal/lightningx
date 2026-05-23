@@ -519,25 +519,30 @@ async fn handle_place_order(
     crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
     crate::ws_handler::broadcast_kline_pub(&s, &req.symbol).await;
 
-    // Push order_update to the user's personal WS channel so the Exchange page
-    // shows a fill / partial-fill toast even for REST-placed orders.
-    if result.status != OrderStatus::Accepted {
-        let ws_status = match result.status {
-            OrderStatus::Filled          => "FILLED",
-            OrderStatus::PartiallyFilled => "PARTIAL",
-            OrderStatus::Cancelled       => "CANCELED",
-            _                            => db_status,
-        };
-        if let Some(tx) = s.user_tx.get(&user_id) {
-            let msg = serde_json::json!({
-                "type": "order_update",
-                "order_id": db_order_id,
-                "status": ws_status,
-                "filled": result.filled,
-                "filled_qty": result.filled,
-            }).to_string();
-            let _ = tx.send(msg).await;
-        }
+    // Push order_update to the user's personal WS channel so multi-tab /
+    // other WS clients learn about the order — including resting GTC orders
+    // (status=Accepted, filled=0) which previously got no broadcast.
+    let ws_status = match result.status {
+        OrderStatus::Accepted        => "OPEN",
+        OrderStatus::PartiallyFilled => "PARTIAL",
+        OrderStatus::Filled          => "FILLED",
+        OrderStatus::Cancelled       => "CANCELED",
+        OrderStatus::Rejected        => "REJECTED",
+    };
+    if let Some(tx) = s.user_tx.get(&user_id) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let msg = serde_json::json!({
+            "type": "order_update",
+            "order_id": db_order_id,
+            "status": ws_status,
+            "filled": result.filled,
+            "filled_qty": result.filled,
+            "ts": ts,
+        }).to_string();
+        let _ = tx.send(msg).await;
     }
 
     // Re-fetch final order state from DB and return it.
@@ -613,6 +618,22 @@ async fn handle_cancel_order(
         }
     } else if remaining > 0.0 {
         let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+    }
+
+    // Notify the user's WS subscribers (other tabs, etc.) that the order is
+    // gone — the WS path does this too, this brings the REST path in line.
+    if let Some(tx) = s.user_tx.get(&user_id) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let msg = serde_json::json!({
+            "type": "order_update",
+            "order_id": order_id,
+            "status": "CANCELED",
+            "ts": ts,
+        }).to_string();
+        let _ = tx.send(msg).await;
     }
 
     (StatusCode::OK, Json(json!({"cancelled": order_id}))).into_response()

@@ -460,6 +460,55 @@ async fn handle_place_order(
         }
     }
 
+    // Broadcast trade event + ticker update when there were fills.
+    if result.filled > 0.0 {
+        let avg_fill_price = if !result.fills.is_empty() {
+            let cost: f64 = result.fills.iter().map(|&(_, p, q)| p * q).sum();
+            cost / result.filled
+        } else {
+            req.price.or(best_opposing).unwrap_or(0.0)
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let trade_msg = serde_json::json!({
+            "type": "trade",
+            "symbol": &req.symbol,
+            "price": avg_fill_price,
+            "qty": result.filled,
+            "side": &req.side,
+            "ts": now_secs,
+        }).to_string();
+        let _ = s.market_tx.send(trade_msg);
+
+        let sym_clone = req.symbol.clone();
+        let db_clone = s.db.clone();
+        let mtx_clone = s.market_tx.clone();
+        tokio::spawn(async move {
+            let open_24h: Option<f64> = sqlx::query_scalar(
+                "SELECT price FROM trades WHERE symbol=$1
+                 AND created_at > NOW() - INTERVAL '24 hours'
+                 ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(&sym_clone)
+            .fetch_optional(db_clone.as_ref())
+            .await
+            .unwrap_or(None);
+            let change = match open_24h {
+                Some(o) if o != 0.0 => (avg_fill_price - o) / o * 100.0,
+                _ => 0.0,
+            };
+            let ticker = serde_json::json!({
+                "type": "ticker",
+                "symbol": sym_clone,
+                "last": avg_fill_price,
+                "change": change,
+            }).to_string();
+            let _ = mtx_clone.send(ticker);
+        });
+    }
+
     // Broadcast depth update and current-minute kline.
     crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
     crate::ws_handler::broadcast_kline_pub(&s, &req.symbol).await;

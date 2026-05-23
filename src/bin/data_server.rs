@@ -129,12 +129,22 @@ async fn handle_klines(
     State(s): State<AppState>,
     Query(params): Query<KlinesQuery>,
 ) -> impl IntoResponse {
-    let _interval = params.interval.unwrap_or_else(|| "1m".to_string());
+    let interval = params.interval.as_deref().unwrap_or("1m");
     let limit = params.limit.unwrap_or(200).min(1000);
 
-    let rows = sqlx::query(
+    // Map frontend interval codes to PostgreSQL date_bin durations (whitelist).
+    let bin_width = match interval {
+        "5m"  => "5 minutes",
+        "15m" => "15 minutes",
+        "1h"  => "1 hour",
+        "4h"  => "4 hours",
+        "1d"  => "1 day",
+        _     => "1 minute",
+    };
+
+    let sql = format!(
         "SELECT
-           extract(epoch FROM date_trunc('minute', created_at))::bigint AS time,
+           extract(epoch FROM date_bin('{bin}', created_at, TIMESTAMPTZ '2000-01-01'))::bigint AS time,
            (array_agg(price ORDER BY created_at ASC))[1] AS open,
            max(price) AS high,
            min(price) AS low,
@@ -142,10 +152,13 @@ async fn handle_klines(
            sum(quantity) AS volume
          FROM trades
          WHERE symbol = $1
-         GROUP BY date_trunc('minute', created_at)
+         GROUP BY date_bin('{bin}', created_at, TIMESTAMPTZ '2000-01-01')
          ORDER BY time ASC
          LIMIT $2",
-    )
+        bin = bin_width
+    );
+
+    let rows = sqlx::query(&sql)
     .bind(&params.symbol)
     .bind(limit)
     .fetch_all(s.db.as_ref())

@@ -874,13 +874,23 @@ pub async fn market_data_broadcaster(state: AppState) {
                     let db = state.db.clone();
                     let mtx = state.market_tx.clone();
                     tokio::spawn(async move {
-                        let open_24h: Option<f64> = sqlx::query_scalar(
-                            "SELECT price FROM trades WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours' ORDER BY created_at ASC LIMIT 1"
+                        // Single query: 24h open + high + low + volume.
+                        let row: Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
+                            "SELECT
+                               (SELECT price FROM trades
+                                WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours'
+                                ORDER BY created_at ASC LIMIT 1) AS open_24h,
+                               MAX(price)      AS high,
+                               MIN(price)      AS low,
+                               SUM(quantity)   AS volume
+                             FROM trades
+                             WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours'"
                         )
                         .bind(&symbol)
                         .fetch_optional(db.as_ref())
                         .await
                         .unwrap_or(None);
+                        let (open_24h, high, low, volume) = row.unwrap_or_default();
                         let change = match open_24h {
                             Some(o) if o != 0.0 => (last_price - o) / o * 100.0,
                             _ => 0.0,
@@ -890,6 +900,9 @@ pub async fn market_data_broadcaster(state: AppState) {
                             "symbol": symbol,
                             "last": last_price,
                             "change": change,
+                            "high": high,
+                            "low": low,
+                            "volume": volume,
                         }).to_string();
                         let _ = mtx.send(msg);
                     });

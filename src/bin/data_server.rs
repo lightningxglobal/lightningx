@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use jsonwebtoken::{decode, DecodingKey, Validation};
-use lightning_exchange::{account_repository::AccountRepository, db};
+use lightning_exchange::{account_repository::AccountRepository, db, positions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -304,6 +304,15 @@ async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl 
     }
 }
 
+async fn handle_positions(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let user_id = match auth_user(&headers, &s.jwt_secret) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let rows = positions::all_positions_for_user(s.db.as_ref(), user_id).await;
+    (StatusCode::OK, Json(json!(rows))).into_response()
+}
+
 #[derive(Deserialize)]
 struct TradeQuery {
     symbol: Option<String>,
@@ -404,6 +413,7 @@ fn router(state: AppState) -> Router {
         .route("/api/orders", get(handle_orders))
         .route("/api/orders/:id", get(handle_order))
         .route("/api/accounts", get(handle_accounts))
+        .route("/api/positions", get(handle_positions))
         .route("/api/trades", get(handle_trades))
         .with_state(state)
 }

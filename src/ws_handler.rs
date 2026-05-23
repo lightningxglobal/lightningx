@@ -479,7 +479,7 @@ async fn handle_client_message(
                         }
                         let _ = repo.settle_trade(buyer_id, seller_id, base_asset, quote_asset, fp, fq, 0.0, 0.0).await;
 
-                        // Notify maker of balance change.
+                        // Notify maker of balance change and position change.
                         if let Some(maker_id) = maker_uid {
                             let (m_debit, m_credit) = if side == "buy" { (base_asset, quote_asset) } else { (quote_asset, base_asset) };
                             for asset in [m_debit, m_credit] {
@@ -487,6 +487,11 @@ async fn handle_client_message(
                                     let msg = json!({"type":"balance_update","asset":asset,"balance":acc.balance,"available":acc.balance-acc.frozen,"frozen":acc.frozen}).to_string();
                                     if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.send(msg).await; }
                                 }
+                            }
+                            if let Some(pos_msg) = crate::positions::position_update_msg(
+                                state.db.as_ref(), maker_id, base_asset,
+                            ).await {
+                                if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.send(pos_msg).await; }
                             }
                         }
                     }
@@ -617,6 +622,15 @@ async fn handle_client_message(
                         if let Some(tx) = state.user_tx.get(&user_id) {
                             let _ = tx.send(bal_msg).await;
                         }
+                    }
+                }
+
+                // Position update for the base asset whose holdings just changed.
+                if let Some(pos_msg) = crate::positions::position_update_msg(
+                    state.db.as_ref(), user_id, base_asset,
+                ).await {
+                    if let Some(tx) = state.user_tx.get(&user_id) {
+                        let _ = tx.send(pos_msg).await;
                     }
                 }
             } else {

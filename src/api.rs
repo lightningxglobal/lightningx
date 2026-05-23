@@ -438,7 +438,8 @@ async fn handle_place_order(
         }
     }
 
-    // Push balance_update to taker and all makers that were involved in fills.
+    // Push balance_update + position_update to taker and all makers that were
+    // involved in fills.
     let all_notify: Vec<i64> = std::iter::once(user_id)
         .chain(notified_maker_uids.into_iter())
         .collect();
@@ -456,6 +457,11 @@ async fn handle_place_order(
                     }).to_string();
                     let _ = tx.send(msg).await;
                 }
+            }
+            if let Some(msg) =
+                crate::positions::position_update_msg(s.db.as_ref(), uid, base_asset).await
+            {
+                let _ = tx.send(msg).await;
             }
         }
     }

@@ -34,6 +34,8 @@ pub struct DbOrder {
     pub quantity: f64,
     pub filled: f64,
     pub status: String,
+    #[serde(default)]
+    pub freeze_price: f64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

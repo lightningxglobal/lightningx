@@ -1,0 +1,13 @@
+-- Persist the price used to compute the frozen quote-asset amount at
+-- order-placement time so the restart cleanup can release the exact
+-- amount instead of guessing with the current best ask.
+--
+-- Semantics:
+--   limit buy   → freeze_price = price (USDT cost = price * quantity)
+--   limit sell  → freeze_price = 0    (sells freeze base_asset by quantity)
+--   market buy  → freeze_price = best_opposing_ask at placement
+--   market sell → freeze_price = 0
+--
+-- Legacy rows default to 0; recovery code falls back to the limit `price`
+-- column for buys whose freeze_price hasn't been backfilled yet.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS freeze_price FLOAT8 NOT NULL DEFAULT 0;

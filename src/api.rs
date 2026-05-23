@@ -296,10 +296,18 @@ async fn handle_place_order(
         levels.first().map(|(p, _)| *p)
     };
 
+    // Compute the price that actually backs the frozen quote-asset amount.
+    // For sells we freeze base_asset by quantity, so freeze_price has no
+    // role — persisted as 0.0 by convention.
+    let freeze_price: f64 = if req.side == "buy" {
+        req.price.or(best_opposing).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
     // Freeze funds before touching the engine.
     let repo = AccountRepository::new(s.db.as_ref());
     let freeze_result = if req.side == "buy" {
-        let freeze_price = req.price.or(best_opposing).unwrap_or(0.0);
         if freeze_price > 0.0 {
             repo.freeze_for_buy(user_id, quote_asset, freeze_price * req.quantity).await
         } else {
@@ -319,11 +327,12 @@ async fn handle_place_order(
         .unwrap_or(0);
 
     let db_order = sqlx::query_as::<_, DbOrder>(
-        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
-         VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING') RETURNING *",
+        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
+         VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING', $7) RETURNING *",
     )
     .bind(user_id).bind(&req.symbol).bind(&req.side)
     .bind(&req.order_type).bind(req.price).bind(req.quantity)
+    .bind(freeze_price)
     .fetch_one(s.db.as_ref()).await;
 
     let db_order = match db_order {
@@ -994,15 +1003,19 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
             }
 
             // Insert the order row, getting a fresh id from the sequence.
+            // Limit buys persist `price` as freeze_price (USDT cost backing);
+            // sells persist 0 since freezing is by base-asset quantity.
+            let seed_freeze_price = if side == "buy" { price } else { 0.0 };
             let inserted = sqlx::query_as::<_, DbOrder>(
-                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
-                 VALUES (nextval('orders_id_seq'), $1, $2, $3, 'limit', $4, $5, 0, 'PENDING') RETURNING *",
+                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
+                 VALUES (nextval('orders_id_seq'), $1, $2, $3, 'limit', $4, $5, 0, 'PENDING', $6) RETURNING *",
             )
             .bind(demo_user_id)
             .bind(symbol)
             .bind(side)
             .bind(price)
             .bind(qty)
+            .bind(seed_freeze_price)
             .fetch_one(s.db.as_ref())
             .await;
 

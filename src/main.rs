@@ -89,11 +89,14 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
             };
             if freeze.is_err() { continue; }
 
+            // Limit buys: freeze_price = price (USDT cost backing).
+            // Limit sells: 0.0 (sells freeze base_asset by quantity).
+            let seed_fp = if *side == "buy" { price } else { 0.0 };
             let db_order = match sqlx::query_as::<_, DbOrder>(
-                "INSERT INTO orders (id,user_id,symbol,side,order_type,price,quantity,filled,status)
-                 VALUES (nextval('orders_id_seq'),$1,$2,$3,'limit',$4,$5,0,'PENDING') RETURNING *",
+                "INSERT INTO orders (id,user_id,symbol,side,order_type,price,quantity,filled,status,freeze_price)
+                 VALUES (nextval('orders_id_seq'),$1,$2,$3,'limit',$4,$5,0,'PENDING',$6) RETURNING *",
             )
-            .bind(demo_id).bind(*symbol).bind(*side).bind(price).bind(*qty)
+            .bind(demo_id).bind(*symbol).bind(*side).bind(price).bind(*qty).bind(seed_fp)
             .fetch_one(pool).await {
                 Ok(o) => o,
                 Err(_) => {
@@ -227,11 +230,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Cancel any stale PENDING/TRADING market orders left from prior crashes.
     // Market orders never rest in the book, so survivors are stuck; release
-    // their frozen funds best-effort and flip them to CANCELED.
+    // their frozen funds and flip them to CANCELED. Uses the persisted
+    // freeze_price so the release amount is exact; legacy rows whose
+    // freeze_price wasn't backfilled fall back to the limit `price` column
+    // (correct for limit buys) or the current best ask (market buys).
     {
         let repo = AccountRepository::new(&pool);
-        let stale: Vec<(i64, i64, String, String, f64, f64)> = sqlx::query_as(
-            "SELECT id, user_id, symbol, side, quantity, filled FROM orders
+        let stale: Vec<(i64, i64, String, String, f64, f64, Option<f64>, f64)> = sqlx::query_as(
+            "SELECT id, user_id, symbol, side, quantity, filled, price, freeze_price
+             FROM orders
              WHERE status IN ('PENDING','TRADING') AND order_type='market'",
         )
         .fetch_all(&pool)
@@ -239,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
 
         let mut cleaned = 0usize;
-        for (id, user_id, symbol, side, quantity, filled) in stale {
+        for (id, user_id, symbol, side, quantity, filled, row_price, freeze_price) in stale {
             let remaining = quantity - filled;
             if remaining > 0.0 {
                 let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
@@ -248,14 +255,17 @@ async fn main() -> anyhow::Result<()> {
                 if side == "sell" {
                     let _ = repo.release_frozen(user_id, base_asset, remaining).await;
                 } else {
-                    // We don't persist the freeze price for market buys, so estimate
-                    // with the current best ask. Inaccurate by definition, but the
-                    // alternative is leaving funds frozen forever.
-                    let best_ask: Option<f64> = engines.get(&symbol).and_then(|e| {
-                        let eng = e.value().lock().unwrap();
-                        eng.get_top_levels(1, false).first().map(|(p, _)| *p)
-                    });
-                    if let Some(p) = best_ask {
+                    let resolved_price = if freeze_price > 0.0 {
+                        Some(freeze_price)
+                    } else if let Some(p) = row_price.filter(|p| *p > 0.0) {
+                        Some(p)
+                    } else {
+                        engines.get(&symbol).and_then(|e| {
+                            let eng = e.value().lock().unwrap();
+                            eng.get_top_levels(1, false).first().map(|(p, _)| *p)
+                        })
+                    };
+                    if let Some(p) = resolved_price {
                         let _ = repo.release_frozen(user_id, quote_asset, p * remaining).await;
                     }
                 }

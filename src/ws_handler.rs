@@ -304,10 +304,32 @@ async fn handle_client_message(
                 Order::new(order_id, engine_side, price.unwrap_or(0.0), qty, tif, now_ns)
             };
 
+            // Parse base/quote assets from symbol (e.g. "BTC_USDT" → "BTC", "USDT").
+            let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+
+            // Capture best opposing price before matching — used as the fill
+            // price for market orders AND persisted as freeze_price so the
+            // restart cleanup can release the exact amount later.
+            let best_opposing_price = {
+                let eng = engine.lock().unwrap();
+                let levels = eng.get_top_levels(1, engine_side == Side::Sell);
+                levels.first().map(|(p, _)| *p)
+            };
+
+            // Price that backs the frozen quote-asset amount (buy only).
+            // Sells freeze base_asset by quantity → 0.0 by convention.
+            let freeze_price_val: f64 = if side == "buy" {
+                price.or(best_opposing_price).unwrap_or(0.0)
+            } else {
+                0.0
+            };
+
             // Persist to DB as PENDING before running through engine.
             let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
-                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status)
-                 VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING') RETURNING *",
+                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
+                 VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING', $7) RETURNING *",
             )
             .bind(user_id)
             .bind(&symbol)
@@ -315,6 +337,7 @@ async fn handle_client_message(
             .bind(&order_type)
             .bind(price)
             .bind(qty)
+            .bind(freeze_price_val)
             .fetch_one(state.db.as_ref())
             .await;
 
@@ -329,23 +352,10 @@ async fn handle_client_message(
                 }
             };
 
-            // Parse base/quote assets from symbol (e.g. "BTC_USDT" → "BTC", "USDT").
-            let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
-            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
-
-            // Capture best opposing price before matching (used as fill price for market orders).
-            let best_opposing_price = {
-                let eng = engine.lock().unwrap();
-                let levels = eng.get_top_levels(1, engine_side == Side::Sell);
-                levels.first().map(|(p, _)| *p)
-            };
-
             // Freeze funds before sending to engine.
             let repo = AccountRepository::new(state.db.as_ref());
             let freeze_result = if side == "buy" {
-                let freeze_price = price.or(best_opposing_price).unwrap_or(0.0);
-                let freeze_amount = freeze_price * qty;
+                let freeze_amount = freeze_price_val * qty;
                 if freeze_amount > 0.0 {
                     repo.freeze_for_buy(user_id, quote_asset, freeze_amount).await
                 } else {

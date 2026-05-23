@@ -481,6 +481,52 @@ async fn handle_symbols(State(s): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!(symbols))).into_response()
 }
 
+async fn handle_market_trades(
+    State(s): State<AppState>,
+    Query(q): Query<TradeQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(50).min(200);
+    let rows = sqlx::query(
+        "SELECT t.id, t.symbol, t.price, t.quantity,
+                (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS ts_us,
+                CASE
+                    WHEN t.buy_order_id IS NULL OR t.sell_order_id IS NULL THEN 'buy'
+                    WHEN t.buy_order_id > t.sell_order_id THEN 'buy'
+                    ELSE 'sell'
+                END AS side
+         FROM trades t
+         WHERE ($1::text IS NULL OR t.symbol = $1)
+         ORDER BY t.created_at DESC, t.id DESC
+         LIMIT $2",
+    )
+    .bind(&q.symbol)
+    .bind(limit)
+    .fetch_all(s.db.as_ref())
+    .await;
+
+    match rows {
+        Ok(rows) => {
+            use sqlx::Row;
+            let out: Vec<Value> = rows
+                .iter()
+                .map(|r| json!({
+                    "id":    r.get::<i64, _>("id"),
+                    "price": r.get::<f64, _>("price"),
+                    "qty":   r.get::<f64, _>("quantity"),
+                    "side":  r.get::<String, _>("side"),
+                    "ts":    r.get::<i64, _>("ts_us"),
+                }))
+                .collect();
+            (StatusCode::OK, Json(json!(out))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 fn router(state: AppState) -> Router {
@@ -494,6 +540,7 @@ fn router(state: AppState) -> Router {
         .route("/api/positions", get(handle_positions))
         .route("/api/agg-trades", get(handle_agg_trades))
         .route("/api/trades", get(handle_trades))
+        .route("/api/market-trades", get(handle_market_trades))
         .with_state(state)
 }
 

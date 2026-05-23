@@ -126,7 +126,8 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
                       + 15.0 * sin(extract(epoch from ts) /  300.0)
                       +  4.0 * sin(extract(epoch from ts) /   60.0),
                     0.05 + 0.08 * abs(sin(extract(epoch from ts) / 47.0)),
-                    0.0, 0.0, ts
+                    0.0, 0.0,
+                    ts + (((extract(epoch from ts)::bigint * 1337 + 271828) % 9999) * interval '1 microsecond')
              FROM generate_series(
                  NOW() - INTERVAL '3 hours',
                  NOW() - INTERVAL '30 seconds',
@@ -144,7 +145,8 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
                       + 1.5 * sin(extract(epoch from ts) /  300.0)
                       + 0.4 * sin(extract(epoch from ts) /   60.0),
                     0.5 + 0.8 * abs(sin(extract(epoch from ts) / 53.0)),
-                    0.0, 0.0, ts
+                    0.0, 0.0,
+                    ts + (((extract(epoch from ts)::bigint * 2311 + 161803) % 9999) * interval '1 microsecond')
              FROM generate_series(
                  NOW() - INTERVAL '3 hours',
                  NOW() - INTERVAL '30 seconds',
@@ -163,7 +165,8 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
                       +  80.0 * sin(extract(epoch from ts) /  300.0)
                       +  20.0 * sin(extract(epoch from ts) /   60.0),
                     0.002 + 0.004 * abs(sin(extract(epoch from ts) / 41.0)),
-                    0.0, 0.0, ts
+                    0.0, 0.0,
+                    ts + (((extract(epoch from ts)::bigint * 997 + 314159) % 9999) * interval '1 microsecond')
              FROM generate_series(
                  NOW() - INTERVAL '3 hours',
                  NOW() - INTERVAL '30 seconds',

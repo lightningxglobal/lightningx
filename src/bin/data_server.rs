@@ -488,7 +488,8 @@ async fn handle_market_trades(
     let limit = q.limit.unwrap_or(50).min(200);
     let rows = sqlx::query(
         "SELECT t.id, t.symbol, t.price, t.quantity,
-                (EXTRACT(EPOCH FROM t.created_at) * 1000000)::bigint AS ts_us,
+                (EXTRACT(EPOCH FROM t.created_at)::bigint * 1000000
+                 + EXTRACT(MICROSECONDS FROM t.created_at)::bigint % 1000000) AS ts_us,
                 CASE
                     WHEN t.buy_order_id IS NULL OR t.sell_order_id IS NULL THEN 'buy'
                     WHEN t.buy_order_id > t.sell_order_id THEN 'buy'

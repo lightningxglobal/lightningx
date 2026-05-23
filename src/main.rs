@@ -115,20 +115,60 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
     }
     tracing::info!("Demo data seeded: {} orders placed", placed);
 
-    // Insert seed trades so tickers have a `last` price immediately.
+    // Insert dense seed trade history (3 hours, every 25 s) so K-line charts
+    // show meaningful OHLCV variation across 1m / 5m / 15m / 1h intervals.
     if eth_already.is_none() {
         let _ = sqlx::query(
-            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee)
-             VALUES ('ETH_USDT', 3000.0, 0.001, 0.0, 0.0),
-                    ('SOL_USDT', 150.0,  0.01,  0.0, 0.0)",
+            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
+             SELECT 'ETH_USDT',
+                    3000.0
+                      + 80.0 * sin(extract(epoch from ts) / 1800.0)
+                      + 15.0 * sin(extract(epoch from ts) /  300.0)
+                      +  4.0 * sin(extract(epoch from ts) /   60.0),
+                    0.05 + 0.08 * abs(sin(extract(epoch from ts) / 47.0)),
+                    0.0, 0.0, ts
+             FROM generate_series(
+                 NOW() - INTERVAL '3 hours',
+                 NOW() - INTERVAL '30 seconds',
+                 '25 seconds'::interval
+             ) AS gs(ts)",
+        )
+        .execute(pool)
+        .await;
+
+        let _ = sqlx::query(
+            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
+             SELECT 'SOL_USDT',
+                    150.0
+                      + 6.0 * sin(extract(epoch from ts) / 1800.0)
+                      + 1.5 * sin(extract(epoch from ts) /  300.0)
+                      + 0.4 * sin(extract(epoch from ts) /   60.0),
+                    0.5 + 0.8 * abs(sin(extract(epoch from ts) / 53.0)),
+                    0.0, 0.0, ts
+             FROM generate_series(
+                 NOW() - INTERVAL '3 hours',
+                 NOW() - INTERVAL '30 seconds',
+                 '25 seconds'::interval
+             ) AS gs(ts)",
         )
         .execute(pool)
         .await;
     }
     if btc_already.is_none() {
         let _ = sqlx::query(
-            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee)
-             VALUES ('BTC_USDT', 51000.0, 0.001, 0.0, 0.0)",
+            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
+             SELECT 'BTC_USDT',
+                    51000.0
+                      + 400.0 * sin(extract(epoch from ts) / 1800.0)
+                      +  80.0 * sin(extract(epoch from ts) /  300.0)
+                      +  20.0 * sin(extract(epoch from ts) /   60.0),
+                    0.002 + 0.004 * abs(sin(extract(epoch from ts) / 41.0)),
+                    0.0, 0.0, ts
+             FROM generate_series(
+                 NOW() - INTERVAL '3 hours',
+                 NOW() - INTERVAL '30 seconds',
+                 '25 seconds'::interval
+             ) AS gs(ts)",
         )
         .execute(pool)
         .await;

@@ -430,14 +430,19 @@ async fn handle_trades(
             let out: Vec<Value> = rows
                 .iter()
                 .map(|r| {
-                    json!({
-                        "id": r.get::<i64, _>("id"),
-                        "symbol": r.get::<String, _>("symbol"),
-                        "price": r.get::<f64, _>("price"),
-                        "quantity": r.get::<f64, _>("quantity"),
-                        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                        "side": r.get::<String, _>("side"),
-                    })
+                    {
+                        let price = r.get::<f64, _>("price");
+                        let quantity = r.get::<f64, _>("quantity");
+                        json!({
+                            "id": r.get::<i64, _>("id"),
+                            "symbol": r.get::<String, _>("symbol"),
+                            "price": price,
+                            "quantity": quantity,
+                            "value": price * quantity,
+                            "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                            "side": r.get::<String, _>("side"),
+                        })
+                    }
                 })
                 .collect();
             (StatusCode::OK, Json(json!(out))).into_response()

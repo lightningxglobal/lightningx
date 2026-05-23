@@ -180,9 +180,21 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
 
         let mut max_id: u64 = 0;
+        let mut restored = 0usize;
+        let mut skipped = 0usize;
         for db_order in &rows {
             let order_id = db_order.id as u64;
             if order_id > max_id { max_id = order_id; }
+
+            // Market orders (and IOC orders missing a price) can never rest in the
+            // book — they were left in PENDING by a crash mid-flight. Skip them
+            // here; the cleanup pass below cancels them and releases frozen funds.
+            if db_order.order_type == "market"
+                || (db_order.order_type == "ioc" && db_order.price.is_none())
+            {
+                skipped += 1;
+                continue;
+            }
 
             let remaining = db_order.quantity - db_order.filled;
             if remaining <= 0.0 { continue; }
@@ -200,12 +212,66 @@ async fn main() -> anyhow::Result<()> {
 
             if let Some(eng_ref) = engines.get(&db_order.symbol) {
                 let mut eng = eng_ref.lock().unwrap();
-                let _ = eng.add_to_book(order);
+                if eng.add_to_book(order).is_ok() {
+                    restored += 1;
+                }
             }
         }
-        tracing::info!("Restored {} active orders from DB", rows.len());
+        tracing::info!(
+            "Restored {} active orders from DB ({} non-restable skipped)",
+            restored,
+            skipped,
+        );
         max_id
     };
+
+    // Cancel any stale PENDING/TRADING market orders left from prior crashes.
+    // Market orders never rest in the book, so survivors are stuck; release
+    // their frozen funds best-effort and flip them to CANCELED.
+    {
+        let repo = AccountRepository::new(&pool);
+        let stale: Vec<(i64, i64, String, String, f64, f64)> = sqlx::query_as(
+            "SELECT id, user_id, symbol, side, quantity, filled FROM orders
+             WHERE status IN ('PENDING','TRADING') AND order_type='market'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let mut cleaned = 0usize;
+        for (id, user_id, symbol, side, quantity, filled) in stale {
+            let remaining = quantity - filled;
+            if remaining > 0.0 {
+                let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+                let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+                let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+                if side == "sell" {
+                    let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+                } else {
+                    // We don't persist the freeze price for market buys, so estimate
+                    // with the current best ask. Inaccurate by definition, but the
+                    // alternative is leaving funds frozen forever.
+                    let best_ask: Option<f64> = engines.get(&symbol).and_then(|e| {
+                        let eng = e.value().lock().unwrap();
+                        eng.get_top_levels(1, false).first().map(|(p, _)| *p)
+                    });
+                    if let Some(p) = best_ask {
+                        let _ = repo.release_frozen(user_id, quote_asset, p * remaining).await;
+                    }
+                }
+            }
+            let _ = sqlx::query(
+                "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await;
+            cleaned += 1;
+        }
+        if cleaned > 0 {
+            tracing::warn!("Cleaned up {} stale market orders from prior runs", cleaned);
+        }
+    }
 
     seed_demo_if_empty(&pool, &engines).await;
 

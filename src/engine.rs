@@ -758,6 +758,15 @@ impl MatchingEngine {
                             if let Some(idx) = self.orders.remove(&counter_order_id) {
                                 self.pools.orders.release(idx);
                             }
+                            // Drop the level when its last order has gone, so
+                            // depth snapshots don't emit a 0-qty ghost.
+                            let level_empty = opposite_book
+                                .get_node_at_price(best_price)
+                                .map(|lvl| lvl.total_quantity <= 0.0)
+                                .unwrap_or(false);
+                            if level_empty {
+                                let _ = opposite_book.remove_level(best_price);
+                            }
                         }
                     }
                 }
@@ -930,6 +939,15 @@ impl MatchingEngine {
                                 // 从orders HashMap中移除并释放池索引
                                 if let Some(idx) = self.orders.remove(&counter_order_id) {
                                     self.pools.orders.release(idx);
+                                }
+                                // Drop the level when its last order has gone, so
+                                // depth snapshots don't emit a 0-qty ghost.
+                                let level_empty = opposite_book
+                                    .get_node_at_price(best_price)
+                                    .map(|lvl| lvl.total_quantity <= 0.0)
+                                    .unwrap_or(false);
+                                if level_empty {
+                                    let _ = opposite_book.remove_level(best_price);
                                 }
                             }
                         }
@@ -1309,6 +1327,27 @@ mod tests {
 
         assert_eq!(result.status, OrderStatus::Rejected);
         assert_eq!(result.filled, 0.0);
+    }
+
+    #[test]
+    fn test_fully_consumed_level_does_not_leave_ghost() {
+        // Regression: after a maker order is fully consumed, the price level
+        // must not stay in the book as a 0-qty ghost. Without remove_level
+        // get_top_levels would surface `(50000.0, 0.0)` which the depth
+        // broadcast then renders as a phantom ask.
+        let pool_config = PoolConfig::default();
+        let mut engine = MatchingEngine::new(pool_config).unwrap();
+
+        let sell = Order::new(1, Side::Sell, 50_000.0, 1.0, TimeInForce::GTC, 0);
+        engine.place_order(sell).unwrap();
+        let buy = Order::new_market(2, Side::Buy, 1.0, 0);
+        engine.place_order(buy).unwrap();
+
+        assert!(
+            engine.get_top_levels(5, false).is_empty(),
+            "asks should be empty after the level is fully consumed, got {:?}",
+            engine.get_top_levels(5, false),
+        );
     }
 
     #[test]

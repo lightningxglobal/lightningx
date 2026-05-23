@@ -314,6 +314,79 @@ async fn handle_positions(State(s): State<AppState>, headers: HeaderMap) -> impl
 }
 
 #[derive(Deserialize)]
+struct AggTradesQuery {
+    symbol: String,
+    interval: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn handle_agg_trades(
+    State(s): State<AppState>,
+    Query(q): Query<AggTradesQuery>,
+) -> impl IntoResponse {
+    let interval = q.interval.as_deref().unwrap_or("1s");
+    let limit = q.limit.unwrap_or(60).clamp(1, 300);
+
+    // Whitelist the interval — interpolated into SQL, must not be user-controlled.
+    let bin_width = match interval {
+        "5s"  => "5 seconds",
+        "30s" => "30 seconds",
+        _     => "1 second",
+    };
+
+    let sql = format!(
+        "SELECT
+           extract(epoch FROM date_bin('{bin}', created_at, TIMESTAMPTZ '2000-01-01'))::bigint AS time,
+           (array_agg(price ORDER BY created_at ASC))[1]  AS open,
+           max(price)                                      AS high,
+           min(price)                                      AS low,
+           (array_agg(price ORDER BY created_at DESC))[1] AS close,
+           sum(quantity)                                   AS volume,
+           count(*)::bigint                                AS trade_count
+         FROM trades
+         WHERE symbol = $1
+         GROUP BY date_bin('{bin}', created_at, TIMESTAMPTZ '2000-01-01')
+         ORDER BY time DESC
+         LIMIT $2",
+        bin = bin_width,
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(&q.symbol)
+        .bind(limit)
+        .fetch_all(s.db.as_ref())
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            use sqlx::Row;
+            // Returned DESC for the LIMIT; reverse so consumers get ASC.
+            let mut bars: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "time":        r.get::<i64, _>("time"),
+                        "open":        r.get::<f64, _>("open"),
+                        "high":        r.get::<f64, _>("high"),
+                        "low":         r.get::<f64, _>("low"),
+                        "close":       r.get::<f64, _>("close"),
+                        "volume":      r.get::<f64, _>("volume"),
+                        "trade_count": r.get::<i64, _>("trade_count"),
+                    })
+                })
+                .collect();
+            bars.reverse();
+            (StatusCode::OK, Json(json!(bars))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct TradeQuery {
     symbol: Option<String>,
     limit: Option<i64>,
@@ -414,6 +487,7 @@ fn router(state: AppState) -> Router {
         .route("/api/orders/:id", get(handle_order))
         .route("/api/accounts", get(handle_accounts))
         .route("/api/positions", get(handle_positions))
+        .route("/api/agg-trades", get(handle_agg_trades))
         .route("/api/trades", get(handle_trades))
         .with_state(state)
 }

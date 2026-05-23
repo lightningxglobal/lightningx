@@ -169,6 +169,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     msg_symbol(&msg).map(|sym| {
                         session.subscribed.contains(&format!("kline.{}", sym))
                     }).unwrap_or(false)
+                } else if msg.contains("\"type\":\"agg_trade\"") {
+                    msg_symbol(&msg).map(|sym| {
+                        session.subscribed.contains(&format!("agg_trades.{}", sym))
+                    }).unwrap_or(false)
                 } else {
                     false
                 };
@@ -857,6 +861,7 @@ pub async fn market_data_broadcaster(state: AppState) {
     let mut depth_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut ticker_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut agg_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     // Last-seen top-bid price per symbol — drives ticker broadcasts and the
     // 24h-change calc. Keyed by symbol so a new symbol picked up at runtime
     // gets its own entry on first non-empty depth tick.
@@ -976,6 +981,64 @@ pub async fn market_data_broadcaster(state: AppState) {
                             }
                         }
                     });
+                }
+            }
+
+            _ = agg_interval.tick() => {
+                // Per-second OHLCV+count for the active second and the active
+                // 5s window. Only query symbols that have seen at least one
+                // trade (last_prices entry) to keep DB load bounded.
+                let now = unix_now();
+                let bucket_1s = now;                  // 1-second boundary == unix epoch second
+                let bucket_5s = now - (now % 5);
+                let symbols: Vec<String> = last_prices.keys().cloned().collect();
+                for symbol in symbols {
+                    for &(interval_label, bin_w, bucket_start) in &[
+                        ("1s", "1 second",  bucket_1s),
+                        ("5s", "5 seconds", bucket_5s),
+                    ] {
+                        let db = state.db.clone();
+                        let mtx = state.market_tx.clone();
+                        let sym = symbol.clone();
+                        let sql = format!(
+                            "SELECT
+                               (array_agg(price ORDER BY created_at ASC))[1]  AS open,
+                               MAX(price)                                      AS high,
+                               MIN(price)                                      AS low,
+                               (array_agg(price ORDER BY created_at DESC))[1] AS close,
+                               COALESCE(SUM(quantity), 0.0)                    AS volume,
+                               COUNT(*)::bigint                                AS trade_count
+                             FROM trades
+                             WHERE symbol = $1
+                               AND created_at >= date_bin('{bin}', to_timestamp($2), TIMESTAMPTZ '2000-01-01')
+                               AND created_at <  date_bin('{bin}', to_timestamp($2), TIMESTAMPTZ '2000-01-01') + INTERVAL '{bin}'",
+                            bin = bin_w,
+                        );
+                        tokio::spawn(async move {
+                            let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64, i64), _> =
+                                sqlx::query_as(&sql)
+                                    .bind(&sym)
+                                    .bind(bucket_start as f64)
+                                    .fetch_one(db.as_ref())
+                                    .await;
+                            if let Ok((Some(open), Some(high), Some(low), Some(close), volume, trade_count)) = row {
+                                if trade_count == 0 { return; }
+                                let msg = json!({
+                                    "type": "agg_trade",
+                                    "symbol": sym,
+                                    "interval": interval_label,
+                                    "time": bucket_start,
+                                    "open": open,
+                                    "high": high,
+                                    "low": low,
+                                    "close": close,
+                                    "volume": volume,
+                                    "trade_count": trade_count,
+                                }).to_string();
+                                let _ = mtx.send(msg);
+                            }
+                        });
+                    }
                 }
             }
         }

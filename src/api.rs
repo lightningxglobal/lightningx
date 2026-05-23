@@ -497,9 +497,9 @@ async fn handle_place_order(
         } else {
             req.price.or(best_opposing).unwrap_or(0.0)
         };
-        let now_secs = std::time::SystemTime::now()
+        let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
         let trade_msg = serde_json::json!({
             "type": "trade",
@@ -507,7 +507,7 @@ async fn handle_place_order(
             "price": avg_fill_price,
             "qty": result.filled,
             "side": &req.side,
-            "ts": now_secs,
+            "ts": now_us,
         }).to_string();
         let _ = s.market_tx.send(trade_msg);
 
@@ -555,7 +555,7 @@ async fn handle_place_order(
     if let Some(tx) = s.user_tx.get(&user_id) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
         let msg = serde_json::json!({
             "type": "order_update",
@@ -648,7 +648,7 @@ async fn handle_cancel_order(
     if let Some(tx) = s.user_tx.get(&user_id) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
         let msg = serde_json::json!({
             "type": "order_update",

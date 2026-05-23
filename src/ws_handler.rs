@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
 }
 

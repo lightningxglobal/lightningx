@@ -21,6 +21,13 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 // ─── Client → Server message types ───────────────────────────────────────────
 // Parse from raw Value to avoid serde internal-tag conflict with a field also named "type".
 
@@ -966,7 +973,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                 // Fetch real OHLCV from the trades table for the last 60 seconds,
                 // per active symbol. Skip when the bar has no trades so we don't
                 // corrupt the chart with a fake flat candle.
-                let now = unix_now();
+                let now = unix_secs();
                 let bar_time = now - (now % 60);
                 let symbols: Vec<String> = state.engines.iter().map(|e| e.key().clone()).collect();
                 for symbol in symbols {
@@ -1022,8 +1029,8 @@ pub async fn market_data_broadcaster(state: AppState) {
                 // Per-second OHLCV+count for the active second and the active
                 // 5s window. Only query symbols that have seen at least one
                 // trade (last_prices entry) to keep DB load bounded.
-                let now = unix_now();
-                let bucket_1s = now;                  // 1-second boundary == unix epoch second
+                let now = unix_secs();
+                let bucket_1s = now;
                 let bucket_5s = now - (now % 5);
                 let symbols: Vec<String> = last_prices.keys().cloned().collect();
                 for symbol in symbols {

@@ -17,13 +17,13 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
-    let port = std::env::var("DESK_PORT").unwrap_or_else(|_| "3001".to_string());
+    let port = std::env::var("DESK_PORT").unwrap_or_else(|_| "4003".to_string());
     let desk_id: u64 = std::env::var("DESK_ID")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     let upstream_ws_url = std::env::var("UPSTREAM_WS_URL")
-        .unwrap_or_else(|_| "ws://127.0.0.1:3000/ws".to_string());
+        .unwrap_or_else(|_| "ws://127.0.0.1:4001/ws".to_string());
 
     tracing::info!("Connecting to database…");
     let pool = db::create_pool(&database_url).await?;
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = DeskAppState {
         db: Arc::new(pool),
-        upstream_ws_url: Arc::new(upstream_ws_url),
+        upstream_ws_url: Arc::new(upstream_ws_url.clone()),
         market_tx: Arc::new(market_tx),
         rate_limiter: Arc::new(parking_lot::Mutex::new(
             RateLimiter::new(RateLimitPolicy::default_trading()),
@@ -56,10 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", port);
-    tracing::info!("Desk Server listening on {} (upstream: {})",
-        addr,
-        std::env::var("UPSTREAM_WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:3000/ws".to_string())
-    );
+    tracing::info!("Desk Server listening on {} (upstream: {})", addr, upstream_ws_url);
     let listener = TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

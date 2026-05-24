@@ -126,6 +126,8 @@ async fn main() -> anyhow::Result<()> {
                         // details. On ACCEPTED we INSERT the DB row + freeze funds.
                         // On REJECTED/CANCELLED we just drop the meta (no freeze happened).
                         let ws_meta = pending_meta.remove(&order_id).map(|(_, m)| m);
+                        // client_order_id is only available on the first event (ACCEPTED).
+                        let ws_client_oid = ws_meta.as_ref().map(|m| m.client_order_id.clone());
 
                         if let Some(meta) = ws_meta {
                             if kind == order_update_kind::ACCEPTED {
@@ -193,15 +195,20 @@ async fn main() -> anyhow::Result<()> {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_micros() as u64)
                                 .unwrap_or(0);
-                            let upd = serde_json::json!({
+                            let mut upd = serde_json::json!({
                                 "type": "order_update",
                                 "order_id": order_id,
                                 "status": ws_status,
                                 "filled_qty": fill_qty,
                                 "avg_price": fill_price,
                                 "ts": ts,
-                            }).to_string();
-                            let _ = tx.try_send(upd);
+                            });
+                            // Echo client_order_id back on ACCEPTED so client can correlate
+                            // without a separate lookup (only present in fast-path WS orders).
+                            if let Some(ref coid) = ws_client_oid {
+                                upd["client_order_id"] = serde_json::Value::String(coid.clone());
+                            }
+                            let _ = tx.try_send(upd.to_string());
                         }
                     }
 

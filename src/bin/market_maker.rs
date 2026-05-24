@@ -111,9 +111,19 @@ async fn rest_ensure_funds(http: &Client, base: &str, token: &str) {
 #[derive(Clone)]
 struct WsExchangeClient {
     ws_tx: mpsc::Sender<String>,
+    /// Pending order submissions: coid → resolve with exchange order_id on order_submitted.
     pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
     dead_orders: Arc<DashMap<i64, ()>>,
     order_counter: Arc<AtomicU64>,
+    /// Latency probes: coid → resolve with recv_us when order_update OPEN arrives.
+    latency_pending: Arc<DashMap<u64, oneshot::Sender<u64>>>,
+}
+
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 impl WsExchangeClient {
@@ -143,6 +153,50 @@ impl WsExchangeClient {
         }
     }
 
+    /// Like place_order but also measures end-to-end latency from send to
+    /// order_update OPEN (engine confirmed ACCEPTED).
+    /// Returns (order_id, latency_us).
+    async fn place_order_timed(
+        &self,
+        symbol: &str, side: &str, price: f64, qty: f64,
+    ) -> Option<(i64, u64)> {
+        let coid = self.order_counter.fetch_add(1, Ordering::Relaxed);
+        let (sub_tx, mut sub_rx) = oneshot::channel::<Option<i64>>();
+        let (lat_tx, lat_rx) = oneshot::channel::<u64>();
+        self.pending.insert(coid, sub_tx);
+        self.latency_pending.insert(coid, lat_tx);
+
+        let send_ts = now_us();
+
+        let msg = json!({
+            "type": "place_order",
+            "client_order_id": coid.to_string(),
+            "symbol": symbol,
+            "side": side,
+            "order_type": "limit",
+            "price": price,
+            "qty": qty,
+        }).to_string();
+
+        if self.ws_tx.send(msg).await.is_err() {
+            self.pending.remove(&coid);
+            self.latency_pending.remove(&coid);
+            return None;
+        }
+
+        // Wait for order_update OPEN (engine confirmed ACCEPTED).
+        let recv_ts = match tokio::time::timeout(Duration::from_secs(5), lat_rx).await {
+            Ok(Ok(ts)) => ts,
+            _ => {
+                self.latency_pending.remove(&coid);
+                return None;
+            }
+        };
+        // order_submitted should have already arrived; get order_id via try_recv.
+        let order_id = sub_rx.try_recv().ok().flatten().unwrap_or(0);
+        Some((order_id, recv_ts.saturating_sub(send_ts)))
+    }
+
     async fn cancel_order(&self, order_id: i64) {
         let msg = json!({"type": "cancel_order", "order_id": order_id}).to_string();
         let _ = self.ws_tx.send(msg).await;
@@ -166,6 +220,7 @@ async fn ws_manager(
     mut outbox: mpsc::Receiver<String>,
     pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
     dead_orders: Arc<DashMap<i64, ()>>,
+    latency_pending: Arc<DashMap<u64, oneshot::Sender<u64>>>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -197,7 +252,7 @@ async fn ws_manager(
                 msg = stream.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            route_desk_msg(&text, &pending, &dead_orders);
+                            route_desk_msg(&text, &pending, &dead_orders, &latency_pending);
                         }
                         Some(Ok(Message::Close(_))) | None => {
                             warn!("Desk WS closed by server");
@@ -236,6 +291,7 @@ fn route_desk_msg(
     text: &str,
     pending: &DashMap<u64, oneshot::Sender<Option<i64>>>,
     dead_orders: &DashMap<i64, ()>,
+    latency_pending: &DashMap<u64, oneshot::Sender<u64>>,
 ) {
     let v: Value = match serde_json::from_str(text) { Ok(v) => v, _ => return };
     let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
@@ -260,11 +316,27 @@ fn route_desk_msg(
             if let Some((_, tx)) = pending.remove(&coid) {
                 let _ = tx.send(None);
             }
+            // Also clean up any latency probe for this coid.
+            latency_pending.remove(&coid);
         }
         "order_update" => {
-            // FILLED = maker order consumed by taker. CANCELED = cancel confirmed.
-            // Both mean the order is gone; symbol tasks need to re-place the level.
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+
+            // Resolve latency probe on OPEN (engine confirmed ACCEPTED).
+            // client_order_id is only included for WS fast-path ACCEPTED events.
+            if status == "OPEN" {
+                let coid: u64 = v.get("client_order_id")
+                    .and_then(|c| c.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(u64::MAX);
+                if coid != u64::MAX {
+                    if let Some((_, tx)) = latency_pending.remove(&coid) {
+                        let _ = tx.send(now_us());
+                    }
+                }
+            }
+
+            // FILLED/CANCELED: order is gone; symbol tasks need to re-place the level.
             if matches!(status, "FILLED" | "CANCELED") {
                 if let Some(oid) = v.get("order_id").and_then(|i| i.as_i64()) {
                     dead_orders.insert(oid, ());
@@ -471,6 +543,60 @@ fn round_qty(qty: f64, min_qty: f64) -> f64 {
     (((qty / min_qty).floor() * min_qty) * 1e8).round() / 1e8
 }
 
+// ── End-to-end latency probe ──────────────────────────────────────────────────
+//
+// Sends probe orders far off-market (won't fill) at a steady rate, measures
+// send→order_update_OPEN latency (the full round-trip through desk-server,
+// Aeron, engine, Aeron back, and WS push), then reports percentiles.
+
+async fn run_latency_probe(client: WsExchangeClient) {
+    // Brief warm-up so market-making is stable before probing.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    info!("[latency] Starting probe — 200 samples at 50ms intervals");
+
+    let mut samples: Vec<u64> = Vec::with_capacity(200);
+    let mut probe_orders: Vec<i64> = Vec::new();
+
+    for i in 0..200u32 {
+        // Far-off-market bid: $1 for ETH — will be ACCEPTED but never fill.
+        match client.place_order_timed("ETH_USDT", "buy", 1.0, 0.001).await {
+            Some((oid, us)) => {
+                samples.push(us);
+                if oid > 0 { probe_orders.push(oid); }
+                if i % 20 == 19 {
+                    info!("[latency] #{:3}  {}μs  (running median ~{}μs)", i + 1, us,
+                        { let mut s = samples.clone(); s.sort_unstable(); s[s.len()/2] });
+                }
+            }
+            None => warn!("[latency] #{i:3} timeout/error"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Cancel probe orders (best-effort).
+    for oid in probe_orders {
+        client.cancel_order(oid).await;
+    }
+
+    if samples.len() < 10 {
+        warn!("[latency] Too few samples ({}) for meaningful stats", samples.len());
+        return;
+    }
+
+    samples.sort_unstable();
+    let n = samples.len();
+    let p50  = samples[n * 50 / 100];
+    let p95  = samples[n * 95 / 100];
+    let p99  = samples[n * 99 / 100];
+    let min  = samples[0];
+    let max  = samples[n - 1];
+    let mean = samples.iter().sum::<u64>() / n as u64;
+    info!(
+        "[latency] RESULTS ({n} samples): \
+         min={min}μs  mean={mean}μs  p50={p50}μs  p95={p95}μs  p99={p99}μs  max={max}μs"
+    );
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -498,19 +624,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared WS client: one TCP connection, shared by all symbol tasks.
     let (ws_tx, ws_rx) = mpsc::channel::<String>(512);
-    let pending   = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
-    let dead_orders = Arc::new(DashMap::<i64, ()>::new());
+    let pending        = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
+    let dead_orders    = Arc::new(DashMap::<i64, ()>::new());
+    let latency_pending = Arc::new(DashMap::<u64, oneshot::Sender<u64>>::new());
 
     let client = WsExchangeClient {
         ws_tx,
         pending: pending.clone(),
         dead_orders: dead_orders.clone(),
         order_counter: Arc::new(AtomicU64::new(0)),
+        latency_pending: latency_pending.clone(),
     };
 
     // WS manager: handles connection lifecycle, auth, send/recv, reconnect.
     let ws_url = exchange_ws_url();
-    tokio::spawn(ws_manager(ws_url, token, ws_rx, pending, dead_orders));
+    tokio::spawn(ws_manager(ws_url, token, ws_rx, pending, dead_orders, latency_pending));
 
     // Brief pause for the WS manager to connect and authenticate.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -523,12 +651,15 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     info!("Starting market-making on {} symbols", SYMBOLS.len());
-    let handles: Vec<_> = SYMBOLS.iter()
+    let mut handles: Vec<_> = SYMBOLS.iter()
         .map(|cfg| {
             let c = client.clone();
             tokio::spawn(async move { run_symbol(cfg, c).await })
         })
         .collect();
+
+    // Latency probe: runs concurrently with market-making.
+    handles.push(tokio::spawn(run_latency_probe(client.clone())));
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down…");

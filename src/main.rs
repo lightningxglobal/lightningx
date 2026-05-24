@@ -15,109 +15,32 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
-/// Plant limit orders for ETH_USDT, SOL_USDT and BTC_USDT on first startup.
-/// Idempotent per symbol: skips ETH/SOL if ETH_USDT already has active orders,
-/// skips BTC if BTC_USDT already has active orders.
-async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<MatchingEngine>>>) {
-    let eth_already: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM orders WHERE symbol='ETH_USDT' AND status IN ('PENDING','TRADING') LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
-
-    let btc_already: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM orders WHERE symbol='BTC_USDT' AND status IN ('PENDING','TRADING') LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
-
-    if eth_already.is_some() && btc_already.is_some() {
-        tracing::info!("Demo data already present, skipping seed");
-        return;
-    }
-
-    let demo_id: i64 = match sqlx::query_scalar::<_, i64>(
-        "INSERT INTO users (email, password_hash, full_name, kyc_status)
-         VALUES ('demo@lightning.exchange', 'x', 'Demo User', 'verified')
-         ON CONFLICT (email) DO UPDATE SET id = users.id RETURNING id",
+/// Seed demo K-line trade history on first startup so charts show meaningful data.
+/// Idempotent: skips a symbol if it already has any trades in the DB.
+/// Does NOT place limit orders — the market-maker provides all live orderbook liquidity.
+async fn seed_demo_if_empty(pool: &PgPool) {
+    let eth_has_trades: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM trades WHERE symbol='ETH_USDT' LIMIT 1",
     )
     .fetch_one(pool)
     .await
-    {
-        Ok(id) => id,
-        Err(e) => { tracing::warn!("seed_demo: user upsert failed: {e}"); return; }
-    };
+    .unwrap_or(0) > 0;
 
-    let _ = sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1,'USDT',20000,0),($1,'ETH',5,0),($1,'SOL',100,0),($1,'BTC',5,0)
-         ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = GREATEST(accounts.balance, EXCLUDED.balance), updated_at=NOW()",
+    let btc_has_trades: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM trades WHERE symbol='BTC_USDT' LIMIT 1",
     )
-    .bind(demo_id)
-    .execute(pool)
-    .await;
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0) > 0;
 
-    let plans: &[(&str, &str, &[f64], f64, &str, &str)] = &[
-        ("ETH_USDT","buy", &[2990.,2980.,2970.,2960.,2950.], 0.5, "ETH","USDT"),
-        ("ETH_USDT","sell",&[3010.,3020.,3030.,3040.,3050.], 0.5, "ETH","USDT"),
-        ("SOL_USDT","buy", &[149.,148.,147.,146.,145.],     10.0, "SOL","USDT"),
-        ("SOL_USDT","sell",&[151.,152.,153.,154.,155.],     10.0, "SOL","USDT"),
-        ("BTC_USDT","buy", &[50900.,50800.,50700.,50600.,50500.], 0.01, "BTC","USDT"),
-        ("BTC_USDT","sell",&[51100.,51200.,51300.,51400.,51500.], 0.01, "BTC","USDT"),
-    ];
-
-    let repo = AccountRepository::new(pool);
-    let mut placed = 0usize;
-
-    for (symbol, side, prices, qty, base, quote) in plans {
-        // Skip symbols whose demo orders are already present.
-        let symbol_already = if *symbol == "BTC_USDT" { btc_already.is_some() } else { eth_already.is_some() };
-        if symbol_already { continue; }
-
-        let Some(eng_ref) = engines.get(*symbol) else { continue };
-        let engine = eng_ref.value().clone();
-        let engine_side = if *side == "buy" { Side::Buy } else { Side::Sell };
-
-        for &price in *prices {
-            let freeze = if *side == "buy" {
-                repo.freeze_for_buy(demo_id, quote, price * qty).await
-            } else {
-                repo.freeze_for_sell(demo_id, base, *qty).await
-            };
-            if freeze.is_err() { continue; }
-
-            // Limit buys: freeze_price = price (USDT cost backing).
-            // Limit sells: 0.0 (sells freeze base_asset by quantity).
-            let seed_fp = if *side == "buy" { price } else { 0.0 };
-            let db_order = match sqlx::query_as::<_, DbOrder>(
-                "INSERT INTO orders (id,user_id,symbol,side,order_type,price,quantity,filled,status,freeze_price)
-                 VALUES (nextval('orders_id_seq'),$1,$2,$3,'limit',$4,$5,0,'PENDING',$6) RETURNING *",
-            )
-            .bind(demo_id).bind(*symbol).bind(*side).bind(price).bind(*qty).bind(seed_fp)
-            .fetch_one(pool).await {
-                Ok(o) => o,
-                Err(_) => {
-                    let asset = if *side == "buy" { *quote } else { *base };
-                    let amt   = if *side == "buy" { price * qty } else { *qty };
-                    let _ = repo.release_frozen(demo_id, asset, amt).await;
-                    continue;
-                }
-            };
-
-            let order = Order::new(db_order.id as u64, engine_side, price, *qty, TimeInForce::GTC, 0);
-            let mut eng = engine.lock().unwrap();
-            let _ = eng.add_to_book(order);
-            placed += 1;
-        }
+    if eth_has_trades && btc_has_trades {
+        tracing::info!("Demo trade history already present, skipping seed");
+        return;
     }
-    tracing::info!("Demo data seeded: {} orders placed", placed);
 
     // Insert dense seed trade history (3 hours, every 25 s) so K-line charts
     // show meaningful OHLCV variation across 1m / 5m / 15m / 1h intervals.
-    if eth_already.is_none() {
+    if !eth_has_trades {
         let _ = sqlx::query(
             "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
              SELECT 'ETH_USDT',
@@ -155,8 +78,10 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
         )
         .execute(pool)
         .await;
+        tracing::info!("Demo trade history seeded for ETH_USDT + SOL_USDT");
     }
-    if btc_already.is_none() {
+
+    if !btc_has_trades {
         let _ = sqlx::query(
             "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
              SELECT 'BTC_USDT',
@@ -175,6 +100,7 @@ async fn seed_demo_if_empty(pool: &PgPool, engines: &DashMap<String, Arc<Mutex<M
         )
         .execute(pool)
         .await;
+        tracing::info!("Demo trade history seeded for BTC_USDT");
     }
 }
 
@@ -214,6 +140,44 @@ async fn main() -> anyhow::Result<()> {
         .bind(quote)
         .execute(&pool)
         .await;
+    }
+
+    // Cancel stale orders from automated accounts (market-maker + demo seed user).
+    // These accounts always restart fresh; stale orders at outdated prices would cross
+    // new market-maker orders and cause a burst of trades and a CPU spike.
+    {
+        let repo = AccountRepository::new(&pool);
+        let bot_stale: Vec<(i64, i64, String, String, f64, f64, f64)> = sqlx::query_as(
+            "SELECT o.id, o.user_id, o.symbol, o.side, o.quantity, o.filled, COALESCE(o.freeze_price, COALESCE(o.price, 0.0))
+             FROM orders o
+             JOIN users u ON u.id = o.user_id
+             WHERE o.status IN ('PENDING','TRADING')
+               AND u.email IN ('robot@lightningx.exchange', 'demo@lightning.exchange')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        for (id, user_id, symbol, side, quantity, filled, per_unit_price) in &bot_stale {
+            let remaining = quantity - filled;
+            if remaining > 0.0 {
+                let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+                let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+                let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+                if side == "sell" {
+                    let _ = repo.release_frozen(*user_id, base_asset, remaining).await;
+                } else if *per_unit_price > 0.0 {
+                    let _ = repo.release_frozen(*user_id, quote_asset, per_unit_price * remaining).await;
+                }
+            }
+            let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        if !bot_stale.is_empty() {
+            tracing::warn!("Canceled {} stale bot orders (market-maker + demo) from previous session", bot_stale.len());
+        }
     }
 
     // Recover active orders from DB back into engines so book state survives restarts.
@@ -326,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    seed_demo_if_empty(&pool, &engines).await;
+    seed_demo_if_empty(&pool).await;
 
     let (market_tx, _) = broadcast::channel::<String>(1024);
 

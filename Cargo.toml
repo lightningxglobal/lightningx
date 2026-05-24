@@ -70,6 +70,10 @@ name = "market-maker"
 path = "src/bin/market_maker.rs"
 
 [[bin]]
+name = "trade-bot"
+path = "src/bin/trade_bot.rs"
+
+[[bin]]
 name = "kline-service"
 path = "src/bin/kline_service.rs"
 

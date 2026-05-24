@@ -79,6 +79,8 @@ async fn main() -> anyhow::Result<()> {
         let pending_orders = state.pending_orders.clone();
         let user_tx = state.user_tx.clone();
         let last_depth = state.last_depth.clone();
+        let db = state.db.clone();
+        let rt = tokio::runtime::Handle::current();
 
         std::thread::Builder::new()
             .name("aeron-event-loop".to_string())
@@ -129,21 +131,25 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Process trade notifications — broadcast to WS subscribers.
+                    // Process trade notifications — broadcast to WS and persist to DB.
                     while let Some(trade) = trade_sub.poll() {
                         let symbol = {
                             let end = trade.symbol.iter().position(|&b| b == 0).unwrap_or(16);
                             String::from_utf8_lossy(&trade.symbol[..end]).to_string()
                         };
-                        // Copy packed fields to locals.
+                        // Copy packed fields to locals before any use (misaligned ref safety).
                         let price: f64 = trade.price;
                         let quantity: f64 = trade.quantity;
                         let side: u8 = trade.side;
+                        let taker_id: u64 = trade.taker_order_id;
+                        let maker_id: u64 = trade.maker_order_id;
                         let side_str = if side == 0 { "buy" } else { "sell" };
                         let ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_micros() as u64)
                             .unwrap_or(0);
+
+                        // Broadcast to WS subscribers.
                         let trade_msg = serde_json::json!({
                             "type": "trade",
                             "symbol": symbol,
@@ -153,6 +159,28 @@ async fn main() -> anyhow::Result<()> {
                             "ts": ts,
                         }).to_string();
                         let _ = market_tx.send(trade_msg);
+
+                        // Persist to DB (fire-and-forget async task).
+                        let (buy_oid, sell_oid): (i64, i64) = if side == 0 {
+                            (taker_id as i64, maker_id as i64)
+                        } else {
+                            (maker_id as i64, taker_id as i64)
+                        };
+                        let db2 = db.clone();
+                        let sym = symbol.clone();
+                        rt.spawn(async move {
+                            let _ = sqlx::query(
+                                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+                                 VALUES ($1, $2, $3, $4, $5, NOW())"
+                            )
+                            .bind(&sym)
+                            .bind(buy_oid)
+                            .bind(sell_oid)
+                            .bind(price)
+                            .bind(quantity)
+                            .execute(db2.as_ref())
+                            .await;
+                        });
                     }
 
                     // Process depth snapshots — update cache and broadcast to WS.

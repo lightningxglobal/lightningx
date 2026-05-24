@@ -325,10 +325,6 @@ impl MatchingEngine {
             return Err(MatchingEngineError::OrderPoolExhausted);
         }
 
-        // 分配订单ID
-        order.id = self.next_order_id;
-        self.next_order_id += 1;
-
         self.affected_makers_buf.clear();
 
         // 处理市价单或限价单
@@ -361,8 +357,6 @@ impl MatchingEngine {
             if !self.pools.has_space_for_order() {
                 return Err(MatchingEngineError::OrderPoolExhausted);
             }
-            order.id = self.next_order_id;
-            self.next_order_id += 1;
         }
 
         // 批量处理订单，使用内部affected_makers缓冲区
@@ -674,10 +668,34 @@ impl MatchingEngine {
                     Some(&pool_idx) => {
                         match self.pools.orders.get(pool_idx) {
                             Some(o) => *o,
-                            None => break,
+                            None => {
+                                // Pool slot invalid: stale entry. Clean up and try next.
+                                let opp = match order.side {
+                                    Side::Buy => &mut self.sell_book,
+                                    Side::Sell => &mut self.buy_book,
+                                };
+                                let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                                self.orders.remove(&counter_order_id);
+                                if opp.get_node_at_price(best_price).map(|n| n.orders.is_empty()).unwrap_or(true) {
+                                    let _ = opp.remove_level(best_price);
+                                }
+                                continue;
+                            }
                         }
                     }
-                    None => break,
+                    None => {
+                        // ID in price-level list but not in self.orders (zombie from failed cancel).
+                        // Remove the stale list entry and continue to the next order.
+                        let opp = match order.side {
+                            Side::Buy => &mut self.sell_book,
+                            Side::Sell => &mut self.buy_book,
+                        };
+                        let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                        if opp.get_node_at_price(best_price).map(|n| n.orders.is_empty()).unwrap_or(true) {
+                            let _ = opp.remove_level(best_price);
+                        }
+                        continue;
+                    }
                 };
 
                 // 计算成交数量
@@ -893,10 +911,31 @@ impl MatchingEngine {
                         Some(&pool_idx) => {
                             match self.pools.orders.get(pool_idx) {
                                 Some(o) => *o,
-                                None => break,
+                                None => {
+                                    let opp = match order.side {
+                                        Side::Buy => &mut self.sell_book,
+                                        Side::Sell => &mut self.buy_book,
+                                    };
+                                    let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                                    self.orders.remove(&counter_order_id);
+                                    if opp.get_node_at_price(best_price).map(|n| n.orders.is_empty()).unwrap_or(true) {
+                                        let _ = opp.remove_level(best_price);
+                                    }
+                                    continue;
+                                }
                             }
                         }
-                        None => break,
+                        None => {
+                            let opp = match order.side {
+                                Side::Buy => &mut self.sell_book,
+                                Side::Sell => &mut self.buy_book,
+                            };
+                            let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                            if opp.get_node_at_price(best_price).map(|n| n.orders.is_empty()).unwrap_or(true) {
+                                let _ = opp.remove_level(best_price);
+                            }
+                            continue;
+                        }
                     };
 
                     let order_remaining = order.quantity - filled;
@@ -1135,9 +1174,8 @@ impl MatchingEngine {
         };
 
         // 从价格档位的订单队列中移除此订单
-        let _ = book.remove_order_at_level(order.price, order_id);
-
-        Ok(())
+        book.remove_order_at_level(order.price, order_id)
+            .map_err(|_| MatchingEngineError::OrderNotFound)
     }
 
     /// 生成市场深度快照

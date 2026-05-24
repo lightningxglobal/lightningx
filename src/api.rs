@@ -631,7 +631,10 @@ async fn handle_cancel_order(
 
     // Best-effort cancel in engine for this symbol.
     if let Some(engine) = s.engines.get(&symbol) {
-        let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+        let res = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+        if let Err(e) = res {
+            tracing::warn!("engine cancel_order({}) failed: {:?}", order_id, e);
+        }
     }
 
     // Release frozen funds for the unfilled portion.
@@ -902,7 +905,7 @@ async fn handle_robot_funds(
         "INSERT INTO accounts (user_id, asset, balance, frozen)
          VALUES ($1, 'USDT', 50000, 0), ($1, 'BTC', 5, 0), ($1, 'ETH', 500, 0), ($1, 'SOL', 50000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = GREATEST(accounts.balance, EXCLUDED.balance), updated_at = NOW()",
+         SET balance = GREATEST(accounts.balance, EXCLUDED.balance), frozen = 0, updated_at = NOW()",
     )
     .bind(user_id)
     .execute(s.db.as_ref())

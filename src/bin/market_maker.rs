@@ -376,13 +376,13 @@ async fn refresh_book(
     client: &WsExchangeClient,
     bids: &[(f64, f64)],
     asks: &[(f64, f64)],
-    bid_book: &mut HashMap<u64, i64>,
-    ask_book: &mut HashMap<u64, i64>,
+    bid_book: &mut HashMap<u64, (i64, f64)>,
+    ask_book: &mut HashMap<u64, (i64, f64)>,
     cycle: u32,
 ) {
     // Prune orders that the engine filled or canceled — they need to be re-placed.
-    bid_book.retain(|_, id| client.dead_orders.remove(id).is_none());
-    ask_book.retain(|_, id| client.dead_orders.remove(id).is_none());
+    bid_book.retain(|_, (id, _)| client.dead_orders.remove(id).is_none());
+    ask_book.retain(|_, (id, _)| client.dead_orders.remove(id).is_none());
 
     // Periodically clear any CANCELED echoes we already removed from bid/ask_book
     // (cancel_order is fire-and-forget; the CANCELED event still arrives for it).
@@ -404,22 +404,38 @@ async fn refresh_book(
         .map(|&(p, q)| (p, round_qty((q * QTY_SCALE).max(cfg.min_qty), cfg.min_qty)))
         .collect();
 
-    // Diff.
-    let desired_bid_keys: HashSet<u64> = desired_bids.iter().map(|(p, _)| p.to_bits()).collect();
-    let desired_ask_keys: HashSet<u64> = desired_asks.iter().map(|(p, _)| p.to_bits()).collect();
+    // Diff: cancel levels absent from desired, or whose qty drifted >15%.
+    const QTY_DRIFT: f64 = 0.15;
+
+    let desired_bid_map: HashMap<u64, f64> = desired_bids.iter().map(|(p, q)| (p.to_bits(), *q)).collect();
+    let desired_ask_map: HashMap<u64, f64> = desired_asks.iter().map(|(p, q)| (p.to_bits(), *q)).collect();
 
     let bid_cancels: Vec<i64> = bid_book.iter()
-        .filter(|(k, _)| !desired_bid_keys.contains(k))
-        .map(|(_, &id)| id).collect();
+        .filter(|(k, (_, pq))| match desired_bid_map.get(k) {
+            None => true,
+            Some(dq) => (dq - pq).abs() / pq > QTY_DRIFT,
+        })
+        .map(|(_, (id, _))| *id).collect();
     let ask_cancels: Vec<i64> = ask_book.iter()
-        .filter(|(k, _)| !desired_ask_keys.contains(k))
-        .map(|(_, &id)| id).collect();
+        .filter(|(k, (_, pq))| match desired_ask_map.get(k) {
+            None => true,
+            Some(dq) => (dq - pq).abs() / pq > QTY_DRIFT,
+        })
+        .map(|(_, (id, _))| *id).collect();
+
+    // Prices being cancelled so they can be re-placed with updated qty.
+    let bid_cancel_prices: HashSet<u64> = bid_book.iter()
+        .filter(|(_, (id, _))| bid_cancels.contains(id))
+        .map(|(k, _)| *k).collect();
+    let ask_cancel_prices: HashSet<u64> = ask_book.iter()
+        .filter(|(_, (id, _))| ask_cancels.contains(id))
+        .map(|(k, _)| *k).collect();
 
     let bid_adds: Vec<(f64, f64)> = desired_bids.iter()
-        .filter(|(p, _)| !bid_book.contains_key(&p.to_bits()))
+        .filter(|(p, _)| !bid_book.contains_key(&p.to_bits()) || bid_cancel_prices.contains(&p.to_bits()))
         .copied().collect();
     let ask_adds: Vec<(f64, f64)> = desired_asks.iter()
-        .filter(|(p, _)| !ask_book.contains_key(&p.to_bits()))
+        .filter(|(p, _)| !ask_book.contains_key(&p.to_bits()) || ask_cancel_prices.contains(&p.to_bits()))
         .copied().collect();
 
     if bid_cancels.is_empty() && ask_cancels.is_empty()
@@ -444,14 +460,14 @@ async fn refresh_book(
     );
 
     // Update local books.
-    bid_book.retain(|_, id| !bid_cancels.contains(id));
-    ask_book.retain(|_, id| !ask_cancels.contains(id));
+    bid_book.retain(|_, (id, _)| !bid_cancels.contains(id));
+    ask_book.retain(|_, (id, _)| !ask_cancels.contains(id));
 
-    for ((p, _), result) in bid_adds.iter().zip(bid_results) {
-        if let Some(id) = result { bid_book.insert(p.to_bits(), id); }
+    for ((p, q), result) in bid_adds.iter().zip(bid_results) {
+        if let Some(id) = result { bid_book.insert(p.to_bits(), (id, *q)); }
     }
-    for ((p, _), result) in ask_adds.iter().zip(ask_results) {
-        if let Some(id) = result { ask_book.insert(p.to_bits(), id); }
+    for ((p, q), result) in ask_adds.iter().zip(ask_results) {
+        if let Some(id) = result { ask_book.insert(p.to_bits(), (id, *q)); }
     }
 
     info!(
@@ -466,10 +482,8 @@ async fn refresh_book(
 // ── Per-symbol WebSocket loop ─────────────────────────────────────────────────
 
 async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
-    let mut bid_book: HashMap<u64, i64> = HashMap::new();
-    let mut ask_book: HashMap<u64, i64> = HashMap::new();
-    let mut last_bid: f64 = 0.0;
-    let mut last_ask: f64 = 0.0;
+    let mut bid_book: HashMap<u64, (i64, f64)> = HashMap::new();
+    let mut ask_book: HashMap<u64, (i64, f64)> = HashMap::new();
     let mut cycle: u32 = 0;
     let mut reconnect_delay = Duration::from_secs(1);
 
@@ -506,15 +520,6 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
             let asks = parse_levels(&depth.asks);
             if bids.is_empty() || asks.is_empty() { continue; }
 
-            let best_bid = bids[0].0;
-            let best_ask = asks[0].0;
-
-            // Only run a diff when the BBO moves — stable ticks cost nothing.
-            if (best_bid - last_bid).abs() < 1e-9 && (best_ask - last_ask).abs() < 1e-9 {
-                continue;
-            }
-            last_bid = best_bid;
-            last_ask = best_ask;
             cycle = cycle.wrapping_add(1);
 
             refresh_book(cfg, &client, &bids, &asks, &mut bid_book, &mut ask_book, cycle).await;
@@ -531,8 +536,6 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
         } else {
             warn!("[{}] Binance WS disconnected, reconnecting in {reconnect_delay:?}…", cfg.our_symbol);
         }
-        last_bid = 0.0;
-        last_ask = 0.0;
         tokio::time::sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
     }

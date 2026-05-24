@@ -333,6 +333,7 @@ mod tests {
             side: 0,
             time_in_force: 0,
             _pad: [0; 14],
+            symbol: [0; 16],
         };
 
         subscriber.tx.send(InboundMsg::NewOrder(req)).unwrap();

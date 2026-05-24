@@ -165,9 +165,6 @@ async fn main() -> anyhow::Result<()> {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_micros() as u64)
                                     .unwrap_or(0);
-                                // We don't have symbol in DepthSnapshotEvent; broadcast as "unknown"
-                                // until multi-symbol routing is implemented in exchange_engine.
-                                // For now, peek at last_depth to derive symbol.
                                 let bids: Vec<[f64; 2]> = evt.bids[..evt.num_bids as usize]
                                     .iter()
                                     .filter(|(_, q)| *q > 0.0)
@@ -178,10 +175,11 @@ async fn main() -> anyhow::Result<()> {
                                     .filter(|(_, q)| *q > 0.0)
                                     .map(|&(p, q)| [p, q])
                                     .collect();
-                                // Use first known symbol as fallback for single-symbol MVP.
-                                let symbol = last_depth.iter().next()
-                                    .map(|e| e.key().clone())
-                                    .unwrap_or_else(|| "ETH_USDT".to_string());
+                                let end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                                let symbol = std::str::from_utf8(&evt.symbol[..end])
+                                    .unwrap_or("ETH_USDT")
+                                    .to_string();
+                                let symbol = if symbol.is_empty() { "ETH_USDT".to_string() } else { symbol };
                                 let depth_json = serde_json::json!({
                                     "type": "depth",
                                     "symbol": symbol,

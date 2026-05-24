@@ -52,9 +52,10 @@ pub struct NewOrderRequest {
     pub side: u8,           // 0=Buy, 1=Sell
     pub time_in_force: u8,  // 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
     pub _pad: [u8; 14],
+    pub symbol: [u8; 16],
 }
 
-static_assertions::const_assert_eq!(std::mem::size_of::<NewOrderRequest>(), 48);
+static_assertions::const_assert_eq!(std::mem::size_of::<NewOrderRequest>(), 64);
 
 // Inbound: 撤销委托
 #[repr(C, packed)]
@@ -159,14 +160,14 @@ pub fn encode_new_order(msg: &NewOrderRequest, buf: &mut [u8]) -> Result<usize, 
     }
 
     // 写 header
-    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_NEW_ORDER, 48));
+    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_NEW_ORDER, 64));
     // 写消息体
     let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const NewOrderRequest as *const u8, 48)
+        std::slice::from_raw_parts(msg as *const NewOrderRequest as *const u8, 64)
     };
-    buf[8..56].copy_from_slice(msg_bytes);
+    buf[8..72].copy_from_slice(msg_bytes);
 
-    Ok(56)
+    Ok(72)
 }
 
 pub fn encode_cancel_order(msg: &CancelOrderRequest, buf: &mut [u8]) -> Result<usize, ()> {
@@ -289,7 +290,7 @@ pub fn decode_header(buf: &[u8]) -> Option<SbeHeader> {
 }
 
 pub fn decode_new_order(buf: &[u8]) -> Option<NewOrderRequest> {
-    if buf.len() < 8 + 48 {
+    if buf.len() < 8 + 64 {
         return None;
     }
     unsafe {
@@ -326,11 +327,12 @@ mod tests {
             side: 0,  // Buy
             time_in_force: 0,  // GTC
             _pad: [0; 14],
+            symbol: [0; 16],
         };
 
         let mut buf = [0u8; 256];
         let encoded_len = encode_new_order(&req, &mut buf).expect("encode failed");
-        assert_eq!(encoded_len, 56);
+        assert_eq!(encoded_len, 72);
 
         // 验证消息体 - 通过raw bytes验证以避免packed struct对齐问题
         let _decoded = decode_new_order(&buf).expect("decode failed");
@@ -390,6 +392,7 @@ mod tests {
             side: 0,
             time_in_force: 0,
             _pad: [0; 14],
+            symbol: [0; 16],
         };
 
         let mut buf = [0u8; 30];  // too small

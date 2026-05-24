@@ -600,6 +600,11 @@ async fn handle_place_order(
             TimeInForce::FOK      => 2,
             TimeInForce::PostOnly => 3,
         };
+        let mut sym_bytes = [0u8; 16];
+        let sb = req.symbol.as_bytes();
+        let copy_len = sb.len().min(16);
+        sym_bytes[..copy_len].copy_from_slice(&sb[..copy_len]);
+
         let sbe_req = SbeNewOrder {
             client_order_id: db_order_id as u64,
             participant_id: user_id as u64,
@@ -608,6 +613,7 @@ async fn handle_place_order(
             side: side_byte,
             time_in_force: tif_byte,
             _pad: [0; 14],
+            symbol: sym_bytes,
         };
 
         let (tx, rx) = oneshot::channel::<OrderUpdateMsg>();

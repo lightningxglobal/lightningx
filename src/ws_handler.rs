@@ -460,6 +460,7 @@ async fn handle_client_message(
                     side: side_byte,
                     time_in_force: tif_byte,
                     _pad: [0; 14],
+                    symbol: [0; 16],
                 };
 
                 let (tx, rx) = oneshot::channel::<crate::transport::OrderUpdateMsg>();

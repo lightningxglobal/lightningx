@@ -14,7 +14,10 @@ use tracing::{info, warn};
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const EXCHANGE_URL: &str = "http://localhost:4001";
+// Desk server endpoint; override with EXCHANGE_URL env var.
+fn exchange_url() -> String {
+    std::env::var("EXCHANGE_URL").unwrap_or_else(|_| "http://localhost:4003".to_string())
+}
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
 
@@ -334,7 +337,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("LightningX Market Maker starting…");
 
-    let client = ExchangeClient::new(EXCHANGE_URL);
+    let client = ExchangeClient::new(&exchange_url());
 
     // Authenticate
     let mut attempts = 0u32;

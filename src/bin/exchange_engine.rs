@@ -7,15 +7,40 @@ use lightning_exchange::{
         TRADE_CHANNEL, TRADE_STREAM,
         DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
     },
-    aeron_transport::{AeronOrderSubscriber, AeronOrderUpdatePublisher, AeronTradePublisher, AeronMarketDataPublisher},
+    aeron_transport::{
+        AeronOrderSubscriber, AeronOrderUpdatePublisher,
+        AeronTradePublisher, AeronMarketDataPublisher,
+    },
     db,
-    engine::{MatchingEngine, PoolConfig},
+    engine::{MatchingEngine, OrderStatus, PoolConfig},
+    market_data::DepthSnapshotEvent,
     models::DbOrder,
     order::{Order, Side, TimeInForce},
-    trading_engine::{TradingConfig, TradingEngine},
+    sbe::TradeNotification,
+    transport::{
+        InboundMsg, MarketDataPublisher, OrderSubscriber, OrderUpdateMsg, OrderUpdatePublisher,
+        TradePublisher,
+    },
 };
 use aeron_wrapper::AeronClient;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+fn symbol_bytes(symbol: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let bytes = symbol.as_bytes();
+    let copy_len = bytes.len().min(16);
+    out[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    out
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -70,13 +95,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Restore active limit orders from DB into a single MatchingEngine per symbol.
-    // For this single-engine design, all symbols share one engine; the desk_server
-    // already routes by symbol at the DB/WS layer, so the matching engine itself
-    // is symbol-agnostic (it holds price levels, not symbols).
-    // NOTE: multi-symbol routing via Aeron is handled at the desk layer; for now
-    // we start one engine instance and accept all orders on a single stream.
-    let mut engines: std::collections::HashMap<String, MatchingEngine> = symbols
+    // Restore active limit orders from DB into a per-symbol MatchingEngine.
+    let mut engines: HashMap<String, MatchingEngine> = symbols
         .iter()
         .map(|s| {
             let eng = MatchingEngine::new(PoolConfig::default()).expect("failed to create engine");
@@ -91,15 +111,11 @@ async fn main() -> anyhow::Result<()> {
     .await
     .unwrap_or_default();
 
-    let mut max_id: u64 = 0;
     let mut restored = 0usize;
     let mut skipped = 0usize;
 
     for db_order in &rows {
         let order_id = db_order.id as u64;
-        if order_id > max_id {
-            max_id = order_id;
-        }
 
         if db_order.order_type == "market"
             || (db_order.order_type == "ioc" && db_order.price.is_none())
@@ -180,57 +196,235 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // DB access ends here. Engines are moved into TradingEngine below.
+    // DB access ends here.
     drop(pool);
 
-    // For now: start one TradingEngine per symbol, each on its own Aeron stream.
-    // The desk_server must route by symbol; this is a single-symbol MVP binding.
-    // Multi-symbol multiplexing can be added later without changing the engine.
-    //
-    // We use the first symbol's engine as the primary for the Aeron subscription.
-    // TODO: per-symbol Aeron streams when desk_server supports symbol routing.
-    let primary_symbol = symbols.first().map(|s| s.as_str()).unwrap_or("ETH_USDT");
-    let primary_engine = engines
-        .remove(primary_symbol)
-        .unwrap_or_else(|| MatchingEngine::new(PoolConfig::default()).expect("engine"));
-
+    // ----- Aeron setup ---------------------------------------------------
     let client = Arc::new(
         AeronClient::new(AERON_DIR).map_err(|e| anyhow::anyhow!("Aeron init failed: {:?}", e))?,
     );
 
-    let subscriber = Box::new(
-        AeronOrderSubscriber::new(client.clone(), ORDERS_CHANNEL, ORDERS_STREAM)
-            .map_err(|e| anyhow::anyhow!("subscriber: {}", e))?,
-    );
-    let ou_pub = Box::new(
-        AeronOrderUpdatePublisher::new(client.clone(), ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM)
-            .map_err(|e| anyhow::anyhow!("ou_pub: {}", e))?,
-    );
-    let trade_pub = Box::new(
-        AeronTradePublisher::new(client.clone(), TRADE_CHANNEL, TRADE_STREAM)
-            .map_err(|e| anyhow::anyhow!("trade_pub: {}", e))?,
-    );
-    let md_pub = Box::new(
-        AeronMarketDataPublisher::new(
-            client.clone(),
-            DEPTH_CHANNEL,
-            DEPTH_STREAM,
-            DEPTH50_STREAM,
-            LEVEL2_STREAM,
-        )
-        .map_err(|e| anyhow::anyhow!("md_pub: {}", e))?,
+    let mut subscriber = AeronOrderSubscriber::new(client.clone(), ORDERS_CHANNEL, ORDERS_STREAM)
+        .map_err(|e| anyhow::anyhow!("subscriber: {}", e))?;
+    let mut ou_pub = AeronOrderUpdatePublisher::new(
+        client.clone(),
+        ORDER_UPDATE_CHANNEL,
+        ORDER_UPDATE_STREAM,
+    )
+    .map_err(|e| anyhow::anyhow!("ou_pub: {}", e))?;
+    let mut trade_pub = AeronTradePublisher::new(client.clone(), TRADE_CHANNEL, TRADE_STREAM)
+        .map_err(|e| anyhow::anyhow!("trade_pub: {}", e))?;
+    let mut md_pub = AeronMarketDataPublisher::new(
+        client.clone(),
+        DEPTH_CHANNEL,
+        DEPTH_STREAM,
+        DEPTH50_STREAM,
+        LEVEL2_STREAM,
+    )
+    .map_err(|e| anyhow::anyhow!("md_pub: {}", e))?;
+
+    tracing::info!(
+        "Exchange engine started (symbols={:?}, engines={})",
+        symbols,
+        engines.len()
     );
 
-    let engine = TradingEngine::with_engine(primary_engine, TradingConfig::default());
-    let (matching_thread, publishing_thread) = engine.run(subscriber, ou_pub, trade_pub, md_pub);
+    // ----- Matching thread (dedicated OS thread, spin loop, no tokio) ----
+    let symbols_for_thread = symbols.clone();
+    let matching_thread = std::thread::Builder::new()
+        .name("matching".to_string())
+        .spawn(move || {
+            let mut trade_seq: u64 = 0;
+            let mut depth_seq: u64 = 0;
 
-    tracing::info!("Exchange engine started (symbol={})", primary_symbol);
+            let depth_interval = Duration::from_millis(10);
+            let start = Instant::now();
+            let mut last_depth_pub: HashMap<String, Instant> = symbols_for_thread
+                .iter()
+                .map(|s| (s.clone(), start))
+                .collect();
+
+            loop {
+                // do_work first (per Aeron official pattern)
+                subscriber.do_work();
+                ou_pub.do_work();
+                trade_pub.do_work();
+                md_pub.do_work();
+
+                // Drain queued inbound messages
+                while let Some(msg) = subscriber.poll() {
+                    match msg {
+                        InboundMsg::NewOrder(req) => {
+                            let ts = now_ns();
+                            let symbol = std::str::from_utf8(&req.symbol)
+                                .unwrap_or("")
+                                .trim_end_matches('\0')
+                                .to_string();
+
+                            let engine = match engines.get_mut(&symbol) {
+                                Some(eng) => eng,
+                                None => {
+                                    let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        1, // reason: unknown symbol
+                                        ts,
+                                    ));
+                                    continue;
+                                }
+                            };
+
+                            let side = if req.side == 0 { Side::Buy } else { Side::Sell };
+                            let tif = match req.time_in_force {
+                                0 => TimeInForce::GTC,
+                                1 => TimeInForce::IOC,
+                                2 => TimeInForce::FOK,
+                                3 => TimeInForce::PostOnly,
+                                _ => TimeInForce::GTC,
+                            };
+                            let order = if req.price == 0.0 {
+                                Order::new_market(req.client_order_id, side, req.quantity, ts)
+                            } else {
+                                Order::new(req.client_order_id, side, req.price, req.quantity, tif, ts)
+                            };
+
+                            match engine.place_order(order) {
+                                Err(_) => {
+                                    let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        2, // reason: engine error
+                                        ts,
+                                    ));
+                                }
+                                Ok(result) => {
+                                    // Publish per-fill trade notifications.
+                                    let sym_bytes = symbol_bytes(&symbol);
+                                    for &(maker_order_id, fill_price, fill_qty) in &result.fills {
+                                        trade_seq += 1;
+                                        let trade = TradeNotification {
+                                            sequence: trade_seq,
+                                            taker_order_id: req.client_order_id,
+                                            maker_order_id,
+                                            price: fill_price,
+                                            quantity: fill_qty,
+                                            side: req.side,
+                                            _pad: [0; 7],
+                                            symbol: sym_bytes,
+                                        };
+                                        let _ = trade_pub.publish(&trade);
+                                    }
+
+                                    // Publish a single OrderUpdateMsg reflecting the final status.
+                                    let last_price = result
+                                        .fills
+                                        .last()
+                                        .map(|f| f.1)
+                                        .unwrap_or(req.price);
+                                    let update = match result.status {
+                                        OrderStatus::Accepted => OrderUpdateMsg::accepted(
+                                            result.order_id,
+                                            req.client_order_id,
+                                            req.participant_id,
+                                            ts,
+                                        ),
+                                        OrderStatus::Filled => OrderUpdateMsg::filled(
+                                            result.order_id,
+                                            req.client_order_id,
+                                            req.participant_id,
+                                            last_price,
+                                            result.filled,
+                                            ts,
+                                        ),
+                                        OrderStatus::PartiallyFilled => {
+                                            let remaining = req.quantity - result.filled;
+                                            OrderUpdateMsg::partial_fill(
+                                                result.order_id,
+                                                req.client_order_id,
+                                                req.participant_id,
+                                                last_price,
+                                                result.filled,
+                                                remaining,
+                                                ts,
+                                            )
+                                        }
+                                        OrderStatus::Cancelled => OrderUpdateMsg::cancelled(
+                                            result.order_id,
+                                            req.client_order_id,
+                                            req.participant_id,
+                                            req.quantity - result.filled,
+                                            ts,
+                                        ),
+                                        OrderStatus::Rejected => OrderUpdateMsg::rejected(
+                                            req.client_order_id,
+                                            req.participant_id,
+                                            3,
+                                            ts,
+                                        ),
+                                    };
+                                    let _ = ou_pub.publish(&update);
+                                }
+                            }
+                        }
+                        InboundMsg::CancelOrder(req) => {
+                            let ts = now_ns();
+                            let mut cancelled_qty = 0.0;
+                            let mut found = false;
+                            for eng in engines.values_mut() {
+                                if let Ok(res) = eng.cancel_order(req.order_id) {
+                                    cancelled_qty = res.cancelled_quantity;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if found {
+                                let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
+                                    req.order_id,
+                                    0,
+                                    0,
+                                    cancelled_qty,
+                                    ts,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Per-symbol depth snapshot every 10ms.
+                let now_instant = Instant::now();
+                for (symbol, engine) in engines.iter() {
+                    let last = last_depth_pub.get(symbol).copied().unwrap_or(now_instant);
+                    if now_instant.duration_since(last) >= depth_interval {
+                        if let Some(slot) = last_depth_pub.get_mut(symbol) {
+                            *slot = now_instant;
+                        }
+                        depth_seq += 1;
+                        let mut snap = DepthSnapshotEvent::new(now_ns(), depth_seq);
+                        snap.symbol = symbol_bytes(symbol);
+
+                        // get_top_levels(limit, is_buy): true = buy_book (bids), false = sell_book (asks)
+                        let bids = engine.get_top_levels(20, true);
+                        let asks = engine.get_top_levels(20, false);
+                        for (i, (p, q)) in bids.iter().take(20).enumerate() {
+                            snap.bids[i] = (*p, *q);
+                        }
+                        for (i, (p, q)) in asks.iter().take(20).enumerate() {
+                            snap.asks[i] = (*p, *q);
+                        }
+                        snap.num_bids = bids.len().min(20) as u8;
+                        snap.num_asks = asks.len().min(20) as u8;
+
+                        let _ = md_pub.publish_depth(&snap);
+                    }
+                }
+
+                std::hint::spin_loop();
+            }
+        })?;
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutting down exchange engine...");
-
     matching_thread.thread().unpark();
-    publishing_thread.thread().unpark();
 
     Ok(())
 }

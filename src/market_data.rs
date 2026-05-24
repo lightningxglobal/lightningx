@@ -1655,7 +1655,8 @@ pub struct DepthSnapshotEvent {
     pub sequence: u64,            // 快照序列号
     pub num_bids: u8,             // 实际bid档位数 (≤20)
     pub num_asks: u8,             // 实际ask档位数 (≤20)
-    _pad1: [u8; 62],              // 填充至64字节对齐
+    pub symbol: [u8; 16],
+    _pad1: [u8; 46],              // 填充至64字节对齐
     pub bids: [(f64, f64); 20],   // (price, quantity)，从高到低排序
     pub asks: [(f64, f64); 20],   // (price, quantity)，从低到高排序
 }
@@ -1667,7 +1668,8 @@ impl DepthSnapshotEvent {
             sequence,
             num_bids: 0,
             num_asks: 0,
-            _pad1: [0; 62],
+            symbol: [0u8; 16],
+            _pad1: [0u8; 46],
             bids: [(0.0, 0.0); 20],
             asks: [(0.0, 0.0); 20],
         }

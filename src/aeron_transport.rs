@@ -44,8 +44,8 @@ impl PollCallback for OrderInboundCallback {
 
         match template_id {
             1 => {
-                // NewOrderRequest: header(8) + body(48) = 56字节
-                if data.len() >= 56 {
+                // NewOrderRequest: header(8) + body(64) = 72字节
+                if data.len() >= 72 {
                     unsafe {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const NewOrderRequest
@@ -64,7 +64,7 @@ impl PollCallback for OrderInboundCallback {
                         info!("[OrderInboundCallback] ✅ NewOrder enqueued (queue size={})", queue.len());
                     }
                 } else {
-                    info!("[OrderInboundCallback] ❌ NewOrderRequest too short: {} < 56", data.len());
+                    info!("[OrderInboundCallback] ❌ NewOrderRequest too short: {} < 72", data.len());
                 }
             }
             2 => {
@@ -425,7 +425,7 @@ impl DeskOrderPublisher {
     }
 
     pub fn publish_new_order(&mut self, req: &crate::sbe::NewOrderRequest) -> Result<(), crate::transport::TransportError> {
-        let mut data = [0u8; 56]; // 8 header + 48 body
+        let mut data = [0u8; 72]; // 8 header + 64 body
         crate::sbe::encode_new_order(req, &mut data).map_err(|_| crate::transport::TransportError::BackPressured)?;
 
         loop {

@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         depth_ring: 1024,
         depth50_ring: 256,
         level2_ring: 64,
+        symbol: String::new(),
     };
 
     info!("✓ 配置完成");

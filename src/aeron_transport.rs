@@ -256,20 +256,20 @@ impl TradePublisher for AeronTradePublisher {
     }
 
     fn publish(&mut self, msg: &TradeNotification) -> Result<(), TransportError> {
-        // Create SBE-encoded message: 8-byte header + 48-byte body = 56 bytes
-        let mut data = vec![0u8; 56];
+        // Create SBE-encoded message: 8-byte header + 64-byte body = 72 bytes
+        let mut data = vec![0u8; 72];
 
         // SBE Header (8 bytes)
-        data[0..2].copy_from_slice(&48u16.to_le_bytes());   // block_length = 48 (message body size)
-        data[2..4].copy_from_slice(&3u16.to_le_bytes());    // template_id = 3 (Trade)
+        data[0..2].copy_from_slice(&64u16.to_le_bytes());   // block_length = 64 (message body size)
+        data[2..4].copy_from_slice(&20u16.to_le_bytes());   // template_id = 20 (TEMPLATE_TRADE_NOTIFICATION)
         data[4..6].copy_from_slice(&1u16.to_le_bytes());    // schema_id = 1
         data[6..8].copy_from_slice(&0u16.to_le_bytes());    // version = 0
 
         // Copy TradeNotification directly into body
         let msg_bytes = unsafe {
-            std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 48)
+            std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 64)
         };
-        data[8..56].copy_from_slice(msg_bytes);
+        data[8..72].copy_from_slice(msg_bytes);
 
         loop {
             match self.publisher.send(&data) {

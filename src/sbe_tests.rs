@@ -100,7 +100,7 @@ mod sbe_encoding_tests {
         assert_eq!(timestamp_parsed, 1234567890);
     }
 
-    // Test Trade SBE encoding (with header)
+    // Test Trade SBE encoding (with header): 8-byte header + 64-byte body = 72 bytes
     #[test]
     fn test_trade_sbe_encoding_with_header() {
         let msg = TradeNotification {
@@ -111,27 +111,27 @@ mod sbe_encoding_tests {
             quantity: 15.0,
             side: 1, // SELL
             _pad: [0; 7],
-            symbol: [0; 16],
+            symbol: *b"ETH_USDT\0\0\0\0\0\0\0\0",
         };
 
         // Simulate server-side encoding
-        let mut data = vec![0u8; 56]; // 8-byte header + 48-byte body
+        let mut data = vec![0u8; 72]; // 8-byte header + 64-byte body
 
         // SBE Header
-        data[0..2].copy_from_slice(&48u16.to_le_bytes());
-        data[2..4].copy_from_slice(&3u16.to_le_bytes()); // template_id = 3
+        data[0..2].copy_from_slice(&64u16.to_le_bytes());
+        data[2..4].copy_from_slice(&20u16.to_le_bytes()); // template_id = 20 (TEMPLATE_TRADE_NOTIFICATION)
         data[4..6].copy_from_slice(&1u16.to_le_bytes());
         data[6..8].copy_from_slice(&0u16.to_le_bytes());
 
         // Copy TradeNotification
         let msg_bytes = unsafe {
-            std::slice::from_raw_parts(&msg as *const TradeNotification as *const u8, 48)
+            std::slice::from_raw_parts(&msg as *const TradeNotification as *const u8, 64)
         };
-        data[8..56].copy_from_slice(msg_bytes);
+        data[8..72].copy_from_slice(msg_bytes);
 
         // Verify header
-        assert_eq!(u16::from_le_bytes([data[0], data[1]]), 48);
-        assert_eq!(u16::from_le_bytes([data[2], data[3]]), 3); // template_id
+        assert_eq!(u16::from_le_bytes([data[0], data[1]]), 64);
+        assert_eq!(u16::from_le_bytes([data[2], data[3]]), 20); // template_id
 
         // Verify body
         let sequence = u64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -149,15 +149,15 @@ mod sbe_encoding_tests {
         assert_eq!(side, 1);
     }
 
-    // Test Trade SBE decoding (client-side)
+    // Test Trade SBE decoding (client-side): 8-byte header + 64-byte body = 72 bytes
     #[test]
     fn test_trade_sbe_decoding_with_header() {
         // Simulate received message
-        let mut data = vec![0u8; 56];
+        let mut data = vec![0u8; 72];
 
         // Header
-        data[0..2].copy_from_slice(&48u16.to_le_bytes());
-        data[2..4].copy_from_slice(&3u16.to_le_bytes());
+        data[0..2].copy_from_slice(&64u16.to_le_bytes());
+        data[2..4].copy_from_slice(&20u16.to_le_bytes());
         data[4..6].copy_from_slice(&1u16.to_le_bytes());
         data[6..8].copy_from_slice(&0u16.to_le_bytes());
 
@@ -173,6 +173,10 @@ mod sbe_encoding_tests {
         let quantity: f64 = 15.0;
         data[40..48].copy_from_slice(&quantity.to_le_bytes());
         data[48] = 1; // side = SELL
+        // bytes 49..56 = _pad
+        // bytes 56..72 = symbol
+        let sym = b"ETH_USDT\0\0\0\0\0\0\0\0";
+        data[56..72].copy_from_slice(sym);
 
         // Client-side parsing
         let sequence_parsed = u64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -181,6 +185,7 @@ mod sbe_encoding_tests {
         let price_parsed = f64::from_le_bytes(data[32..40].try_into().unwrap());
         let quantity_parsed = f64::from_le_bytes(data[40..48].try_into().unwrap());
         let side_parsed = data[48];
+        let symbol_parsed = &data[56..72];
 
         assert_eq!(sequence_parsed, 0);
         assert_eq!(taker_order_id_parsed, 3);
@@ -188,6 +193,7 @@ mod sbe_encoding_tests {
         assert_eq!(price_parsed, 50000.0);
         assert_eq!(quantity_parsed, 15.0);
         assert_eq!(side_parsed, 1);
+        assert_eq!(symbol_parsed, b"ETH_USDT\0\0\0\0\0\0\0\0");
     }
 
     // Test that message sizes are correct
@@ -197,7 +203,7 @@ mod sbe_encoding_tests {
         assert_eq!(std::mem::size_of::<TradeNotification>(), 64);
     }
 
-    // Test full round-trip: create → encode → decode → verify
+    // Test full round-trip: create -> encode -> decode -> verify
     #[test]
     fn test_orderupdate_roundtrip() {
         let original = OrderUpdateMsg {

@@ -3,6 +3,7 @@
 //! 基于跳表的极高频交易撮合引擎，支持GTC、IOC、FOK、Post-Only四种委托类型。
 //! 单线程无锁设计，目标TPS > 6,000,000，延迟 < 3微秒。
 
+pub mod aeron_channels;
 pub mod order;
 pub mod trade;
 pub mod error;

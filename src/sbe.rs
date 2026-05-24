@@ -134,9 +134,11 @@ pub struct TradeNotification {
     pub quantity: f64,
     pub side: u8,  // taker side: 0=Buy, 1=Sell
     pub _pad: [u8; 7],
+    /// Symbol as null-padded ASCII, e.g. b"ETH_USDT\0\0\0\0\0\0\0\0"
+    pub symbol: [u8; 16],
 }
 
-static_assertions::const_assert_eq!(std::mem::size_of::<TradeNotification>(), 48);
+static_assertions::const_assert_eq!(std::mem::size_of::<TradeNotification>(), 64);
 
 // ============================================================================
 // 编码函数 (消息体 → 字节)
@@ -263,13 +265,13 @@ pub fn encode_trade_notification(msg: &TradeNotification, buf: &mut [u8]) -> Res
         return Err(());
     }
 
-    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_TRADE_NOTIFICATION, 48));
+    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_TRADE_NOTIFICATION, 64));
     let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 48)
+        std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 64)
     };
-    buf[8..56].copy_from_slice(msg_bytes);
+    buf[8..72].copy_from_slice(msg_bytes);
 
-    Ok(56)
+    Ok(72)
 }
 
 // ============================================================================
@@ -365,11 +367,12 @@ mod tests {
             quantity: 50.0,
             side: 0,  // Buy
             _pad: [0; 7],
+            symbol: *b"ETH_USDT        ",
         };
 
         let mut buf = [0u8; 256];
         let len = encode_trade_notification(&msg, &mut buf).expect("encode failed");
-        assert_eq!(len, 56);
+        assert_eq!(len, 72);
 
         // Verify by raw bytes
         let template_id_bytes = &buf[2..4];

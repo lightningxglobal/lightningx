@@ -26,6 +26,8 @@ pub struct TradingConfig {
     pub depth_ring: usize,
     pub depth50_ring: usize,
     pub level2_ring: usize,
+    /// Symbol this engine trades, e.g. "ETH_USDT". Written into TradeNotification for kline_service.
+    pub symbol: String,
 }
 
 impl Default for TradingConfig {
@@ -47,17 +49,24 @@ impl Default for TradingConfig {
             depth_ring: 1024,
             depth50_ring: 256,
             level2_ring: 64,
+            symbol: String::new(),
         }
     }
 }
 
 pub struct TradingEngine {
     config: TradingConfig,
+    engine: Option<MatchingEngine>,
 }
 
 impl TradingEngine {
     pub fn new(config: TradingConfig) -> Self {
-        Self { config }
+        Self { config, engine: None }
+    }
+
+    /// Create a TradingEngine with a pre-built MatchingEngine (e.g. after order recovery).
+    pub fn with_engine(engine: MatchingEngine, config: TradingConfig) -> Self {
+        Self { config, engine: Some(engine) }
     }
 
     pub fn run(
@@ -76,11 +85,14 @@ impl TradingEngine {
 
         let pool_config = self.config.pool_config;
         let market_data_config = self.config.market_data_config;
+        let prebuilt_engine = self.engine;
+        let symbol = self.config.symbol.clone();
 
         // 启动撮合线程
         let matching_thread = spawn(move || {
             run_matching_thread(
                 subscriber,
+                prebuilt_engine,
                 pool_config,
                 market_data_config,
                 order_update_tx,
@@ -102,6 +114,7 @@ impl TradingEngine {
                 order_update_pub,
                 trade_pub,
                 market_data_pub,
+                symbol,
             )
         });
 
@@ -115,6 +128,7 @@ impl TradingEngine {
 
 fn run_matching_thread(
     mut subscriber: Box<dyn OrderSubscriber>,
+    prebuilt_engine: Option<MatchingEngine>,
     pool_config: PoolConfig,
     market_data_config: MarketDataConfig,
     mut order_update_tx: Producer<OrderUpdateEvent>,
@@ -124,7 +138,8 @@ fn run_matching_thread(
     level2_tx: Producer<Level2SnapshotEvent>,
 ) {
     use tracing::info;
-    let mut engine = MatchingEngine::new(pool_config).expect("failed to create engine");
+    let mut engine = prebuilt_engine
+        .unwrap_or_else(|| MatchingEngine::new(pool_config).expect("failed to create engine"));
     engine.set_market_data_config(market_data_config);
 
     // 直接传入外部的producer，避免内部ringbuffer的堆分配和复制开销
@@ -344,9 +359,16 @@ fn run_publishing_thread(
     mut order_update_pub: Box<dyn OrderUpdatePublisher>,
     mut trade_pub: Box<dyn TradePublisher>,
     mut market_data_pub: Box<dyn MarketDataPublisher>,
+    symbol: String,
 ) {
     use tracing::info;
     let mut published_count = 0u64;
+
+    // Pre-encode symbol as null-padded ASCII for TradeNotification
+    let mut symbol_bytes = [0u8; 16];
+    let sym_src = symbol.as_bytes();
+    let copy_len = sym_src.len().min(16);
+    symbol_bytes[..copy_len].copy_from_slice(&sym_src[..copy_len]);
 
     loop {
         // 定期调用do_work()来维护所有Publishers的连接状态
@@ -404,6 +426,7 @@ fn run_publishing_thread(
                 quantity: evt.quantity,
                 side: if evt.side == Side::Buy { 0 } else { 1 },
                 _pad: [0; 7],
+                symbol: symbol_bytes,
             };
             match trade_pub.publish(&msg) {
                 Ok(()) => {

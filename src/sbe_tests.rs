@@ -111,6 +111,7 @@ mod sbe_encoding_tests {
             quantity: 15.0,
             side: 1, // SELL
             _pad: [0; 7],
+            symbol: [0; 16],
         };
 
         // Simulate server-side encoding
@@ -193,7 +194,7 @@ mod sbe_encoding_tests {
     #[test]
     fn test_message_struct_sizes() {
         assert_eq!(std::mem::size_of::<OrderUpdateMsg>(), 64);
-        assert_eq!(std::mem::size_of::<TradeNotification>(), 48);
+        assert_eq!(std::mem::size_of::<TradeNotification>(), 64);
     }
 
     // Test full round-trip: create → encode → decode → verify

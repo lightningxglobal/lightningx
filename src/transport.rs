@@ -368,6 +368,7 @@ mod tests {
             quantity: 5.0,
             side: 0,
             _pad: [0; 7],
+            symbol: [0; 16],
         };
 
         publisher.publish(&msg).expect("publish failed");

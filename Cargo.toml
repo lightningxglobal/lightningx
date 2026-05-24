@@ -68,3 +68,7 @@ path = "src/bin/data_server.rs"
 [[bin]]
 name = "market-maker"
 path = "src/bin/market_maker.rs"
+
+[[bin]]
+name = "exchange-engine"
+path = "src/bin/exchange_engine.rs"

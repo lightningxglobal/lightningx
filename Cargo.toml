@@ -33,6 +33,7 @@ bcrypt = "0.15"
 thiserror = "1"
 anyhow = "1"
 dashmap = "6"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -63,3 +64,7 @@ path = "src/bin/desk_server.rs"
 [[bin]]
 name = "lightning-data"
 path = "src/bin/data_server.rs"
+
+[[bin]]
+name = "market-maker"
+path = "src/bin/market_maker.rs"

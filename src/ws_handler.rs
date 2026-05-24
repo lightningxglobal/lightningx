@@ -45,6 +45,8 @@ enum ClientMsg {
         qty: f64,
     },
     CancelOrder { order_id: i64 },
+    CancelSymbol { symbol: String },
+    CancelAll,
     Ping,
 }
 
@@ -88,6 +90,10 @@ impl ClientMsg {
             "cancel_order" => Some(ClientMsg::CancelOrder {
                 order_id: v.get("order_id")?.as_i64()?,
             }),
+            "cancel_symbol" => Some(ClientMsg::CancelSymbol {
+                symbol: v.get("symbol")?.as_str()?.to_owned(),
+            }),
+            "cancel_all" => Some(ClientMsg::CancelAll),
             "ping" => Some(ClientMsg::Ping),
             _ => None,
         }
@@ -850,6 +856,24 @@ async fn handle_client_message(
             }).to_string())
         }
 
+        ClientMsg::CancelSymbol { symbol } => {
+            let user_id = match session.user_id {
+                Some(id) => id,
+                None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
+            };
+            let n = bulk_cancel(user_id, Some(&symbol), state, &personal_tx).await;
+            Some(json!({"type": "cancel_all_ok", "symbol": symbol, "cancelled": n}).to_string())
+        }
+
+        ClientMsg::CancelAll => {
+            let user_id = match session.user_id {
+                Some(id) => id,
+                None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
+            };
+            let n = bulk_cancel(user_id, None, state, &personal_tx).await;
+            Some(json!({"type": "cancel_all_ok", "cancelled": n}).to_string())
+        }
+
         ClientMsg::CancelOrder { order_id } => {
             let user_id = match session.user_id {
                 Some(id) => id,
@@ -939,6 +963,89 @@ async fn handle_client_message(
             Some(json!({"type": "order_update", "order_id": order_id, "status": "CANCELED", "ts": unix_now()}).to_string())
         }
     }
+}
+
+/// Cancel all open orders for `user_id`, optionally filtered to a single symbol.
+/// Cancels each order in the engine, updates DB, releases frozen funds, and
+/// pushes an `order_update CANCELED` event to the user's personal WS channel.
+/// Returns the number of orders cancelled.
+async fn bulk_cancel(
+    user_id: i64,
+    symbol: Option<&str>,
+    state: &AppState,
+    personal_tx: &tokio::sync::mpsc::Sender<String>,
+) -> usize {
+    #[derive(sqlx::FromRow)]
+    struct OpenOrder { id: i64, symbol: String, side: String, price: Option<f64>, quantity: f64, filled: f64 }
+
+    let rows: Vec<OpenOrder> = match symbol {
+        Some(sym) => sqlx::query_as(
+            "SELECT id, symbol, side, price, quantity, filled FROM orders
+             WHERE user_id=$1 AND symbol=$2 AND status IN ('PENDING','TRADING')",
+        ).bind(user_id).bind(sym),
+        None => sqlx::query_as(
+            "SELECT id, symbol, side, price, quantity, filled FROM orders
+             WHERE user_id=$1 AND status IN ('PENDING','TRADING')",
+        ).bind(user_id),
+    }
+    .fetch_all(state.db.as_ref())
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() { return 0; }
+
+    let repo = crate::account_repository::AccountRepository::new(state.db.as_ref());
+    let ts = unix_now();
+    let mut count = 0usize;
+
+    for order in rows {
+        let remaining = order.quantity - order.filled;
+
+        // Cancel in matching engine (best-effort).
+        if let Some(engines) = &state.engines {
+            if let Some(engine) = engines.get(&order.symbol) {
+                let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order.id as u64) };
+            }
+        } else if let Some(aeron_pub) = &state.aeron_pub {
+            let req = crate::sbe::CancelOrderRequest { order_id: order.id as u64 };
+            let _ = aeron_pub.lock().publish_cancel(&req);
+        }
+
+        // Update DB.
+        let _ = sqlx::query(
+            "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1",
+        )
+        .bind(order.id)
+        .execute(state.db.as_ref())
+        .await;
+
+        // Release frozen funds for the unfilled portion.
+        let sym_parts: Vec<&str> = order.symbol.splitn(2, '_').collect();
+        let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+        let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+
+        if order.side == "buy" {
+            let fp = order.price.unwrap_or(0.0);
+            if fp > 0.0 && remaining > 0.0 {
+                let _ = repo.release_frozen(user_id, quote_asset, fp * remaining).await;
+            }
+        } else if remaining > 0.0 {
+            let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+        }
+
+        // Push order_update to the caller's personal channel.
+        let _ = personal_tx.send(json!({
+            "type": "order_update",
+            "order_id": order.id,
+            "status": "CANCELED",
+            "filled_qty": order.filled,
+            "ts": ts,
+        }).to_string()).await;
+
+        count += 1;
+    }
+
+    count
 }
 
 /// Build a depth snapshot JSON for the given symbol from the matching engine.

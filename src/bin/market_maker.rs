@@ -147,6 +147,11 @@ impl WsExchangeClient {
         let msg = json!({"type": "cancel_order", "order_id": order_id}).to_string();
         let _ = self.ws_tx.send(msg).await;
     }
+
+    async fn cancel_symbol(&self, symbol: &str) {
+        let msg = json!({"type": "cancel_symbol", "symbol": symbol}).to_string();
+        let _ = self.ws_tx.send(msg).await;
+    }
 }
 
 // ── WS connection manager ──────────────────────────────────────────────────────
@@ -491,6 +496,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Brief pause for the WS manager to connect and authenticate.
     tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Cancel any leftover orders from a previous session before starting.
+    info!("Clearing leftover orders…");
+    for cfg in SYMBOLS {
+        client.cancel_symbol(cfg.our_symbol).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     info!("Starting market-making on {} symbols", SYMBOLS.len());
     let handles: Vec<_> = SYMBOLS.iter()

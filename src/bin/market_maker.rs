@@ -188,19 +188,11 @@ async fn ws_manager(
         info!("Desk WS connected and authenticated");
 
         // Drive outgoing + incoming until the connection drops.
+        // biased: always drain incoming responses before sending more orders —
+        // prevents oneshot starvation when the outbox is continuously full.
         loop {
             tokio::select! {
-                msg = outbox.recv() => {
-                    match msg {
-                        Some(text) => {
-                            if sink.send(Message::Text(text)).await.is_err() {
-                                warn!("Desk WS send error");
-                                break;
-                            }
-                        }
-                        None => return, // all clients dropped — shutting down
-                    }
-                }
+                biased;
 
                 msg = stream.next() => {
                     match msg {
@@ -216,6 +208,18 @@ async fn ws_manager(
                             break;
                         }
                         _ => {}
+                    }
+                }
+
+                msg = outbox.recv() => {
+                    match msg {
+                        Some(text) => {
+                            if sink.send(Message::Text(text)).await.is_err() {
+                                warn!("Desk WS send error");
+                                break;
+                            }
+                        }
+                        None => return, // all clients dropped — shutting down
                     }
                 }
             }
@@ -234,8 +238,10 @@ fn route_desk_msg(
     dead_orders: &DashMap<i64, ()>,
 ) {
     let v: Value = match serde_json::from_str(text) { Ok(v) => v, _ => return };
+    let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+    tracing::debug!("desk← type={msg_type} raw={}", &text[..text.len().min(120)]);
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-        "order_accepted" => {
+        "order_submitted" | "order_accepted" => {
             // Correlate by client_order_id and resolve the waiting place_order future.
             let coid: u64 = v.get("client_order_id")
                 .and_then(|c| c.as_str())

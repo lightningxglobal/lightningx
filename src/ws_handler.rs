@@ -256,10 +256,10 @@ async fn handle_client_message(
                 // In standalone mode: push from engine. In Aeron mode: push from last_depth cache.
                 if let Some(engines) = &state.engines {
                     if let Some(engine) = engines.get(&sym) {
-                        let _ = personal_tx.send(build_depth_json(engine.value(), &sym)).await;
+                        let _ = personal_tx.try_send(build_depth_json(engine.value(), &sym));
                     }
                 } else if let Some(depth_json) = state.last_depth.get(&sym) {
-                    let _ = personal_tx.send(depth_json.to_string()).await;
+                    let _ = personal_tx.try_send(depth_json.to_string());
                 }
             }
             None
@@ -406,13 +406,13 @@ async fn handle_client_message(
                 let frozen_asset = if side == "buy" { quote_asset } else { base_asset };
                 if let Ok(acc) = repo.get_account(user_id, frozen_asset).await {
                     if let Some(tx) = state.user_tx.get(&user_id) {
-                        let _ = tx.send(json!({
+                        let _ = tx.try_send(json!({
                             "type": "balance_update",
                             "asset": frozen_asset,
                             "balance": acc.balance,
                             "available": acc.balance - acc.frozen,
                             "frozen": acc.frozen,
-                        }).to_string()).await;
+                        }).to_string());
                     }
                 }
             }
@@ -446,10 +446,10 @@ async fn handle_client_message(
                     }
                 }
             } else if let Some(aeron_pub) = &state.aeron_pub {
-                // Aeron mode: publish order, await response via pending_orders.
+                // Aeron mode: publish order and return immediately.
+                // The engine's OrderUpdate arrives via the Aeron event loop in desk_server
+                // which pushes it to user_tx (WS order_update) and updates the DB.
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
-                use crate::transport::order_update_kind;
-                use tokio::sync::oneshot;
 
                 let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
                 let tif_byte: u8 = match tif {
@@ -469,13 +469,10 @@ async fn handle_client_message(
                     symbol: [0; 16],
                 };
 
-                let (tx, rx) = oneshot::channel::<crate::transport::OrderUpdateMsg>();
-                state.pending_orders.insert(db_order_id as u64, tx);
-
-                // Publish and drop guard immediately so we can await below.
+                // Publish and return immediately — the Aeron event loop in desk_server
+                // receives the engine's OrderUpdate and pushes it to user_tx asynchronously.
                 let pub_err = { aeron_pub.lock().publish_new_order(&sbe_req).err() };
                 if pub_err.is_some() {
-                    state.pending_orders.remove(&(db_order_id as u64));
                     let _ = sqlx::query(
                         "UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1",
                     )
@@ -489,52 +486,9 @@ async fn handle_client_message(
                     }).to_string());
                 }
 
-                let update = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-                    Ok(Ok(msg)) => msg,
-                    _ => {
-                        state.pending_orders.remove(&(db_order_id as u64));
-                        return Some(json!({
-                            "type": "order_rejected",
-                            "client_order_id": client_order_id,
-                            "reason": "Order response timeout"
-                        }).to_string());
-                    }
-                };
-
-                // Copy packed struct fields to locals before use.
-                let fill_qty: f64 = update.fill_qty;
-
-                // Map OrderUpdateMsg into a pseudo EngineResult for unified downstream code.
-                let (db_status, ws_status) = match update.kind {
-                    k if k == order_update_kind::ACCEPTED     => ("PENDING",   "OPEN"),
-                    k if k == order_update_kind::PARTIAL_FILL => ("TRADING",   "PARTIAL_FILL"),
-                    k if k == order_update_kind::FILLED       => ("COMPLETED", "FILLED"),
-                    k if k == order_update_kind::CANCELLED    => ("CANCELED",  "CANCELED"),
-                    _                                         => ("REJECTED",  "REJECTED"),
-                };
-                let _ = sqlx::query(
-                    "UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3",
-                )
-                .bind(db_status)
-                .bind(fill_qty)
-                .bind(db_order_id)
-                .execute(state.db.as_ref())
-                .await;
-
                 let ts_now = unix_now();
-                let upd_msg = json!({
-                    "type": "order_update",
-                    "order_id": db_order_id,
-                    "status": ws_status,
-                    "filled_qty": fill_qty,
-                    "ts": ts_now,
-                }).to_string();
-                if let Some(utx) = state.user_tx.get(&user_id) {
-                    let _ = utx.send(upd_msg).await;
-                }
-
                 return Some(json!({
-                    "type": "order_accepted",
+                    "type": "order_submitted",
                     "client_order_id": client_order_id,
                     "order_id": db_order_id,
                     "symbol": symbol,
@@ -636,13 +590,13 @@ async fn handle_client_message(
                             for asset in [m_debit, m_credit] {
                                 if let Ok(acc) = repo.get_account(maker_id, asset).await {
                                     let msg = json!({"type":"balance_update","asset":asset,"balance":acc.balance,"available":acc.balance-acc.frozen,"frozen":acc.frozen}).to_string();
-                                    if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.send(msg).await; }
+                                    if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.try_send(msg); }
                                 }
                             }
                             if let Some(pos_msg) = crate::positions::position_update_msg(
                                 state.db.as_ref(), maker_id, base_asset,
                             ).await {
-                                if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.send(pos_msg).await; }
+                                if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.try_send(pos_msg); }
                             }
                         }
                     }
@@ -678,7 +632,7 @@ async fn handle_client_message(
                             "avg_price": fp,
                             "ts": ts
                         }).to_string();
-                        if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.send(upd).await; }
+                        if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.try_send(upd); }
                     }
 
                     // Insert trade record with both sides.
@@ -756,7 +710,7 @@ async fn handle_client_message(
                     "ts": ts
                 }).to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {
-                    let _ = tx.send(update_msg).await;
+                    let _ = tx.try_send(update_msg);
                 }
 
                 // Send balance_update so frontend can refresh balances.
@@ -771,7 +725,7 @@ async fn handle_client_message(
                             "frozen": acc.frozen
                         }).to_string();
                         if let Some(tx) = state.user_tx.get(&user_id) {
-                            let _ = tx.send(bal_msg).await;
+                            let _ = tx.try_send(bal_msg);
                         }
                     }
                 }
@@ -781,7 +735,7 @@ async fn handle_client_message(
                     state.db.as_ref(), user_id, base_asset,
                 ).await {
                     if let Some(tx) = state.user_tx.get(&user_id) {
-                        let _ = tx.send(pos_msg).await;
+                        let _ = tx.try_send(pos_msg);
                     }
                 }
             } else if result.status == OrderStatus::Accepted {
@@ -796,7 +750,7 @@ async fn handle_client_message(
                     "ts": ts
                 }).to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {
-                    let _ = tx.send(open_msg).await;
+                    let _ = tx.try_send(open_msg);
                 }
                 // New resting order changes the book — push depth so the
                 // frontend reflects it without waiting for the 2s tick.
@@ -823,7 +777,7 @@ async fn handle_client_message(
                     "ts": ts
                 }).to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {
-                    let _ = tx.send(cancel_msg).await;
+                    let _ = tx.try_send(cancel_msg);
                 }
 
                 // Refresh frontend balance for the released asset (frozen → available).
@@ -837,7 +791,7 @@ async fn handle_client_message(
                             "frozen": acc.frozen
                         }).to_string();
                         if let Some(tx) = state.user_tx.get(&user_id) {
-                            let _ = tx.send(bal_msg).await;
+                            let _ = tx.try_send(bal_msg);
                         }
                     }
                 }
@@ -949,13 +903,13 @@ async fn handle_client_message(
             if let Some(tx) = state.user_tx.get(&user_id) {
                 for asset in [released_asset, if released_asset == base_asset { quote_asset } else { base_asset }] {
                     if let Ok(acc) = repo.get_account(user_id, asset).await {
-                        let _ = tx.send(json!({
+                        let _ = tx.try_send(json!({
                             "type": "balance_update",
                             "asset": acc.asset,
                             "balance": acc.balance,
                             "available": acc.balance - acc.frozen,
                             "frozen": acc.frozen,
-                        }).to_string()).await;
+                        }).to_string());
                     }
                 }
             }
@@ -1034,13 +988,13 @@ async fn bulk_cancel(
         }
 
         // Push order_update to the caller's personal channel.
-        let _ = personal_tx.send(json!({
+        let _ = personal_tx.try_send(json!({
             "type": "order_update",
             "order_id": order.id,
             "status": "CANCELED",
             "filled_qty": order.filled,
             "ts": ts,
-        }).to_string()).await;
+        }).to_string());
 
         count += 1;
     }

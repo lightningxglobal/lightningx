@@ -23,7 +23,7 @@ const ROBOT_PASSWORD: &str = "robot_secret_2026";
 
 const DEPTH_LEVELS: usize = 5;      // levels per side to mirror (fewer = less load)
 const QTY_SCALE: f64 = 0.02;        // use 2% of Binance's qty per level
-const MAX_USDT_PER_SIDE: f64 = 4000.0; // safety cap: total USDT exposure per side
+const MAX_USDT_PER_SIDE: f64 = 40000.0; // safety cap: total USDT exposure per side
 const REFRESH_MS: u64 = 2000;       // poll every 2s — Binance REST rate limit is 1200 req/min
 
 const BINANCE_API: &str = "https://api.binance.com/api/v3/depth";

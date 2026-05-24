@@ -10,6 +10,7 @@ use lightning_exchange::{
     aeron_transport::{DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber, DeskDepthSubscriber},
     api::{router, AppState},
     db,
+    transport::AeronCmd,
     ws_handler::market_data_broadcaster,
 };
 use aeron_wrapper::AeronClient;
@@ -38,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Aeron init failed: {:?}", e))?,
     );
 
-    let order_pub = DeskOrderPublisher::new(client.clone(), ORDERS_CHANNEL, ORDERS_STREAM)
+    let mut order_pub = DeskOrderPublisher::new(client.clone(), ORDERS_CHANNEL, ORDERS_STREAM)
         .map_err(|e| anyhow::anyhow!("DeskOrderPublisher: {}", e))?;
 
     let mut order_update_sub = DeskOrderUpdateSubscriber::new(
@@ -56,6 +57,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Aeron subscribers and publisher created");
 
+    // ── Command channel: async WS handlers → Aeron spin thread ───────────────
+    let (aeron_cmd_tx, mut aeron_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<AeronCmd>();
+
+    // ── Sync next_order_id from DB so WS atomic IDs don't collide ─────────────
+    let max_db_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM orders")
+        .fetch_one(&pool).await.unwrap_or(0);
+    let initial_id = (max_db_id as u64) + 1;
+
     // ── Shared state ──────────────────────────────────────────────────────────
     let (market_tx, _) = broadcast::channel::<String>(1024);
 
@@ -64,19 +73,19 @@ async fn main() -> anyhow::Result<()> {
         engines: None,
         market_tx: Arc::new(market_tx),
         user_tx: Arc::new(DashMap::new()),
-        next_order_id: Arc::new(AtomicU64::new(1)),
-        aeron_pub: Some(Arc::new(parking_lot::Mutex::new(order_pub))),
+        next_order_id: Arc::new(AtomicU64::new(initial_id)),
+        aeron_cmd_tx: Some(aeron_cmd_tx),
+        pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
     };
 
-    // ── Aeron event loop (dedicated OS thread) ────────────────────────────────
-    // Bridge: market_tx (broadcast::Sender) and pending_orders / user_tx
-    // (DashMap) are all Arc'd and thread-safe, so the OS thread can use them
-    // directly without going through a tokio channel.
+    // ── Aeron spin thread: WS command drain + inbound event loop ─────────────
+    // order_pub lives here exclusively — no mutex needed.
     {
         let market_tx = state.market_tx.clone();
         let pending_orders = state.pending_orders.clone();
+        let pending_meta = state.pending_meta.clone();
         let user_tx = state.user_tx.clone();
         let last_depth = state.last_depth.clone();
         let db = state.db.clone();
@@ -86,12 +95,21 @@ async fn main() -> anyhow::Result<()> {
             .name("aeron-event-loop".to_string())
             .spawn(move || {
                 loop {
+                    // Drain outbound commands (WS/REST → engine) without blocking.
+                    while let Ok(cmd) = aeron_cmd_rx.try_recv() {
+                        match cmd {
+                            AeronCmd::NewOrder(req) => { let _ = order_pub.publish_new_order(&req); }
+                            AeronCmd::Cancel(req)   => { let _ = order_pub.publish_cancel(&req); }
+                        }
+                    }
+
                     order_update_sub.do_work();
                     trade_sub.do_work();
                     depth_sub.do_work();
 
                     // Process order updates — complete pending REST/WS requests.
                     while let Some(msg) = order_update_sub.poll() {
+                        use lightning_exchange::transport::order_update_kind;
                         // Copy packed struct fields to locals to avoid misaligned refs.
                         let order_id: u64 = msg.order_id;
                         let participant_id: u64 = msg.participant_id;
@@ -99,15 +117,71 @@ async fn main() -> anyhow::Result<()> {
                         let fill_price: f64 = msg.fill_price;
                         let kind: u8 = msg.kind;
 
-                        // Route to waiting request (pending_orders) if any.
+                        // Route to waiting REST request (pending_orders) if any.
                         if let Some((_, tx)) = pending_orders.remove(&order_id) {
                             let _ = tx.send(msg);
                         }
 
-                        // Also push order_update to user's personal WS channel.
+                        // For WS fast-path orders, pending_meta holds the order
+                        // details. On ACCEPTED we INSERT the DB row + freeze funds.
+                        // On REJECTED/CANCELLED we just drop the meta (no freeze happened).
+                        let ws_meta = pending_meta.remove(&order_id).map(|(_, m)| m);
+
+                        if let Some(meta) = ws_meta {
+                            if kind == order_update_kind::ACCEPTED {
+                                let oid = order_id as i64;
+                                let db4 = db.clone();
+                                rt.spawn(async move {
+                                    // Upsert: covers the race where REST path also ran.
+                                    let _ = sqlx::query(
+                                        "INSERT INTO orders \
+                                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price) \
+                                         VALUES ($1,$2,$3,$4,$5,$6,$7,0,'PENDING',$8) \
+                                         ON CONFLICT (id) DO UPDATE SET status='PENDING', updated_at=NOW()"
+                                    )
+                                    .bind(oid).bind(meta.user_id).bind(&meta.symbol)
+                                    .bind(&meta.side).bind(&meta.order_type)
+                                    .bind(meta.price).bind(meta.qty).bind(meta.freeze_price)
+                                    .execute(&*db4).await;
+
+                                    // Freeze funds after engine accepts.
+                                    let repo = lightning_exchange::account_repository::AccountRepository::new(&db4);
+                                    let sym: Vec<&str> = meta.symbol.splitn(2, '_').collect();
+                                    let base = sym.first().copied().unwrap_or("BTC");
+                                    let quote = sym.last().copied().unwrap_or("USDT");
+                                    if meta.side == "buy" {
+                                        let amount = meta.freeze_price * meta.qty;
+                                        if amount > 0.0 { let _ = repo.freeze_for_buy(meta.user_id, quote, amount).await; }
+                                    } else {
+                                        let _ = repo.freeze_for_sell(meta.user_id, base, meta.qty).await;
+                                    }
+                                });
+                            }
+                            // REJECTED / CANCELLED with meta: no DB row and no frozen
+                            // funds, so nothing else to do.
+                        } else {
+                            // REST-path order OR subsequent WS update (row already exists).
+                            let db_status = match kind {
+                                k if k == order_update_kind::ACCEPTED     => "PENDING",
+                                k if k == order_update_kind::PARTIAL_FILL => "TRADING",
+                                k if k == order_update_kind::FILLED       => "COMPLETED",
+                                k if k == order_update_kind::CANCELLED    => "CANCELED",
+                                _                                         => "REJECTED",
+                            };
+                            let oid = order_id as i64;
+                            let db3 = db.clone();
+                            rt.spawn(async move {
+                                let _ = sqlx::query(
+                                    "UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3",
+                                )
+                                .bind(db_status).bind(fill_qty).bind(oid)
+                                .execute(&*db3).await;
+                            });
+                        }
+
+                        // Push order_update to user's personal WS channel.
                         let user_id = participant_id as i64;
                         if let Some(tx) = user_tx.get(&user_id) {
-                            use lightning_exchange::transport::order_update_kind;
                             let ws_status = match kind {
                                 k if k == order_update_kind::ACCEPTED     => "OPEN",
                                 k if k == order_update_kind::PARTIAL_FILL => "PARTIAL",

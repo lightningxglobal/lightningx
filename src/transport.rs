@@ -6,6 +6,29 @@ pub use crate::sbe::{NewOrderRequest, CancelOrderRequest, TradeNotification};
 use crate::market_data::{DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent};
 use std::sync::mpsc::{channel, Sender, Receiver};
 
+// ============================================================================
+// WS fast-path: Aeron command sent from async WS handler to Aeron spin thread
+// ============================================================================
+
+/// A command queued by the WS/REST handler for the Aeron spin thread to publish.
+pub enum AeronCmd {
+    NewOrder(NewOrderRequest),
+    Cancel(CancelOrderRequest),
+}
+
+/// Order metadata stored by the WS handler so the Aeron event loop can
+/// create the DB row and freeze funds after the engine confirms the order.
+pub struct OrderMeta {
+    pub user_id: i64,
+    pub symbol: String,
+    pub side: String,
+    pub order_type: String,
+    pub price: Option<f64>,
+    pub qty: f64,
+    pub client_order_id: String,
+    pub freeze_price: f64,
+}
+
 #[derive(Debug)]
 pub enum TransportError {
     Disconnected,

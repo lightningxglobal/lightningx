@@ -300,7 +300,8 @@ async fn main() -> anyhow::Result<()> {
         market_tx: Arc::new(market_tx),
         user_tx: Arc::new(DashMap::new()),
         next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
-        aeron_pub: None,
+        aeron_cmd_tx: None,
+        pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
     };

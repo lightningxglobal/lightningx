@@ -1,10 +1,9 @@
 /// REST API layer: auth, accounts, orders, user profile, KYC
 use crate::account_repository::AccountRepository;
-use crate::aeron_transport::DeskOrderPublisher;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::models::{DbOrder, User};
 use crate::order::{Order, Side, TimeInForce};
-use crate::transport::OrderUpdateMsg;
+use crate::transport::{AeronCmd, OrderMeta, OrderUpdateMsg};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
     extract::{Path, Query, State},
@@ -31,11 +30,13 @@ pub struct AppState {
     pub market_tx: Arc<broadcast::Sender<String>>,
     /// Per-user personal update channel (order fills, balance changes).
     pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
-    /// Monotonically increasing order ID counter (separate from engine's internal counter).
+    /// Monotonically increasing order ID counter (desk_server Aeron mode uses this directly).
     pub next_order_id: Arc<AtomicU64>,
-    /// Aeron order publisher (desk_server mode only).
-    pub aeron_pub: Option<Arc<parking_lot::Mutex<DeskOrderPublisher>>>,
-    /// Pending order responses: order_id → oneshot sender (desk_server mode only).
+    /// Lock-free command channel to the Aeron spin thread (desk_server mode only).
+    pub aeron_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
+    /// Pending order metadata stored by WS fast path until Aeron event loop handles DB+freeze.
+    pub pending_meta: Arc<DashMap<u64, Box<OrderMeta>>>,
+    /// Pending REST order responses: order_id → oneshot sender (desk_server mode only).
     pub pending_orders: Arc<DashMap<u64, oneshot::Sender<OrderUpdateMsg>>>,
     /// Last known depth per symbol from Aeron push (desk_server mode only).
     pub last_depth: Arc<DashMap<String, serde_json::Value>>,
@@ -589,7 +590,7 @@ async fn handle_place_order(
     }
 
     // ── Aeron mode: publish order to exchange_engine, await OrderUpdate ───────
-    if let Some(aeron_pub) = &s.aeron_pub {
+    if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
         use crate::sbe::{NewOrderRequest as SbeNewOrder};
         use crate::transport::order_update_kind;
 
@@ -619,9 +620,7 @@ async fn handle_place_order(
         let (tx, rx) = oneshot::channel::<OrderUpdateMsg>();
         s.pending_orders.insert(db_order_id as u64, tx);
 
-        // Publish and immediately drop the guard so we can await below.
-        let publish_err = { aeron_pub.lock().publish_new_order(&sbe_req).err() };
-        if let Some(e) = publish_err {
+        if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
             s.pending_orders.remove(&(db_order_id as u64));
             let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
                 .bind(db_order_id).execute(s.db.as_ref()).await;
@@ -631,7 +630,7 @@ async fn handle_place_order(
             } else {
                 let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
             }
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Aeron publish failed: {:?}", e)}))).into_response();
+            return (StatusCode::BAD_GATEWAY, Json(json!({"error": "Aeron channel closed"}))).into_response();
         }
 
         let update = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
@@ -744,11 +743,10 @@ async fn handle_cancel_order(
                 tracing::warn!("engine cancel_order({}) failed: {:?}", order_id, e);
             }
         }
-    } else if let Some(aeron_pub) = &s.aeron_pub {
-        // Aeron mode: send cancel to exchange_engine.
+    } else if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
+        // Aeron mode: send cancel to exchange_engine via lock-free channel.
         let cancel_req = crate::sbe::CancelOrderRequest { order_id: order_id as u64 };
-        let mut pub_guard = aeron_pub.lock();
-        let _ = pub_guard.publish_cancel(&cancel_req);
+        let _ = aeron_cmd_tx.send(AeronCmd::Cancel(cancel_req));
     }
 
     // Release frozen funds for the unfilled portion.

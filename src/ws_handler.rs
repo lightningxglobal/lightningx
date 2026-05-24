@@ -345,6 +345,80 @@ async fn handle_client_message(
                 0.0
             };
 
+            // ── Aeron fast path: skip DB + freeze in critical path ──────────────
+            // Order ID assigned atomically; DB INSERT + fund freeze happen
+            // in the Aeron event loop after the engine confirms ACCEPTED.
+            if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+                use crate::sbe::NewOrderRequest as SbeNewOrder;
+                use crate::transport::{AeronCmd, OrderMeta};
+
+                let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
+                let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
+                let tif_byte: u8 = match tif {
+                    TimeInForce::GTC      => 0,
+                    TimeInForce::IOC      => 1,
+                    TimeInForce::FOK      => 2,
+                    TimeInForce::PostOnly => 3,
+                };
+                let mut sym_bytes = [0u8; 16];
+                let sb = symbol.as_bytes();
+                let copy_len = sb.len().min(16);
+                sym_bytes[..copy_len].copy_from_slice(&sb[..copy_len]);
+
+                let sbe_req = SbeNewOrder {
+                    client_order_id: order_id,
+                    participant_id: user_id as u64,
+                    price: price.unwrap_or(0.0),
+                    quantity: qty,
+                    side: side_byte,
+                    time_in_force: tif_byte,
+                    _pad: [0; 14],
+                    symbol: sym_bytes,
+                };
+
+                state.pending_meta.insert(order_id, Box::new(OrderMeta {
+                    user_id,
+                    symbol: symbol.clone(),
+                    side: side.clone(),
+                    order_type: order_type.clone(),
+                    price,
+                    qty,
+                    client_order_id: client_order_id.clone(),
+                    freeze_price: freeze_price_val,
+                }));
+
+                if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
+                    state.pending_meta.remove(&order_id);
+                    return Some(json!({
+                        "type": "order_rejected",
+                        "client_order_id": client_order_id,
+                        "reason": "Aeron channel closed"
+                    }).to_string());
+                }
+
+                return Some(json!({
+                    "type": "order_submitted",
+                    "client_order_id": client_order_id,
+                    "order_id": order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "order_type": order_type,
+                    "price": price,
+                    "quantity": qty,
+                    "ts": unix_now()
+                }).to_string());
+            }
+
+            // ── Standalone engine path: DB + freeze + local matching ─────────────
+            let engine = match engine_opt {
+                Some(e) => e,
+                None => return Some(json!({
+                    "type": "order_rejected",
+                    "client_order_id": client_order_id,
+                    "reason": "No matching engine configured"
+                }).to_string()),
+            };
+
             // Persist to DB as PENDING before running through engine.
             let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
                 "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
@@ -370,9 +444,6 @@ async fn handle_client_message(
                     }).to_string());
                 }
             };
-            // Use the DB-assigned ID as the engine order ID so that fill settlement
-            // looks up the correct DB row. Keeps next_order_id in sync for WS orders
-            // that don't go through the REST-path atomic counter.
             let engine_order = if order_type == "market" {
                 Order::new_market(db_order_id as u64, engine_side, qty, now_ns)
             } else {
@@ -387,7 +458,7 @@ async fn handle_client_message(
                 if freeze_amount > 0.0 {
                     repo.freeze_for_buy(user_id, quote_asset, freeze_amount).await
                 } else {
-                    Ok(()) // market buy with no book — will reject after engine
+                    Ok(())
                 }
             } else {
                 repo.freeze_for_sell(user_id, base_asset, qty).await
@@ -401,7 +472,6 @@ async fn handle_client_message(
                     "reason": e.to_string()
                 }).to_string());
             }
-            // Push balance_update immediately after freeze so frontend shows correct available.
             {
                 let frozen_asset = if side == "buy" { quote_asset } else { base_asset };
                 if let Ok(acc) = repo.get_account(user_id, frozen_asset).await {
@@ -417,8 +487,7 @@ async fn handle_client_message(
                 }
             }
 
-            // Route to engine: local (standalone) vs Aeron (desk) mode.
-            let result = if let Some(engine) = engine_opt {
+            let result = {
                 let engine_result = {
                     let mut eng = engine.lock().unwrap();
                     eng.place_order(engine_order)
@@ -445,65 +514,6 @@ async fn handle_client_message(
                         }).to_string());
                     }
                 }
-            } else if let Some(aeron_pub) = &state.aeron_pub {
-                // Aeron mode: publish order and return immediately.
-                // The engine's OrderUpdate arrives via the Aeron event loop in desk_server
-                // which pushes it to user_tx (WS order_update) and updates the DB.
-                use crate::sbe::NewOrderRequest as SbeNewOrder;
-
-                let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
-                let tif_byte: u8 = match tif {
-                    TimeInForce::GTC      => 0,
-                    TimeInForce::IOC      => 1,
-                    TimeInForce::FOK      => 2,
-                    TimeInForce::PostOnly => 3,
-                };
-                let sbe_req = SbeNewOrder {
-                    client_order_id: db_order_id as u64,
-                    participant_id: user_id as u64,
-                    price: price.unwrap_or(0.0),
-                    quantity: qty,
-                    side: side_byte,
-                    time_in_force: tif_byte,
-                    _pad: [0; 14],
-                    symbol: [0; 16],
-                };
-
-                // Publish and return immediately — the Aeron event loop in desk_server
-                // receives the engine's OrderUpdate and pushes it to user_tx asynchronously.
-                let pub_err = { aeron_pub.lock().publish_new_order(&sbe_req).err() };
-                if pub_err.is_some() {
-                    let _ = sqlx::query(
-                        "UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1",
-                    )
-                    .bind(db_order_id)
-                    .execute(state.db.as_ref())
-                    .await;
-                    return Some(json!({
-                        "type": "order_rejected",
-                        "client_order_id": client_order_id,
-                        "reason": "Aeron publish failed"
-                    }).to_string());
-                }
-
-                let ts_now = unix_now();
-                return Some(json!({
-                    "type": "order_submitted",
-                    "client_order_id": client_order_id,
-                    "order_id": db_order_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "order_type": order_type,
-                    "price": price,
-                    "quantity": qty,
-                    "ts": ts_now
-                }).to_string());
-            } else {
-                return Some(json!({
-                    "type": "order_rejected",
-                    "client_order_id": client_order_id,
-                    "reason": "No matching engine configured"
-                }).to_string());
             };
 
             // Map engine status to (DB, WS) status strings. IOC/FOK that
@@ -875,10 +885,9 @@ async fn handle_client_message(
                 if let Some(engine) = engines.get(&symbol) {
                     let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
                 }
-            } else if let Some(aeron_pub) = &state.aeron_pub {
+            } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 let cancel_req = crate::sbe::CancelOrderRequest { order_id: order_id as u64 };
-                let mut pub_guard = aeron_pub.lock();
-                let _ = pub_guard.publish_cancel(&cancel_req);
+                let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(cancel_req));
             }
 
             // Release frozen funds for the unfilled portion.
@@ -960,9 +969,9 @@ async fn bulk_cancel(
             if let Some(engine) = engines.get(&order.symbol) {
                 let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order.id as u64) };
             }
-        } else if let Some(aeron_pub) = &state.aeron_pub {
+        } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
             let req = crate::sbe::CancelOrderRequest { order_id: order.id as u64 };
-            let _ = aeron_pub.lock().publish_cancel(&req);
+            let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(req));
         }
 
         // Update DB.

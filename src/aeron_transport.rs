@@ -399,6 +399,312 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
     }
 }
 
+// ============================================================================
+// 柜台侧 - 发送委托到引擎 (Stream 1)
+// ============================================================================
+
+pub struct DeskOrderPublisher {
+    client: Arc<AeronClient>,
+    publisher: aeron_wrapper::Publisher,
+}
+
+impl DeskOrderPublisher {
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
+        let publisher = client
+            .add_publication(channel, stream_id)
+            .map_err(|e| format!("Failed to add desk order publication: {:?}", e))?;
+
+        use tracing::info;
+        info!("✓ DeskOrderPublisher created on stream {}", stream_id);
+
+        Ok(Self { client, publisher })
+    }
+
+    pub fn do_work(&mut self) {
+        self.client.do_work();
+    }
+
+    pub fn publish_new_order(&mut self, req: &crate::sbe::NewOrderRequest) -> Result<(), crate::transport::TransportError> {
+        let mut data = [0u8; 56]; // 8 header + 48 body
+        crate::sbe::encode_new_order(req, &mut data).map_err(|_| crate::transport::TransportError::BackPressured)?;
+
+        loop {
+            match self.publisher.send(&data) {
+                Ok(()) => return Ok(()),
+                Err(AeronError::BackPressured) => { std::hint::spin_loop(); }
+                Err(AeronError::NotConnected) => return Err(crate::transport::TransportError::Disconnected),
+                Err(AeronError::Closed) => return Err(crate::transport::TransportError::Closed),
+                Err(_) => return Err(crate::transport::TransportError::BackPressured),
+            }
+        }
+    }
+
+    pub fn publish_cancel(&mut self, req: &crate::sbe::CancelOrderRequest) -> Result<(), crate::transport::TransportError> {
+        let mut data = [0u8; 16]; // 8 header + 8 body
+        crate::sbe::encode_cancel_order(req, &mut data).map_err(|_| crate::transport::TransportError::BackPressured)?;
+
+        loop {
+            match self.publisher.send(&data) {
+                Ok(()) => return Ok(()),
+                Err(AeronError::BackPressured) => { std::hint::spin_loop(); }
+                Err(AeronError::NotConnected) => return Err(crate::transport::TransportError::Disconnected),
+                Err(AeronError::Closed) => return Err(crate::transport::TransportError::Closed),
+                Err(_) => return Err(crate::transport::TransportError::BackPressured),
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 柜台侧 - 接收订单更新 (Stream 2)
+// ============================================================================
+
+struct OrderUpdateCallback {
+    queue: Arc<Mutex<VecDeque<crate::transport::OrderUpdateMsg>>>,
+}
+
+impl PollCallback for OrderUpdateCallback {
+    fn on_data(&mut self, data: &[u8]) {
+        // SBE: 8-byte header + 64-byte body = 72 bytes
+        if data.len() < 72 {
+            return;
+        }
+        let template_id = u16::from_le_bytes([data[2], data[3]]);
+        // template_id = 2 (unified OrderUpdate)
+        if template_id == 2 {
+            unsafe {
+                let msg = std::ptr::read_unaligned(
+                    &data[8] as *const u8 as *const crate::transport::OrderUpdateMsg,
+                );
+                let mut q = self.queue.lock();
+                q.push_back(msg);
+            }
+        }
+    }
+}
+
+pub struct DeskOrderUpdateSubscriber {
+    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderUpdateCallback>>>>,
+    queue: Arc<Mutex<VecDeque<crate::transport::OrderUpdateMsg>>>,
+    client: Arc<AeronClient>,
+}
+
+impl DeskOrderUpdateSubscriber {
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let subscriber = client
+            .add_subscription(
+                channel,
+                stream_id,
+                10_000,
+                OrderUpdateCallback { queue: queue.clone() },
+                NoopLifecycle,
+            )
+            .map_err(|e| format!("Failed to subscribe to order updates: {:?}", e))?;
+
+        use tracing::info;
+        info!("✓ DeskOrderUpdateSubscriber created on stream {}", stream_id);
+
+        Ok(Self {
+            subscriber: Arc::new(Mutex::new(subscriber)),
+            queue,
+            client,
+        })
+    }
+
+    pub fn do_work(&mut self) {
+        self.client.do_work();
+    }
+
+    pub fn poll(&mut self) -> Option<crate::transport::OrderUpdateMsg> {
+        {
+            let mut sub = self.subscriber.lock();
+            let _ = sub.poll();
+        }
+        self.queue.lock().pop_front()
+    }
+}
+
+// ============================================================================
+// 柜台侧 - 接收成交通知 (Stream 3)
+// ============================================================================
+
+struct TradeNotificationCallback {
+    queue: Arc<Mutex<VecDeque<TradeNotification>>>,
+}
+
+impl PollCallback for TradeNotificationCallback {
+    fn on_data(&mut self, data: &[u8]) {
+        // SBE: 8-byte header + 64-byte body = 72 bytes
+        if data.len() < 72 {
+            return;
+        }
+        let template_id = u16::from_le_bytes([data[2], data[3]]);
+        if template_id == 20 {
+            unsafe {
+                let msg = std::ptr::read_unaligned(
+                    &data[8] as *const u8 as *const TradeNotification,
+                );
+                self.queue.lock().push_back(msg);
+            }
+        }
+    }
+}
+
+pub struct DeskTradeSubscriber {
+    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<TradeNotificationCallback>>>>,
+    queue: Arc<Mutex<VecDeque<TradeNotification>>>,
+    client: Arc<AeronClient>,
+}
+
+impl DeskTradeSubscriber {
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let subscriber = client
+            .add_subscription(
+                channel,
+                stream_id,
+                10_000,
+                TradeNotificationCallback { queue: queue.clone() },
+                NoopLifecycle,
+            )
+            .map_err(|e| format!("Failed to subscribe to trades: {:?}", e))?;
+
+        use tracing::info;
+        info!("✓ DeskTradeSubscriber created on stream {}", stream_id);
+
+        Ok(Self {
+            subscriber: Arc::new(Mutex::new(subscriber)),
+            queue,
+            client,
+        })
+    }
+
+    pub fn do_work(&mut self) {
+        self.client.do_work();
+    }
+
+    pub fn poll(&mut self) -> Option<TradeNotification> {
+        {
+            let mut sub = self.subscriber.lock();
+            let _ = sub.poll();
+        }
+        self.queue.lock().pop_front()
+    }
+}
+
+// ============================================================================
+// 柜台侧 - 接收深度行情 (Streams 4, 5, 6)
+// ============================================================================
+
+pub enum DeskDepthMsg {
+    Depth(DepthSnapshotEvent),
+    Depth50(Depth50SnapshotEvent),
+    Level2(Level2SnapshotEvent),
+}
+
+struct DepthCallback {
+    queue: Arc<Mutex<VecDeque<DeskDepthMsg>>>,
+}
+
+impl PollCallback for DepthCallback {
+    fn on_data(&mut self, data: &[u8]) {
+        let depth_size = std::mem::size_of::<DepthSnapshotEvent>();
+        let depth50_size = std::mem::size_of::<Depth50SnapshotEvent>();
+        let level2_size = std::mem::size_of::<Level2SnapshotEvent>();
+
+        let msg = if data.len() >= depth_size && data.len() < depth50_size {
+            unsafe {
+                let evt = std::ptr::read_unaligned(data.as_ptr() as *const DepthSnapshotEvent);
+                Some(DeskDepthMsg::Depth(evt))
+            }
+        } else if data.len() >= depth50_size && data.len() < level2_size {
+            unsafe {
+                let evt = std::ptr::read_unaligned(data.as_ptr() as *const Depth50SnapshotEvent);
+                Some(DeskDepthMsg::Depth50(evt))
+            }
+        } else if data.len() >= level2_size {
+            unsafe {
+                let evt = std::ptr::read_unaligned(data.as_ptr() as *const Level2SnapshotEvent);
+                Some(DeskDepthMsg::Level2(evt))
+            }
+        } else {
+            None
+        };
+
+        if let Some(m) = msg {
+            self.queue.lock().push_back(m);
+        }
+    }
+}
+
+pub struct DeskDepthSubscriber {
+    depth_sub: Arc<Mutex<Box<aeron_wrapper::Subscriber<DepthCallback>>>>,
+    depth50_sub: Arc<Mutex<Box<aeron_wrapper::Subscriber<DepthCallback>>>>,
+    level2_sub: Arc<Mutex<Box<aeron_wrapper::Subscriber<DepthCallback>>>>,
+    queue: Arc<Mutex<VecDeque<DeskDepthMsg>>>,
+    client: Arc<AeronClient>,
+}
+
+impl DeskDepthSubscriber {
+    pub fn new(
+        client: Arc<AeronClient>,
+        channel: &str,
+        depth_stream: i32,
+        depth50_stream: i32,
+        level2_stream: i32,
+    ) -> Result<Self, String> {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+
+        let depth_sub = client
+            .add_subscription(channel, depth_stream, 10_000,
+                DepthCallback { queue: queue.clone() }, NoopLifecycle)
+            .map_err(|e| format!("Failed to subscribe to depth: {:?}", e))?;
+
+        let depth50_sub = client
+            .add_subscription(channel, depth50_stream, 10_000,
+                DepthCallback { queue: queue.clone() }, NoopLifecycle)
+            .map_err(|e| format!("Failed to subscribe to depth50: {:?}", e))?;
+
+        let level2_sub = client
+            .add_subscription(channel, level2_stream, 10_000,
+                DepthCallback { queue: queue.clone() }, NoopLifecycle)
+            .map_err(|e| format!("Failed to subscribe to level2: {:?}", e))?;
+
+        use tracing::info;
+        info!("✓ DeskDepthSubscriber created on streams {}, {}, {}",
+              depth_stream, depth50_stream, level2_stream);
+
+        Ok(Self {
+            depth_sub: Arc::new(Mutex::new(depth_sub)),
+            depth50_sub: Arc::new(Mutex::new(depth50_sub)),
+            level2_sub: Arc::new(Mutex::new(level2_sub)),
+            queue,
+            client,
+        })
+    }
+
+    pub fn do_work(&mut self) {
+        self.client.do_work();
+    }
+
+    pub fn poll(&mut self) -> Option<DeskDepthMsg> {
+        {
+            let mut s = self.depth_sub.lock();
+            let _ = s.poll();
+        }
+        {
+            let mut s = self.depth50_sub.lock();
+            let _ = s.poll();
+        }
+        {
+            let mut s = self.level2_sub.lock();
+            let _ = s.poll();
+        }
+        self.queue.lock().pop_front()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,8 +1,10 @@
 /// REST API layer: auth, accounts, orders, user profile, KYC
 use crate::account_repository::AccountRepository;
+use crate::aeron_transport::DeskOrderPublisher;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::models::{DbOrder, User};
 use crate::order::{Order, Side, TimeInForce};
+use crate::transport::OrderUpdateMsg;
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
     extract::{Path, Query, State},
@@ -17,19 +19,26 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<PgPool>,
     /// Per-symbol matching engines keyed by symbol (e.g. "BTC_USDT").
-    pub engines: Arc<DashMap<String, Arc<Mutex<MatchingEngine>>>>,
+    /// None in Aeron-connected desk_server mode.
+    pub engines: Option<Arc<DashMap<String, Arc<Mutex<MatchingEngine>>>>>,
     /// Broadcast market data (depth snapshots, trades) to all subscribed connections.
     pub market_tx: Arc<broadcast::Sender<String>>,
     /// Per-user personal update channel (order fills, balance changes).
     pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
     /// Monotonically increasing order ID counter (separate from engine's internal counter).
     pub next_order_id: Arc<AtomicU64>,
+    /// Aeron order publisher (desk_server mode only).
+    pub aeron_pub: Option<Arc<parking_lot::Mutex<DeskOrderPublisher>>>,
+    /// Pending order responses: order_id → oneshot sender (desk_server mode only).
+    pub pending_orders: Arc<DashMap<u64, oneshot::Sender<OrderUpdateMsg>>>,
+    /// Last known depth per symbol from Aeron push (desk_server mode only).
+    pub last_depth: Arc<DashMap<String, serde_json::Value>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -281,20 +290,26 @@ async fn handle_place_order(
         _                 => return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown order_type"}))).into_response(),
     };
 
-    let engine = match s.engines.get(&req.symbol) {
-        Some(e) => e.value().clone(),
-        None    => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown symbol: {}", req.symbol)}))).into_response(),
-    };
+    // In Aeron mode we don't have a local engine; in standalone mode we do.
+    let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = s.engines
+        .as_ref()
+        .and_then(|m| m.get(&req.symbol).map(|e| e.value().clone()));
+
+    if s.engines.is_some() && engine_opt.is_none() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown symbol: {}", req.symbol)}))).into_response();
+    }
 
     let sym_parts: Vec<&str> = req.symbol.splitn(2, '_').collect();
     let base_asset  = sym_parts.first().copied().unwrap_or("BTC");
     let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
 
     // Best opposing price (for market orders that need a freeze estimate).
-    let best_opposing = {
+    let best_opposing = if let Some(ref engine) = engine_opt {
         let eng = engine.lock().unwrap();
         let levels = eng.get_top_levels(1, engine_side == Side::Sell);
         levels.first().map(|(p, _)| *p)
+    } else {
+        None
     };
 
     // Compute the price that actually backs the frozen quote-asset amount.
@@ -351,24 +366,257 @@ async fn handle_place_order(
     };
     let db_order_id = db_order.id;
 
-    // Build engine order using the DB-assigned ID so engine and DB stay in sync.
-    let engine_order = if req.order_type == "market" {
-        Order::new_market(db_order_id as u64, engine_side, req.quantity, now_ns)
-    } else {
-        Order::new(db_order_id as u64, engine_side, req.price.unwrap_or(0.0), req.quantity, tif, now_ns)
-    };
     // Keep the atomic counter in sync so WS orders don't collide.
     s.next_order_id.fetch_max(db_order_id as u64 + 1, Ordering::Relaxed);
 
-    // Run through matching engine.
-    let engine_result = {
-        let mut eng = engine.lock().unwrap();
-        eng.place_order(engine_order)
-    };
+    // ── Route to engine: local (standalone) vs Aeron (desk) ──────────────────
+    if let Some(engine) = engine_opt {
+        // Standalone mode: run through local matching engine.
+        let engine_order = if req.order_type == "market" {
+            Order::new_market(db_order_id as u64, engine_side, req.quantity, now_ns)
+        } else {
+            Order::new(db_order_id as u64, engine_side, req.price.unwrap_or(0.0), req.quantity, tif, now_ns)
+        };
 
-    let result = match engine_result {
-        Ok(r) => r,
-        Err(e) => {
+        let engine_result = {
+            let mut eng = engine.lock().unwrap();
+            eng.place_order(engine_order)
+        };
+
+        let result = match engine_result {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
+                    .bind(db_order_id).execute(s.db.as_ref()).await;
+                if req.side == "buy" {
+                    let p = req.price.or(best_opposing).unwrap_or(0.0);
+                    if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+                } else {
+                    let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
+                }
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+            }
+        };
+
+        let db_status = match result.status {
+            OrderStatus::Accepted        => "PENDING",
+            OrderStatus::PartiallyFilled => "TRADING",
+            OrderStatus::Filled          => "COMPLETED",
+            OrderStatus::Rejected        => "REJECTED",
+            OrderStatus::Cancelled       => "CANCELED",
+        };
+
+        let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
+            .bind(db_status).bind(result.filled).bind(db_order_id)
+            .execute(s.db.as_ref()).await;
+
+        if result.status == OrderStatus::Rejected {
+            if req.side == "buy" {
+                let p = req.price.or(best_opposing).unwrap_or(0.0);
+                if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+            } else {
+                let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
+            }
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "Rejected by matching engine"}))).into_response();
+        }
+
+        // ── Settle fills (standalone path) ────────────────────────────────────
+        let mut notified_maker_uids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for &(maker_order_id, fp, fq) in &result.fills {
+            if fp <= 0.0 || fq <= 0.0 { continue; }
+
+            let maker_uid: Option<i64> = sqlx::query_scalar("SELECT user_id FROM orders WHERE id=$1")
+                .bind(maker_order_id as i64).fetch_optional(s.db.as_ref()).await.unwrap_or(None);
+
+            let (buyer_id, seller_id) = if req.side == "buy" {
+                (user_id, maker_uid.unwrap_or(0))
+            } else {
+                (maker_uid.unwrap_or(0), user_id)
+            };
+
+            if buyer_id > 0 && seller_id > 0 {
+                if req.side == "buy" {
+                    let over = req.price.map(|lp| (lp - fp) * fq).unwrap_or(0.0).max(0.0);
+                    if over > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, over).await; }
+                }
+                let _ = repo.settle_trade(buyer_id, seller_id, base_asset, quote_asset, fp, fq, 0.0, 0.0).await;
+            }
+
+            let _ = sqlx::query(
+                "UPDATE orders SET filled = filled + $1,
+                 status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
+                 updated_at = NOW() WHERE id = $2",
+            )
+            .bind(fq).bind(maker_order_id as i64).execute(s.db.as_ref()).await;
+
+            let (buy_oid, sell_oid): (Option<i64>, Option<i64>) = if req.side == "buy" {
+                (Some(db_order_id), Some(maker_order_id as i64))
+            } else {
+                (Some(maker_order_id as i64), Some(db_order_id))
+            };
+            let _ = sqlx::query(
+                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW())",
+            )
+            .bind(&req.symbol).bind(buy_oid).bind(sell_oid).bind(fp).bind(fq)
+            .execute(s.db.as_ref()).await;
+
+            if let Some(uid) = maker_uid { notified_maker_uids.insert(uid); }
+        }
+
+        if result.status == OrderStatus::Cancelled {
+            let unfilled = req.quantity - result.filled;
+            if unfilled > 0.0 {
+                let (rel_asset, rel_amount) = if req.side == "buy" {
+                    (quote_asset, req.price.or(best_opposing).unwrap_or(0.0) * unfilled)
+                } else {
+                    (base_asset, unfilled)
+                };
+                if rel_amount > 0.0 { let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await; }
+            }
+        }
+
+        let all_notify: Vec<i64> = std::iter::once(user_id)
+            .chain(notified_maker_uids.into_iter())
+            .collect();
+        for uid in all_notify {
+            if let Some(tx) = s.user_tx.get(&uid) {
+                let repo2 = AccountRepository::new(s.db.as_ref());
+                if let Ok(accounts) = repo2.get_all_accounts(uid).await {
+                    for acc in accounts {
+                        let msg = serde_json::json!({
+                            "type": "balance_update",
+                            "asset": acc.asset,
+                            "balance": acc.balance,
+                            "available": acc.balance - acc.frozen,
+                            "frozen": acc.frozen,
+                        }).to_string();
+                        let _ = tx.send(msg).await;
+                    }
+                }
+                if let Some(msg) =
+                    crate::positions::position_update_msg(s.db.as_ref(), uid, base_asset).await
+                {
+                    let _ = tx.send(msg).await;
+                }
+            }
+        }
+
+        if result.filled > 0.0 {
+            let avg_fill_price = if !result.fills.is_empty() {
+                let cost: f64 = result.fills.iter().map(|&(_, p, q)| p * q).sum();
+                cost / result.filled
+            } else {
+                req.price.or(best_opposing).unwrap_or(0.0)
+            };
+            let now_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            let trade_msg = serde_json::json!({
+                "type": "trade",
+                "symbol": &req.symbol,
+                "price": avg_fill_price,
+                "qty": result.filled,
+                "side": &req.side,
+                "ts": now_us,
+            }).to_string();
+            let _ = s.market_tx.send(trade_msg);
+
+            let sym_clone = req.symbol.clone();
+            let db_clone = s.db.clone();
+            let mtx_clone = s.market_tx.clone();
+            tokio::spawn(async move {
+                let open_24h: Option<f64> = sqlx::query_scalar(
+                    "SELECT price FROM trades WHERE symbol=$1
+                     AND created_at > NOW() - INTERVAL '24 hours'
+                     ORDER BY created_at ASC LIMIT 1",
+                )
+                .bind(&sym_clone)
+                .fetch_optional(db_clone.as_ref())
+                .await
+                .unwrap_or(None);
+                let change = match open_24h {
+                    Some(o) if o != 0.0 => (avg_fill_price - o) / o * 100.0,
+                    _ => 0.0,
+                };
+                let ticker = serde_json::json!({
+                    "type": "ticker",
+                    "symbol": sym_clone,
+                    "last": avg_fill_price,
+                    "change": change,
+                }).to_string();
+                let _ = mtx_clone.send(ticker);
+            });
+        }
+
+        crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
+        if result.filled > 0.0 {
+            let s2 = s.clone();
+            let sym2 = req.symbol.clone();
+            tokio::spawn(async move { crate::ws_handler::broadcast_kline_pub(&s2, &sym2).await; });
+        }
+
+        let ws_status = match result.status {
+            OrderStatus::Accepted        => "OPEN",
+            OrderStatus::PartiallyFilled => "PARTIAL",
+            OrderStatus::Filled          => "FILLED",
+            OrderStatus::Cancelled       => "CANCELED",
+            OrderStatus::Rejected        => "REJECTED",
+        };
+        if let Some(tx) = s.user_tx.get(&user_id) {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            let msg = serde_json::json!({
+                "type": "order_update",
+                "order_id": db_order_id,
+                "status": ws_status,
+                "filled": result.filled,
+                "filled_qty": result.filled,
+                "ts": ts,
+            }).to_string();
+            let _ = tx.send(msg).await;
+        }
+
+        return match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
+            .bind(db_order_id).fetch_one(s.db.as_ref()).await
+        {
+            Ok(o) => (StatusCode::CREATED, Json(json!(o))).into_response(),
+            Err(_) => (StatusCode::CREATED, Json(json!({"id": db_order_id}))).into_response(),
+        };
+    }
+
+    // ── Aeron mode: publish order to exchange_engine, await OrderUpdate ───────
+    if let Some(aeron_pub) = &s.aeron_pub {
+        use crate::sbe::{NewOrderRequest as SbeNewOrder};
+        use crate::transport::order_update_kind;
+
+        let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
+        let tif_byte: u8 = match tif {
+            TimeInForce::GTC      => 0,
+            TimeInForce::IOC      => 1,
+            TimeInForce::FOK      => 2,
+            TimeInForce::PostOnly => 3,
+        };
+        let sbe_req = SbeNewOrder {
+            client_order_id: db_order_id as u64,
+            participant_id: user_id as u64,
+            price: req.price.unwrap_or(0.0),
+            quantity: req.quantity,
+            side: side_byte,
+            time_in_force: tif_byte,
+            _pad: [0; 14],
+        };
+
+        let (tx, rx) = oneshot::channel::<OrderUpdateMsg>();
+        s.pending_orders.insert(db_order_id as u64, tx);
+
+        // Publish and immediately drop the guard so we can await below.
+        let publish_err = { aeron_pub.lock().publish_new_order(&sbe_req).err() };
+        if let Some(e) = publish_err {
+            s.pending_orders.remove(&(db_order_id as u64));
             let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
                 .bind(db_order_id).execute(s.db.as_ref()).await;
             if req.side == "buy" {
@@ -377,210 +625,63 @@ async fn handle_place_order(
             } else {
                 let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
             }
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+            return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Aeron publish failed: {:?}", e)}))).into_response();
         }
-    };
 
-    let db_status = match result.status {
-        OrderStatus::Accepted        => "PENDING",
-        OrderStatus::PartiallyFilled => "TRADING",
-        OrderStatus::Filled          => "COMPLETED",
-        OrderStatus::Rejected        => "REJECTED",
-        OrderStatus::Cancelled       => "CANCELED",
-    };
-
-    let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
-        .bind(db_status).bind(result.filled).bind(db_order_id)
-        .execute(s.db.as_ref()).await;
-
-    if result.status == OrderStatus::Rejected {
-        if req.side == "buy" {
-            let p = req.price.or(best_opposing).unwrap_or(0.0);
-            if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
-        } else {
-            let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
-        }
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Rejected by matching engine"}))).into_response();
-    }
-
-    // Settle fills: record trades and update maker orders.
-    let mut notified_maker_uids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for &(maker_order_id, fp, fq) in &result.fills {
-        if fp <= 0.0 || fq <= 0.0 { continue; }
-
-        let maker_uid: Option<i64> = sqlx::query_scalar("SELECT user_id FROM orders WHERE id=$1")
-            .bind(maker_order_id as i64).fetch_optional(s.db.as_ref()).await.unwrap_or(None);
-
-        let (buyer_id, seller_id) = if req.side == "buy" {
-            (user_id, maker_uid.unwrap_or(0))
-        } else {
-            (maker_uid.unwrap_or(0), user_id)
+        let update = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(_)) => {
+                s.pending_orders.remove(&(db_order_id as u64));
+                return (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error": "Order response channel closed"}))).into_response();
+            }
+            Err(_) => {
+                s.pending_orders.remove(&(db_order_id as u64));
+                return (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error": "Order response timeout"}))).into_response();
+            }
         };
 
-        if buyer_id > 0 && seller_id > 0 {
-            if req.side == "buy" {
-                let over = req.price.map(|lp| (lp - fp) * fq).unwrap_or(0.0).max(0.0);
-                if over > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, over).await; }
-            }
-            let _ = repo.settle_trade(buyer_id, seller_id, base_asset, quote_asset, fp, fq, 0.0, 0.0).await;
-        }
-
-        // Update maker order status in DB.
-        let _ = sqlx::query(
-            "UPDATE orders SET filled = filled + $1,
-             status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
-             updated_at = NOW() WHERE id = $2",
-        )
-        .bind(fq).bind(maker_order_id as i64).execute(s.db.as_ref()).await;
-
-        // Record trade.
-        let (buy_oid, sell_oid): (Option<i64>, Option<i64>) = if req.side == "buy" {
-            (Some(db_order_id), Some(maker_order_id as i64))
-        } else {
-            (Some(maker_order_id as i64), Some(db_order_id))
+        let (db_status, ws_status) = match update.kind {
+            k if k == order_update_kind::ACCEPTED      => ("PENDING",    "OPEN"),
+            k if k == order_update_kind::PARTIAL_FILL  => ("TRADING",    "PARTIAL"),
+            k if k == order_update_kind::FILLED        => ("COMPLETED",  "FILLED"),
+            k if k == order_update_kind::CANCELLED     => ("CANCELED",   "CANCELED"),
+            _                                          => ("REJECTED",   "REJECTED"),
         };
-        let _ = sqlx::query(
-            "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
-             VALUES ($1, $2, $3, $4, $5, NOW())",
-        )
-        .bind(&req.symbol).bind(buy_oid).bind(sell_oid).bind(fp).bind(fq)
-        .execute(s.db.as_ref()).await;
 
-        if let Some(uid) = maker_uid { notified_maker_uids.insert(uid); }
-    }
+        // Copy packed struct fields to locals before use (avoids misaligned ref).
+        let fill_qty: f64 = update.fill_qty;
 
-    // Release frozen for IOC/market with partial or zero fill.
-    if result.status == OrderStatus::Cancelled {
-        let unfilled = req.quantity - result.filled;
-        if unfilled > 0.0 {
-            let (rel_asset, rel_amount) = if req.side == "buy" {
-                (quote_asset, req.price.or(best_opposing).unwrap_or(0.0) * unfilled)
-            } else {
-                (base_asset, unfilled)
-            };
-            if rel_amount > 0.0 { let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await; }
-        }
-    }
+        let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
+            .bind(db_status).bind(fill_qty).bind(db_order_id)
+            .execute(s.db.as_ref()).await;
 
-    // Push balance_update + position_update to taker and all makers that were
-    // involved in fills.
-    let all_notify: Vec<i64> = std::iter::once(user_id)
-        .chain(notified_maker_uids.into_iter())
-        .collect();
-    for uid in all_notify {
-        if let Some(tx) = s.user_tx.get(&uid) {
-            let repo2 = AccountRepository::new(s.db.as_ref());
-            if let Ok(accounts) = repo2.get_all_accounts(uid).await {
-                for acc in accounts {
-                    let msg = serde_json::json!({
-                        "type": "balance_update",
-                        "asset": acc.asset,
-                        "balance": acc.balance,
-                        "available": acc.balance - acc.frozen,
-                        "frozen": acc.frozen,
-                    }).to_string();
-                    let _ = tx.send(msg).await;
-                }
-            }
-            if let Some(msg) =
-                crate::positions::position_update_msg(s.db.as_ref(), uid, base_asset).await
-            {
-                let _ = tx.send(msg).await;
-            }
-        }
-    }
-
-    // Broadcast trade event + ticker update when there were fills.
-    if result.filled > 0.0 {
-        let avg_fill_price = if !result.fills.is_empty() {
-            let cost: f64 = result.fills.iter().map(|&(_, p, q)| p * q).sum();
-            cost / result.filled
-        } else {
-            req.price.or(best_opposing).unwrap_or(0.0)
-        };
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        let trade_msg = serde_json::json!({
-            "type": "trade",
-            "symbol": &req.symbol,
-            "price": avg_fill_price,
-            "qty": result.filled,
-            "side": &req.side,
-            "ts": now_us,
-        }).to_string();
-        let _ = s.market_tx.send(trade_msg);
-
-        let sym_clone = req.symbol.clone();
-        let db_clone = s.db.clone();
-        let mtx_clone = s.market_tx.clone();
-        tokio::spawn(async move {
-            let open_24h: Option<f64> = sqlx::query_scalar(
-                "SELECT price FROM trades WHERE symbol=$1
-                 AND created_at > NOW() - INTERVAL '24 hours'
-                 ORDER BY created_at ASC LIMIT 1",
-            )
-            .bind(&sym_clone)
-            .fetch_optional(db_clone.as_ref())
-            .await
-            .unwrap_or(None);
-            let change = match open_24h {
-                Some(o) if o != 0.0 => (avg_fill_price - o) / o * 100.0,
-                _ => 0.0,
-            };
-            let ticker = serde_json::json!({
-                "type": "ticker",
-                "symbol": sym_clone,
-                "last": avg_fill_price,
-                "change": change,
+        if let Some(tx) = s.user_tx.get(&user_id) {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            let msg = serde_json::json!({
+                "type": "order_update",
+                "order_id": db_order_id,
+                "status": ws_status,
+                "filled_qty": fill_qty,
+                "ts": ts,
             }).to_string();
-            let _ = mtx_clone.send(ticker);
-        });
+            let _ = tx.send(msg).await;
+        }
+
+        return match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
+            .bind(db_order_id).fetch_one(s.db.as_ref()).await
+        {
+            Ok(o) => (StatusCode::CREATED, Json(json!(o))).into_response(),
+            Err(_) => (StatusCode::CREATED, Json(json!({"id": db_order_id}))).into_response(),
+        };
     }
 
-    // Broadcast depth update; kline only when a trade actually occurred.
-    crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
-    if result.filled > 0.0 {
-        let s2 = s.clone();
-        let sym2 = req.symbol.clone();
-        tokio::spawn(async move { crate::ws_handler::broadcast_kline_pub(&s2, &sym2).await; });
-    }
-
-    // Push order_update to the user's personal WS channel so multi-tab /
-    // other WS clients learn about the order — including resting GTC orders
-    // (status=Accepted, filled=0) which previously got no broadcast.
-    let ws_status = match result.status {
-        OrderStatus::Accepted        => "OPEN",
-        OrderStatus::PartiallyFilled => "PARTIAL",
-        OrderStatus::Filled          => "FILLED",
-        OrderStatus::Cancelled       => "CANCELED",
-        OrderStatus::Rejected        => "REJECTED",
-    };
-    if let Some(tx) = s.user_tx.get(&user_id) {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        let msg = serde_json::json!({
-            "type": "order_update",
-            "order_id": db_order_id,
-            "status": ws_status,
-            "filled": result.filled,
-            "filled_qty": result.filled,
-            "ts": ts,
-        }).to_string();
-        let _ = tx.send(msg).await;
-    }
-
-    // Re-fetch final order state from DB and return it.
-    match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
-        .bind(db_order_id).fetch_one(s.db.as_ref()).await
-    {
-        Ok(o) => (StatusCode::CREATED, Json(json!(o))).into_response(),
-        Err(_) => (StatusCode::CREATED, Json(json!({"id": db_order_id}))).into_response(),
-    }
+    // Neither engine nor Aeron — should not happen.
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "No matching engine configured"}))).into_response()
 }
+
 
 async fn handle_cancel_order(
     State(s): State<AppState>,
@@ -629,12 +730,19 @@ async fn handle_cancel_order(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 
-    // Best-effort cancel in engine for this symbol.
-    if let Some(engine) = s.engines.get(&symbol) {
-        let res = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
-        if let Err(e) = res {
-            tracing::warn!("engine cancel_order({}) failed: {:?}", order_id, e);
+    // Best-effort cancel in engine for this symbol (standalone mode only).
+    if let Some(engines) = &s.engines {
+        if let Some(engine) = engines.get(&symbol) {
+            let res = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+            if let Err(e) = res {
+                tracing::warn!("engine cancel_order({}) failed: {:?}", order_id, e);
+            }
         }
+    } else if let Some(aeron_pub) = &s.aeron_pub {
+        // Aeron mode: send cancel to exchange_engine.
+        let cancel_req = crate::sbe::CancelOrderRequest { order_id: order_id as u64 };
+        let mut pub_guard = aeron_pub.lock();
+        let _ = pub_guard.publish_cancel(&cancel_req);
     }
 
     // Release frozen funds for the unfilled portion.
@@ -1019,10 +1127,10 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
         .fetch_optional(s.db.as_ref()).await.unwrap_or(None);
         if already.is_some() { continue; }
 
-        let engine = match s.engines.get(symbol) {
-            Some(e) => e.value().clone(),
-            None => continue,
-        };
+        let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = s.engines
+            .as_ref()
+            .and_then(|m| m.get(symbol).map(|e| e.value().clone()));
+        // In Aeron mode there is no local engine; seed is DB-only (no orderbook).
         let engine_side = if side == "buy" { Side::Buy } else { Side::Sell };
 
         for price in prices {
@@ -1067,9 +1175,12 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
             };
 
             // Place into the engine book directly (no matching, no fund effects).
-            let order = Order::new(db_order.id as u64, engine_side, price, qty, TimeInForce::GTC, 0);
-            let mut eng = engine.lock().unwrap();
-            let _ = eng.add_to_book(order);
+            // In Aeron mode we skip local book insertion; the exchange_engine manages its own book.
+            if let Some(ref engine) = engine_opt {
+                let order = Order::new(db_order.id as u64, engine_side, price, qty, TimeInForce::GTC, 0);
+                let mut eng = engine.lock().unwrap();
+                let _ = eng.add_to_book(order);
+            }
             placed += 1;
         }
     }

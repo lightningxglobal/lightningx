@@ -296,10 +296,13 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         db: Arc::new(pool),
-        engines: Arc::new(engines),
+        engines: Some(Arc::new(engines)),
         market_tx: Arc::new(market_tx),
         user_tx: Arc::new(DashMap::new()),
         next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
+        aeron_pub: None,
+        pending_orders: Arc::new(DashMap::new()),
+        last_depth: Arc::new(DashMap::new()),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

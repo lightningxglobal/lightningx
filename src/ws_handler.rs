@@ -247,8 +247,13 @@ async fn handle_client_message(
                 session.subscribed.insert(ch);
             }
             for sym in depth_symbols {
-                if let Some(engine) = state.engines.get(&sym) {
-                    let _ = personal_tx.send(build_depth_json(engine.value(), &sym)).await;
+                // In standalone mode: push from engine. In Aeron mode: push from last_depth cache.
+                if let Some(engines) = &state.engines {
+                    if let Some(engine) = engines.get(&sym) {
+                        let _ = personal_tx.send(build_depth_json(engine.value(), &sym)).await;
+                    }
+                } else if let Some(depth_json) = state.last_depth.get(&sym) {
+                    let _ = personal_tx.send(depth_json.to_string()).await;
                 }
             }
             None
@@ -292,15 +297,18 @@ async fn handle_client_message(
                 _ => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Unknown order type"}).to_string()),
             };
 
-            // Look up the matching engine for this symbol; reject unknown symbols up front.
-            let engine = match state.engines.get(&symbol) {
-                Some(e) => e.value().clone(),
-                None => return Some(json!({
+            // Look up the matching engine for this symbol; only available in standalone mode.
+            let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = state.engines
+                .as_ref()
+                .and_then(|m| m.get(&symbol).map(|e| e.value().clone()));
+            // In standalone mode, reject unknown symbols up front.
+            if state.engines.is_some() && engine_opt.is_none() {
+                return Some(json!({
                     "type": "order_rejected",
                     "client_order_id": client_order_id,
                     "reason": format!("Unknown symbol: {}", symbol)
-                }).to_string()),
-            };
+                }).to_string());
+            }
 
             let now_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -315,10 +323,12 @@ async fn handle_client_message(
             // Capture best opposing price before matching — used as the fill
             // price for market orders AND persisted as freeze_price so the
             // restart cleanup can release the exact amount later.
-            let best_opposing_price = {
+            let best_opposing_price: Option<f64> = if let Some(ref engine) = engine_opt {
                 let eng = engine.lock().unwrap();
                 let levels = eng.get_top_levels(1, engine_side == Side::Sell);
                 levels.first().map(|(p, _)| *p)
+            } else {
+                None
             };
 
             // Price that backs the frozen quote-asset amount (buy only).
@@ -401,34 +411,138 @@ async fn handle_client_message(
                 }
             }
 
-            // Run through matching engine — hold lock briefly.
-            let engine_result = {
-                let mut eng = engine.lock().unwrap();
-                eng.place_order(engine_order)
-            };
+            // Route to engine: local (standalone) vs Aeron (desk) mode.
+            let result = if let Some(engine) = engine_opt {
+                let engine_result = {
+                    let mut eng = engine.lock().unwrap();
+                    eng.place_order(engine_order)
+                };
+                match engine_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = sqlx::query(
+                            "UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1",
+                        )
+                        .bind(db_order_id)
+                        .execute(state.db.as_ref())
+                        .await;
+                        if side == "buy" {
+                            let p = price.or(best_opposing_price).unwrap_or(0.0);
+                            if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * qty).await; }
+                        } else {
+                            let _ = repo.release_frozen(user_id, base_asset, qty).await;
+                        }
+                        return Some(json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": e.to_string()
+                        }).to_string());
+                    }
+                }
+            } else if let Some(aeron_pub) = &state.aeron_pub {
+                // Aeron mode: publish order, await response via pending_orders.
+                use crate::sbe::NewOrderRequest as SbeNewOrder;
+                use crate::transport::order_update_kind;
+                use tokio::sync::oneshot;
 
-            let result = match engine_result {
-                Ok(r) => r,
-                Err(e) => {
+                let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
+                let tif_byte: u8 = match tif {
+                    TimeInForce::GTC      => 0,
+                    TimeInForce::IOC      => 1,
+                    TimeInForce::FOK      => 2,
+                    TimeInForce::PostOnly => 3,
+                };
+                let sbe_req = SbeNewOrder {
+                    client_order_id: db_order_id as u64,
+                    participant_id: user_id as u64,
+                    price: price.unwrap_or(0.0),
+                    quantity: qty,
+                    side: side_byte,
+                    time_in_force: tif_byte,
+                    _pad: [0; 14],
+                };
+
+                let (tx, rx) = oneshot::channel::<crate::transport::OrderUpdateMsg>();
+                state.pending_orders.insert(db_order_id as u64, tx);
+
+                // Publish and drop guard immediately so we can await below.
+                let pub_err = { aeron_pub.lock().publish_new_order(&sbe_req).err() };
+                if pub_err.is_some() {
+                    state.pending_orders.remove(&(db_order_id as u64));
                     let _ = sqlx::query(
                         "UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1",
                     )
                     .bind(db_order_id)
                     .execute(state.db.as_ref())
                     .await;
-                    // Release frozen funds — engine rejected before any fill.
-                    if side == "buy" {
-                        let p = price.or(best_opposing_price).unwrap_or(0.0);
-                        if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * qty).await; }
-                    } else {
-                        let _ = repo.release_frozen(user_id, base_asset, qty).await;
-                    }
                     return Some(json!({
                         "type": "order_rejected",
                         "client_order_id": client_order_id,
-                        "reason": e.to_string()
+                        "reason": "Aeron publish failed"
                     }).to_string());
                 }
+
+                let update = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                    Ok(Ok(msg)) => msg,
+                    _ => {
+                        state.pending_orders.remove(&(db_order_id as u64));
+                        return Some(json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": "Order response timeout"
+                        }).to_string());
+                    }
+                };
+
+                // Copy packed struct fields to locals before use.
+                let fill_qty: f64 = update.fill_qty;
+
+                // Map OrderUpdateMsg into a pseudo EngineResult for unified downstream code.
+                let (db_status, ws_status) = match update.kind {
+                    k if k == order_update_kind::ACCEPTED     => ("PENDING",   "OPEN"),
+                    k if k == order_update_kind::PARTIAL_FILL => ("TRADING",   "PARTIAL_FILL"),
+                    k if k == order_update_kind::FILLED       => ("COMPLETED", "FILLED"),
+                    k if k == order_update_kind::CANCELLED    => ("CANCELED",  "CANCELED"),
+                    _                                         => ("REJECTED",  "REJECTED"),
+                };
+                let _ = sqlx::query(
+                    "UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3",
+                )
+                .bind(db_status)
+                .bind(fill_qty)
+                .bind(db_order_id)
+                .execute(state.db.as_ref())
+                .await;
+
+                let ts_now = unix_now();
+                let upd_msg = json!({
+                    "type": "order_update",
+                    "order_id": db_order_id,
+                    "status": ws_status,
+                    "filled_qty": fill_qty,
+                    "ts": ts_now,
+                }).to_string();
+                if let Some(utx) = state.user_tx.get(&user_id) {
+                    let _ = utx.send(upd_msg).await;
+                }
+
+                return Some(json!({
+                    "type": "order_accepted",
+                    "client_order_id": client_order_id,
+                    "order_id": db_order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "order_type": order_type,
+                    "price": price,
+                    "quantity": qty,
+                    "ts": ts_now
+                }).to_string());
+            } else {
+                return Some(json!({
+                    "type": "order_rejected",
+                    "client_order_id": client_order_id,
+                    "reason": "No matching engine configured"
+                }).to_string());
             };
 
             // Map engine status to (DB, WS) status strings. IOC/FOK that
@@ -777,9 +891,15 @@ async fn handle_client_message(
                 return Some(json!({"type": "error", "message": e.to_string()}).to_string());
             }
 
-            // Best-effort cancel in engine for this symbol.
-            if let Some(engine) = state.engines.get(&symbol) {
-                let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+            // Best-effort cancel in engine (standalone) or via Aeron (desk mode).
+            if let Some(engines) = &state.engines {
+                if let Some(engine) = engines.get(&symbol) {
+                    let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+                }
+            } else if let Some(aeron_pub) = &state.aeron_pub {
+                let cancel_req = crate::sbe::CancelOrderRequest { order_id: order_id as u64 };
+                let mut pub_guard = aeron_pub.lock();
+                let _ = pub_guard.publish_cancel(&cancel_req);
             }
 
             // Release frozen funds for the unfilled portion.
@@ -839,8 +959,12 @@ fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
 
 /// Build and broadcast a depth snapshot for the given symbol.
 pub fn broadcast_depth_pub(state: &AppState, symbol: &str) {
-    if let Some(engine) = state.engines.get(symbol) {
-        let _ = state.market_tx.send(build_depth_json(engine.value(), symbol));
+    if let Some(engines) = &state.engines {
+        if let Some(engine) = engines.get(symbol) {
+            let _ = state.market_tx.send(build_depth_json(engine.value(), symbol));
+        }
+    } else if let Some(depth_json) = state.last_depth.get(symbol) {
+        let _ = state.market_tx.send(depth_json.to_string());
     }
 }
 
@@ -920,18 +1044,35 @@ pub async fn market_data_broadcaster(state: AppState) {
     loop {
         tokio::select! {
             _ = depth_interval.tick() => {
-                for (symbol, bids, asks) in snapshot_all_engines(&state.engines) {
-                    if let Some((p, _)) = bids.first() {
-                        last_prices.insert(symbol.clone(), *p);
+                // Only broadcast depth from local engines in standalone mode.
+                // In Aeron mode, depth is pushed by exchange_engine via Aeron.
+                if let Some(ref engines) = state.engines {
+                    for (symbol, bids, asks) in snapshot_all_engines(engines) {
+                        if let Some((p, _)) = bids.first() {
+                            last_prices.insert(symbol.clone(), *p);
+                        }
+                        let msg = json!({
+                            "type": "depth",
+                            "symbol": symbol,
+                            "bids": bids,
+                            "asks": asks,
+                            "ts": unix_now()
+                        }).to_string();
+                        let _ = state.market_tx.send(msg);
                     }
-                    let msg = json!({
-                        "type": "depth",
-                        "symbol": symbol,
-                        "bids": bids,
-                        "asks": asks,
-                        "ts": unix_now()
-                    }).to_string();
-                    let _ = state.market_tx.send(msg);
+                } else {
+                    // In Aeron mode, collect last prices from last_depth cache.
+                    for entry in state.last_depth.iter() {
+                        let sym = entry.key().clone();
+                        let depth_val = entry.value().clone();
+                        if let Some(bids) = depth_val.get("bids").and_then(|b| b.as_array()) {
+                            if let Some(first_bid) = bids.first() {
+                                if let Some(p) = first_bid.get(0).and_then(|v| v.as_f64()) {
+                                    last_prices.insert(sym, p);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -984,7 +1125,11 @@ pub async fn market_data_broadcaster(state: AppState) {
                 // corrupt the chart with a fake flat candle.
                 let now = unix_secs();
                 let bar_time = now - (now % 60);
-                let symbols: Vec<String> = state.engines.iter().map(|e| e.key().clone()).collect();
+                let symbols: Vec<String> = if let Some(ref engines) = state.engines {
+                    engines.iter().map(|e| e.key().clone()).collect()
+                } else {
+                    last_prices.keys().cloned().collect()
+                };
                 for symbol in symbols {
                     let db = state.db.clone();
                     let mtx = state.market_tx.clone();

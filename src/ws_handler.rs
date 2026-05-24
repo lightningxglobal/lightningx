@@ -1101,7 +1101,7 @@ fn snapshot_all_engines(
 pub async fn market_data_broadcaster(state: AppState) {
     let mut depth_interval = tokio::time::interval(std::time::Duration::from_secs(2));
     depth_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     kline_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ticker_interval = tokio::time::interval(std::time::Duration::from_secs(5));
     ticker_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -156,7 +156,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             }
 
             // Broadcast market data (depth, trades)
-            Ok(msg) = market_rx.recv() => {
+            result = market_rx.recv() => {
+                let msg = match result {
+                    Ok(m) => m,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
                 // Only forward if this client subscribed to a matching channel.
                 // We do a quick prefix check on the JSON "type" field to avoid
                 // deserializing the whole payload.
@@ -302,15 +307,6 @@ async fn handle_client_message(
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
 
-            // Allocate an engine-level order ID.
-            let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
-
-            let engine_order = if order_type == "market" {
-                Order::new_market(order_id, engine_side, qty, now_ns)
-            } else {
-                Order::new(order_id, engine_side, price.unwrap_or(0.0), qty, tif, now_ns)
-            };
-
             // Parse base/quote assets from symbol (e.g. "BTC_USDT" → "BTC", "USDT").
             let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
             let base_asset = sym_parts.first().copied().unwrap_or("BTC");
@@ -358,6 +354,15 @@ async fn handle_client_message(
                     }).to_string());
                 }
             };
+            // Use the DB-assigned ID as the engine order ID so that fill settlement
+            // looks up the correct DB row. Keeps next_order_id in sync for WS orders
+            // that don't go through the REST-path atomic counter.
+            let engine_order = if order_type == "market" {
+                Order::new_market(db_order_id as u64, engine_side, qty, now_ns)
+            } else {
+                Order::new(db_order_id as u64, engine_side, price.unwrap_or(0.0), qty, tif, now_ns)
+            };
+            state.next_order_id.fetch_max(db_order_id as u64 + 1, Ordering::Relaxed);
 
             // Freeze funds before sending to engine.
             let repo = AccountRepository::new(state.db.as_ref());
@@ -900,9 +905,13 @@ fn snapshot_all_engines(
 
 pub async fn market_data_broadcaster(state: AppState) {
     let mut depth_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    depth_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    kline_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ticker_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    ticker_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agg_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    agg_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Last-seen top-bid price per symbol — drives ticker broadcasts and the
     // 24h-change calc. Keyed by symbol so a new symbol picked up at runtime
     // gets its own entry on first non-empty depth tick.

@@ -539,9 +539,13 @@ async fn handle_place_order(
         });
     }
 
-    // Broadcast depth update and current-minute kline.
+    // Broadcast depth update; kline only when a trade actually occurred.
     crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
-    crate::ws_handler::broadcast_kline_pub(&s, &req.symbol).await;
+    if result.filled > 0.0 {
+        let s2 = s.clone();
+        let sym2 = req.symbol.clone();
+        tokio::spawn(async move { crate::ws_handler::broadcast_kline_pub(&s2, &sym2).await; });
+    }
 
     // Push order_update to the user's personal WS channel so multi-tab /
     // other WS clients learn about the order — including resting GTC orders

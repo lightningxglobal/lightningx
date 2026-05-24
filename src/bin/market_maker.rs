@@ -176,6 +176,24 @@ impl ExchangeClient {
         }
     }
 
+    /// Query all open orders for this account (status=PENDING or TRADING) for a given symbol.
+    async fn open_order_ids(&self, symbol: &str) -> Vec<i64> {
+        let token = self.token.lock().await.clone();
+        #[derive(serde::Deserialize)]
+        struct OrderId { id: i64 }
+        let res = self.http
+            .get(format!("{}/api/orders?status=open&symbol={symbol}&limit=500", self.base))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await;
+        match res {
+            Ok(r) if r.status().is_success() => {
+                r.json::<Vec<OrderId>>().await.unwrap_or_default().into_iter().map(|o| o.id).collect()
+            }
+            _ => vec![],
+        }
+    }
+
     async fn place_order(&self, symbol: &str, side: &str, price: f64, qty: f64) -> Option<i64> {
         let token = self.token.lock().await.clone();
         let res = self.http
@@ -254,9 +272,12 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: ExchangeClient) {
             continue;
         }
 
-        // 1. Cancel all tracked orders sequentially to avoid thundering-herd on the exchange
-        let ids = std::mem::take(&mut tracked_ids);
-        for id in ids {
+        // 1. Cancel ALL open orders for this symbol (tracked + any orphans from previous
+        //    cycles whose cancel failed). This prevents stale orders from accumulating
+        //    in the engine and crossing with new ones.
+        tracked_ids.clear();
+        let all_open = client.open_order_ids(cfg.our_symbol).await;
+        for id in all_open {
             client.cancel_order(id).await;
         }
 

@@ -40,8 +40,8 @@ fn exchange_ws_url() -> String {
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
 const DEPTH_LEVELS: usize = 20;
-const QTY_SCALE: f64 = 0.02;
-const MAX_USDT_PER_SIDE: f64 = 40000.0;
+const QTY_SCALE: f64 = 1.0;
+const MAX_USDT_PER_SIDE: f64 = 2_000_000.0;
 const BINANCE_WS_BASE: &str = "wss://fstream.binance.com/ws";
 
 struct SymbolConfig {

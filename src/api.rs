@@ -1015,7 +1015,7 @@ async fn handle_robot_funds(
 
     let result = sqlx::query(
         "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 50000, 0), ($1, 'BTC', 5, 0), ($1, 'ETH', 500, 0), ($1, 'SOL', 50000, 0)
+         VALUES ($1, 'USDT', 10000000, 0), ($1, 'BTC', 10000, 0), ($1, 'ETH', 1000000, 0), ($1, 'SOL', 10000000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
          SET balance = GREATEST(accounts.balance, EXCLUDED.balance), frozen = 0, updated_at = NOW()",
     )

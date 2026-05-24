@@ -288,8 +288,15 @@ async fn main() -> anyhow::Result<()> {
                                 Order::new(req.client_order_id, side, req.price, req.quantity, tif, ts)
                             };
 
+                            let side_str = if req.side == 0 { "buy" } else { "sell" };
+                            let req_price: f64 = req.price;
+                            let req_qty: f64 = req.quantity;
+                            let req_coid: u64 = req.client_order_id;
+                            tracing::debug!("NewOrder: symbol={} side={} price={} qty={} id={}", symbol, side_str, req_price, req_qty, req_coid);
+
                             match engine.place_order(order) {
-                                Err(_) => {
+                                Err(e) => {
+                                    tracing::warn!("place_order FAILED: symbol={} side={} price={} err={:?}", symbol, side_str, req_price, e);
                                     let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
                                         req.client_order_id,
                                         req.participant_id,
@@ -298,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
                                     ));
                                 }
                                 Ok(result) => {
+                                    tracing::debug!("place_order OK: symbol={} side={} status={:?} filled={}", symbol, side_str, result.status, result.filled);
                                     // Publish per-fill trade notifications.
                                     let sym_bytes = symbol_bytes(&symbol);
                                     for &(maker_order_id, fill_price, fill_qty) in &result.fills {
@@ -405,6 +413,11 @@ async fn main() -> anyhow::Result<()> {
                         // get_top_levels(limit, is_buy): true = buy_book (bids), false = sell_book (asks)
                         let bids = engine.get_top_levels(20, true);
                         let asks = engine.get_top_levels(20, false);
+                        if symbol == "ETH_USDT" {
+                            tracing::debug!("depth snap: {} bids={} asks={}", symbol, bids.len(), asks.len());
+                            if let Some((p, q)) = bids.first() { tracing::debug!("  best bid: {} @ {}", q, p); }
+                            if let Some((p, q)) = asks.first() { tracing::debug!("  best ask: {} @ {}", q, p); }
+                        }
                         for (i, (p, q)) in bids.iter().take(20).enumerate() {
                             snap.bids[i] = (*p, *q);
                         }

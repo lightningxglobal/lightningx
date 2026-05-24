@@ -1173,9 +1173,19 @@ impl MatchingEngine {
             Side::Sell => &mut self.sell_book,
         };
 
-        // 从价格档位的订单队列中移除此订单
         book.remove_order_at_level(order.price, order_id)
-            .map_err(|_| MatchingEngineError::OrderNotFound)
+            .map_err(|_| MatchingEngineError::OrderNotFound)?;
+
+        // Remove the price level entirely if no orders remain, to avoid ghost
+        // 0-qty levels showing up in get_top_levels() depth snapshots.
+        let level_empty = book.get_node_at_price(order.price)
+            .map(|n| n.orders.is_empty())
+            .unwrap_or(true);
+        if level_empty {
+            let _ = book.remove_level(order.price);
+        }
+
+        Ok(())
     }
 
     /// 生成市场深度快照

@@ -165,6 +165,13 @@ async fn main() -> anyhow::Result<()> {
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_micros() as u64)
                                     .unwrap_or(0);
+                                let num_bids: u8 = evt.num_bids;
+                                let num_asks: u8 = evt.num_asks;
+                                tracing::debug!("depth recv: num_bids={} num_asks={}", num_bids, num_asks);
+                                if num_asks > 0 {
+                                    let first_ask: (f64, f64) = evt.asks[0];
+                                    tracing::debug!("  first ask: price={} qty={}", first_ask.0, first_ask.1);
+                                }
                                 let bids: Vec<[f64; 2]> = evt.bids[..evt.num_bids as usize]
                                     .iter()
                                     .filter(|(_, q)| *q > 0.0)

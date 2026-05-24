@@ -153,7 +153,7 @@ async fn handle_orders(
             "SELECT * FROM orders WHERE user_id=$1 AND ($2::text IS NULL OR symbol=$2) AND status=ANY($3) ORDER BY created_at DESC LIMIT $4",
         ).bind(user_id).bind(&q.symbol).bind(&statuses).bind(limit).fetch_all(s.db.as_ref()).await,
         None => sqlx::query_as::<_, DbOrder>(
-            "SELECT * FROM orders WHERE user_id=$1 AND ($2::text IS NULL OR symbol=$2) ORDER BY created_at DESC LIMIT $4",
+            "SELECT * FROM orders WHERE user_id=$1 AND ($2::text IS NULL OR symbol=$2) ORDER BY created_at DESC LIMIT $3",
         ).bind(user_id).bind(&q.symbol).bind(limit).fetch_all(s.db.as_ref()).await,
     };
     match orders {

@@ -151,21 +151,14 @@ impl ExchangeClient {
     async fn ensure_funds(&self) -> anyhow::Result<()> {
         let token = self.token.lock().await.clone();
         let resp = self.http
-            .post(format!("{}/api/test-funds", self.base))
+            .post(format!("{}/api/robot-funds", self.base))
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await?;
-        match resp.status().as_u16() {
-            200 => {
-                let txt = resp.text().await.unwrap_or_default();
-                info!("Test funds granted: {txt}");
-            }
-            400 => {
-                // Already has funds — normal
-            }
-            code => {
-                warn!("test-funds returned {code}");
-            }
+        if resp.status().is_success() {
+            info!("Robot inventory topped up");
+        } else {
+            warn!("robot-funds returned {}", resp.status());
         }
         Ok(())
     }

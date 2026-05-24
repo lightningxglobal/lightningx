@@ -56,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/klines", get(handle_klines))
         .route("/api/user/password", patch(handle_change_password))
         .route("/api/test-funds", post(handle_test_funds))
+        .route("/api/robot-funds", post(handle_robot_funds))
         .route("/api/seed-demo", post(handle_seed_demo))
         .with_state(state)
 }
@@ -878,6 +879,33 @@ async fn handle_test_funds(
 
     match result {
         Ok(_) => (StatusCode::OK, Json(json!({"message": "Test funds granted: 10,000 USDT + 1 BTC + 10 ETH + 100 SOL", "usdt": 10000, "btc": 1, "eth": 10, "sol": 100}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// Top up robot account to maintain sufficient inventory for market-making.
+/// Always sets balances to at least the specified floor amounts.
+async fn handle_robot_funds(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    let result = sqlx::query(
+        "INSERT INTO accounts (user_id, asset, balance, frozen)
+         VALUES ($1, 'USDT', 50000, 0), ($1, 'BTC', 5, 0), ($1, 'ETH', 500, 0), ($1, 'SOL', 50000, 0)
+         ON CONFLICT (user_id, asset) DO UPDATE
+         SET balance = GREATEST(accounts.balance, EXCLUDED.balance), updated_at = NOW()",
+    )
+    .bind(user_id)
+    .execute(s.db.as_ref())
+    .await;
+
+    match result {
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

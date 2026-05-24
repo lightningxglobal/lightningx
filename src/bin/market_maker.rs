@@ -21,12 +21,12 @@ fn exchange_url() -> String {
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
 
-const DEPTH_LEVELS: usize = 5;      // levels per side to mirror (fewer = less load)
+const DEPTH_LEVELS: usize = 20;     // levels per side to mirror
 const QTY_SCALE: f64 = 0.02;        // use 2% of Binance's qty per level
 const MAX_USDT_PER_SIDE: f64 = 40000.0; // safety cap: total USDT exposure per side
 const REFRESH_MS: u64 = 2000;       // poll every 2s — Binance REST rate limit is 1200 req/min
 
-const BINANCE_API: &str = "https://api.binance.com/api/v3/depth";
+const BINANCE_API: &str = "https://fapi.binance.com/fapi/v1/depth";
 
 struct SymbolConfig {
     our_symbol: &'static str,
@@ -287,9 +287,8 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: ExchangeClient) {
         // 2. Place bid orders
         let mut usdt_spent = 0.0_f64;
         for (price, binance_qty) in bids.iter().take(DEPTH_LEVELS) {
-            let qty = (binance_qty * QTY_SCALE).max(0.0);
+            let qty = (binance_qty * QTY_SCALE).max(cfg.min_qty);
             let qty = round_qty(qty, cfg.min_qty);
-            if qty < cfg.min_qty { continue; }
             let cost = price * qty;
             if usdt_spent + cost > MAX_USDT_PER_SIDE { break; }
             usdt_spent += cost;
@@ -300,9 +299,8 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: ExchangeClient) {
 
         // 3. Place ask orders
         for (price, binance_qty) in asks.iter().take(DEPTH_LEVELS) {
-            let qty = (binance_qty * QTY_SCALE).max(0.0);
+            let qty = (binance_qty * QTY_SCALE).max(cfg.min_qty);
             let qty = round_qty(qty, cfg.min_qty);
-            if qty < cfg.min_qty { continue; }
             if let Some(id) = client.place_order(cfg.our_symbol, "sell", *price, qty).await {
                 tracked_ids.push(id);
             }

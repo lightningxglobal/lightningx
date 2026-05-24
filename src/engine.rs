@@ -683,6 +683,25 @@ impl MatchingEngine {
                 // 计算成交数量
                 let order_remaining = order.quantity - filled;
                 let counter_remaining = counter_order.remaining();
+
+                // Safety guard: float accumulation can leave counter_remaining ≤ 0
+                // even though is_filled() is false. Force-remove the ghost order so
+                // we don't spin on it indefinitely.
+                if counter_remaining <= 0.0 {
+                    let opp = match order.side {
+                        Side::Buy => &mut self.sell_book,
+                        Side::Sell => &mut self.buy_book,
+                    };
+                    let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                    if let Some(idx) = self.orders.remove(&counter_order_id) {
+                        self.pools.orders.release(idx);
+                    }
+                    if opp.get_node_at_price(best_price).map(|n| n.orders.is_empty()).unwrap_or(true) {
+                        let _ = opp.remove_level(best_price);
+                    }
+                    continue;
+                }
+
                 let trade_qty = order_remaining.min(counter_remaining);
 
                 // 收集被修改的 maker ID 及成交明细
@@ -758,12 +777,13 @@ impl MatchingEngine {
                             if let Some(idx) = self.orders.remove(&counter_order_id) {
                                 self.pools.orders.release(idx);
                             }
-                            // Drop the level when its last order has gone, so
-                            // depth snapshots don't emit a 0-qty ghost.
+                            // Drop the level when its last order has gone.
+                            // Use orders.is_empty() instead of total_quantity <= 0
+                            // to handle float drift where total_quantity ≈ 0 but > 0.
                             let level_empty = opposite_book
                                 .get_node_at_price(best_price)
-                                .map(|lvl| lvl.total_quantity <= 0.0)
-                                .unwrap_or(false);
+                                .map(|lvl| lvl.orders.is_empty())
+                                .unwrap_or(true);
                             if level_empty {
                                 let _ = opposite_book.remove_level(best_price);
                             }
@@ -881,6 +901,22 @@ impl MatchingEngine {
 
                     let order_remaining = order.quantity - filled;
                     let counter_remaining = counter_order.remaining();
+
+                    if counter_remaining <= 0.0 {
+                        let opp = match order.side {
+                            Side::Buy => &mut self.sell_book,
+                            Side::Sell => &mut self.buy_book,
+                        };
+                        let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                        if let Some(idx) = self.orders.remove(&counter_order_id) {
+                            self.pools.orders.release(idx);
+                        }
+                        if opp.get_node_at_price(best_price).map(|n| n.orders.is_empty()).unwrap_or(true) {
+                            let _ = opp.remove_level(best_price);
+                        }
+                        continue;
+                    }
+
                     let trade_qty = order_remaining.min(counter_remaining);
 
                     // 更新订单状态
@@ -940,12 +976,10 @@ impl MatchingEngine {
                                 if let Some(idx) = self.orders.remove(&counter_order_id) {
                                     self.pools.orders.release(idx);
                                 }
-                                // Drop the level when its last order has gone, so
-                                // depth snapshots don't emit a 0-qty ghost.
                                 let level_empty = opposite_book
                                     .get_node_at_price(best_price)
-                                    .map(|lvl| lvl.total_quantity <= 0.0)
-                                    .unwrap_or(false);
+                                    .map(|lvl| lvl.orders.is_empty())
+                                    .unwrap_or(true);
                                 if level_empty {
                                     let _ = opposite_book.remove_level(best_price);
                                 }

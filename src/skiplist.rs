@@ -396,10 +396,14 @@ impl SkipList {
 
     /// 获取缓存的最优价格（如果有效）或重新计算
     pub fn get_best_price_cached(&mut self) -> Option<f64> {
-        // Check if cached price is still valid
+        // Check if cached price is still valid.
+        // Use orders.is_empty() rather than total_quantity > 0 because float
+        // accumulation (e.g. 0.1+0.2-0.1-0.2 ≈ 3e-17) can leave total_quantity
+        // slightly positive even after all orders are removed, creating a ghost
+        // level that would spin match_order forever.
         if let Some(price) = self.best_price {
             if let Some(node) = self.get_node_at_price(price) {
-                if node.total_quantity > 0.0 {
+                if !node.orders.is_empty() {
                     return Some(price);
                 }
             }

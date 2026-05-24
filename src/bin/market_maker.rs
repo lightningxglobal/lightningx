@@ -18,10 +18,10 @@ const EXCHANGE_URL: &str = "http://localhost:4001";
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
 
-const DEPTH_LEVELS: usize = 10;     // levels per side to mirror
+const DEPTH_LEVELS: usize = 5;      // levels per side to mirror (fewer = less load)
 const QTY_SCALE: f64 = 0.02;        // use 2% of Binance's qty per level
 const MAX_USDT_PER_SIDE: f64 = 4000.0; // safety cap: total USDT exposure per side
-const REFRESH_MS: u64 = 500;        // minimum ms between refresh cycles
+const REFRESH_MS: u64 = 2000;       // poll every 2s — Binance REST rate limit is 1200 req/min
 
 const BINANCE_API: &str = "https://api.binance.com/api/v3/depth";
 
@@ -254,15 +254,11 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: ExchangeClient) {
             continue;
         }
 
-        // 1. Cancel all tracked orders
+        // 1. Cancel all tracked orders sequentially to avoid thundering-herd on the exchange
         let ids = std::mem::take(&mut tracked_ids);
-        let cancel_futs: Vec<_> = ids.iter()
-            .map(|&id| {
-                let c = client.clone();
-                async move { c.cancel_order(id).await }
-            })
-            .collect();
-        futures::future::join_all(cancel_futs).await;
+        for id in ids {
+            client.cancel_order(id).await;
+        }
 
         // 2. Place bid orders
         let mut usdt_spent = 0.0_f64;

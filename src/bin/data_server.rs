@@ -1,4 +1,4 @@
-/// Lightning Data Service — read-only historical data API on port 3002.
+/// Lightning Data Service — read-only historical data API on port 4002.
 /// Serves tickers, klines, orders, trades, and account balances from PostgreSQL.
 /// No matching engine, no WebSocket, no fund mutation.
 use axum::{
@@ -553,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
-    let port = std::env::var("DATA_PORT").unwrap_or_else(|_| "3002".to_string());
+    let port = std::env::var("DATA_PORT").unwrap_or_else(|_| "4002".to_string());
     let jwt_secret = std::env::var("JWT_SECRET")
         .unwrap_or_else(|_| "exchange_jwt_secret_change_in_prod".to_string());
 

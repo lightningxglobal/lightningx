@@ -442,7 +442,19 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
             refresh_book(cfg, &client, &bids, &asks, &mut bid_book, &mut ask_book, cycle).await;
         }
 
-        warn!("[{}] Binance WS disconnected, reconnecting in {reconnect_delay:?}…", cfg.our_symbol);
+        // On disconnect, cancel all open orders for this symbol — prices may
+        // have moved while we were offline and the stale book would mislead the diff.
+        let n = bid_book.len() + ask_book.len();
+        if n > 0 {
+            warn!("[{}] Binance WS disconnected, cancelling {} stale orders…", cfg.our_symbol, n);
+            client.cancel_symbol(cfg.our_symbol).await;
+            bid_book.clear();
+            ask_book.clear();
+        } else {
+            warn!("[{}] Binance WS disconnected, reconnecting in {reconnect_delay:?}…", cfg.our_symbol);
+        }
+        last_bid = 0.0;
+        last_ask = 0.0;
         tokio::time::sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
     }

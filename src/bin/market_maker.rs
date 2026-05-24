@@ -4,7 +4,7 @@
 /// partial-book stream (`@depth20@100ms`).  Cancel+replace fires only when
 /// the best bid or ask price changes, so we react as fast as Binance pushes
 /// without flooding the exchange with no-op cycles.
-use futures_util::StreamExt;
+use futures_util::{future, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -183,7 +183,7 @@ fn parse_levels(raw: &[[String; 2]]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-// ── Cancel all open + place fresh book ────────────────────────────────────────
+// ── Cancel all open + place fresh book (all requests concurrent) ──────────────
 
 async fn refresh_book(
     cfg: &SymbolConfig,
@@ -193,25 +193,32 @@ async fn refresh_book(
     tracked: &mut Vec<i64>,
 ) {
     tracked.clear();
-    for id in client.open_order_ids(cfg.our_symbol).await {
-        client.cancel_order(id).await;
-    }
 
+    // 1. Cancel all open orders concurrently.
+    let open_ids = client.open_order_ids(cfg.our_symbol).await;
+    future::join_all(open_ids.iter().map(|&id| client.cancel_order(id))).await;
+
+    // 2. Build the desired bid/ask levels.
+    let mut bid_orders: Vec<(f64, f64)> = Vec::new();
     let mut usdt_spent = 0.0_f64;
     for (price, binance_qty) in bids.iter().take(DEPTH_LEVELS) {
         let qty = round_qty((binance_qty * QTY_SCALE).max(cfg.min_qty), cfg.min_qty);
         let cost = price * qty;
         if usdt_spent + cost > MAX_USDT_PER_SIDE { break; }
         usdt_spent += cost;
-        if let Some(id) = client.place_order(cfg.our_symbol, "buy", *price, qty).await {
-            tracked.push(id);
-        }
+        bid_orders.push((*price, qty));
     }
-    for (price, binance_qty) in asks.iter().take(DEPTH_LEVELS) {
+    let ask_orders: Vec<(f64, f64)> = asks.iter().take(DEPTH_LEVELS).map(|(price, binance_qty)| {
         let qty = round_qty((binance_qty * QTY_SCALE).max(cfg.min_qty), cfg.min_qty);
-        if let Some(id) = client.place_order(cfg.our_symbol, "sell", *price, qty).await {
-            tracked.push(id);
-        }
+        (*price, qty)
+    }).collect();
+
+    // 3. Place all bids and asks concurrently.
+    let bid_futs = bid_orders.iter().map(|(price, qty)| client.place_order(cfg.our_symbol, "buy", *price, *qty));
+    let ask_futs = ask_orders.iter().map(|(price, qty)| client.place_order(cfg.our_symbol, "sell", *price, *qty));
+    let results = future::join_all(bid_futs.chain(ask_futs)).await;
+    for id in results.into_iter().flatten() {
+        tracked.push(id);
     }
 }
 

@@ -131,11 +131,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let mut session = WsSession::new();
 
     // Personal update channel for this connection.
-    let (personal_tx, mut personal_rx) = mpsc::channel::<String>(64);
+    // Large capacity to absorb market-making bursts (3 symbols × 120 ops × 2 updates = 720+).
+    let (personal_tx, mut personal_rx) = mpsc::channel::<String>(65536);
     // Broadcast subscriber — create before entering loop so we don't miss messages.
     let mut market_rx = state.market_tx.subscribe();
 
-    loop {
+    'conn: loop {
         tokio::select! {
             // Incoming message from client
             msg = socket.recv() => {
@@ -145,19 +146,26 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             &text, &mut session, &state, personal_tx.clone()
                         ).await {
                             if socket.send(Message::Text(reply)).await.is_err() {
-                                break;
+                                break 'conn;
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => break 'conn,
                     _ => {}
+                }
+                // Drain all buffered personal updates immediately after handling
+                // the incoming message to prevent channel overflow under burst load.
+                while let Ok(msg) = personal_rx.try_recv() {
+                    if socket.send(Message::Text(msg)).await.is_err() {
+                        break 'conn;
+                    }
                 }
             }
 
             // Personal order/balance update for this user
             Some(msg) = personal_rx.recv() => {
                 if socket.send(Message::Text(msg)).await.is_err() {
-                    break;
+                    break 'conn;
                 }
             }
 
@@ -165,8 +173,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             result = market_rx.recv() => {
                 let msg = match result {
                     Ok(m) => m,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue 'conn,
+                    Err(_) => break 'conn,
                 };
                 // Only forward if this client subscribed to a matching channel.
                 // We do a quick prefix check on the JSON "type" field to avoid
@@ -197,7 +205,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
                 if should_forward {
                     if socket.send(Message::Text(msg)).await.is_err() {
-                        break;
+                        break 'conn;
                     }
                 }
             }
@@ -350,9 +358,13 @@ async fn handle_client_message(
             // in the Aeron event loop after the engine confirms ACCEPTED.
             if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
+                use crate::tracer::MS_WS_ORDER_RECV;
                 use crate::transport::{AeronCmd, OrderMeta};
 
                 let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref t) = state.tracer {
+                    t.record(MS_WS_ORDER_RECV, order_id);
+                }
                 let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
                 let tif_byte: u8 = match tif {
                     TimeInForce::GTC      => 0,

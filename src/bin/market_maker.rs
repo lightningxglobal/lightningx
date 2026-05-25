@@ -242,9 +242,10 @@ async fn ws_manager(
         }
         info!("Desk WS connected and authenticated");
 
-        // After each incoming stream message, drain all pending outbox items before
-        // waiting for the next event.  This prevents outbox starvation during
-        // Binance refresh bursts without giving stream unconditional priority.
+        // Fair select: process one stream message OR send one outbox message per
+        // iteration.  No drain loop — draining blocks the read side and causes
+        // a TCP deadlock when the peer's recv buffer fills (200 concurrent orders
+        // generate ~80KB of responses which exceeds the 64KB socket buffer).
         'conn: loop {
             tokio::select! {
                 msg = stream.next() => {
@@ -261,18 +262,6 @@ async fn ws_manager(
                             break 'conn;
                         }
                         _ => {}
-                    }
-                    // After processing the stream message, flush any buffered outbox items.
-                    loop {
-                        match outbox.try_recv() {
-                            Ok(text) => {
-                                if sink.send(Message::Text(text)).await.is_err() {
-                                    warn!("Desk WS send error");
-                                    break 'conn;
-                                }
-                            }
-                            Err(_) => break,
-                        }
                     }
                 }
 
@@ -566,41 +555,44 @@ async fn run_latency_probe(client: WsExchangeClient) {
     // Brief warm-up so market-making is stable before probing.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    const PROBE_COUNT: u32 = 5_000;
-    const INTERVAL_MS: u64 = 10;
-    info!("[latency] Starting probe — {PROBE_COUNT} samples at {INTERVAL_MS}ms intervals");
+    // Sequential zero-sleep probe: fire the next order as soon as the previous
+    // OPEN is confirmed.  This measures true system latency without queuing
+    // distortion — the single shared WS connection is never overloaded,
+    // and throughput equals 1 / p50_latency (~6k orders/sec).
+    const PROBE_COUNT: usize = 200_000;
 
-    let mut samples: Vec<u64> = Vec::with_capacity(PROBE_COUNT as usize);
-    let mut probe_orders: Vec<i64> = Vec::new();
+    info!("[latency] Starting probe — {PROBE_COUNT} samples, sequential, no sleep");
+
+    let mut samples: Vec<u64> = Vec::with_capacity(PROBE_COUNT);
+    let mut timeouts: usize = 0;
+    let start = std::time::Instant::now();
 
     for i in 0..PROBE_COUNT {
-        // Far-off-market bid: $1 for ETH — will be ACCEPTED but never fill.
+        // Far-off-market bid: $1 for ETH — accepted but never fills.
         match client.place_order_timed("ETH_USDT", "buy", 1.0, 0.001).await {
-            Some((oid, us)) => {
-                samples.push(us);
-                if oid > 0 { probe_orders.push(oid); }
-                if i % 500 == 499 {
-                    info!("[latency] #{:5}  {}μs  (running median ~{}μs)", i + 1, us,
-                        { let mut s = samples.clone(); s.sort_unstable(); s[s.len()/2] });
-                }
-            }
-            None => warn!("[latency] #{i:5} timeout/error"),
+            Some((_oid, us)) => samples.push(us),
+            None             => timeouts += 1,
         }
-        tokio::time::sleep(Duration::from_millis(INTERVAL_MS)).await;
+
+        if i > 0 && i % 20_000 == 0 {
+            let n = samples.len();
+            let rate = n as f64 / start.elapsed().as_secs_f64();
+            info!("[latency] #{i}: {n} samples, {timeouts} timeouts, {rate:.0} orders/sec");
+        }
     }
 
-    // Cancel probe orders (best-effort).
-    for oid in probe_orders {
-        client.cancel_order(oid).await;
-    }
+    let elapsed = start.elapsed();
 
-    if samples.len() < 10 {
-        warn!("[latency] Too few samples ({}) for meaningful stats", samples.len());
+    // Clean up resting probe orders with a single cancel-all.
+    client.cancel_symbol("ETH_USDT").await;
+
+    let n = samples.len();
+    if n < 10 {
+        warn!("[latency] Too few samples ({n}) for meaningful stats");
         return;
     }
 
     samples.sort_unstable();
-    let n = samples.len();
     let p50   = samples[n * 50 / 100];
     let p90   = samples[n * 90 / 100];
     let p95   = samples[n * 95 / 100];
@@ -609,10 +601,11 @@ async fn run_latency_probe(client: WsExchangeClient) {
     let min   = samples[0];
     let max   = samples[n - 1];
     let mean  = samples.iter().sum::<u64>() / n as u64;
-    let timeouts = PROBE_COUNT as usize - n;
+    let throughput = n as f64 / elapsed.as_secs_f64();
     info!(
-        "[latency] RESULTS ({n} samples, {timeouts} timeouts): \
-         min={min}μs  mean={mean}μs  p50={p50}μs  p90={p90}μs  p95={p95}μs  p99={p99}μs  p999={p999}μs  max={max}μs"
+        "[latency] RESULTS ({n} samples, {timeouts} timeouts, {throughput:.0} orders/sec, elapsed={:.1}s): \
+         min={min}μs  mean={mean}μs  p50={p50}μs  p90={p90}μs  p95={p95}μs  p99={p99}μs  p999={p999}μs  max={max}μs",
+        elapsed.as_secs_f64()
     );
 }
 
@@ -642,7 +635,7 @@ async fn main() -> anyhow::Result<()> {
     rest_ensure_funds(&http, &base, &token).await;
 
     // Shared WS client: one TCP connection, shared by all symbol tasks.
-    let (ws_tx, ws_rx) = mpsc::channel::<String>(512);
+    let (ws_tx, ws_rx) = mpsc::channel::<String>(8192);
     let pending        = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
     let dead_orders    = Arc::new(DashMap::<i64, ()>::new());
     let latency_pending = Arc::new(DashMap::<u64, oneshot::Sender<u64>>::new());

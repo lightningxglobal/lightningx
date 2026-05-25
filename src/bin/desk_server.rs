@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use lightning_exchange::{
     aeron_channels::{
         AERON_DIR,
-        ORDERS_CHANNEL, ORDERS_STREAM,
+        ORDERS_CHANNEL, orders_stream_for_symbol,
         ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
         TRADE_CHANNEL, TRADE_STREAM,
         DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
@@ -41,8 +41,19 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Aeron init failed: {:?}", e))?,
     );
 
-    let mut order_pub = DeskOrderPublisher::new(client.clone(), ORDERS_CHANNEL, ORDERS_STREAM)
-        .map_err(|e| anyhow::anyhow!("DeskOrderPublisher: {}", e))?;
+    // Per-symbol order publishers: each symbol routes to its own Aeron stream so the
+    // matching threads never share a stream and there is zero HOL blocking between symbols.
+    let symbols_env = std::env::var("SYMBOLS")
+        .unwrap_or_else(|_| "ETH_USDT,BTC_USDT,SOL_USDT".to_string());
+    let mut order_pubs: std::collections::HashMap<String, DeskOrderPublisher> =
+        symbols_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        .map(|sym| {
+            let stream = orders_stream_for_symbol(&sym);
+            let pub_ = DeskOrderPublisher::new(client.clone(), ORDERS_CHANNEL, stream)
+                .unwrap_or_else(|e| panic!("DeskOrderPublisher({sym}): {e}"));
+            (sym, pub_)
+        })
+        .collect();
 
     let mut order_update_sub = DeskOrderUpdateSubscriber::new(
         client.clone(), ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
@@ -110,12 +121,25 @@ async fn main() -> anyhow::Result<()> {
                     while let Ok(cmd) = aeron_cmd_rx.try_recv() {
                         match cmd {
                             AeronCmd::NewOrder(req) => {
-                                let _ = order_pub.publish_new_order(&req);
+                                let sym = std::str::from_utf8(&req.symbol)
+                                    .unwrap_or("").trim_end_matches('\0');
+                                if let Some(pub_) = order_pubs.get_mut(sym) {
+                                    let _ = pub_.publish_new_order(&req);
+                                } else if let Some(pub_) = order_pubs.values_mut().next() {
+                                    // unknown symbol: fall back to first available publisher
+                                    let _ = pub_.publish_new_order(&req);
+                                }
                                 if let Some(ref t) = spin_tracer {
                                     t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
                                 }
                             }
-                            AeronCmd::Cancel(req) => { let _ = order_pub.publish_cancel(&req); }
+                            AeronCmd::Cancel(req) => {
+                                // Cancel doesn't carry a symbol — broadcast to all streams.
+                                // Only the engine that owns the order will find it and confirm.
+                                for pub_ in order_pubs.values_mut() {
+                                    let _ = pub_.publish_cancel(&req);
+                                }
+                            }
                         }
                     }
 

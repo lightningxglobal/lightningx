@@ -1,24 +1,44 @@
 /// Aeron channel and stream ID constants shared by all binaries.
 ///
-/// Production topology
-/// ───────────────────
+/// Transport selection — AERON_TRANSPORT env var
+/// ───────────────────────────────────────────────
+///   ipc  (default) — shared memory, same machine, ~1–5μs RTT, stable
+///   udp             — UDP sockets, simulates cross-machine production topology
+///
+/// Production topology (udp mode)
+/// ───────────────────────────────
 ///   Engine machine  : exchange_engine  +  kline_service  +  beacon sidecar
 ///   Desk machine    : desk_server
 ///
-/// Channels that cross the engine↔desk boundary use UDP so the two machines
-/// can be physically separated (security isolation, independent scaling).
-/// The Metrics channel stays IPC because the beacon sidecar always runs
-/// co-located with the engine/desk on the same host.
-///
-/// For cross-machine deployment replace "localhost" with the actual engine IP
-/// (e.g. ENGINE_IP=10.0.1.10) in the endpoint strings below.
+/// For cross-machine deployment set ENGINE_HOST to the engine's IP.
+/// On macOS, UDP loopback has unavoidable jitter (scheduler, BSD network stack).
+/// For accurate UDP latency measurements, run on Linux with:
+///   AERON_SENDER_IDLE_STRATEGY=noop AERON_RECEIVER_IDLE_STRATEGY=noop
+///   ethtool -C <nic> rx-usecs 0 tx-usecs 0   (disable interrupt coalescing)
 
 pub const AERON_DIR: &str = "/tmp/aeron";
+
+/// Resolve the engine host: ENGINE_HOST env var, defaulting to localhost.
+fn engine_host() -> String {
+    std::env::var("ENGINE_HOST").unwrap_or_else(|_| "localhost".to_string())
+}
+
+/// Build a channel URI for a given local port.
+/// ipc mode  → "aeron:ipc"  (ignores port, same channel for all)
+/// udp mode  → "aeron:udp?endpoint=<ENGINE_HOST>:<port>"
+fn channel(port: u16) -> String {
+    match std::env::var("AERON_TRANSPORT").as_deref() {
+        Ok("udp") => format!("aeron:udp?endpoint={}:{}", engine_host(), port),
+        _          => "aeron:ipc".to_string(),   // default: IPC
+    }
+}
+
+// ── Per-channel accessors ──────────────────────────────────────────────────
 
 /// Desk → Engine: NewOrder / CancelOrder (SBE)
 /// Per-symbol streams start at ORDERS_STREAM_BASE (10, 11, 12 …).
 /// Stream 1 is kept as a legacy fallback for unknown symbols.
-pub const ORDERS_CHANNEL: &str = "aeron:udp?endpoint=localhost:20121";
+pub fn orders_channel()       -> String { channel(20121) }
 pub const ORDERS_STREAM: i32 = 1;          // legacy / unknown-symbol fallback
 pub const ORDERS_STREAM_BASE: i32 = 10;    // per-symbol streams: base + sorted_index
 
@@ -37,27 +57,23 @@ pub fn orders_stream_for_symbol(symbol: &str) -> i32 {
 }
 
 /// Engine → Desk: OrderUpdate (SBE)
-pub const ORDER_UPDATE_CHANNEL: &str = "aeron:udp?endpoint=localhost:20122";
+pub fn order_update_channel() -> String { channel(20122) }
 pub const ORDER_UPDATE_STREAM: i32 = 2;
 
 /// Engine → Desk + kline_service: TradeNotification (SBE)
-/// Multiple subscribers (desk_server and kline_service) share the same Aeron media
-/// driver at /tmp/aeron, so both receive every message from a single UDP socket.
-pub const TRADE_CHANNEL: &str = "aeron:udp?endpoint=localhost:20123";
+/// Multiple subscribers share the same Aeron media driver at /tmp/aeron,
+/// so both receive every message from a single UDP socket.
+pub fn trade_channel()        -> String { channel(20123) }
 pub const TRADE_STREAM: i32 = 3;
 
 /// Engine → Desk: depth snapshots (10-level / 50-level / 400-level on streams 4/5/6)
-/// All three depth tiers share one UDP endpoint; stream ID distinguishes the tier.
-pub const DEPTH_CHANNEL: &str = "aeron:udp?endpoint=localhost:20124";
+/// All three depth tiers share one channel; stream ID distinguishes the tier.
+pub fn depth_channel()        -> String { channel(20124) }
 pub const DEPTH_STREAM: i32 = 4;
-
-pub const DEPTH50_CHANNEL: &str = "aeron:udp?endpoint=localhost:20125"; // unused in constructors — kept for documentation
 pub const DEPTH50_STREAM: i32 = 5;
-
-pub const LEVEL2_CHANNEL: &str = "aeron:udp?endpoint=localhost:20126"; // unused in constructors — kept for documentation
 pub const LEVEL2_STREAM: i32 = 6;
 
 /// Tracing checkpoint publisher → Beacon sidecar (GSL metrics)
-/// Stays IPC: the beacon sidecar always runs on the same host as the publisher.
+/// Always IPC: the beacon sidecar runs co-located with the publisher.
 pub const METRICS_CHANNEL: &str = "aeron:ipc";
 pub const METRICS_STREAM: i32 = 1001;

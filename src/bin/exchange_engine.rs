@@ -2,10 +2,10 @@ use lightning_exchange::{
     account_repository::AccountRepository,
     aeron_channels::{
         AERON_DIR,
-        ORDERS_CHANNEL, orders_stream_for_symbol,
-        ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
-        TRADE_CHANNEL, TRADE_STREAM,
-        DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
+        orders_channel, orders_stream_for_symbol,
+        order_update_channel, ORDER_UPDATE_STREAM,
+        trade_channel, TRADE_STREAM,
+        depth_channel, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
         METRICS_CHANNEL, METRICS_STREAM,
     },
     tracer::{spawn_tracer, MS_AERON_ORDER_RECV, MS_MATCHING_DONE, MS_AERON_UPDATE_SEND, ENGINE_INSTANCE_ID},
@@ -61,16 +61,16 @@ fn spawn_symbol_thread(
             );
             let orders_stream = orders_stream_for_symbol(&symbol);
             let mut subscriber = AeronOrderSubscriber::new(
-                client.clone(), ORDERS_CHANNEL, orders_stream,
+                client.clone(), &orders_channel(), orders_stream,
             ).unwrap_or_else(|e| panic!("[{}] subscriber: {}", symbol, e));
             let mut ou_pub = AeronOrderUpdatePublisher::new(
-                client.clone(), ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
+                client.clone(), &order_update_channel(), ORDER_UPDATE_STREAM,
             ).unwrap_or_else(|e| panic!("[{}] ou_pub: {}", symbol, e));
             let mut trade_pub = AeronTradePublisher::new(
-                client.clone(), TRADE_CHANNEL, TRADE_STREAM,
+                client.clone(), &trade_channel(), TRADE_STREAM,
             ).unwrap_or_else(|e| panic!("[{}] trade_pub: {}", symbol, e));
             let mut md_pub = AeronMarketDataPublisher::new(
-                client.clone(), DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
+                client.clone(), &depth_channel(), DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
             ).unwrap_or_else(|e| panic!("[{}] md_pub: {}", symbol, e));
 
             let mut engine = engine;
@@ -232,7 +232,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .fetch_all(&pool).await.unwrap_or_default();
 
-        for (id, user_id, symbol, side, quantity, filled, per_unit_price) in &bot_stale {
+        // Release frozen funds per order (must be per-row: different amounts per user/asset),
+        // then cancel all stale bot orders in one bulk UPDATE instead of N individual queries.
+        for (_, user_id, symbol, side, quantity, filled, per_unit_price) in &bot_stale {
             let remaining = quantity - filled;
             if remaining > 0.0 {
                 let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
@@ -244,10 +246,15 @@ async fn main() -> anyhow::Result<()> {
                     let _ = repo.release_frozen(*user_id, quote_asset, per_unit_price * remaining).await;
                 }
             }
-            let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
-                .bind(id).execute(&pool).await;
         }
         if !bot_stale.is_empty() {
+            let ids: Vec<i64> = bot_stale.iter().map(|(id, ..)| *id).collect();
+            let _ = sqlx::query(
+                "UPDATE orders SET status='CANCELED', updated_at=NOW()
+                 WHERE id = ANY($1)",
+            )
+            .bind(&ids)
+            .execute(&pool).await;
             tracing::warn!("Canceled {} stale bot orders from previous session", bot_stale.len());
         }
     }

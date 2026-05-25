@@ -2,10 +2,10 @@ use dashmap::DashMap;
 use lightning_exchange::{
     aeron_channels::{
         AERON_DIR,
-        ORDERS_CHANNEL, orders_stream_for_symbol,
-        ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
-        TRADE_CHANNEL, TRADE_STREAM,
-        DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
+        orders_channel, orders_stream_for_symbol,
+        order_update_channel, ORDER_UPDATE_STREAM,
+        trade_channel, TRADE_STREAM,
+        depth_channel, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
         METRICS_CHANNEL, METRICS_STREAM,
     },
     aeron_transport::{DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber, DeskDepthSubscriber},
@@ -49,22 +49,22 @@ async fn main() -> anyhow::Result<()> {
         symbols_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
         .map(|sym| {
             let stream = orders_stream_for_symbol(&sym);
-            let pub_ = DeskOrderPublisher::new(client.clone(), ORDERS_CHANNEL, stream)
+            let pub_ = DeskOrderPublisher::new(client.clone(), &orders_channel(), stream)
                 .unwrap_or_else(|e| panic!("DeskOrderPublisher({sym}): {e}"));
             (sym, pub_)
         })
         .collect();
 
     let mut order_update_sub = DeskOrderUpdateSubscriber::new(
-        client.clone(), ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
+        client.clone(), &order_update_channel(), ORDER_UPDATE_STREAM,
     )
     .map_err(|e| anyhow::anyhow!("DeskOrderUpdateSubscriber: {}", e))?;
 
-    let mut trade_sub = DeskTradeSubscriber::new(client.clone(), TRADE_CHANNEL, TRADE_STREAM)
+    let mut trade_sub = DeskTradeSubscriber::new(client.clone(), &trade_channel(), TRADE_STREAM)
         .map_err(|e| anyhow::anyhow!("DeskTradeSubscriber: {}", e))?;
 
     let mut depth_sub = DeskDepthSubscriber::new(
-        client.clone(), DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
+        client.clone(), &depth_channel(), DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
     )
     .map_err(|e| anyhow::anyhow!("DeskDepthSubscriber: {}", e))?;
 

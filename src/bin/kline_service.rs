@@ -5,7 +5,7 @@
 
 use aeron_wrapper::{AeronClient, NoopLifecycle, PollCallback};
 use lightning_exchange::{
-    aeron_channels::{AERON_DIR, TRADE_CHANNEL, TRADE_STREAM},
+    aeron_channels::{AERON_DIR, trade_channel, TRADE_STREAM},
     sbe::TEMPLATE_TRADE_NOTIFICATION,
 };
 use parking_lot::Mutex;
@@ -241,9 +241,10 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+        let ch = trade_channel();
         let callback = TradeCallback { queue: queue_for_aeron.clone() };
         let mut sub = match client.add_subscription(
-            TRADE_CHANNEL,
+            &ch,
             TRADE_STREAM,
             1024,
             callback,
@@ -256,10 +257,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        tracing::info!(
-            "kline_service: subscribed to {} stream {}",
-            TRADE_CHANNEL, TRADE_STREAM,
-        );
+        tracing::info!("kline_service: subscribed to {} stream {}", ch, TRADE_STREAM);
 
         loop {
             client.do_work();

@@ -153,13 +153,6 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     Some(Ok(Message::Close(_))) | None => break 'conn,
                     _ => {}
                 }
-                // Drain all buffered personal updates immediately after handling
-                // the incoming message to prevent channel overflow under burst load.
-                while let Ok(msg) = personal_rx.try_recv() {
-                    if socket.send(Message::Text(msg)).await.is_err() {
-                        break 'conn;
-                    }
-                }
             }
 
             // Personal order/balance update for this user

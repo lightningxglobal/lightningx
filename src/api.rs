@@ -346,11 +346,15 @@ async fn handle_place_order(
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
 
+    // Use the same shared AtomicU64 counter as the WS path so REST and WS IDs
+    // never collide regardless of the Postgres sequence value.
+    let rest_order_id = s.next_order_id.fetch_add(1, Ordering::Relaxed) as i64;
+
     let db_order = sqlx::query_as::<_, DbOrder>(
         "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
-         VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING', $7) RETURNING *",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8) RETURNING *",
     )
-    .bind(user_id).bind(&req.symbol).bind(&req.side)
+    .bind(rest_order_id).bind(user_id).bind(&req.symbol).bind(&req.side)
     .bind(&req.order_type).bind(req.price).bind(req.quantity)
     .bind(freeze_price)
     .fetch_one(s.db.as_ref()).await;
@@ -369,9 +373,6 @@ async fn handle_place_order(
         }
     };
     let db_order_id = db_order.id;
-
-    // Keep the atomic counter in sync so WS orders don't collide.
-    s.next_order_id.fetch_max(db_order_id as u64 + 1, Ordering::Relaxed);
 
     // ── Route to engine: local (standalone) vs Aeron (desk) ──────────────────
     if let Some(engine) = engine_opt {

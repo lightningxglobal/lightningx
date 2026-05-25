@@ -304,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
         pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
+        tracer: None,
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

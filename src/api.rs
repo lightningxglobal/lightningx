@@ -3,6 +3,7 @@ use crate::account_repository::AccountRepository;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::models::{DbOrder, User};
 use crate::order::{Order, Side, TimeInForce};
+use crate::tracer::ExchangeTracer;
 use crate::transport::{AeronCmd, OrderMeta, OrderUpdateMsg};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
@@ -40,6 +41,8 @@ pub struct AppState {
     pub pending_orders: Arc<DashMap<u64, oneshot::Sender<OrderUpdateMsg>>>,
     /// Last known depth per symbol from Aeron push (desk_server mode only).
     pub last_depth: Arc<DashMap<String, serde_json::Value>>,
+    /// Latency tracer checkpoints (desk-server side). None in standalone mode.
+    pub tracer: Option<Arc<ExchangeTracer>>,
 }
 
 pub fn router(state: AppState) -> Router {

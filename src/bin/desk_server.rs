@@ -6,10 +6,12 @@ use lightning_exchange::{
         ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
         TRADE_CHANNEL, TRADE_STREAM,
         DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
+        METRICS_CHANNEL, METRICS_STREAM,
     },
     aeron_transport::{DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber, DeskDepthSubscriber},
     api::{router, AppState},
     db,
+    tracer::{spawn_tracer, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV, MS_WS_UPDATE_SEND, DESK_INSTANCE_ID},
     transport::AeronCmd,
     ws_handler::market_data_broadcaster,
 };
@@ -57,6 +59,13 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Aeron subscribers and publisher created");
 
+    // ── Latency tracer (optional — disabled if sidecar is not running) ────────
+    let tracer = spawn_tracer(AERON_DIR, METRICS_CHANNEL, METRICS_STREAM, DESK_INSTANCE_ID)
+        .map(Arc::new);
+    if tracer.is_some() {
+        tracing::info!("Exchange tracer connected (instance_id={})", DESK_INSTANCE_ID);
+    }
+
     // ── Command channel: async WS handlers → Aeron spin thread ───────────────
     let (aeron_cmd_tx, mut aeron_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<AeronCmd>();
 
@@ -78,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
         pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
+        tracer: tracer.clone(),
     };
 
     // ── Aeron spin thread: WS command drain + inbound event loop ─────────────
@@ -90,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         let last_depth = state.last_depth.clone();
         let db = state.db.clone();
         let rt = tokio::runtime::Handle::current();
+        let spin_tracer = tracer.clone();
 
         std::thread::Builder::new()
             .name("aeron-event-loop".to_string())
@@ -98,8 +109,13 @@ async fn main() -> anyhow::Result<()> {
                     // Drain outbound commands (WS/REST → engine) without blocking.
                     while let Ok(cmd) = aeron_cmd_rx.try_recv() {
                         match cmd {
-                            AeronCmd::NewOrder(req) => { let _ = order_pub.publish_new_order(&req); }
-                            AeronCmd::Cancel(req)   => { let _ = order_pub.publish_cancel(&req); }
+                            AeronCmd::NewOrder(req) => {
+                                let _ = order_pub.publish_new_order(&req);
+                                if let Some(ref t) = spin_tracer {
+                                    t.record(MS_AERON_ORDER_SEND, req.client_order_id);
+                                }
+                            }
+                            AeronCmd::Cancel(req) => { let _ = order_pub.publish_cancel(&req); }
                         }
                     }
 
@@ -112,10 +128,14 @@ async fn main() -> anyhow::Result<()> {
                         use lightning_exchange::transport::order_update_kind;
                         // Copy packed struct fields to locals to avoid misaligned refs.
                         let order_id: u64 = msg.order_id;
+                        let client_order_id: u64 = msg.client_order_id;
                         let participant_id: u64 = msg.participant_id;
                         let fill_qty: f64 = msg.fill_qty;
                         let fill_price: f64 = msg.fill_price;
                         let kind: u8 = msg.kind;
+                        if let Some(ref t) = spin_tracer {
+                            t.record(MS_AERON_UPDATE_RECV, client_order_id);
+                        }
 
                         // Route to waiting REST request (pending_orders) if any.
                         if let Some((_, tx)) = pending_orders.remove(&order_id) {
@@ -183,7 +203,13 @@ async fn main() -> anyhow::Result<()> {
 
                         // Push order_update to user's personal WS channel.
                         let user_id = participant_id as i64;
+                        if user_tx.get(&user_id).is_none() {
+                            tracing::warn!("no WS channel for user {user_id}, order_update {order_id} lost");
+                        }
                         if let Some(tx) = user_tx.get(&user_id) {
+                            if let Some(ref t) = spin_tracer {
+                                t.record(MS_WS_UPDATE_SEND, client_order_id);
+                            }
                             let ws_status = match kind {
                                 k if k == order_update_kind::ACCEPTED     => "OPEN",
                                 k if k == order_update_kind::PARTIAL_FILL => "PARTIAL",
@@ -208,53 +234,46 @@ async fn main() -> anyhow::Result<()> {
                             if let Some(ref coid) = ws_client_oid {
                                 upd["client_order_id"] = serde_json::Value::String(coid.clone());
                             }
-                            let _ = tx.try_send(upd.to_string());
+                            if tx.try_send(upd.to_string()).is_err() {
+                                tracing::warn!("personal channel full for user {user_id}, dropping order_update {order_id}");
+                            }
                         }
                     }
 
-                    // Process trade notifications — broadcast to WS and persist to DB.
+                    // Process trade notifications — offload JSON + broadcast + DB to tokio.
+                    // Spin thread only extracts raw fields (~100ns); heavy work runs async.
                     while let Some(trade) = trade_sub.poll() {
-                        let symbol = {
-                            let end = trade.symbol.iter().position(|&b| b == 0).unwrap_or(16);
-                            String::from_utf8_lossy(&trade.symbol[..end]).to_string()
-                        };
-                        // Copy packed fields to locals before any use (misaligned ref safety).
+                        let end = trade.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                        let symbol: String = String::from_utf8_lossy(&trade.symbol[..end]).into_owned();
                         let price: f64 = trade.price;
                         let quantity: f64 = trade.quantity;
                         let side: u8 = trade.side;
                         let taker_id: u64 = trade.taker_order_id;
                         let maker_id: u64 = trade.maker_order_id;
-                        let side_str = if side == 0 { "buy" } else { "sell" };
-                        let ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_micros() as u64)
-                            .unwrap_or(0);
 
-                        // Broadcast to WS subscribers.
-                        let trade_msg = serde_json::json!({
-                            "type": "trade",
-                            "symbol": symbol,
-                            "price": price,
-                            "qty": quantity,
-                            "side": side_str,
-                            "ts": ts,
-                        }).to_string();
-                        let _ = market_tx.send(trade_msg);
-
-                        // Persist to DB (fire-and-forget async task).
-                        let (buy_oid, sell_oid): (i64, i64) = if side == 0 {
-                            (taker_id as i64, maker_id as i64)
-                        } else {
-                            (maker_id as i64, taker_id as i64)
-                        };
+                        let market_tx2 = market_tx.clone();
                         let db2 = db.clone();
-                        let sym = symbol.clone();
                         rt.spawn(async move {
+                            let side_str = if side == 0 { "buy" } else { "sell" };
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_micros() as u64)
+                                .unwrap_or(0);
+                            let trade_msg = format!(
+                                r#"{{"type":"trade","symbol":"{symbol}","price":{price},"qty":{quantity},"side":"{side_str}","ts":{ts}}}"#
+                            );
+                            let _ = market_tx2.send(trade_msg);
+
+                            let (buy_oid, sell_oid): (i64, i64) = if side == 0 {
+                                (taker_id as i64, maker_id as i64)
+                            } else {
+                                (maker_id as i64, taker_id as i64)
+                            };
                             let _ = sqlx::query(
                                 "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
                                  VALUES ($1, $2, $3, $4, $5, NOW())"
                             )
-                            .bind(&sym)
+                            .bind(&symbol)
                             .bind(buy_oid)
                             .bind(sell_oid)
                             .bind(price)
@@ -264,52 +283,44 @@ async fn main() -> anyhow::Result<()> {
                         });
                     }
 
-                    // Process depth snapshots — update cache and broadcast to WS.
+                    // Process depth snapshots — spin thread copies raw arrays (~320B memcpy),
+                    // offloads JSON build + DashMap + broadcast to tokio (10-30μs saved).
                     while let Some(depth_msg) = depth_sub.poll() {
                         use lightning_exchange::aeron_transport::DeskDepthMsg;
                         match depth_msg {
                             DeskDepthMsg::Depth(evt) => {
-                                // Build JSON from the 20-level snapshot.
-                                let ts = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_micros() as u64)
-                                    .unwrap_or(0);
-                                let num_bids: u8 = evt.num_bids;
-                                let num_asks: u8 = evt.num_asks;
-                                tracing::debug!("depth recv: num_bids={} num_asks={}", num_bids, num_asks);
-                                if num_asks > 0 {
-                                    let first_ask: (f64, f64) = evt.asks[0];
-                                    tracing::debug!("  first ask: price={} qty={}", first_ask.0, first_ask.1);
-                                }
-                                let bids: Vec<[f64; 2]> = evt.bids[..evt.num_bids as usize]
-                                    .iter()
-                                    .filter(|(_, q)| *q > 0.0)
-                                    .map(|&(p, q)| [p, q])
-                                    .collect();
-                                let asks: Vec<[f64; 2]> = evt.asks[..evt.num_asks as usize]
-                                    .iter()
-                                    .filter(|(_, q)| *q > 0.0)
-                                    .map(|&(p, q)| [p, q])
-                                    .collect();
+                                let nb = evt.num_bids as usize;
+                                let na = evt.num_asks as usize;
+                                let mut bids_raw = [(0.0f64, 0.0f64); 20];
+                                let mut asks_raw = [(0.0f64, 0.0f64); 20];
+                                bids_raw[..nb].copy_from_slice(&evt.bids[..nb]);
+                                asks_raw[..na].copy_from_slice(&evt.asks[..na]);
                                 let end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
                                 let symbol = std::str::from_utf8(&evt.symbol[..end])
-                                    .unwrap_or("ETH_USDT")
-                                    .to_string();
+                                    .unwrap_or("ETH_USDT").to_string();
                                 let symbol = if symbol.is_empty() { "ETH_USDT".to_string() } else { symbol };
-                                let depth_json = serde_json::json!({
-                                    "type": "depth",
-                                    "symbol": symbol,
-                                    "bids": bids,
-                                    "asks": asks,
-                                    "ts": ts,
+
+                                let market_tx2 = market_tx.clone();
+                                let last_depth2 = last_depth.clone();
+                                rt.spawn(async move {
+                                    let bids: Vec<[f64; 2]> = bids_raw[..nb]
+                                        .iter().filter(|(_, q)| *q > 0.0)
+                                        .map(|&(p, q)| [p, q]).collect();
+                                    let asks: Vec<[f64; 2]> = asks_raw[..na]
+                                        .iter().filter(|(_, q)| *q > 0.0)
+                                        .map(|&(p, q)| [p, q]).collect();
+                                    let ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_micros() as u64).unwrap_or(0);
+                                    let depth_json = serde_json::json!({
+                                        "type": "depth", "symbol": symbol,
+                                        "bids": bids, "asks": asks, "ts": ts,
+                                    });
+                                    last_depth2.insert(symbol, depth_json.clone());
+                                    let _ = market_tx2.send(depth_json.to_string());
                                 });
-                                last_depth.insert(symbol.clone(), depth_json.clone());
-                                let _ = market_tx.send(depth_json.to_string());
                             }
-                            DeskDepthMsg::Depth50(_) | DeskDepthMsg::Level2(_) => {
-                                // Extended depth snapshots — not currently forwarded to WS clients.
-                                // They update last_depth for future REST depth endpoint.
-                            }
+                            DeskDepthMsg::Depth50(_) | DeskDepthMsg::Level2(_) => {}
                         }
                     }
 

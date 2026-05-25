@@ -37,6 +37,7 @@ pub mod account_repository;
 pub mod positions;
 pub mod api;
 pub mod ws_handler;
+pub mod tracer;
 #[cfg(test)]
 mod sbe_tests;
 #[cfg(test)]

@@ -6,7 +6,9 @@ use lightning_exchange::{
         ORDER_UPDATE_CHANNEL, ORDER_UPDATE_STREAM,
         TRADE_CHANNEL, TRADE_STREAM,
         DEPTH_CHANNEL, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
+        METRICS_CHANNEL, METRICS_STREAM,
     },
+    tracer::{spawn_tracer, MS_AERON_ORDER_RECV, MS_MATCHING_DONE, MS_AERON_UPDATE_SEND, ENGINE_INSTANCE_ID},
     aeron_transport::{
         AeronOrderSubscriber, AeronOrderUpdatePublisher,
         AeronTradePublisher, AeronMarketDataPublisher,
@@ -229,6 +231,12 @@ async fn main() -> anyhow::Result<()> {
         engines.len()
     );
 
+    // ----- Latency tracer (optional) ----------------------------------------
+    let tracer = spawn_tracer(AERON_DIR, METRICS_CHANNEL, METRICS_STREAM, ENGINE_INSTANCE_ID);
+    if tracer.is_some() {
+        tracing::info!("Exchange tracer connected (instance_id={})", ENGINE_INSTANCE_ID);
+    }
+
     // ----- Matching thread (dedicated OS thread, spin loop, no tokio) ----
     let symbols_for_thread = symbols.clone();
     let matching_thread = std::thread::Builder::new()
@@ -255,6 +263,9 @@ async fn main() -> anyhow::Result<()> {
                 while let Some(msg) = subscriber.poll() {
                     match msg {
                         InboundMsg::NewOrder(req) => {
+                            if let Some(ref t) = tracer {
+                                t.record(MS_AERON_ORDER_RECV, req.client_order_id);
+                            }
                             let ts = now_ns();
                             let symbol = std::str::from_utf8(&req.symbol)
                                 .unwrap_or("")
@@ -297,14 +308,23 @@ async fn main() -> anyhow::Result<()> {
                             match engine.place_order(order) {
                                 Err(e) => {
                                     tracing::warn!("place_order FAILED: symbol={} side={} price={} err={:?}", symbol, side_str, req_price, e);
+                                    if let Some(ref t) = tracer {
+                                        t.record(MS_MATCHING_DONE, req.client_order_id);
+                                    }
                                     let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
                                         req.client_order_id,
                                         req.participant_id,
                                         2, // reason: engine error
                                         ts,
                                     ));
+                                    if let Some(ref t) = tracer {
+                                        t.record(MS_AERON_UPDATE_SEND, req.client_order_id);
+                                    }
                                 }
                                 Ok(result) => {
+                                    if let Some(ref t) = tracer {
+                                        t.record(MS_MATCHING_DONE, req.client_order_id);
+                                    }
                                     tracing::debug!("place_order OK: symbol={} side={} status={:?} filled={}", symbol, side_str, result.status, result.filled);
                                     // Publish per-fill trade notifications.
                                     let sym_bytes = symbol_bytes(&symbol);
@@ -371,6 +391,9 @@ async fn main() -> anyhow::Result<()> {
                                         ),
                                     };
                                     let _ = ou_pub.publish(&update);
+                                    if let Some(ref t) = tracer {
+                                        t.record(MS_AERON_UPDATE_SEND, req.client_order_id);
+                                    }
                                 }
                             }
                         }

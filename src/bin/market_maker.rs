@@ -242,13 +242,11 @@ async fn ws_manager(
         }
         info!("Desk WS connected and authenticated");
 
-        // Drive outgoing + incoming until the connection drops.
-        // biased: always drain incoming responses before sending more orders —
-        // prevents oneshot starvation when the outbox is continuously full.
-        loop {
+        // After each incoming stream message, drain all pending outbox items before
+        // waiting for the next event.  This prevents outbox starvation during
+        // Binance refresh bursts without giving stream unconditional priority.
+        'conn: loop {
             tokio::select! {
-                biased;
-
                 msg = stream.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
@@ -256,13 +254,25 @@ async fn ws_manager(
                         }
                         Some(Ok(Message::Close(_))) | None => {
                             warn!("Desk WS closed by server");
-                            break;
+                            break 'conn;
                         }
                         Some(Err(e)) => {
                             warn!("Desk WS error: {e}");
-                            break;
+                            break 'conn;
                         }
                         _ => {}
+                    }
+                    // After processing the stream message, flush any buffered outbox items.
+                    loop {
+                        match outbox.try_recv() {
+                            Ok(text) => {
+                                if sink.send(Message::Text(text)).await.is_err() {
+                                    warn!("Desk WS send error");
+                                    break 'conn;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
 
@@ -271,7 +281,7 @@ async fn ws_manager(
                         Some(text) => {
                             if sink.send(Message::Text(text)).await.is_err() {
                                 warn!("Desk WS send error");
-                                break;
+                                break 'conn;
                             }
                         }
                         None => return, // all clients dropped — shutting down
@@ -555,25 +565,28 @@ fn round_qty(qty: f64, min_qty: f64) -> f64 {
 async fn run_latency_probe(client: WsExchangeClient) {
     // Brief warm-up so market-making is stable before probing.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    info!("[latency] Starting probe — 200 samples at 50ms intervals");
 
-    let mut samples: Vec<u64> = Vec::with_capacity(200);
+    const PROBE_COUNT: u32 = 5_000;
+    const INTERVAL_MS: u64 = 10;
+    info!("[latency] Starting probe — {PROBE_COUNT} samples at {INTERVAL_MS}ms intervals");
+
+    let mut samples: Vec<u64> = Vec::with_capacity(PROBE_COUNT as usize);
     let mut probe_orders: Vec<i64> = Vec::new();
 
-    for i in 0..200u32 {
+    for i in 0..PROBE_COUNT {
         // Far-off-market bid: $1 for ETH — will be ACCEPTED but never fill.
         match client.place_order_timed("ETH_USDT", "buy", 1.0, 0.001).await {
             Some((oid, us)) => {
                 samples.push(us);
                 if oid > 0 { probe_orders.push(oid); }
-                if i % 20 == 19 {
-                    info!("[latency] #{:3}  {}μs  (running median ~{}μs)", i + 1, us,
+                if i % 500 == 499 {
+                    info!("[latency] #{:5}  {}μs  (running median ~{}μs)", i + 1, us,
                         { let mut s = samples.clone(); s.sort_unstable(); s[s.len()/2] });
                 }
             }
-            None => warn!("[latency] #{i:3} timeout/error"),
+            None => warn!("[latency] #{i:5} timeout/error"),
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(INTERVAL_MS)).await;
     }
 
     // Cancel probe orders (best-effort).
@@ -588,15 +601,18 @@ async fn run_latency_probe(client: WsExchangeClient) {
 
     samples.sort_unstable();
     let n = samples.len();
-    let p50  = samples[n * 50 / 100];
-    let p95  = samples[n * 95 / 100];
-    let p99  = samples[n * 99 / 100];
-    let min  = samples[0];
-    let max  = samples[n - 1];
-    let mean = samples.iter().sum::<u64>() / n as u64;
+    let p50   = samples[n * 50 / 100];
+    let p90   = samples[n * 90 / 100];
+    let p95   = samples[n * 95 / 100];
+    let p99   = samples[n * 99 / 100];
+    let p999  = samples[(n * 999 / 1000).min(n - 1)];
+    let min   = samples[0];
+    let max   = samples[n - 1];
+    let mean  = samples.iter().sum::<u64>() / n as u64;
+    let timeouts = PROBE_COUNT as usize - n;
     info!(
-        "[latency] RESULTS ({n} samples): \
-         min={min}μs  mean={mean}μs  p50={p50}μs  p95={p95}μs  p99={p99}μs  max={max}μs"
+        "[latency] RESULTS ({n} samples, {timeouts} timeouts): \
+         min={min}μs  mean={mean}μs  p50={p50}μs  p90={p90}μs  p95={p95}μs  p99={p99}μs  p999={p999}μs  max={max}μs"
     );
 }
 
@@ -653,15 +669,21 @@ async fn main() -> anyhow::Result<()> {
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    info!("Starting market-making on {} symbols", SYMBOLS.len());
-    let mut handles: Vec<_> = SYMBOLS.iter()
-        .map(|cfg| {
-            let c = client.clone();
-            tokio::spawn(async move { run_symbol(cfg, c).await })
-        })
-        .collect();
+    let probe_only = std::env::var("PROBE_ONLY").is_ok();
+    let mut handles: Vec<_> = if probe_only {
+        info!("PROBE_ONLY mode — skipping market-making");
+        vec![]
+    } else {
+        info!("Starting market-making on {} symbols", SYMBOLS.len());
+        SYMBOLS.iter()
+            .map(|cfg| {
+                let c = client.clone();
+                tokio::spawn(async move { run_symbol(cfg, c).await })
+            })
+            .collect()
+    };
 
-    // Latency probe: runs concurrently with market-making.
+    // Latency probe: runs concurrently with market-making (or alone in PROBE_ONLY mode).
     handles.push(tokio::spawn(run_latency_probe(client.clone())));
 
     tokio::signal::ctrl_c().await?;

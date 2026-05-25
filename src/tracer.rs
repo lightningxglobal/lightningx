@@ -52,15 +52,28 @@ const SYM: &[u8] = b"EXCHANGE";
 
 /// Send half: clone-and-share across AppState / handlers.
 /// `record()` is non-blocking — drops the message if the background thread is gone.
+///
+/// Timestamp is captured **at the call site** (not in the drain thread) so queuing
+/// delay in the mpsc channel does not inflate the reported latency.
 #[derive(Clone)]
 pub struct ExchangeTracer {
-    tx: UnboundedSender<(i32, u64)>, // (milestone_id, order_id)
+    tx: UnboundedSender<(i32, u64, i64, [u8; 16])>, // (milestone_id, order_id, ts_ns, sym)
 }
 
 impl ExchangeTracer {
+    /// Record a checkpoint without a specific symbol (uses zero bytes → sidecar default group).
     #[inline]
     pub fn record(&self, milestone_id: i32, order_id: u64) {
-        let _ = self.tx.send((milestone_id, order_id));
+        let ts_ns = now_ns();
+        let _ = self.tx.send((milestone_id, order_id, ts_ns, [0u8; 16]));
+    }
+
+    /// Record a checkpoint with the instrument symbol for per-symbol Grafana grouping.
+    /// `sym` is a fixed 16-byte NUL-padded ASCII field (same layout as `NewOrderRequest.symbol`).
+    #[inline]
+    pub fn record_sym(&self, milestone_id: i32, order_id: u64, sym: &[u8; 16]) {
+        let ts_ns = now_ns();
+        let _ = self.tx.send((milestone_id, order_id, ts_ns, *sym));
     }
 }
 
@@ -74,7 +87,7 @@ pub fn spawn_tracer(
     stream_id: i32,
     instance_id: i32,
 ) -> Option<ExchangeTracer> {
-    let (tx, rx) = unbounded_channel::<(i32, u64)>();
+    let (tx, rx) = unbounded_channel::<(i32, u64, i64, [u8; 16])>();
 
     let aeron_dir = aeron_dir.to_string();
     let channel = channel.to_string();
@@ -134,11 +147,11 @@ fn wait_for_pub(client: &AeronClient, channel: &str, stream_id: i32) -> Option<P
     Some(pub_)
 }
 
-fn drain_loop(mut rx: UnboundedReceiver<(i32, u64)>, pub_: &Publisher, instance_id: i32) {
+fn drain_loop(mut rx: UnboundedReceiver<(i32, u64, i64, [u8; 16])>, pub_: &Publisher, instance_id: i32) {
     let mut buf = [0u8; 600];
     loop {
-        while let Ok((milestone_id, order_id)) = rx.try_recv() {
-            let n = serialize_checkpoint(&mut buf, instance_id, milestone_id, order_id, now_ns());
+        while let Ok((milestone_id, order_id, ts_ns, sym)) = rx.try_recv() {
+            let n = serialize_checkpoint(&mut buf, instance_id, milestone_id, order_id, ts_ns, &sym);
             let _ = pub_.send(&buf[..n]);
         }
         std::hint::spin_loop();
@@ -152,7 +165,13 @@ fn serialize_checkpoint(
     milestone_id: i32,
     order_id: u64,
     ts_ns: i64,
+    sym: &[u8; 16],
 ) -> usize {
+    // Trim NUL padding from the fixed-size symbol field.
+    let sym_len = sym.iter().position(|&b| b == 0).unwrap_or(16);
+    // Fall back to static "EXCHANGE" tag when no symbol was provided.
+    let (sym_bytes, sym_len) = if sym_len == 0 { (SYM, SYM.len()) } else { (&sym[..], sym_len) };
+
     let mut p = 0usize;
 
     buf[p..p + 4].copy_from_slice(&MSG_TYPE_CHECKPOINT.to_le_bytes()); p += 4;
@@ -161,11 +180,11 @@ fn serialize_checkpoint(
     p += 8; // reserved = 0
     buf[p..p + 8].copy_from_slice(&ts_ns.to_le_bytes()); p += 8;
 
-    // Tags: count=1, tag_id=TAG_ID_SYMBOL, value=SYM
+    // Tags: count=1, tag_id=TAG_ID_SYMBOL, value=sym
     buf[p..p + 2].copy_from_slice(&1i16.to_le_bytes()); p += 2;
     buf[p..p + 2].copy_from_slice(&TAG_ID_SYMBOL.to_le_bytes()); p += 2;
-    buf[p] = SYM.len() as u8; p += 1;
-    buf[p..p + SYM.len()].copy_from_slice(SYM); p += SYM.len();
+    buf[p] = sym_len as u8; p += 1;
+    buf[p..p + sym_len].copy_from_slice(&sym_bytes[..sym_len]); p += sym_len;
 
     // Payload: milestone_id + tracing_id (decimal order_id)
     buf[p..p + 4].copy_from_slice(&milestone_id.to_le_bytes()); p += 4;

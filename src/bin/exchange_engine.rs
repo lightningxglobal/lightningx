@@ -264,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
                     match msg {
                         InboundMsg::NewOrder(req) => {
                             if let Some(ref t) = tracer {
-                                t.record(MS_AERON_ORDER_RECV, req.client_order_id);
+                                t.record_sym(MS_AERON_ORDER_RECV, req.client_order_id, &req.symbol);
                             }
                             let ts = now_ns();
                             let symbol = std::str::from_utf8(&req.symbol)
@@ -309,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
                                 Err(e) => {
                                     tracing::warn!("place_order FAILED: symbol={} side={} price={} err={:?}", symbol, side_str, req_price, e);
                                     if let Some(ref t) = tracer {
-                                        t.record(MS_MATCHING_DONE, req.client_order_id);
+                                        t.record_sym(MS_MATCHING_DONE, req.client_order_id, &req.symbol);
                                     }
                                     let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
                                         req.client_order_id,
@@ -318,12 +318,12 @@ async fn main() -> anyhow::Result<()> {
                                         ts,
                                     ));
                                     if let Some(ref t) = tracer {
-                                        t.record(MS_AERON_UPDATE_SEND, req.client_order_id);
+                                        t.record_sym(MS_AERON_UPDATE_SEND, req.client_order_id, &req.symbol);
                                     }
                                 }
                                 Ok(result) => {
                                     if let Some(ref t) = tracer {
-                                        t.record(MS_MATCHING_DONE, req.client_order_id);
+                                        t.record_sym(MS_MATCHING_DONE, req.client_order_id, &req.symbol);
                                     }
                                     tracing::debug!("place_order OK: symbol={} side={} status={:?} filled={}", symbol, side_str, result.status, result.filled);
                                     // Publish per-fill trade notifications.
@@ -392,7 +392,7 @@ async fn main() -> anyhow::Result<()> {
                                     };
                                     let _ = ou_pub.publish(&update);
                                     if let Some(ref t) = tracer {
-                                        t.record(MS_AERON_UPDATE_SEND, req.client_order_id);
+                                        t.record_sym(MS_AERON_UPDATE_SEND, req.client_order_id, &req.symbol);
                                     }
                                 }
                             }

@@ -355,8 +355,12 @@ async fn handle_client_message(
                 use crate::transport::{AeronCmd, OrderMeta};
 
                 let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
+                // Build sym_bytes first so the tracer checkpoint carries the symbol.
+                let mut sym_bytes = [0u8; 16];
+                let sb = symbol.as_bytes();
+                sym_bytes[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
                 if let Some(ref t) = state.tracer {
-                    t.record(MS_WS_ORDER_RECV, order_id);
+                    t.record_sym(MS_WS_ORDER_RECV, order_id, &sym_bytes);
                 }
                 let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
                 let tif_byte: u8 = match tif {
@@ -365,10 +369,6 @@ async fn handle_client_message(
                     TimeInForce::FOK      => 2,
                     TimeInForce::PostOnly => 3,
                 };
-                let mut sym_bytes = [0u8; 16];
-                let sb = symbol.as_bytes();
-                let copy_len = sb.len().min(16);
-                sym_bytes[..copy_len].copy_from_slice(&sb[..copy_len]);
 
                 let sbe_req = SbeNewOrder {
                     client_order_id: order_id,

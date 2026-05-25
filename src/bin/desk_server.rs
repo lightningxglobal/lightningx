@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                             AeronCmd::NewOrder(req) => {
                                 let _ = order_pub.publish_new_order(&req);
                                 if let Some(ref t) = spin_tracer {
-                                    t.record(MS_AERON_ORDER_SEND, req.client_order_id);
+                                    t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
                                 }
                             }
                             AeronCmd::Cancel(req) => { let _ = order_pub.publish_cancel(&req); }

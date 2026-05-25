@@ -1,7 +1,8 @@
-/// trade-bot: places small market orders periodically to generate live trade flow.
+/// trade-bot: places market orders continuously to generate live trade flow.
 ///
-/// Cycles through all symbols round-robin, alternating buy/sell each cycle,
-/// so Recent Trades always has fresh entries without drifting inventory too far.
+/// Fires all symbols in parallel every TRADE_INTERVAL_MS ms (not round-robin),
+/// alternating buy/sell each cycle with random quantity jitter.
+/// Result: ~5 trades/sec per symbol = 15 trades/sec across 3 symbols.
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -13,17 +14,17 @@ fn exchange_url() -> String {
 
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
-const TRADE_INTERVAL_MS: u64 = 3000;
+const TRADE_INTERVAL_MS: u64 = 200;
 
 struct SymbolConfig {
     symbol: &'static str,
-    qty: f64,
+    base_qty: f64,
 }
 
 const SYMBOLS: &[SymbolConfig] = &[
-    SymbolConfig { symbol: "ETH_USDT", qty: 0.01 },
-    SymbolConfig { symbol: "BTC_USDT", qty: 0.0001 },
-    SymbolConfig { symbol: "SOL_USDT", qty: 0.1 },
+    SymbolConfig { symbol: "ETH_USDT", base_qty: 0.05 },
+    SymbolConfig { symbol: "BTC_USDT", base_qty: 0.001 },
+    SymbolConfig { symbol: "SOL_USDT", base_qty: 0.5 },
 ];
 
 #[derive(Serialize)]
@@ -54,6 +55,13 @@ async fn login(http: &Client, base: &str) -> anyhow::Result<String> {
     Ok(resp.json::<LoginResponse>().await?.token)
 }
 
+/// Return a pseudo-random multiplier in [0.4, 1.6] based on seed.
+/// Uses a simple LCG to avoid pulling in a rand crate.
+fn qty_jitter(seed: u64) -> f64 {
+    let x = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+    0.4 + (x >> 58) as f64 / 10.0   // 0.4 + [0..15]/10 = 0.4..1.9, clamp below
+}
+
 async fn place_market(http: &Client, base: &str, token: &str, symbol: &str, side: &str, qty: f64) {
     let res = http
         .post(format!("{base}/api/orders"))
@@ -63,7 +71,7 @@ async fn place_market(http: &Client, base: &str, token: &str, symbol: &str, side
     match res {
         Ok(r) if r.status().is_success() => {
             if let Ok(p) = r.json::<PlaceOrderResponse>().await {
-                info!("[{symbol}] market {side} {qty} → id={:?}", p.id);
+                info!("[{symbol}] market {side} {qty:.4} → id={:?}", p.id);
             }
         }
         Ok(r) => warn!("[{symbol}] market {side} → {}", r.status()),
@@ -80,7 +88,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Trade bot starting…");
 
-    // Retry login until desk-server is ready.
     let mut token = String::new();
     for attempt in 1..=10 {
         match login(&http, &base).await {
@@ -94,21 +101,31 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("Authenticated");
 
-    // Ensure funds
     let _ = http.post(format!("{base}/api/robot-funds"))
         .header("Authorization", format!("Bearer {token}"))
         .send().await;
 
-    info!("Starting trade loop ({TRADE_INTERVAL_MS}ms interval, {} symbols)", SYMBOLS.len());
+    info!(
+        "Starting trade loop ({}ms interval, {} symbols in parallel)",
+        TRADE_INTERVAL_MS, SYMBOLS.len()
+    );
 
     let mut cycle: u64 = 0;
     loop {
         tokio::time::sleep(Duration::from_millis(TRADE_INTERVAL_MS)).await;
 
-        let cfg = &SYMBOLS[cycle as usize % SYMBOLS.len()];
         let side = if cycle % 2 == 0 { "buy" } else { "sell" };
-        cycle += 1;
 
-        place_market(&http, &base, &token, cfg.symbol, side, cfg.qty).await;
+        // Fire all symbols in parallel with jittered quantities.
+        let futs: Vec<_> = SYMBOLS.iter().enumerate().map(|(i, cfg)| {
+            let jitter = qty_jitter(cycle.wrapping_add(i as u64 * 31337));
+            let qty = (cfg.base_qty * jitter * 1e4).round() / 1e4;
+            let qty = qty.max(cfg.base_qty * 0.4);  // floor at 40% of base
+            place_market(&http, &base, &token, cfg.symbol, side, qty)
+        }).collect();
+
+        futures::future::join_all(futs).await;
+
+        cycle += 1;
     }
 }

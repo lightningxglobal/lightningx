@@ -1282,8 +1282,8 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            order_capacity: 1_000_000,
-            queue_capacity: 100_000,
+            order_capacity: 2_000_000,
+            queue_capacity: 2_000_000,
             orderbook_type: crate::orderbook_impl::OrderBookType::SkipList,
         }
     }

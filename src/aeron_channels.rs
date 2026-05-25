@@ -16,6 +16,23 @@
 ///   AERON_SENDER_IDLE_STRATEGY=noop AERON_RECEIVER_IDLE_STRATEGY=noop
 ///   ethtool -C <nic> rx-usecs 0 tx-usecs 0   (disable interrupt coalescing)
 
+/// Aeron media driver directory.
+/// Linux default: /dev/shm/aeron (tmpfs, zero disk I/O).
+/// macOS default: /tmp/aeron (no /dev/shm on macOS).
+/// Override with AERON_DIR env var.
+pub fn aeron_dir() -> String {
+    if let Ok(v) = std::env::var("AERON_DIR") {
+        return v;
+    }
+    if cfg!(target_os = "linux") {
+        "/dev/shm/aeron".to_string()
+    } else {
+        "/tmp/aeron".to_string()
+    }
+}
+
+/// Keep AERON_DIR as a legacy constant for macOS builds that still use /tmp/aeron.
+/// New code should call aeron_dir() instead.
 pub const AERON_DIR: &str = "/tmp/aeron";
 
 /// Resolve the engine host: ENGINE_HOST env var, defaulting to localhost.

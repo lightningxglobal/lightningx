@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use lightning_exchange::{
     aeron_channels::{
-        AERON_DIR,
+        aeron_dir,
         orders_channel, orders_stream_for_symbol,
         order_update_channel, ORDER_UPDATE_STREAM,
         trade_channel, TRADE_STREAM,
@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Aeron setup ───────────────────────────────────────────────────────────
     let client = Arc::new(
-        AeronClient::new(AERON_DIR)
+        AeronClient::new(&aeron_dir())
             .map_err(|e| anyhow::anyhow!("Aeron init failed: {:?}", e))?,
     );
 
@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Aeron subscribers and publisher created");
 
     // ── Latency tracer (optional — disabled if sidecar is not running) ────────
-    let tracer = spawn_tracer(AERON_DIR, METRICS_CHANNEL, METRICS_STREAM, DESK_INSTANCE_ID)
+    let tracer = spawn_tracer(&aeron_dir(), METRICS_CHANNEL, METRICS_STREAM, DESK_INSTANCE_ID)
         .map(Arc::new);
     if tracer.is_some() {
         tracing::info!("Exchange tracer connected (instance_id={})", DESK_INSTANCE_ID);

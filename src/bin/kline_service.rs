@@ -5,7 +5,7 @@
 
 use aeron_wrapper::{AeronClient, NoopLifecycle, PollCallback};
 use lightning_exchange::{
-    aeron_channels::{AERON_DIR, trade_channel, TRADE_STREAM},
+    aeron_channels::{aeron_dir, trade_channel, TRADE_STREAM},
     sbe::TEMPLATE_TRADE_NOTIFICATION,
 };
 use parking_lot::Mutex;
@@ -233,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Aeron poll loop — must run in a dedicated OS thread
     std::thread::spawn(move || {
-        let client = match AeronClient::new(AERON_DIR) {
+        let client = match AeronClient::new(&aeron_dir()) {
             Ok(c) => Arc::new(c),
             Err(e) => {
                 tracing::error!("kline_service: AeronClient::new failed: {:?}", e);

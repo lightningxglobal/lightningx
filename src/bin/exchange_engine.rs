@@ -1,7 +1,7 @@
 use lightning_exchange::{
     account_repository::AccountRepository,
     aeron_channels::{
-        AERON_DIR,
+        aeron_dir,
         orders_channel, orders_stream_for_symbol,
         order_update_channel, ORDER_UPDATE_STREAM,
         trade_channel, TRADE_STREAM,
@@ -57,7 +57,7 @@ fn spawn_symbol_thread(
         .name(format!("match-{}", symbol))
         .spawn(move || {
             let client = Arc::new(
-                AeronClient::new(AERON_DIR).expect("AeronClient"),
+                AeronClient::new(&aeron_dir()).expect("AeronClient"),
             );
             let orders_stream = orders_stream_for_symbol(&symbol);
             let mut subscriber = AeronOrderSubscriber::new(
@@ -328,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Exchange engine started — spawning {} symbol threads", symbols.len());
 
     // ----- Latency tracer (optional) -----------------------------------------
-    let tracer = spawn_tracer(AERON_DIR, METRICS_CHANNEL, METRICS_STREAM, ENGINE_INSTANCE_ID);
+    let tracer = spawn_tracer(&aeron_dir(), METRICS_CHANNEL, METRICS_STREAM, ENGINE_INSTANCE_ID);
     if tracer.is_some() {
         tracing::info!("Exchange tracer connected (instance_id={})", ENGINE_INSTANCE_ID);
     }

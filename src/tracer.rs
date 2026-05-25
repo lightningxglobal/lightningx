@@ -115,7 +115,7 @@ pub fn spawn_tracer(
             tracing::info!("exchange tracer: connected to sidecar (instance_id={})", instance_id);
             register_scenario(&pub_, instance_id);
 
-            drain_loop(rx, &pub_, instance_id);
+            drain_loop(rx, &client, &pub_, instance_id);
         })
         .ok()?;
 
@@ -147,12 +147,21 @@ fn wait_for_pub(client: &AeronClient, channel: &str, stream_id: i32) -> Option<P
     Some(pub_)
 }
 
-fn drain_loop(mut rx: UnboundedReceiver<(i32, u64, i64, [u8; 16])>, pub_: &Publisher, instance_id: i32) {
+fn drain_loop(mut rx: UnboundedReceiver<(i32, u64, i64, [u8; 16])>, client: &AeronClient, pub_: &Publisher, instance_id: i32) {
     let mut buf = [0u8; 600];
+    let mut idle = 0u32;
     loop {
         while let Ok((milestone_id, order_id, ts_ns, sym)) = rx.try_recv() {
             let n = serialize_checkpoint(&mut buf, instance_id, milestone_id, order_id, ts_ns, &sym);
             let _ = pub_.send(&buf[..n]);
+            idle = 0;
+        }
+        // Aeron client times out if do_work() is not called within ~10 seconds.
+        // Call it every ~1 ms of idle time (every 1000 spin iterations) to keep
+        // the publication alive without burning CPU when traffic is low.
+        idle += 1;
+        if idle % 1_000 == 0 {
+            client.do_work();
         }
         std::hint::spin_loop();
     }

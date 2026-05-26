@@ -309,6 +309,7 @@ async fn ws_manager(
     pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
     dead_orders: Arc<DashMap<i64, ()>>,
     latency_pending: Arc<DashMap<u64, oneshot::Sender<u64>>>,
+    cleanup_symbols: &'static [&'static str],
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -331,7 +332,17 @@ async fn ws_manager(
             warn!("Desk WS auth send failed, reconnecting…");
             continue;
         }
-        info!("Desk WS connected and authenticated");
+
+        // Cancel stale orders from any previous session (handles desk-server restarts
+        // where the market-maker process survives but loses order-update delivery).
+        for sym in cleanup_symbols {
+            let msg = json!({"type":"cancel_symbol","symbol":sym}).to_string();
+            if ws.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
+                warn!("Desk WS cancel_symbol send failed");
+                break;
+            }
+        }
+        info!("Desk WS connected, authenticated, stale orders cleared");
 
         'conn: loop {
             tokio::select! {
@@ -747,7 +758,8 @@ async fn main() -> anyhow::Result<()> {
 
     // WS manager: handles connection lifecycle, auth, send/recv, reconnect.
     let ws_url = exchange_ws_url();
-    tokio::spawn(ws_manager(ws_url, token, ws_rx, pending, dead_orders, latency_pending));
+    const SYMBOL_NAMES: &[&str] = &["BTC_USDT", "ETH_USDT", "SOL_USDT"];
+    tokio::spawn(ws_manager(ws_url, token, ws_rx, pending, dead_orders, latency_pending, SYMBOL_NAMES));
 
     // Brief pause for the WS manager to connect and authenticate.
     tokio::time::sleep(Duration::from_millis(500)).await;

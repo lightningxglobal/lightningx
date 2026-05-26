@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="bolt-grad" x1="60%" y1="0%" x2="40%" y2="100%">
+      <stop offset="0%" stop-color="#FFE033"/>
+      <stop offset="55%" stop-color="#00E08A"/>
+      <stop offset="100%" stop-color="#00B275"/>
+    </linearGradient>
+    <linearGradient id="ring-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFE033" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#00B275" stop-opacity="0.6"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="soft-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Dark background circle -->
+  <circle cx="50" cy="50" r="50" fill="#0D1117"/>
+
+  <!-- Subtle green ambient glow behind bolt -->
+  <path d="M 56 10 L 26 52 L 46 52 L 31 90 L 73 46 L 53 46 Z"
+        fill="#00E08A" opacity="0.15" filter="url(#soft-glow)"/>
+
+  <!-- Outer ring with gradient -->
+  <circle cx="50" cy="50" r="47" fill="none" stroke="url(#ring-grad)" stroke-width="1.5"/>
+
+  <!-- Lightning bolt -->
+  <path d="M 56 10 L 26 52 L 46 52 L 31 90 L 73 46 L 53 46 Z"
+        fill="url(#bolt-grad)"
+        filter="url(#glow)"/>
+
+  <!-- Highlight streak on bolt (top-left edge shine) -->
+  <path d="M 54 13 L 30 50 L 44 50"
+        fill="none" stroke="white" stroke-width="1.2"
+        stroke-opacity="0.25" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

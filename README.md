@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" width="80" height="80" alt="LightningX Logo" />
+</p>
+
 # LightningX Exchange
 
 A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with sub-millisecond end-to-end latency.

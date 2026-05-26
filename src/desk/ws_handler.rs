@@ -3,9 +3,11 @@ use crate::api::AppState;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::order::{Order, Side, TimeInForce};
 use crate::user_service;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{Request, State};
+use axum::response::Response;
+use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket};
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -123,15 +125,25 @@ impl WsSession {
 // ─── Upgrade handler ──────────────────────────────────────────────────────────
 
 pub async fn ws_handler(
-    ws: WebSocketUpgrade,
     State(state): State<AppState>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    mut req: Request,
+) -> Response {
+    let (response, fut) = upgrade::upgrade(&mut req).expect("WS upgrade failed");
+    tokio::spawn(async move {
+        match fut.await {
+            Ok(ws) => handle_socket(ws, state).await,
+            Err(e) => tracing::error!("WS upgrade error: {e}"),
+        }
+    });
+    response.map(|_| axum::body::Body::empty())
 }
 
 // ─── Socket loop ──────────────────────────────────────────────────────────────
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
+async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState) {
+    socket.set_writev(false);
+    socket.set_auto_close(true);
+    socket.set_auto_pong(true);
     let mut session = WsSession::new();
 
     // Personal update channel for this connection.
@@ -143,25 +155,32 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     'conn: loop {
         tokio::select! {
             // Incoming message from client
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Some(reply) = handle_client_message(
-                            &text, &mut session, &state, personal_tx.clone()
-                        ).await {
-                            if socket.send(Message::Text(reply)).await.is_err() {
-                                break 'conn;
+            frame = socket.read_frame() => {
+                match frame {
+                    Ok(frame) => match frame.opcode {
+                        OpCode::Text => {
+                            let text = match std::str::from_utf8(&frame.payload) {
+                                Ok(t) => t,
+                                Err(_) => continue 'conn,
+                            };
+                            if let Some(reply) = handle_client_message(
+                                text, &mut session, &state, personal_tx.clone()
+                            ).await {
+                                if socket.write_frame(Frame::text(Payload::Owned(reply.into_bytes()))).await.is_err() {
+                                    break 'conn;
+                                }
                             }
                         }
+                        OpCode::Close => break 'conn,
+                        _ => {}
                     }
-                    Some(Ok(Message::Close(_))) | None => break 'conn,
-                    _ => {}
+                    Err(_) => break 'conn,
                 }
             }
 
             // Personal order/balance update for this user
             Some(msg) = personal_rx.recv() => {
-                if socket.send(Message::Text(msg)).await.is_err() {
+                if socket.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
                     break 'conn;
                 }
             }
@@ -201,7 +220,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 };
 
                 if should_forward {
-                    if socket.send(Message::Text(msg)).await.is_err() {
+                    if socket.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
                         break 'conn;
                     }
                 }

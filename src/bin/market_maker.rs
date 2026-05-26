@@ -10,7 +10,11 @@
 /// are detected immediately via WS order_update events and re-queued on the
 /// next diff cycle.
 use dashmap::DashMap;
-use futures_util::{future, SinkExt, StreamExt};
+use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
+use futures_util::future;
+use http_body_util::Empty;
+use hyper::{body::Bytes, Request, header::{CONNECTION, UPGRADE}};
+use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,9 +22,94 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
+
+// ── WebSocket connection helpers ──────────────────────────────────────────────
+
+// Hyper executor that spawns tokio tasks.
+struct SpawnExecutor;
+impl<Fut> hyper::rt::Executor<Fut> for SpawnExecutor
+where
+    Fut: std::future::Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    fn execute(&self, fut: Fut) { tokio::spawn(fut); }
+}
+
+// Parse a ws:// or wss:// URL into (is_tls, host, port, path_with_query).
+fn parse_ws_url(url: &str) -> (bool, String, u16, String) {
+    let tls = url.starts_with("wss://");
+    let rest = if tls { &url[6..] } else { &url[5..] };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = if let Some(colon) = authority.rfind(':') {
+        let port = authority[colon + 1..].parse().unwrap_or(if tls { 443 } else { 80 });
+        (authority[..colon].to_string(), port)
+    } else {
+        (authority.to_string(), if tls { 443 } else { 80 })
+    };
+    (tls, host, port, path)
+}
+
+// Build HTTP/1.1 upgrade request headers common to both plain and TLS connections.
+fn ws_upgrade_request(host: &str, path: &str) -> anyhow::Result<Request<Empty<Bytes>>> {
+    Ok(Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("Host", host)
+        .header(CONNECTION, "upgrade")
+        .header(UPGRADE, "websocket")
+        .header("Sec-WebSocket-Key", handshake::generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .body(Empty::new())?)
+}
+
+// Connect to a plain ws:// WebSocket endpoint.
+async fn ws_connect_plain(
+    url: &str,
+) -> anyhow::Result<WebSocket<TokioIo<hyper::upgrade::Upgraded>>> {
+    let (_, host, port, path) = parse_ws_url(url);
+    let tcp = TcpStream::connect(format!("{host}:{port}")).await?;
+    let req = ws_upgrade_request(&host, &path)?;
+    let (ws, _) = handshake::client(&SpawnExecutor, req, tcp).await?;
+    Ok(ws)
+}
+
+// Connect to a TLS wss:// WebSocket endpoint using system root certs.
+async fn ws_connect_tls(
+    url: &str,
+) -> anyhow::Result<WebSocket<TokioIo<hyper::upgrade::Upgraded>>> {
+    use std::sync::Arc;
+    use tokio_rustls::rustls;
+
+    // Ring must be installed as the process-level crypto provider (rustls 0.23+).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (_, host, port, path) = parse_ws_url(url);
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().unwrap_or_default() {
+        let _ = roots.add(cert);
+    }
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+        .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
+
+    let tcp = TcpStream::connect(format!("{host}:{port}")).await?;
+    let tls = connector.connect(server_name, tcp).await?;
+    let req = ws_upgrade_request(&host, &path)?;
+    let (ws, _) = handshake::client(&SpawnExecutor, req, tls).await?;
+    Ok(ws)
+}
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -223,8 +312,8 @@ async fn ws_manager(
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        let ws = match connect_async(&ws_url).await {
-            Ok((ws, _)) => { backoff = Duration::from_secs(1); ws }
+        let mut ws = match ws_connect_plain(&ws_url).await {
+            Ok(ws) => { backoff = Duration::from_secs(1); ws }
             Err(e) => {
                 warn!("Desk WS connect failed: {e}, retry in {backoff:?}");
                 tokio::time::sleep(backoff).await;
@@ -232,31 +321,33 @@ async fn ws_manager(
                 continue;
             }
         };
-        let (mut sink, mut stream) = ws.split();
+        ws.set_writev(false);
+        ws.set_auto_close(true);
+        ws.set_auto_pong(true);
 
         // Authenticate immediately on connect.
-        if sink.send(Message::Text(json!({"type":"auth","token":&token}).to_string())).await.is_err() {
+        let auth_msg = json!({"type":"auth","token":&token}).to_string();
+        if ws.write_frame(Frame::text(Payload::Owned(auth_msg.into_bytes()))).await.is_err() {
             warn!("Desk WS auth send failed, reconnecting…");
             continue;
         }
         info!("Desk WS connected and authenticated");
 
-        // Fair select: process one stream message OR send one outbox message per
-        // iteration.  No drain loop — draining blocks the read side and causes
-        // a TCP deadlock when the peer's recv buffer fills (200 concurrent orders
-        // generate ~80KB of responses which exceeds the 64KB socket buffer).
         'conn: loop {
             tokio::select! {
-                msg = stream.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            route_desk_msg(&text, &pending, &dead_orders, &latency_pending);
+                biased;
+                frame = ws.read_frame() => {
+                    match frame {
+                        Ok(f) if f.opcode == OpCode::Text => {
+                            if let Ok(text) = std::str::from_utf8(&f.payload) {
+                                route_desk_msg(text, &pending, &dead_orders, &latency_pending);
+                            }
                         }
-                        Some(Ok(Message::Close(_))) | None => {
+                        Ok(f) if f.opcode == OpCode::Close => {
                             warn!("Desk WS closed by server");
                             break 'conn;
                         }
-                        Some(Err(e)) => {
+                        Err(e) => {
                             warn!("Desk WS error: {e}");
                             break 'conn;
                         }
@@ -267,12 +358,12 @@ async fn ws_manager(
                 msg = outbox.recv() => {
                     match msg {
                         Some(text) => {
-                            if sink.send(Message::Text(text)).await.is_err() {
+                            if ws.write_frame(Frame::text(Payload::Owned(text.into_bytes()))).await.is_err() {
                                 warn!("Desk WS send error");
                                 break 'conn;
                             }
                         }
-                        None => return, // all clients dropped — shutting down
+                        None => return,
                     }
                 }
             }
@@ -489,8 +580,8 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
 
     loop {
         let url = format!("{BINANCE_WS_BASE}/{}", cfg.binance_stream);
-        let ws = match connect_async(&url).await {
-            Ok((ws, _)) => { reconnect_delay = Duration::from_secs(1); ws }
+        let mut ws = match ws_connect_tls(&url).await {
+            Ok(ws) => { reconnect_delay = Duration::from_secs(1); ws }
             Err(e) => {
                 warn!("[{}] Binance WS connect failed: {e}, retry in {reconnect_delay:?}", cfg.our_symbol);
                 tokio::time::sleep(reconnect_delay).await;
@@ -498,14 +589,21 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
                 continue;
             }
         };
+        ws.set_auto_close(true);
+        ws.set_auto_pong(true);
         info!("[{}] Binance WS connected", cfg.our_symbol);
-        let (_, mut read) = ws.split();
 
-        while let Some(msg) = read.next().await {
-            let text = match msg {
-                Ok(Message::Text(t)) => t,
-                Ok(Message::Close(_)) => break,
+        loop {
+            let frame = match ws.read_frame().await {
+                Ok(f) => f,
                 Err(e) => { warn!("[{}] Binance WS error: {e}", cfg.our_symbol); break; }
+            };
+            let text = match frame.opcode {
+                OpCode::Text => match std::str::from_utf8(&frame.payload) {
+                    Ok(t) => t.to_string(),
+                    Err(_) => continue,
+                },
+                OpCode::Close => break,
                 _ => continue,
             };
 

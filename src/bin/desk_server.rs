@@ -441,7 +441,6 @@ async fn main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("aeron-event-loop".to_string())
             .spawn(move || {
-                let mut idle_us: u64 = 0;
                 loop {
                     let mut did_work = false;
                     // Drain outbound commands (WS/REST → engine) without blocking.
@@ -573,13 +572,16 @@ async fn main() -> anyhow::Result<()> {
 
                         // Push order_update to user's personal WS channel.
                         let user_id = participant_id as i64;
+                        // Record latency milestone unconditionally — measures when
+                        // the desk-server is ready to forward the update, regardless
+                        // of whether a WS connection exists for this user.
+                        if let Some(ref t) = spin_tracer {
+                            t.record(MS_WS_UPDATE_SEND, client_order_id);
+                        }
                         if user_tx.get(&user_id).is_none() {
                             tracing::warn!("no WS channel for user {user_id}, order_update {order_id} lost");
                         }
                         if let Some(tx) = user_tx.get(&user_id) {
-                            if let Some(ref t) = spin_tracer {
-                                t.record(MS_WS_UPDATE_SEND, client_order_id);
-                            }
                             let ws_status = match kind {
                                 k if k == order_update_kind::ACCEPTED     => "OPEN",
                                 k if k == order_update_kind::PARTIAL_FILL => "PARTIAL",
@@ -675,14 +677,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Backoff when idle: exponential up to 500μs max.
-                    // Keeps latency acceptable while freeing CPU on resource-constrained hosts.
-                    // Remove and use spin_loop() instead if dedicated CPU cores are available.
                     if !did_work {
-                        idle_us = (idle_us * 2 + 10).min(500);
-                        std::thread::sleep(std::time::Duration::from_micros(idle_us));
-                    } else {
-                        idle_us = 0;
+                        std::hint::spin_loop();
                     }
                 }
             })?;

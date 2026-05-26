@@ -259,23 +259,29 @@ async fn main() -> anyhow::Result<()> {
 
         tracing::info!("kline_service: subscribed to {} stream {}", ch, TRADE_STREAM);
 
+        let mut idle_us: u64 = 0;
         loop {
             client.do_work();
-            let _ = sub.poll();
+            let fragments = sub.poll();
 
             // Drain the callback queue and forward trades to the tokio accumulator
-            let mut batch = Vec::new();
+            let mut batch_len = 0usize;
             {
                 let mut q = queue_for_aeron.lock();
                 while let Some(item) = q.pop_front() {
-                    batch.push(item);
+                    let _ = trade_fwd_tx.send(item);
+                    batch_len += 1;
                 }
             }
-            for item in batch {
-                let _ = trade_fwd_tx.send(item);
-            }
 
-            std::hint::spin_loop();
+            // Backoff when idle: exponential up to 10ms. Kline is not latency-sensitive.
+            // Remove and use spin_loop() instead if dedicated CPU cores are available.
+            if fragments == 0 && batch_len == 0 {
+                idle_us = (idle_us * 2 + 1000).min(10_000);
+                std::thread::sleep(std::time::Duration::from_micros(idle_us));
+            } else {
+                idle_us = 0;
+            }
         }
     });
 

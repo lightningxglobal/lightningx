@@ -1046,23 +1046,23 @@ async fn handle_klines(
     State(s): State<AppState>,
     Query(params): Query<KlinesQuery>,
 ) -> impl IntoResponse {
-    let _interval = params.interval.unwrap_or_else(|| "1m".to_string()); // reserved for future intervals
+    let interval = params.interval.unwrap_or_else(|| "1m".to_string());
     let limit = params.limit.unwrap_or(200).min(1000);
+    // Read from klines table (written by kline_service). Return the most recent
+    // N bars in ascending time order so the frontend always sees current data.
     let rows = sqlx::query(
-        "SELECT
-           extract(epoch FROM date_trunc('minute', created_at))::bigint AS time,
-           (array_agg(price ORDER BY created_at ASC))[1] AS open,
-           max(price) AS high,
-           min(price) AS low,
-           (array_agg(price ORDER BY created_at DESC))[1] AS close,
-           sum(quantity) AS volume
-         FROM trades
-         WHERE symbol = $1
-         GROUP BY date_trunc('minute', created_at)
-         ORDER BY time ASC
-         LIMIT $2",
+        "SELECT open_time AS time, open, high, low, close, volume
+         FROM (
+           SELECT open_time, open, high, low, close, volume
+           FROM klines
+           WHERE symbol = $1 AND interval = $2
+           ORDER BY open_time DESC
+           LIMIT $3
+         ) sub
+         ORDER BY time ASC",
     )
     .bind(&params.symbol)
+    .bind(&interval)
     .bind(limit)
     .fetch_all(s.db.as_ref())
     .await;

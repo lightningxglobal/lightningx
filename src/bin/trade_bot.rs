@@ -22,9 +22,7 @@ struct SymbolConfig {
 }
 
 const SYMBOLS: &[SymbolConfig] = &[
-    SymbolConfig { symbol: "ETH_USDT", base_qty: 0.05 },
     SymbolConfig { symbol: "BTC_USDT", base_qty: 0.001 },
-    SymbolConfig { symbol: "SOL_USDT", base_qty: 0.5 },
 ];
 
 #[derive(Serialize)]

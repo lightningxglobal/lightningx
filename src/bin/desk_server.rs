@@ -116,9 +116,12 @@ async fn main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("aeron-event-loop".to_string())
             .spawn(move || {
+                let mut idle_us: u64 = 0;
                 loop {
+                    let mut did_work = false;
                     // Drain outbound commands (WS/REST → engine) without blocking.
                     while let Ok(cmd) = aeron_cmd_rx.try_recv() {
+                        did_work = true;
                         match cmd {
                             AeronCmd::NewOrder(req) => {
                                 let sym = std::str::from_utf8(&req.symbol)
@@ -149,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
 
                     // Process order updates — complete pending REST/WS requests.
                     while let Some(msg) = order_update_sub.poll() {
+                        did_work = true;
                         use lightning_exchange::transport::order_update_kind;
                         // Copy packed struct fields to locals to avoid misaligned refs.
                         let order_id: u64 = msg.order_id;
@@ -267,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
                     // Process trade notifications — offload JSON + broadcast + DB to tokio.
                     // Spin thread only extracts raw fields (~100ns); heavy work runs async.
                     while let Some(trade) = trade_sub.poll() {
+                        did_work = true;
                         let end = trade.symbol.iter().position(|&b| b == 0).unwrap_or(16);
                         let symbol: String = String::from_utf8_lossy(&trade.symbol[..end]).into_owned();
                         let price: f64 = trade.price;
@@ -310,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
                     // Process depth snapshots — spin thread copies raw arrays (~320B memcpy),
                     // offloads JSON build + DashMap + broadcast to tokio (10-30μs saved).
                     while let Some(depth_msg) = depth_sub.poll() {
+                        did_work = true;
                         use lightning_exchange::aeron_transport::DeskDepthMsg;
                         match depth_msg {
                             DeskDepthMsg::Depth(evt) => {
@@ -321,8 +327,8 @@ async fn main() -> anyhow::Result<()> {
                                 asks_raw[..na].copy_from_slice(&evt.asks[..na]);
                                 let end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
                                 let symbol = std::str::from_utf8(&evt.symbol[..end])
-                                    .unwrap_or("ETH_USDT").to_string();
-                                let symbol = if symbol.is_empty() { "ETH_USDT".to_string() } else { symbol };
+                                    .unwrap_or("BTC_USDT").to_string();
+                                let symbol = if symbol.is_empty() { "BTC_USDT".to_string() } else { symbol };
 
                                 let market_tx2 = market_tx.clone();
                                 let last_depth2 = last_depth.clone();
@@ -348,7 +354,15 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    std::hint::spin_loop();
+                    // Backoff when idle: exponential up to 500μs max.
+                    // Keeps latency acceptable while freeing CPU on resource-constrained hosts.
+                    // Remove and use spin_loop() instead if dedicated CPU cores are available.
+                    if !did_work {
+                        idle_us = (idle_us * 2 + 10).min(500);
+                        std::thread::sleep(std::time::Duration::from_micros(idle_us));
+                    } else {
+                        idle_us = 0;
+                    }
                 }
             })?;
     }

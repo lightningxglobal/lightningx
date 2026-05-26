@@ -39,7 +39,8 @@ fn exchange_ws_url() -> String {
 
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
-const DEPTH_LEVELS: usize = 20;
+// 5 levels per side on constrained hosts; increase to 20 when CPU budget allows.
+const DEPTH_LEVELS: usize = 5;
 const QTY_SCALE: f64 = 1.0;
 const MAX_USDT_PER_SIDE: f64 = 2_000_000.0;
 const BINANCE_WS_BASE: &str = "wss://fstream.binance.com/ws";
@@ -51,9 +52,7 @@ struct SymbolConfig {
 }
 
 const SYMBOLS: &[SymbolConfig] = &[
-    SymbolConfig { our_symbol: "ETH_USDT", binance_stream: "ethusdt@depth20@100ms", min_qty: 0.001 },
-    SymbolConfig { our_symbol: "BTC_USDT", binance_stream: "btcusdt@depth20@100ms", min_qty: 0.0001 },
-    SymbolConfig { our_symbol: "SOL_USDT", binance_stream: "solusdt@depth20@100ms", min_qty: 0.01 },
+    SymbolConfig { our_symbol: "BTC_USDT", binance_stream: "btcusdt@depth5@500ms", min_qty: 0.0001 },
 ];
 
 // ── REST helpers (login + robot-funds only) ────────────────────────────────────
@@ -568,8 +567,8 @@ async fn run_latency_probe(client: WsExchangeClient) {
     let start = std::time::Instant::now();
 
     for i in 0..PROBE_COUNT {
-        // Far-off-market bid: $1 for ETH — accepted but never fills.
-        match client.place_order_timed("ETH_USDT", "buy", 1.0, 0.001).await {
+        // Far-off-market bid: $1 for BTC — accepted but never fills.
+        match client.place_order_timed("BTC_USDT", "buy", 1.0, 0.0001).await {
             Some((_oid, us)) => samples.push(us),
             None             => timeouts += 1,
         }
@@ -584,7 +583,7 @@ async fn run_latency_probe(client: WsExchangeClient) {
     let elapsed = start.elapsed();
 
     // Clean up resting probe orders with a single cancel-all.
-    client.cancel_symbol("ETH_USDT").await;
+    client.cancel_symbol("BTC_USDT").await;
 
     let n = samples.len();
     if n < 10 {

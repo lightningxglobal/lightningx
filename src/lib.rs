@@ -1,40 +1,46 @@
 //! LightningX matching engine — lock-free SkipList order book, 6–9M TPS, <100ns latency.
 
-// ── Core engine ──────────────────────────────────────────────────────────────
-pub mod float_ext;
-pub mod engine;
-pub mod order;
-pub mod trade;
-pub mod orderbook;
-pub mod orderbook_impl;
-pub mod skiplist;
-pub mod snapshot;
-pub mod market_data;
-pub mod pools;
-pub mod list_pool;
-pub mod event;
-pub mod error;
-pub mod time_provider;
+// ── 撮合子系统 (matching engine + market data) ────────────────────────────────
+pub mod matching;
 
-// ── Transport / encoding ─────────────────────────────────────────────────────
-pub mod sbe;
+// ── 传输子系统 (Aeron / SBE / tracer) ────────────────────────────────────────
 pub mod transport;
-pub mod order_update;
-pub mod aeron_transport;
-pub mod aeron_channels;
-pub mod tracer;
 
-// ── Server / API ─────────────────────────────────────────────────────────────
-pub mod db;
-pub mod models;
-pub mod account;
-pub mod account_repository;
-pub mod positions;
-pub mod user_service;
-pub mod rate_limit;
-pub mod snowflake;
-pub mod api;
-pub mod ws_handler;
+// ── 柜台子系统 (desk server + API) ───────────────────────────────────────────
+pub mod desk;
+
+// ── Flat re-exports: preserve all existing `crate::module` paths ──────────────
+pub use matching::float_ext;
+pub use matching::engine;
+pub use matching::order;
+pub use matching::trade;
+pub use matching::orderbook;
+pub use matching::orderbook_impl;
+pub use matching::skiplist;
+pub use matching::snapshot;
+pub use matching::market_data;
+pub use matching::pools;
+pub use matching::list_pool;
+pub use matching::event;
+pub use matching::error;
+pub use matching::time_provider;
+
+pub use transport::sbe;
+pub use transport::order_update;
+pub use transport::aeron_transport;
+pub use transport::aeron_channels;
+pub use transport::tracer;
+
+pub use desk::db;
+pub use desk::models;
+pub use desk::account;
+pub use desk::account_repository;
+pub use desk::positions;
+pub use desk::user_service;
+pub use desk::rate_limit;
+pub use desk::snowflake;
+pub use desk::api;
+pub use desk::ws_handler;
 
 #[cfg(test)]
 mod sbe_tests;

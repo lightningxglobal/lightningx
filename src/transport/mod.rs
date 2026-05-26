@@ -1,8 +1,14 @@
+pub mod sbe;
+pub mod order_update;
+pub mod aeron_transport;
+pub mod aeron_channels;
+pub mod tracer;
+
 /// Transport层抽象 - Aeron的trait定义 + Mock实现
 ///
 /// 用于屏蔽实际Aeron实现，通过trait定义来实现解耦和测试隔离
 
-pub use crate::sbe::{NewOrderRequest, CancelOrderRequest, TradeNotification};
+pub use self::sbe::{NewOrderRequest, CancelOrderRequest, TradeNotification};
 use crate::market_data::{DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent};
 use std::sync::mpsc::{channel, Sender, Receiver};
 

@@ -206,6 +206,25 @@ async fn main() -> anyhow::Result<()> {
                                         let _ = repo.freeze_for_sell(meta.user_id, base, meta.qty).await;
                                     }
                                 });
+                            } else if kind == order_update_kind::FILLED || kind == order_update_kind::PARTIAL_FILL {
+                                // Market / IOC order filled immediately — no ACCEPTED was sent.
+                                // Insert the order row now so the fills JOIN and order history work.
+                                let db_status = if kind == order_update_kind::FILLED { "COMPLETED" } else { "TRADING" };
+                                let oid = order_id as i64;
+                                let db4 = db.clone();
+                                rt.spawn(async move {
+                                    let _ = sqlx::query(
+                                        "INSERT INTO orders \
+                                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price) \
+                                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+                                         ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()"
+                                    )
+                                    .bind(oid).bind(meta.user_id).bind(&meta.symbol)
+                                    .bind(&meta.side).bind(&meta.order_type)
+                                    .bind(meta.price).bind(meta.qty)
+                                    .bind(fill_qty).bind(db_status).bind(meta.freeze_price)
+                                    .execute(&*db4).await;
+                                });
                             }
                             // REJECTED / CANCELLED with meta: no DB row and no frozen
                             // funds, so nothing else to do.
@@ -282,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
 
                         let market_tx2 = market_tx.clone();
                         let db2 = db.clone();
+                        let user_tx2 = user_tx.clone();
                         rt.spawn(async move {
                             let side_str = if side == 0 { "buy" } else { "sell" };
                             let ts = std::time::SystemTime::now()
@@ -293,10 +313,12 @@ async fn main() -> anyhow::Result<()> {
                             );
                             let _ = market_tx2.send(trade_msg);
 
+                            let taker_oid = taker_id as i64;
+                            let maker_oid = maker_id as i64;
                             let (buy_oid, sell_oid): (i64, i64) = if side == 0 {
-                                (taker_id as i64, maker_id as i64)
+                                (taker_oid, maker_oid)
                             } else {
-                                (maker_id as i64, taker_id as i64)
+                                (maker_oid, taker_oid)
                             };
                             let _ = sqlx::query(
                                 "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
@@ -309,6 +331,84 @@ async fn main() -> anyhow::Result<()> {
                             .bind(quantity)
                             .execute(db2.as_ref())
                             .await;
+
+                            // Settle accounts. Retry a few times to handle the race where the
+                            // immediately-filled taker order INSERT hasn't committed yet.
+                            let mut retries = 0u32;
+                            let (taker_uid, maker_uid) = loop {
+                                let t: Option<i64> = sqlx::query_scalar(
+                                    "SELECT user_id FROM orders WHERE id = $1"
+                                ).bind(taker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None);
+                                let m: Option<i64> = sqlx::query_scalar(
+                                    "SELECT user_id FROM orders WHERE id = $1"
+                                ).bind(maker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None);
+                                if (t.is_some() && m.is_some()) || retries >= 5 { break (t, m); }
+                                retries += 1;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                            };
+
+                            if let (Some(taker_uid), Some(maker_uid)) = (taker_uid, maker_uid) {
+                                let cost = price * quantity;
+                                let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+                                let base = *sym_parts.first().unwrap_or(&"BTC");
+                                let quote = *sym_parts.last().unwrap_or(&"USDT");
+                                let (buyer_id, seller_id) = if side == 0 {
+                                    (taker_uid, maker_uid)
+                                } else {
+                                    (maker_uid, taker_uid)
+                                };
+
+                                // Buyer: debit quote (direct — taker may not have frozen funds),
+                                //        credit base asset.
+                                let _ = sqlx::query(
+                                    "UPDATE accounts SET balance = balance - $1, updated_at = NOW() \
+                                     WHERE user_id = $2 AND asset = $3"
+                                ).bind(cost).bind(buyer_id).bind(quote)
+                                .execute(db2.as_ref()).await;
+                                let _ = sqlx::query(
+                                    "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1, $2, $3, 0) \
+                                     ON CONFLICT (user_id, asset) DO UPDATE SET balance = accounts.balance + $3, updated_at = NOW()"
+                                ).bind(buyer_id).bind(base).bind(quantity)
+                                .execute(db2.as_ref()).await;
+
+                                // Seller: debit base (direct), release frozen if any, credit quote.
+                                let _ = sqlx::query(
+                                    "UPDATE accounts SET balance = balance - $1, \
+                                     frozen = GREATEST(frozen - $1, 0), updated_at = NOW() \
+                                     WHERE user_id = $2 AND asset = $3"
+                                ).bind(quantity).bind(seller_id).bind(base)
+                                .execute(db2.as_ref()).await;
+                                let _ = sqlx::query(
+                                    "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1, $2, $3, 0) \
+                                     ON CONFLICT (user_id, asset) DO UPDATE SET balance = accounts.balance + $3, updated_at = NOW()"
+                                ).bind(seller_id).bind(quote).bind(cost)
+                                .execute(db2.as_ref()).await;
+
+                                // Push balance_update to both users so the UI reflects changes.
+                                for (uid, assets) in [
+                                    (buyer_id, vec![quote, base]),
+                                    (seller_id, vec![base, quote]),
+                                ] {
+                                    if let Some(tx) = user_tx2.get(&uid) {
+                                        for asset in assets {
+                                            let row: Option<(f64, f64)> = sqlx::query_as(
+                                                "SELECT balance, frozen FROM accounts WHERE user_id = $1 AND asset = $2"
+                                            ).bind(uid).bind(asset)
+                                            .fetch_optional(db2.as_ref()).await.unwrap_or(None);
+                                            if let Some((bal, frz)) = row {
+                                                let msg = serde_json::json!({
+                                                    "type": "balance_update",
+                                                    "asset": asset,
+                                                    "balance": bal,
+                                                    "available": bal - frz,
+                                                    "frozen": frz,
+                                                }).to_string();
+                                                let _ = tx.try_send(msg);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         });
                     }
 

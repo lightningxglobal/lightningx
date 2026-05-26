@@ -7,7 +7,7 @@
 ///
 /// Production topology (udp mode)
 /// ───────────────────────────────
-///   Engine machine  : exchange_engine  +  kline_service  +  beacon sidecar
+///   Engine machine  : exchange_engine  +  kline_service  +  beacon
 ///   Desk machine    : desk_server
 ///
 /// For cross-machine deployment set ENGINE_HOST to the engine's IP.
@@ -90,7 +90,7 @@ pub const DEPTH_STREAM: i32 = 4;
 pub const DEPTH50_STREAM: i32 = 5;
 pub const LEVEL2_STREAM: i32 = 6;
 
-/// Tracing checkpoint publisher → Beacon sidecar (GSL metrics)
-/// Always IPC: the beacon sidecar runs co-located with the publisher.
+/// Tracing checkpoint publisher → Beacon (GSL metrics)
+/// Always IPC: the beacon runs co-located with the publisher.
 pub const METRICS_CHANNEL: &str = "aeron:ipc";
 pub const METRICS_STREAM: i32 = 1001;

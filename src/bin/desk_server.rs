@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Aeron subscribers and publisher created");
 
-    // ── Latency tracer (optional — disabled if sidecar is not running) ────────
+    // ── Latency tracer (optional — disabled if is not running) ────────
     let tracer = spawn_tracer(&aeron_dir(), METRICS_CHANNEL, METRICS_STREAM, DESK_INSTANCE_ID)
         .map(Arc::new);
     if tracer.is_some() {

@@ -1,7 +1,7 @@
-/// Exchange latency tracer — publishes checkpoint messages to the sidecar via Aeron IPC.
+/// Exchange latency tracer — publishes checkpoint messages to beacon via Aeron IPC.
 ///
-/// Wire format is identical to ml_core::sidecar (see ~/work/rs/marketlink) so the same
-/// sidecar process can consume checkpoints from both the exchange and market-link.
+/// Wire format is identical to ml_core::beacon (see ~/work/rs/marketlink) so the same
+/// process can consume checkpoints from both the exchange and market-link.
 ///
 /// Milestone IDs: (site_ordinal << 16) | action_ordinal  (D1L team convention)
 ///
@@ -37,7 +37,7 @@ pub const MS_AERON_ORDER_RECV: i32  = (9_i32 << 16) | 29; // Engine × OnAeronOr
 pub const MS_MATCHING_DONE: i32     = (9_i32 << 16) | 30; // Engine × OnMatchingDone
 pub const MS_AERON_UPDATE_SEND: i32 = (9_i32 << 16) | 31; // Engine × OnAeronUpdateSend
 
-// Wire format constants (same as marketlink sidecar).
+// Wire format constants (same as marketlink).
 const MSG_TYPE_CHECKPOINT: i32 = 6;
 const MSG_TYPE_SCENARIO: i32 = 8;
 const MSG_TYPE_GROUP: i32 = 11;
@@ -61,7 +61,7 @@ pub struct ExchangeTracer {
 }
 
 impl ExchangeTracer {
-    /// Record a checkpoint without a specific symbol (uses zero bytes → sidecar default group).
+    /// Record a checkpoint without a specific symbol (uses zero bytes → default group).
     #[inline]
     pub fn record(&self, milestone_id: i32, order_id: u64) {
         let ts_ns = now_ns();
@@ -78,9 +78,9 @@ impl ExchangeTracer {
 }
 
 /// Spawn background thread that drains (milestone_id, order_id) pairs and publishes
-/// checkpoint wire messages to the sidecar via Aeron IPC.
+/// checkpoint wire messages to beacon via Aeron IPC.
 ///
-/// Returns `None` if Aeron init fails (sidecar not running) — checkpoints are simply dropped.
+/// Returns `None` if Aeron init fails (beacon not running) — checkpoints are simply dropped.
 pub fn spawn_tracer(
     aeron_dir: &str,
     channel: &str,
@@ -103,7 +103,7 @@ pub fn spawn_tracer(
                 }
             };
 
-            // Spin up to 200ms waiting for the publication to connect to the sidecar.
+            // Spin up to 200ms waiting for the publication to connect to beacon.
             let pub_ = match wait_for_pub(&client, &channel, stream_id) {
                 Some(p) => p,
                 None => {
@@ -112,7 +112,7 @@ pub fn spawn_tracer(
                 }
             };
 
-            tracing::info!("exchange tracer: connected to sidecar (instance_id={})", instance_id);
+            tracing::info!("exchange tracer: connected to (instance_id={})", instance_id);
             register_scenario(&pub_, instance_id);
 
             drain_loop(rx, &client, &pub_, instance_id);

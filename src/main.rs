@@ -306,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
         last_depth: Arc::new(DashMap::new()),
         tracer: None,
         account_cache: AccountCache::default(),
+        valid_symbols: Arc::new(std::collections::HashSet::new()),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

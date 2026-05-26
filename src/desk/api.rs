@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -50,6 +50,10 @@ pub struct AppState {
     pub tracer: Option<Arc<ExchangeTracer>>,
     /// In-memory account balances: read path never touches DB after initial load.
     pub account_cache: AccountCache,
+    /// Symbols with live matching engines. Used to reject orders for unknown symbols
+    /// before sending order_submitted, preventing phantom orders in clients.
+    /// Empty set = all symbols allowed (standalone mode with local engines).
+    pub valid_symbols: Arc<HashSet<String>>,
 }
 
 pub fn router(state: AppState) -> Router {

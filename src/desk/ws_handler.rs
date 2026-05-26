@@ -385,6 +385,17 @@ async fn handle_client_message(
                 use crate::tracer::MS_WS_ORDER_RECV;
                 use crate::transport::{AeronCmd, OrderMeta};
 
+                // Reject unknown symbols immediately — before sending order_submitted —
+                // so clients don't track phantom orders waiting for a response that
+                // arrives as order_rejected after the pending entry is gone.
+                if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
+                    return Some(json!({
+                        "type": "order_rejected",
+                        "client_order_id": client_order_id,
+                        "reason": format!("No engine for symbol: {}", symbol)
+                    }).to_string());
+                }
+
                 let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
                 // Build sym_bytes first so the tracer checkpoint carries the symbol.
                 let mut sym_bytes = [0u8; 16];

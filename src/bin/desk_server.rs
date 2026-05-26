@@ -398,6 +398,9 @@ async fn main() -> anyhow::Result<()> {
     // ── Shared state ──────────────────────────────────────────────────────────
     let (market_tx, _) = broadcast::channel::<String>(1024);
 
+    let valid_symbols: std::collections::HashSet<String> =
+        order_pubs.keys().cloned().collect();
+
     let state = AppState {
         db: Arc::new(pool),
         engines: None,
@@ -410,6 +413,7 @@ async fn main() -> anyhow::Result<()> {
         last_depth: Arc::new(DashMap::new()),
         tracer: tracer.clone(),
         account_cache: account_cache.clone(),
+        valid_symbols: Arc::new(valid_symbols),
     };
 
     // ── DB worker: rtrb ring buffer spin thread → DB worker thread ───────────

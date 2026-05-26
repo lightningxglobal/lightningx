@@ -4,7 +4,7 @@
 
 # LightningX Exchange
 
-A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with sub-millisecond end-to-end latency.
+A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with **5 µs median end-to-end latency**.
 
 Live demo: **https://www.lightningx.global**
 
@@ -14,7 +14,7 @@ Live demo: **https://www.lightningx.global**
 
 ![LightningX end-to-end latency on M4 Mac](lightningx-latency-m4.jpg)
 
-*Full system round-trip (client → nginx → desk-server → Aeron → matching engine → Aeron → desk-server → client) measured on an M4 MacBook Pro. p50 ≈ 42 μs, p99 ≈ 95 μs.*
+*Exchange-layer round-trip (WS receive → Aeron IPC → matching engine → Aeron IPC → WS send-ready) measured via beacon tracing on an M4 MacBook Pro. **p50 = 5 µs · p90 = 9 µs · p99 = 15 µs.***
 
 ---
 
@@ -169,15 +169,25 @@ all buffers are pre-allocated (`SmallVec`, arena SkipList, rtrb ring buffers).
 
 ### Full System End-to-End Latency
 
-Round-trip path: **browser → nginx (TLS) → desk-server → Aeron IPC → matching engine → Aeron IPC → desk-server → WebSocket push → browser**
+Round-trip path: **WS receive → Aeron IPC → matching engine → Aeron IPC → WS send-ready**  
+Measured via beacon / HDR histogram tracing on an Apple M4 MacBook Pro.
 
-| Metric | Latency |
-|---|---|
-| P50 | **42 μs** |
-| P99 | **95 μs** |
+| Metric | P50 | P90 | P99 |
+|---|---|---|---|
+| **Full RTT** | **5 µs** | **9 µs** | **15 µs** |
 
-The dominant cost is two Aeron IPC round-trips (~5 μs each) plus two tokio scheduler wake-ups.
-The matching step itself contributes only ~84 ns.
+Stage-by-stage breakdown (steady-state, last-observed values):
+
+| Stage | P50 | P90 |
+|---|---|---|
+| WS receive → Aeron publish | 2 µs | 4 µs |
+| Aeron IPC transit (desk → engine) | < 1 µs | 1 µs |
+| Engine matching | 1 µs | 3 µs |
+| Result publish (engine → Aeron) | 1 µs | 3 µs |
+| Aeron IPC transit (engine → desk) | < 1 µs | 1 µs |
+| Desk processing (Aeron recv → WS ready) | 2 µs | 4 µs |
+
+The matching step contributes only ~1 µs end-to-end; the dominant cost is the two Aeron IPC round-trips and tokio scheduler wake-ups at each WS boundary.
 
 ### What Makes It Fast
 

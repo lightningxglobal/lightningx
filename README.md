@@ -1,179 +1,158 @@
-# Lightning Exchange — Backend
+# LightningX Exchange
 
-High-performance crypto exchange backend written in Rust. Targets 6–9M TPS on a single core using a lock-free SkipList order book, SBE binary encoding, and Aeron transport.
+A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with sub-millisecond end-to-end latency.
 
----
-
-## Quick Start (dev mode)
-
-Prerequisites: PostgreSQL on `localhost:5432`, Redis on `localhost:6379` (Docker containers already running).
-
-```bash
-# Copy environment file
-cp .env.example .env
-
-# Run database migrations and start the API server
-cargo run
-```
-
-Frontend (separate terminal):
-
-```bash
-cd ../exchange-frontend
-npm install
-npm run dev          # Vite dev server on http://localhost:5173
-```
+Live demo: **https://www.lightningx.global**
 
 ---
 
-## Docker Start (full stack)
+## Latency
 
-```bash
-# From /Users/alphawu/work/rs/matching
-docker-compose up -d
-```
+![LightningX end-to-end latency on M4 Mac](lightningx-latency-m4.jpg)
 
-Services started:
-
-| Service            | URL                        |
-|--------------------|----------------------------|
-| exchange-api       | http://localhost:3000      |
-| exchange-frontend  | http://localhost:4001       |
-| PostgreSQL         | localhost:5432              |
-| Redis              | localhost:6379              |
-
-Stop everything:
-
-```bash
-docker-compose down
-```
-
-Destroy data volumes too:
-
-```bash
-docker-compose down -v
-```
-
----
-
-## Environment Variables
-
-| Variable       | Default                                       | Description                        |
-|----------------|-----------------------------------------------|------------------------------------|
-| `DATABASE_URL` | `postgres://user:password@localhost:5432/mydb`| PostgreSQL connection string        |
-| `REDIS_URL`    | `redis://localhost:6379`                      | Redis connection string             |
-| `JWT_SECRET`   | `change_me_in_production`                     | Secret key for JWT signing          |
-| `PORT`         | `3000`                                        | HTTP listen port                    |
-| `HOST`         | `0.0.0.0`                                    | HTTP bind address                   |
-| `RUST_LOG`     | `info`                                        | Log level (`trace/debug/info/warn`) |
-
-Copy `.env.example` to `.env` for local development. In production, inject these via your secrets manager — never commit `.env`.
-
----
-
-## API Endpoint Reference
-
-Base URL: `http://localhost:3000`
-
-### Auth
-
-| Method | Path                   | Body                                      | Description            |
-|--------|------------------------|-------------------------------------------|------------------------|
-| POST   | `/api/auth/register`   | `{ username, email, password }`           | Create account         |
-| POST   | `/api/auth/login`      | `{ email, password }`                     | Login, returns JWT     |
-
-### User Profile
-
-| Method | Path                   | Auth | Description             |
-|--------|------------------------|------|-------------------------|
-| GET    | `/api/user/profile`    | JWT  | Fetch own profile       |
-| PATCH  | `/api/user/profile`    | JWT  | Update profile fields   |
-
-### KYC
-
-| Method | Path       | Auth | Description            |
-|--------|------------|------|------------------------|
-| POST   | `/api/kyc` | JWT  | Submit KYC documents   |
-
-### Accounts / Balances
-
-| Method | Path             | Auth | Description              |
-|--------|------------------|------|--------------------------|
-| GET    | `/api/accounts`  | JWT  | List all asset balances  |
-| GET    | `/api/balances`  | JWT  | Alias for `/api/accounts`|
-
-### Orders
-
-| Method | Path                      | Auth | Description            |
-|--------|---------------------------|------|------------------------|
-| GET    | `/api/orders`             | JWT  | List open/past orders  |
-| POST   | `/api/orders`             | JWT  | Place a new order      |
-| GET    | `/api/orders/:order_id`   | JWT  | Get single order       |
-| DELETE | `/api/orders/:order_id`   | JWT  | Cancel an order        |
-
-Place order body:
-
-```json
-{
-  "symbol": "BTC-USDT",
-  "side": "buy",
-  "type": "limit",
-  "price": "65000.00",
-  "quantity": "0.01"
-}
-```
-
-Supported `type` values: `limit`, `market`, `ioc`, `fok`, `post_only`.
-
-### Trades & Tickers
-
-| Method | Path           | Auth | Description                 |
-|--------|----------------|------|-----------------------------|
-| GET    | `/api/trades`  | —    | Recent trade history        |
-| GET    | `/api/tickers` | —    | 24h ticker stats per symbol |
-
-### WebSocket
-
-Connect to `ws://localhost:3000/ws` for real-time market data (order book depth, trades, ticker).
+*Full system round-trip (client → nginx → desk-server → Aeron → matching engine → Aeron → desk-server → client) measured on an M4 MacBook Pro. p50 ≈ 88 μs, p99 ≈ 215 μs.*
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                      Clients / Browser                   │
-└────────────┬────────────────────────┬────────────────────┘
-             │ REST (HTTP/1.1)         │ WebSocket
-             ▼                         ▼
-┌────────────────────────────────────────────────────────┐
-│                   exchange-frontend                     │
-│            Vue 3 + Vite → nginx (port 4001)            │
-│      /api/* → proxy → exchange-api:3000                │
-│      /ws    → proxy → exchange-api:3000                │
-└──────────────────────┬─────────────────────────────────┘
-                       │
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│                    exchange-api (Rust)                  │
-│   axum HTTP + WebSocket server (port 3000)             │
-│                                                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  │
-│  │  Auth / JWT  │  │  Order API   │  │ Market Data │  │
-│  └──────────────┘  └──────┬───────┘  └──────┬──────┘  │
-│                            │                  │         │
-│              ┌─────────────▼──────────────────▼──────┐ │
-│              │         Matching Engine                │ │
-│              │  SkipList order book (6–9M TPS)        │ │
-│              │  SBE encoding · Aeron transport        │ │
-│              └───────────────────────────────────────┘ │
-└───────────┬────────────────────────────────────────────┘
-            │
-     ┌──────┴───────┐
-     │              │
-     ▼              ▼
-┌─────────┐   ┌──────────┐
-│PostgreSQL│   │  Redis   │
-│ (state)  │   │ (cache)  │
-└─────────┘   └──────────┘
+Browser / API client
+    │  HTTPS / WSS
+    ▼
+nginx  (TLS termination, reverse proxy)
+    │
+    ├─ /api/*  ──►  desk-server  (axum, HTTP + WebSocket)
+    └─ /ws     ──►      │
+                        │  Aeron IPC (lock-free ring buffer)
+                        ▼
+               exchange-engine  (matching engine, one thread per symbol)
+                  SkipList order book · SBE binary messages
+                        │
+                        ├─ order_update  ──►  desk-server  ──►  WebSocket push
+                        ├─ depth / trades ──►  desk-server  ──►  WebSocket broadcast
+                        └─ metrics  ──►  beacon sidecar  ──►  VictoriaMetrics
+                                                                     │
+                        PostgreSQL  ◄──  desk-server (persistence)  Grafana
 ```
+
+**Key design choices:**
+
+| Layer | Technology | Why |
+|---|---|---|
+| Order book | Lock-free SkipList | O(log N) insert/cancel, cache-friendly, 6–9M TPS |
+| Transport | Aeron IPC | Zero-copy ring buffer, sub-microsecond publish latency |
+| Encoding | SBE (Simple Binary Encoding) | Fixed-size, no allocation, 16–72 bytes per message |
+| API server | axum + tokio | Async, zero-cost WS fan-out to thousands of clients |
+| Market data | diff-based Binance mirror | Only cancel/place changed price levels, ~20× less traffic |
+
+---
+
+## Components
+
+| Binary | Description |
+|---|---|
+| `exchange-engine` | Matching engine: one spin-loop thread per symbol, restores resting orders from DB on startup |
+| `desk-server` | WebSocket + REST gateway: auth, order routing, real-time pushes, balance management |
+| `market-maker` | Mirrors Binance top-20 depth into LightningX via diff-based order management |
+| `kline` | Aggregates trades from Aeron into OHLCV candles and persists to PostgreSQL |
+| `trade-bot` | Demo user that places random orders to keep the book active |
+| `beacon` | Latency sidecar: reads HDR histogram traces from engine, pushes `latency_us` to VictoriaMetrics |
+
+---
+
+## Order Types
+
+| Type | Behaviour |
+|---|---|
+| `limit` (GTC) | Rests in the book until filled or cancelled |
+| `market` | Fills against the best available price, IOC semantics |
+| `ioc` | Fills immediately, cancels remaining |
+| `fok` | Fill-or-kill: all-or-nothing |
+| `post_only` | Rejected if it would immediately match (maker only) |
+
+---
+
+## Quick Start (local dev)
+
+Prerequisites: Rust stable, PostgreSQL on `localhost:5432`, Aeron media driver running.
+
+```bash
+# Run database migrations and start desk-server
+DATABASE_URL=postgres://user:password@localhost:5432/mydb \
+cargo run --bin desk-server
+
+# In a separate terminal — start the matching engine
+DATABASE_URL=postgres://user:password@localhost:5432/mydb \
+SYMBOLS=BTC_USDT \
+cargo run --bin exchange-engine
+```
+
+Frontend (separate repo — Vue 3 + Vite):
+
+```bash
+cd ../exchange-frontend
+npm install
+npm run dev          # http://localhost:5173
+```
+
+---
+
+## WebSocket API
+
+Connect to `wss://<host>/ws`.
+
+### Subscribe to market data (no auth required)
+
+```json
+{ "type": "subscribe", "channels": ["depth.BTC_USDT", "trades.BTC_USDT", "ticker.BTC_USDT"] }
+```
+
+### Authenticate
+
+```json
+{ "type": "auth", "token": "<JWT>" }
+```
+
+### Place / cancel orders (requires auth)
+
+```json
+{ "type": "place_order", "symbol": "BTC_USDT", "side": "buy", "order_type": "limit", "price": 65000, "quantity": 0.01, "client_order_id": "my-id-1" }
+{ "type": "cancel_order", "order_id": 12345, "client_order_id": "my-id-1" }
+```
+
+---
+
+## REST API
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/api/auth/register` | — | Create account |
+| POST | `/api/auth/login` | — | Login, returns JWT |
+| GET | `/api/accounts` | JWT | Asset balances |
+| GET | `/api/orders` | JWT | Open and past orders |
+| POST | `/api/orders` | JWT | Place order |
+| DELETE | `/api/orders/:id` | JWT | Cancel order |
+| GET | `/api/trades` | — | Recent trades |
+| GET | `/api/tickers` | — | 24h ticker stats |
+
+---
+
+## Performance
+
+Benchmarked on Apple M4 MacBook Pro (single core):
+
+| Scenario | Throughput |
+|---|---|
+| Single limit orders (GTC) | ~5.3M orders/sec |
+| Batch limit orders | ~7.3M orders/sec |
+| Market orders (IOC) | ~5.1M orders/sec |
+| Deep order book (400 levels) | ~21M orders/sec |
+
+End-to-end latency (M4 localhost, p50/p99): **88 μs / 215 μs**
+
+---
+
+## Disclaimer
+
+> **This platform is for demonstration purposes only. Do NOT use it with real assets.**

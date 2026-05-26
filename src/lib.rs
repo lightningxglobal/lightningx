@@ -1,6 +1,7 @@
 //! LightningX matching engine — lock-free SkipList order book, 6–9M TPS, <100ns latency.
 
 // ── Core engine ──────────────────────────────────────────────────────────────
+pub mod float_ext;
 pub mod engine;
 pub mod order;
 pub mod trade;

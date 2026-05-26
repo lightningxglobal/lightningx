@@ -1,3 +1,5 @@
+use crate::float_ext::{FloatExt};
+
 /// 订单方向
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -82,21 +84,21 @@ impl Order {
         self.quantity - self.filled
     }
 
-    /// 检查是否完全成交
+    /// 检查是否完全成交（使用 epsilon 避免浮点残差导致的幽灵委托）
     #[inline(always)]
     pub fn is_filled(&self) -> bool {
-        self.filled >= self.quantity
+        !self.remaining().positive()
     }
 
     /// 检查订单是否有效
     #[inline(always)]
     pub fn is_valid(&self) -> bool {
         let price_valid = if self.is_market {
-            true  // 市价单不检查 price
+            true
         } else {
-            self.price > 0.0 && !self.price.is_nan()
+            self.price.positive() && !self.price.is_nan()
         };
-        price_valid && self.quantity > 0.0 && !self.quantity.is_nan()
+        price_valid && self.quantity.positive() && !self.quantity.is_nan()
     }
 }
 

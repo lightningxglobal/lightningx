@@ -1,4 +1,5 @@
 use crate::order::{Order, Side, TimeInForce};
+use crate::float_ext::{FloatExt};
 use crate::trade::Trade;
 use crate::error::{MatchingEngineError, OrderResult};
 use crate::event::MatchingEvent;
@@ -118,11 +119,11 @@ impl MatchingEngine {
     #[inline(always)]
     fn validate_order(&self, order: &Order) -> OrderResult<()> {
         // 市价单不检查 price，限价单检查
-        if !order.is_market && (order.price <= 0.0 || order.price.is_nan()) {
+        if !order.is_market && (!order.price.positive() || order.price.is_nan()) {
             return Err(MatchingEngineError::InvalidPrice(order.price));
         }
 
-        if order.quantity <= 0.0 || order.quantity.is_nan() {
+        if !order.quantity.positive() || order.quantity.is_nan() {
             return Err(MatchingEngineError::InvalidQuantity(order.quantity));
         }
 
@@ -383,9 +384,9 @@ impl MatchingEngine {
     fn handle_market_order(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         let filled_qty = self.match_order(order)?;
 
-        let status = if (filled_qty - order.quantity).abs() < 1e-10 {
+        let status = if filled_qty.ge_eps(order.quantity) {
             OrderStatus::Filled
-        } else if filled_qty > 0.0 {
+        } else if filled_qty.positive() {
             OrderStatus::PartiallyFilled
         } else {
             OrderStatus::Rejected
@@ -462,7 +463,7 @@ impl MatchingEngine {
                 break;
             }
             available += qty;
-            if available >= order.quantity - 1e-10 {
+            if available.ge_eps(order.quantity) {
                 return true;
             }
         }
@@ -499,9 +500,9 @@ impl MatchingEngine {
     fn handle_ioc(&mut self, order: Order) -> OrderResult<PlaceOrderResult> {
         let filled_qty = self.match_order(order)?;
 
-        let status = if (filled_qty - order.quantity).abs() < 1e-10 {
+        let status = if filled_qty.ge_eps(order.quantity) {
             OrderStatus::Filled
-        } else if filled_qty > 0.0 {
+        } else if filled_qty.positive() {
             OrderStatus::PartiallyFilled
         } else {
             OrderStatus::Rejected
@@ -521,15 +522,15 @@ impl MatchingEngine {
         let filled_qty = self.match_order(order)?;
 
         // 如果有剩余，加入订单簿
-        if filled_qty < order.quantity {
+        if filled_qty.lt_eps(order.quantity) {
             let mut remaining_order = order;
             remaining_order.filled = filled_qty;
             self.add_to_book(remaining_order)?;
         }
 
-        let status = if (filled_qty - order.quantity).abs() < 1e-10 {
+        let status = if filled_qty.ge_eps(order.quantity) {
             OrderStatus::Filled
-        } else if filled_qty > 0.0 {
+        } else if filled_qty.positive() {
             OrderStatus::PartiallyFilled
         } else {
             OrderStatus::Accepted
@@ -595,7 +596,7 @@ impl MatchingEngine {
 
         // 外层循环：获取最优对手价
         loop {
-            if filled >= order.quantity {
+            if filled.ge_eps(order.quantity) {
                 break;
             }
 
@@ -612,8 +613,8 @@ impl MatchingEngine {
                         if opposite_book.get_node_at_price(price).is_some() {
                             // 市价单直接吃穿所有价位，限价单检查价格匹配
                             let price_matches = order.is_market || match order.side {
-                                Side::Buy => order.price >= price,
-                                Side::Sell => order.price <= price,
+                                Side::Buy => order.price.ge_eps(price),
+                                Side::Sell => order.price.le_eps(price),
                             };
 
                             if !price_matches {
@@ -636,7 +637,7 @@ impl MatchingEngine {
 
             // 内层循环：在同一价格级别内批量成交，减少 best_with_orders() 调用
             loop {
-                if filled >= order.quantity {
+                if filled.ge_eps(order.quantity) {
                     break;
                 }
 
@@ -702,10 +703,9 @@ impl MatchingEngine {
                 let order_remaining = order.quantity - filled;
                 let counter_remaining = counter_order.remaining();
 
-                // Safety guard: float accumulation can leave counter_remaining ≤ 0
-                // even though is_filled() is false. Force-remove the ghost order so
-                // we don't spin on it indefinitely.
-                if counter_remaining <= 0.0 {
+                // Safety guard: float accumulation can leave counter_remaining as noise
+                // (e.g. 1e-17) even though is_filled() was false. Force-remove the ghost.
+                if !counter_remaining.positive() {
                     let opp = match order.side {
                         Side::Buy => &mut self.sell_book,
                         Side::Sell => &mut self.buy_book,
@@ -843,7 +843,7 @@ impl MatchingEngine {
 
             // 外层循环：获取最优对手价
             loop {
-                if filled >= order.quantity {
+                if filled.ge_eps(order.quantity) {
                     break;
                 }
 
@@ -858,8 +858,8 @@ impl MatchingEngine {
                         Some(price) => {
                             if opposite_book.get_node_at_price(price).is_some() {
                                 let price_matches = match order.side {
-                                    Side::Buy => order.price >= price,
-                                    Side::Sell => order.price <= price,
+                                    Side::Buy => order.price.ge_eps(price),
+                                    Side::Sell => order.price.le_eps(price),
                                 };
                                 if !price_matches {
                                     break;
@@ -880,7 +880,7 @@ impl MatchingEngine {
 
                 // 内层循环：在同一价格级别内成交
                 loop {
-                    if filled >= order.quantity {
+                    if filled.ge_eps(order.quantity) {
                         break;
                     }
 
@@ -941,7 +941,7 @@ impl MatchingEngine {
                     let order_remaining = order.quantity - filled;
                     let counter_remaining = counter_order.remaining();
 
-                    if counter_remaining <= 0.0 {
+                    if !counter_remaining.positive() {
                         let opp = match order.side {
                             Side::Buy => &mut self.sell_book,
                             Side::Sell => &mut self.buy_book,
@@ -1038,7 +1038,7 @@ impl MatchingEngine {
             }
 
             // 关键：如果有剩余，加入订单簿（允许批次内后续订单与其匹配）
-            if filled < order.quantity {
+            if filled.lt_eps(order.quantity) {
                 let mut remaining_order = order;
                 remaining_order.filled = filled;
 
@@ -1217,7 +1217,7 @@ impl MatchingEngine {
                 }
             }
 
-            if total_remaining > 0.0 {
+            if total_remaining.positive() {
                 snapshot.add_bid(price, total_remaining).ok();
             }
         }
@@ -1245,7 +1245,7 @@ impl MatchingEngine {
                 }
             }
 
-            if total_remaining > 0.0 {
+            if total_remaining.positive() {
                 snapshot.add_ask(price, total_remaining).ok();
             }
         }

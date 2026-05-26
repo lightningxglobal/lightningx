@@ -355,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
                             // sends order_update for the taker; maker updates must come from here.
                             let maker_row: Option<(String, f64)> = sqlx::query_as(
                                 "UPDATE orders SET filled = filled + $1, \
-                                 status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END, \
+                                 status = CASE WHEN quantity - (filled + $1) < 1e-9 THEN 'COMPLETED' ELSE 'TRADING' END, \
                                  updated_at = NOW() \
                                  WHERE id = $2 \
                                  RETURNING status, filled"

@@ -456,9 +456,21 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or("").trim_end_matches('\0');
                                 if let Some(pub_) = order_pubs.get_mut(sym) {
                                     let _ = pub_.publish_new_order(&req);
-                                } else if let Some(pub_) = order_pubs.values_mut().next() {
-                                    // unknown symbol: fall back to first available publisher
-                                    let _ = pub_.publish_new_order(&req);
+                                } else {
+                                    // No engine for this symbol — reject immediately so the
+                                    // client doesn't time out and clean up pending_meta.
+                                    let coid: u64 = req.client_order_id;
+                                    let uid: u64  = req.participant_id;
+                                    let ws_meta = pending_meta.remove(&coid).map(|(_, m)| m);
+                                    let client_oid = ws_meta.as_ref().map(|m| m.client_order_id.as_str()).unwrap_or("");
+                                    if let Some(tx) = user_tx.get(&(uid as i64)) {
+                                        let msg = serde_json::json!({
+                                            "type": "order_rejected",
+                                            "client_order_id": client_oid,
+                                            "reason": format!("No engine for symbol: {}", sym),
+                                        }).to_string();
+                                        let _ = tx.try_send(msg);
+                                    }
                                 }
                                 if let Some(ref t) = spin_tracer {
                                     t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);

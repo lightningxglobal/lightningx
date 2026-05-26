@@ -872,8 +872,15 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
             };
-            let n = bulk_cancel(user_id, Some(&symbol), state, &personal_tx).await;
-            Some(json!({"type": "cancel_all_ok", "symbol": symbol, "cancelled": n}).to_string())
+            // Run in background so the WS handler is not blocked on DB operations.
+            // This lets queued place_order messages be processed immediately.
+            let state2 = state.clone();
+            let sym2 = symbol.clone();
+            let ptx2 = personal_tx.clone();
+            tokio::spawn(async move {
+                bulk_cancel(user_id, Some(&sym2), &state2, &ptx2).await;
+            });
+            Some(json!({"type": "cancel_all_ok", "symbol": symbol, "cancelled": 0}).to_string())
         }
 
         ClientMsg::CancelAll => {

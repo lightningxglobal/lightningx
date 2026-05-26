@@ -52,6 +52,7 @@ fn spawn_symbol_thread(
     symbol: String,
     engine: MatchingEngine,
     tracer: Option<lightning_exchange::tracer::ExchangeTracer>,
+    uid_map: HashMap<u64, u64>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("match-{}", symbol))
@@ -74,6 +75,9 @@ fn spawn_symbol_thread(
             ).unwrap_or_else(|e| panic!("[{}] md_pub: {}", symbol, e));
 
             let mut engine = engine;
+            // order_id → participant_id: populated on ACCEPTED, used on CANCEL to route
+            // the update back to the correct user even when cancel doesn't carry uid.
+            let mut uid_map = uid_map;
             let mut trade_seq: u64 = 0;
             let mut depth_seq: u64 = 0;
             let depth_interval = Duration::from_millis(10);
@@ -141,21 +145,30 @@ fn spawn_symbol_thread(
                                     }
                                     let last_price = result.fills.last().map(|f| f.1).unwrap_or(req.price);
                                     let update = match result.status {
-                                        OrderStatus::Accepted => OrderUpdateMsg::accepted(
-                                            result.order_id, req.client_order_id, req.participant_id, ts,
-                                        ),
-                                        OrderStatus::Filled => OrderUpdateMsg::filled(
-                                            result.order_id, req.client_order_id, req.participant_id,
-                                            last_price, result.filled, ts,
-                                        ),
+                                        OrderStatus::Accepted => {
+                                            uid_map.insert(result.order_id, req.participant_id);
+                                            OrderUpdateMsg::accepted(
+                                                result.order_id, req.client_order_id, req.participant_id, ts,
+                                            )
+                                        }
+                                        OrderStatus::Filled => {
+                                            uid_map.remove(&result.order_id);
+                                            OrderUpdateMsg::filled(
+                                                result.order_id, req.client_order_id, req.participant_id,
+                                                last_price, result.filled, ts,
+                                            )
+                                        }
                                         OrderStatus::PartiallyFilled => OrderUpdateMsg::partial_fill(
                                             result.order_id, req.client_order_id, req.participant_id,
                                             last_price, result.filled, req.quantity - result.filled, ts,
                                         ),
-                                        OrderStatus::Cancelled => OrderUpdateMsg::cancelled(
-                                            result.order_id, req.client_order_id, req.participant_id,
-                                            req.quantity - result.filled, ts,
-                                        ),
+                                        OrderStatus::Cancelled => {
+                                            uid_map.remove(&result.order_id);
+                                            OrderUpdateMsg::cancelled(
+                                                result.order_id, req.client_order_id, req.participant_id,
+                                                req.quantity - result.filled, ts,
+                                            )
+                                        }
                                         OrderStatus::Rejected => OrderUpdateMsg::rejected(
                                             req.client_order_id, req.participant_id, 3, ts,
                                         ),
@@ -170,9 +183,11 @@ fn spawn_symbol_thread(
 
                         InboundMsg::CancelOrder(req) => {
                             let ts = now_ns();
-                            if let Ok(res) = engine.cancel_order(req.order_id) {
+                            let cancel_oid: u64 = req.order_id;
+                            if let Ok(res) = engine.cancel_order(cancel_oid) {
+                                let participant_id = uid_map.remove(&cancel_oid).unwrap_or(0);
                                 let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
-                                    req.order_id, 0, 0, res.cancelled_quantity, ts,
+                                    req.order_id, 0, participant_id, res.cancelled_quantity, ts,
                                 ));
                             }
                             // If this engine doesn't own the order, cancel_order() returns Err
@@ -267,6 +282,10 @@ async fn main() -> anyhow::Result<()> {
         })
         .collect();
 
+    // uid_maps: symbol → (order_id → participant_id), pre-seeded from restored DB orders
+    // so that cancel events for restored orders carry the correct participant_id.
+    let mut uid_maps: HashMap<String, HashMap<u64, u64>> = HashMap::new();
+
     let rows = sqlx::query_as::<_, DbOrder>(
         "SELECT * FROM orders WHERE status IN ('PENDING', 'TRADING') ORDER BY id ASC",
     )
@@ -286,7 +305,12 @@ async fn main() -> anyhow::Result<()> {
             remaining, TimeInForce::GTC, 0,
         );
         if let Some(eng) = engines.get_mut(&db_order.symbol) {
-            if eng.add_to_book(order).is_ok() { restored += 1; }
+            if eng.add_to_book(order).is_ok() {
+                uid_maps.entry(db_order.symbol.clone())
+                    .or_default()
+                    .insert(db_order.id as u64, db_order.user_id as u64);
+                restored += 1;
+            }
         }
     }
     tracing::info!("Restored {} active orders ({} non-restable skipped)", restored, skipped);
@@ -338,7 +362,8 @@ async fn main() -> anyhow::Result<()> {
     let mut handles = Vec::new();
     for symbol in &symbols {
         let engine = engines.remove(symbol).expect("engine missing");
-        let handle = spawn_symbol_thread(symbol.clone(), engine, tracer.clone());
+        let uid_map = uid_maps.remove(symbol).unwrap_or_default();
+        let handle = spawn_symbol_thread(symbol.clone(), engine, tracer.clone(), uid_map);
         handles.push(handle);
     }
 

@@ -313,6 +313,7 @@ struct PlaceOrderRequest {
     order_type: String,
     price: Option<f64>,
     quantity: f64,
+    client_order_id: Option<String>,
 }
 
 async fn handle_place_order(
@@ -403,12 +404,12 @@ async fn handle_place_order(
     let rest_order_id = s.next_order_id.fetch_add(1, Ordering::Relaxed) as i64;
 
     let db_order = sqlx::query_as::<_, DbOrder>(
-        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8) RETURNING *",
+        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8, $9) RETURNING *",
     )
     .bind(rest_order_id).bind(user_id).bind(&req.symbol).bind(&req.side)
     .bind(&req.order_type).bind(req.price).bind(req.quantity)
-    .bind(freeze_price)
+    .bind(freeze_price).bind(&req.client_order_id)
     .fetch_one(s.db.as_ref()).await;
 
     let db_order = match db_order {

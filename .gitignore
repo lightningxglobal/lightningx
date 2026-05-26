@@ -12,5 +12,12 @@ server.log
 # Aeron media driver
 /aeron-dir/
 
+# IDE
+.idea/
+
+# Test binaries
+test_overflow
+
 # OS
 .DS_Store
+.claude/

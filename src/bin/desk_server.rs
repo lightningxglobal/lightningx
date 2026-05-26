@@ -194,10 +194,16 @@ async fn main() -> anyhow::Result<()> {
                         // On REJECTED/CANCELLED we just drop the meta (no freeze happened).
                         // Cache user_id synchronously before removing from pending_meta
                         // so the trade handler can resolve UIDs without any DB round-trip.
-                        if let Some(meta_ref) = pending_meta.get(&order_id) {
-                            order_uid_cache.insert(order_id, meta_ref.user_id);
+                        //
+                        // REJECTED messages have order_id=0 (engine never assigned one);
+                        // use client_order_id (= desk's internal order_id) for the lookup.
+                        let lookup_id = if kind == order_update_kind::REJECTED { client_order_id } else { order_id };
+                        if let Some(meta_ref) = pending_meta.get(&lookup_id) {
+                            if kind != order_update_kind::REJECTED {
+                                order_uid_cache.insert(order_id, meta_ref.user_id);
+                            }
                         }
-                        let ws_meta = pending_meta.remove(&order_id).map(|(_, m)| m);
+                        let ws_meta = pending_meta.remove(&lookup_id).map(|(_, m)| m);
                         // client_order_id is only available on the first event (ACCEPTED).
                         let ws_client_oid = ws_meta.as_ref().map(|m| m.client_order_id.clone());
 

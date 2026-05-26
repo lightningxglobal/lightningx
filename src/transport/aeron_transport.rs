@@ -29,18 +29,13 @@ struct OrderInboundCallback {
 
 impl PollCallback for OrderInboundCallback {
     fn on_data(&mut self, data: &[u8]) {
-        use tracing::info;
-        info!("[OrderInboundCallback] on_data() called with {} bytes", data.len());
-
         // 解析SBE消息：首8字节是header，后续是消息体
         if data.len() < 8 {
-            info!("[OrderInboundCallback] ❌ Data too short: {}", data.len());
             return;
         }
 
         // 读取template_id (offset 2, 2字节, little-endian)
         let template_id = u16::from_le_bytes([data[2], data[3]]);
-        info!("[OrderInboundCallback] template_id={}", template_id);
 
         match template_id {
             1 => {
@@ -50,21 +45,9 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const NewOrderRequest
                         );
-                        // 复制字段到局部变量来规避alignment检查
-                        let client_id = req.client_order_id;
-                        let participant_id = req.participant_id;
-                        let price = req.price;
-                        let qty = req.quantity;
-                        info!("[OrderInboundCallback] 📊 NewOrder parsed: client_id={}, participant_id={}, price={}, qty={}",
-                              client_id, participant_id, price, qty);
-
-                        // 存储到queue而不是覆盖
                         let mut queue = self.message_queue.lock();
                         queue.push_back(InboundMsg::NewOrder(req));
-                        info!("[OrderInboundCallback] ✅ NewOrder enqueued (queue size={})", queue.len());
                     }
-                } else {
-                    info!("[OrderInboundCallback] ❌ NewOrderRequest too short: {} < 72", data.len());
                 }
             }
             2 => {
@@ -76,15 +59,10 @@ impl PollCallback for OrderInboundCallback {
                         );
                         let mut queue = self.message_queue.lock();
                         queue.push_back(InboundMsg::CancelOrder(req));
-                        info!("[OrderInboundCallback] ✅ CancelOrder enqueued (queue size={})", queue.len());
                     }
-                } else {
-                    info!("[OrderInboundCallback] ❌ CancelOrderRequest too short: {} < 16", data.len());
                 }
             }
-            _ => {
-                info!("[OrderInboundCallback] ❌ Unknown template_id: {}", template_id);
-            }
+            _ => {}
         }
     }
 }
@@ -128,7 +106,6 @@ impl OrderSubscriber for AeronOrderSubscriber {
     }
 
     fn poll(&mut self) -> Option<InboundMsg> {
-        use tracing::info;
         // Aeron回调需要显式的poll()调用来触发
         // poll()会调用on_data()回调，回调写入消息到Arc<Mutex<>>
         {
@@ -137,16 +114,7 @@ impl OrderSubscriber for AeronOrderSubscriber {
         }  // 立即释放lock
 
         // 从队列中pop回调写入的消息
-        let mut queue = self.message_queue.lock();
-        let result = match queue.pop_front() {
-            Some(msg) => {
-                info!("[AeronOrderSubscriber] ✅ dequeued message (queue now {})", queue.len());
-                Some(msg)
-            }
-            None => None,
-        };
-
-        result
+        self.message_queue.lock().pop_front()
     }
 
     fn is_connected(&self) -> bool {
@@ -188,7 +156,7 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
         let mut data = vec![0u8; 72];
 
         // SBE Header (8 bytes)
-        data[0..2].copy_from_slice(&56u16.to_le_bytes());   // block_length = 56 (message body size)
+        data[0..2].copy_from_slice(&64u16.to_le_bytes());   // block_length = 64 (message body size)
         data[2..4].copy_from_slice(&2u16.to_le_bytes());    // template_id = 2 (OrderUpdate)
         data[4..6].copy_from_slice(&1u16.to_le_bytes());    // schema_id = 1
         data[6..8].copy_from_slice(&0u16.to_le_bytes());    // version = 0
@@ -470,7 +438,6 @@ impl PollCallback for OrderUpdateCallback {
             return;
         }
         let template_id = u16::from_le_bytes([data[2], data[3]]);
-        // template_id = 2 (unified OrderUpdate)
         if template_id == 2 {
             unsafe {
                 let msg = std::ptr::read_unaligned(

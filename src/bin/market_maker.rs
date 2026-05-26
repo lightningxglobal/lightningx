@@ -52,6 +52,7 @@ struct SymbolConfig {
 
 const SYMBOLS: &[SymbolConfig] = &[
     SymbolConfig { our_symbol: "BTC_USDT", binance_stream: "btcusdt@depth20@500ms", min_qty: 0.0001 },
+    SymbolConfig { our_symbol: "ETH_USDT", binance_stream: "ethusdt@depth20@500ms", min_qty: 0.001 },
 ];
 
 // ── REST helpers (login + robot-funds only) ────────────────────────────────────

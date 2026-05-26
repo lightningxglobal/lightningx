@@ -41,6 +41,7 @@ enum ClientMsg {
         symbol: String,
         side: String,
         order_type: String,
+        time_in_force: Option<String>,
         price: Option<f64>,
         qty: f64,
     },
@@ -78,12 +79,15 @@ impl ClientMsg {
                 client_order_id: v.get("client_order_id")?.as_str()?.to_owned(),
                 symbol: v.get("symbol")?.as_str()?.to_owned(),
                 side: v.get("side")?.as_str()?.to_owned(),
-                // Clients send the order sub-type in the "order_type" field
-                // ("limit", "market", "ioc", "fok", "post_only").
                 order_type: v.get("order_type")
                     .and_then(|x| x.as_str())
                     .unwrap_or("limit")
                     .to_owned(),
+                // Optional separate time_in_force field (e.g. "GTC", "IOC", "FOK").
+                // Takes effect only when order_type is "limit" or "gtc".
+                time_in_force: v.get("time_in_force")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_ascii_lowercase()),
                 price: v.get("price").and_then(|p| p.as_f64()),
                 qty: v.get("qty").or_else(|| v.get("quantity"))?.as_f64()?,
             }),
@@ -275,7 +279,7 @@ async fn handle_client_message(
 
         ClientMsg::Ping => Some(json!({"type": "pong"}).to_string()),
 
-        ClientMsg::PlaceOrder { client_order_id, symbol, side, order_type, price, qty } => {
+        ClientMsg::PlaceOrder { client_order_id, symbol, side, order_type, time_in_force, price, qty } => {
             let user_id = match session.user_id {
                 Some(id) => id,
                 None => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
@@ -296,11 +300,19 @@ async fn handle_client_message(
             };
 
             let tif = match order_type.as_str() {
-                "limit" | "gtc" => TimeInForce::GTC,
                 "ioc" => TimeInForce::IOC,
                 "fok" => TimeInForce::FOK,
                 "post_only" => TimeInForce::PostOnly,
-                "market" => TimeInForce::IOC, // market orders use IOC semantics internally
+                "market" => TimeInForce::IOC,
+                "limit" | "gtc" => {
+                    // Honour separate time_in_force field when order_type is generic "limit".
+                    match time_in_force.as_deref() {
+                        Some("ioc") => TimeInForce::IOC,
+                        Some("fok") => TimeInForce::FOK,
+                        Some("post_only") => TimeInForce::PostOnly,
+                        _ => TimeInForce::GTC,
+                    }
+                }
                 _ => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Unknown order type"}).to_string()),
             };
 

@@ -39,8 +39,7 @@ fn exchange_ws_url() -> String {
 
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
-// 5 levels per side on constrained hosts; increase to 20 when CPU budget allows.
-const DEPTH_LEVELS: usize = 5;
+const DEPTH_LEVELS: usize = 20;
 const QTY_SCALE: f64 = 1.0;
 const MAX_USDT_PER_SIDE: f64 = 2_000_000.0;
 const BINANCE_WS_BASE: &str = "wss://fstream.binance.com/ws";
@@ -52,7 +51,7 @@ struct SymbolConfig {
 }
 
 const SYMBOLS: &[SymbolConfig] = &[
-    SymbolConfig { our_symbol: "BTC_USDT", binance_stream: "btcusdt@depth5@500ms", min_qty: 0.0001 },
+    SymbolConfig { our_symbol: "BTC_USDT", binance_stream: "btcusdt@depth20@500ms", min_qty: 0.0001 },
 ];
 
 // ── REST helpers (login + robot-funds only) ────────────────────────────────────
@@ -662,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let probe_only = std::env::var("PROBE_ONLY").is_ok();
+    let run_probe  = probe_only || std::env::var("RUN_PROBE").is_ok();
     let mut handles: Vec<_> = if probe_only {
         info!("PROBE_ONLY mode — skipping market-making");
         vec![]
@@ -675,8 +675,11 @@ async fn main() -> anyhow::Result<()> {
             .collect()
     };
 
-    // Latency probe: runs concurrently with market-making (or alone in PROBE_ONLY mode).
-    handles.push(tokio::spawn(run_latency_probe(client.clone())));
+    // Latency probe: only run when explicitly requested via RUN_PROBE or PROBE_ONLY.
+    if run_probe {
+        info!("RUN_PROBE enabled — starting latency probe");
+        handles.push(tokio::spawn(run_latency_probe(client.clone())));
+    }
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down…");

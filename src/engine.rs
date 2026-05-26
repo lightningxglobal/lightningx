@@ -4,7 +4,7 @@ use crate::error::{MatchingEngineError, OrderResult};
 use crate::event::MatchingEvent;
 use crate::market_data::{TradeEvent, DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent, MarketDataConfig};
 use crate::pools::Pools;
-use crate::skiplist::SortOrder;
+use crate::skiplist::{SkipList, SortOrder};
 use crate::orderbook_impl::OrderBookWrapper;
 use crate::orderbook::OrderBook;
 use crate::time_provider;
@@ -50,8 +50,8 @@ impl MatchingEngine {
     /// 创建新的撮合引擎
     pub fn new(pool_config: PoolConfig) -> OrderResult<Self> {
         Ok(Self {
-            buy_book: OrderBookWrapper::new(pool_config.orderbook_type, SortOrder::Descending, pool_config.queue_capacity),
-            sell_book: OrderBookWrapper::new(pool_config.orderbook_type, SortOrder::Ascending, pool_config.queue_capacity),
+            buy_book: SkipList::new_with_pool(SortOrder::Descending, pool_config.queue_capacity),
+            sell_book: SkipList::new_with_pool(SortOrder::Ascending, pool_config.queue_capacity),
             orders: HashMap::with_capacity(pool_config.order_capacity),
             pools: Pools::new(pool_config.order_capacity, pool_config.queue_capacity),
             next_order_id: 1,
@@ -1202,7 +1202,7 @@ impl MatchingEngine {
             if let Some(node) = self.buy_book.get_node_at_price(price) {
                 // 遍历链表中的订单
                 let mut node_idx_opt = node.orders.front();
-                let list_pool = self.buy_book.list_pool();
+                let list_pool = &self.buy_book.list_pool;
                 while let Some(node_idx) = node_idx_opt {
                     if let Some(list_node) = list_pool.get(node_idx) {
                         if let Some(&pool_idx) = self.orders.get(&list_node.order_id) {
@@ -1230,7 +1230,7 @@ impl MatchingEngine {
             if let Some(node) = self.sell_book.get_node_at_price(price) {
                 // 遍历链表中的订单
                 let mut node_idx_opt = node.orders.front();
-                let list_pool = self.sell_book.list_pool();
+                let list_pool = &self.sell_book.list_pool;
                 while let Some(node_idx) = node_idx_opt {
                     if let Some(list_node) = list_pool.get(node_idx) {
                         if let Some(&pool_idx) = self.orders.get(&list_node.order_id) {
@@ -1276,7 +1276,6 @@ impl MatchingEngine {
 pub struct PoolConfig {
     pub order_capacity: usize,
     pub queue_capacity: usize,
-    pub orderbook_type: crate::orderbook_impl::OrderBookType,
 }
 
 impl Default for PoolConfig {
@@ -1284,7 +1283,6 @@ impl Default for PoolConfig {
         Self {
             order_capacity: 2_000_000,
             queue_capacity: 2_000_000,
-            orderbook_type: crate::orderbook_impl::OrderBookType::SkipList,
         }
     }
 }

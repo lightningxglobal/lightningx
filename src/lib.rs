@@ -1,51 +1,47 @@
-//! 加密货币交易撮合引擎
-//!
-//! 基于跳表的极高频交易撮合引擎，支持GTC、IOC、FOK、Post-Only四种委托类型。
-//! 单线程无锁设计，目标TPS > 6,000,000，延迟 < 3微秒。
+//! LightningX matching engine — lock-free SkipList order book, 6–9M TPS, <100ns latency.
 
-pub mod aeron_channels;
+// ── Core engine ──────────────────────────────────────────────────────────────
+pub mod engine;
 pub mod order;
 pub mod trade;
-pub mod error;
-pub mod event;
-pub mod pools;
-pub mod list_pool;
 pub mod orderbook;
 pub mod orderbook_impl;
 pub mod skiplist;
-pub mod array_orderbook;
-pub mod btree_orderbook;
-pub mod engine;
 pub mod snapshot;
 pub mod market_data;
-pub mod aeron_publisher;
+pub mod pools;
+pub mod list_pool;
+pub mod event;
+pub mod error;
 pub mod time_provider;
+
+// ── Transport / encoding ─────────────────────────────────────────────────────
 pub mod sbe;
 pub mod transport;
 pub mod order_update;
-pub mod trading_engine;
 pub mod aeron_transport;
-pub mod account;
-pub mod rate_limit;
-pub mod market_data_server;
-pub mod snowflake;
-pub mod desk_server;
+pub mod aeron_channels;
+pub mod tracer;
+
+// ── Server / API ─────────────────────────────────────────────────────────────
 pub mod db;
 pub mod models;
-pub mod user_service;
+pub mod account;
 pub mod account_repository;
 pub mod positions;
+pub mod user_service;
+pub mod rate_limit;
+pub mod snowflake;
 pub mod api;
 pub mod ws_handler;
-pub mod tracer;
+
 #[cfg(test)]
 mod sbe_tests;
 #[cfg(test)]
 mod boundary_tests;
 
-pub use engine::{
-    MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult,
-};
+// ── Public re-exports ─────────────────────────────────────────────────────────
+pub use engine::{MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult};
 pub use trade::Trade;
 pub use order::{Order, Side, TimeInForce};
 pub use error::{MatchingEngineError, OrderResult};
@@ -53,31 +49,12 @@ pub use event::MatchingEvent;
 pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use market_data::{
     TradeEvent, MarketDataEngine, BBOSnapshot, Level2Snapshot, AggregateTrade, Statistics24h,
-    PublishedSnapshot, SnapshotTimer, SnapshotPublisherThread, TradePublisherThread,
+    PublishedSnapshot, SnapshotTimer,
     DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent, MarketDataConfig,
 };
-pub use aeron_publisher::{
-    SnapshotPublisher, TradePublisher, AeronConfig, PublisherResult, PublisherError,
-    snapshot_to_bytes, bytes_to_snapshot, trade_to_bytes, bytes_to_trade,
-};
-pub use account::{
-    Account, AccountManager, Position, AccountId,
-};
-pub use rate_limit::{
-    RateLimiter, RateLimitPolicy,
-};
-pub use market_data_server::{
-    MarketDataServer, DepthLevel,
-    TradeSnapshot, Statistics, BBO, create_router, start_server,
-};
-pub mod market_data_server_types {
-    pub use crate::market_data_server::{DepthSnapshot, DepthLevel, TradeSnapshot, Statistics, BBO};
-}
+pub use account::{Account, AccountManager, Position, AccountId};
+pub use rate_limit::{RateLimiter, RateLimitPolicy};
 pub use snowflake::SnowflakeIdGenerator;
-pub use desk_server::{
-    DeskServer, DeskConfig, SessionInfo, SessionId,
-    DeskAppState, check_price_deviation, desk_ws_handler, desk_market_data_broadcaster,
-};
 
 #[cfg(test)]
 mod tests {

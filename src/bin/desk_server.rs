@@ -351,6 +351,34 @@ async fn main() -> anyhow::Result<()> {
                             .execute(db2.as_ref())
                             .await;
 
+                            // Update maker order's filled qty and status — the engine only
+                            // sends order_update for the taker; maker updates must come from here.
+                            let maker_row: Option<(String, f64)> = sqlx::query_as(
+                                "UPDATE orders SET filled = filled + $1, \
+                                 status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END, \
+                                 updated_at = NOW() \
+                                 WHERE id = $2 \
+                                 RETURNING status, filled"
+                            )
+                            .bind(quantity).bind(maker_oid)
+                            .fetch_optional(db2.as_ref()).await.unwrap_or(None);
+
+                            // Push order_update WS event to the maker's user so the UI updates.
+                            if let (Some((ref new_status, new_filled)), Some(maker_uid)) = (&maker_row, maker_uid) {
+                                let ws_maker_status = if new_status == "COMPLETED" { "FILLED" } else { "PARTIAL_FILL" };
+                                if let Some(tx) = user_tx2.get(&maker_uid) {
+                                    let upd = serde_json::json!({
+                                        "type": "order_update",
+                                        "order_id": maker_oid,
+                                        "status": ws_maker_status,
+                                        "filled_qty": new_filled,
+                                        "avg_price": price,
+                                        "ts": ts,
+                                    }).to_string();
+                                    let _ = tx.try_send(upd);
+                                }
+                            }
+
                             if let (Some(taker_uid), Some(maker_uid)) = (taker_uid, maker_uid) {
                                 let cost = price * quantity;
                                 let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();

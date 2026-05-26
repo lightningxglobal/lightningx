@@ -153,6 +153,14 @@ End-to-end latency (M4 localhost, p50/p99): **88 μs / 215 μs**
 
 ---
 
+## License
+
+Non-commercial use is free under [AGPL-3.0](LICENSE) — derivative works must be open-sourced under the same terms.
+
+Commercial use requires a separate license agreement. Contact **lightningx.global@gmail.com**.
+
+---
+
 ## Disclaimer
 
 > **This platform is for demonstration purposes only. Do NOT use it with real assets.**

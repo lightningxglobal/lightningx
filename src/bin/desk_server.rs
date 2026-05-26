@@ -437,10 +437,14 @@ async fn main() -> anyhow::Result<()> {
         // each order is accepted so the trade handler never needs a DB lookup
         // for user_id (eliminates the 20ms retry-sleep entirely).
         let order_uid_cache: Arc<DashMap<u64, i64>> = Arc::new(DashMap::new());
+        // DESK_SPIN=false → exponential backoff (EC2/CPU-constrained hosts).
+        // Default: spin_loop() for lowest latency on dedicated cores.
+        let use_spin = std::env::var("DESK_SPIN").map(|v| v != "false").unwrap_or(true);
 
         std::thread::Builder::new()
             .name("aeron-event-loop".to_string())
             .spawn(move || {
+                let mut idle_us: u64 = 0;
                 loop {
                     let mut did_work = false;
                     // Drain outbound commands (WS/REST → engine) without blocking.
@@ -678,7 +682,14 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     if !did_work {
-                        std::hint::spin_loop();
+                        if use_spin {
+                            std::hint::spin_loop();
+                        } else {
+                            idle_us = (idle_us * 2 + 10).min(500);
+                            std::thread::sleep(std::time::Duration::from_micros(idle_us));
+                        }
+                    } else {
+                        idle_us = 0;
                     }
                 }
             })?;

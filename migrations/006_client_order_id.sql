@@ -1,0 +1,1 @@
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_order_id VARCHAR(64);

@@ -217,7 +217,8 @@ async fn handle_trades(
         "SELECT * FROM (
              SELECT DISTINCT ON (t.id)
                  t.id, t.symbol, t.price, t.quantity, t.created_at,
-                 CASE WHEN o.id = t.buy_order_id THEN 'buy' ELSE 'sell' END AS side
+                 CASE WHEN o.id = t.buy_order_id THEN 'buy' ELSE 'sell' END AS side,
+                 o.client_order_id
              FROM trades t
              JOIN orders o ON o.id = t.buy_order_id OR o.id = t.sell_order_id
              WHERE o.user_id = $1
@@ -238,7 +239,8 @@ async fn handle_trades(
                 use sqlx::Row;
                 let price: f64 = r.get("price");
                 let quantity: f64 = r.get("quantity");
-                json!({
+                let client_order_id: Option<String> = r.get("client_order_id");
+                let mut obj = json!({
                     "id":         r.get::<i64, _>("id"),
                     "symbol":     r.get::<String, _>("symbol"),
                     "price":      price,
@@ -246,7 +248,11 @@ async fn handle_trades(
                     "value":      price * quantity,
                     "side":       r.get::<String, _>("side"),
                     "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                })
+                });
+                if let Some(coid) = client_order_id {
+                    obj["client_order_id"] = serde_json::Value::String(coid);
+                }
+                obj
             }).collect();
             (StatusCode::OK, Json(json!(out))).into_response()
         }

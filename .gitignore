@@ -12,6 +12,12 @@ server.log
 # Aeron media driver
 /aeron-dir/
 
+# Internal docs / plans
+docs/
+*.md
+!README.md
+!LICENSE
+
 # IDE
 .idea/
 

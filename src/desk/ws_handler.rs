@@ -463,32 +463,38 @@ async fn handle_client_message(
                 if freeze_amount > 0.0 {
                     repo.freeze_for_buy(user_id, quote_asset, freeze_amount).await
                 } else {
-                    Ok(())
+                    Ok((0.0, 0.0))
                 }
             } else {
                 repo.freeze_for_sell(user_id, base_asset, qty).await
             };
-            if let Err(e) = freeze_result {
-                let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
-                    .bind(db_order_id).execute(state.db.as_ref()).await;
-                return Some(json!({
-                    "type": "order_rejected",
-                    "client_order_id": client_order_id,
-                    "reason": e.to_string()
-                }).to_string());
-            }
             {
                 let frozen_asset = if side == "buy" { quote_asset } else { base_asset };
-                if let Ok(acc) = repo.get_account(user_id, frozen_asset).await {
-                    if let Some(tx) = state.user_tx.get(&user_id) {
-                        let _ = tx.try_send(json!({
-                            "type": "balance_update",
-                            "asset": frozen_asset,
-                            "balance": acc.balance,
-                            "available": acc.balance - acc.frozen,
-                            "frozen": acc.frozen,
+                match freeze_result {
+                    Err(e) => {
+                        let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
+                            .bind(db_order_id).execute(state.db.as_ref()).await;
+                        return Some(json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": e.to_string()
                         }).to_string());
                     }
+                    Ok((bal, frz)) if bal > 0.0 || frz >= 0.0 => {
+                        // Update cache and push WS balance_update from RETURNING values.
+                        state.account_cache.entry(user_id).or_insert_with(std::collections::HashMap::new)
+                            .insert(frozen_asset.to_string(), (bal, frz));
+                        if let Some(tx) = state.user_tx.get(&user_id) {
+                            let _ = tx.try_send(json!({
+                                "type": "balance_update",
+                                "asset": frozen_asset,
+                                "balance": bal,
+                                "available": bal - frz,
+                                "frozen": frz,
+                            }).to_string());
+                        }
+                    }
+                    Ok(_) => {} // no-op freeze (zero amount)
                 }
             }
 
@@ -674,7 +680,12 @@ async fn handle_client_message(
                         } else {
                             (base_asset, unfilled)
                         };
-                        let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await;
+                        if let Ok((bal, frz)) = repo.release_frozen(user_id, rel_asset, rel_amount).await {
+                            if bal > 0.0 || frz >= 0.0 {
+                                state.account_cache.entry(user_id).or_insert_with(std::collections::HashMap::new)
+                                    .insert(rel_asset.to_string(), (bal, frz));
+                            }
+                        }
                     }
                 }
 

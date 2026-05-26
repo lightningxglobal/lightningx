@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use lightning_exchange::{
     account_repository::AccountRepository,
-    api::{router, AppState},
+    api::{router, AppState, AccountCache},
     db,
     engine::{MatchingEngine, PoolConfig},
     models::DbOrder,
@@ -305,6 +305,7 @@ async fn main() -> anyhow::Result<()> {
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
         tracer: None,
+        account_cache: AccountCache::default(),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

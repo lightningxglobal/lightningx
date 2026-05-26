@@ -9,13 +9,14 @@ use lightning_exchange::{
         METRICS_CHANNEL, METRICS_STREAM,
     },
     aeron_transport::{DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber, DeskDepthSubscriber},
-    api::{router, AppState},
+    api::{router, AppState, AccountCache},
     db,
     tracer::{spawn_tracer, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV, MS_WS_UPDATE_SEND, DESK_INSTANCE_ID},
     transport::AeronCmd,
     ws_handler::market_data_broadcaster,
 };
 use aeron_wrapper::AeronClient;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::net::TcpListener;
@@ -34,6 +35,18 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::create_pool(&database_url).await?;
     db::run_migrations(&pool).await?;
     tracing::info!("Migrations applied");
+
+    // Pre-load all account balances into memory so GET /api/balances never touches DB.
+    let account_cache: AccountCache = AccountCache::default();
+    {
+        let rows: Vec<(i64, String, f64, f64)> = sqlx::query_as(
+            "SELECT user_id, asset, balance, frozen FROM accounts",
+        ).fetch_all(&pool).await.unwrap_or_default();
+        for (uid, asset, bal, frz) in rows {
+            account_cache.entry(uid).or_insert_with(HashMap::new).insert(asset, (bal, frz));
+        }
+        tracing::info!("Account cache loaded ({} rows)", account_cache.len());
+    }
 
     // ── Aeron setup ───────────────────────────────────────────────────────────
     let client = Arc::new(
@@ -99,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
         tracer: tracer.clone(),
+        account_cache: account_cache.clone(),
     };
 
     // ── Aeron spin thread: WS command drain + inbound event loop ─────────────
@@ -110,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         let user_tx = state.user_tx.clone();
         let last_depth = state.last_depth.clone();
         let db = state.db.clone();
+        let account_cache = account_cache.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
         // order_id → user_id: populated synchronously in the spin thread when
@@ -190,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
                             if kind == order_update_kind::ACCEPTED {
                                 let oid = order_id as i64;
                                 let db4 = db.clone();
+                                let cache4 = account_cache.clone();
                                 let coid = ws_client_oid.clone();
                                 rt.spawn(async move {
                                     // Upsert: covers the race where REST path also ran.
@@ -205,16 +221,20 @@ async fn main() -> anyhow::Result<()> {
                                     .bind(coid)
                                     .execute(&*db4).await;
 
-                                    // Freeze funds after engine accepts.
+                                    // Freeze funds after engine accepts; update cache with RETURNING value.
                                     let repo = lightning_exchange::account_repository::AccountRepository::new(&db4);
                                     let sym: Vec<&str> = meta.symbol.splitn(2, '_').collect();
                                     let base = sym.first().copied().unwrap_or("BTC");
                                     let quote = sym.last().copied().unwrap_or("USDT");
                                     if meta.side == "buy" {
                                         let amount = meta.freeze_price * meta.qty;
-                                        if amount > 0.0 { let _ = repo.freeze_for_buy(meta.user_id, quote, amount).await; }
-                                    } else {
-                                        let _ = repo.freeze_for_sell(meta.user_id, base, meta.qty).await;
+                                        if amount > 0.0 {
+                                            if let Ok((bal, frz)) = repo.freeze_for_buy(meta.user_id, quote, amount).await {
+                                                cache4.entry(meta.user_id).or_insert_with(HashMap::new).insert(quote.to_string(), (bal, frz));
+                                            }
+                                        }
+                                    } else if let Ok((bal, frz)) = repo.freeze_for_sell(meta.user_id, base, meta.qty).await {
+                                        cache4.entry(meta.user_id).or_insert_with(HashMap::new).insert(base.to_string(), (bal, frz));
                                     }
                                 });
                             } else if kind == order_update_kind::FILLED || kind == order_update_kind::PARTIAL_FILL {
@@ -325,6 +345,7 @@ async fn main() -> anyhow::Result<()> {
                         let market_tx2 = market_tx.clone();
                         let db2 = db.clone();
                         let user_tx2 = user_tx.clone();
+                        let account_cache2 = account_cache.clone();
                         rt.spawn(async move {
                             let side_str = if side == 0 { "buy" } else { "sell" };
                             let ts = std::time::SystemTime::now()
@@ -459,14 +480,17 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 );
 
-                                // Push balance_update immediately using RETURNING data — no extra SELECTs.
+                                // Update cache and push balance_update WS using RETURNING data.
                                 for (uid, updates) in [
                                     (buyer_id,  [(quote, bq_row), (base,  bb_row)]),
                                     (seller_id, [(base,  sb_row), (quote, sq_row)]),
                                 ] {
-                                    if let Some(tx) = user_tx2.get(&uid) {
-                                        for (asset, row) in updates {
-                                            if let Some((bal, frz)) = row {
+                                    for (asset, row) in updates {
+                                        if let Some((bal, frz)) = row {
+                                            // Keep in-memory cache authoritative.
+                                            account_cache2.entry(uid).or_insert_with(HashMap::new).insert(asset.to_string(), (bal, frz));
+                                            // Push WS balance_update if user is connected.
+                                            if let Some(tx) = user_tx2.get(&uid) {
                                                 let msg = serde_json::json!({
                                                     "type": "balance_update",
                                                     "asset": asset,

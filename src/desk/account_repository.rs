@@ -47,60 +47,55 @@ impl<'a> AccountRepository<'a> {
         Ok(())
     }
 
-    /// Freeze funds for a buy order atomically.
-    pub async fn freeze_for_buy(&self, user_id: i64, asset: &str, amount: f64) -> Result<()> {
-        let rows = sqlx::query(
+    /// Freeze funds for a buy order atomically. Returns (balance, frozen) after update.
+    pub async fn freeze_for_buy(&self, user_id: i64, asset: &str, amount: f64) -> Result<(f64, f64)> {
+        let row: Option<(f64, f64)> = sqlx::query_as(
             "UPDATE accounts SET frozen = frozen + $1, updated_at = NOW()
              WHERE user_id = $2 AND asset = $3
-               AND (balance - frozen) >= $1",
+               AND (balance - frozen) >= $1
+             RETURNING balance, frozen",
         )
         .bind(amount)
         .bind(user_id)
         .bind(asset)
-        .execute(self.pool)
-        .await?
-        .rows_affected();
+        .fetch_optional(self.pool)
+        .await?;
 
-        if rows == 0 {
-            Err(anyhow!("Insufficient {} balance to freeze {}", asset, amount))
-        } else {
-            Ok(())
-        }
+        row.ok_or_else(|| anyhow!("Insufficient {} balance to freeze {}", asset, amount))
     }
 
-    /// Freeze position for a sell order atomically.
-    pub async fn freeze_for_sell(&self, user_id: i64, asset: &str, qty: f64) -> Result<()> {
-        let rows = sqlx::query(
+    /// Freeze position for a sell order atomically. Returns (balance, frozen) after update.
+    pub async fn freeze_for_sell(&self, user_id: i64, asset: &str, qty: f64) -> Result<(f64, f64)> {
+        let row: Option<(f64, f64)> = sqlx::query_as(
             "UPDATE accounts SET frozen = frozen + $1, updated_at = NOW()
              WHERE user_id = $2 AND asset = $3
-               AND (balance - frozen) >= $1",
+               AND (balance - frozen) >= $1
+             RETURNING balance, frozen",
         )
         .bind(qty)
         .bind(user_id)
         .bind(asset)
-        .execute(self.pool)
-        .await?
-        .rows_affected();
+        .fetch_optional(self.pool)
+        .await?;
 
-        if rows == 0 {
-            Err(anyhow!("Insufficient {} position to freeze {}", asset, qty))
-        } else {
-            Ok(())
-        }
+        row.ok_or_else(|| anyhow!("Insufficient {} position to freeze {}", asset, qty))
     }
 
-    /// Release frozen funds (on order cancel).
-    pub async fn release_frozen(&self, user_id: i64, asset: &str, amount: f64) -> Result<()> {
-        sqlx::query(
+    /// Release frozen funds (on order cancel). Returns (balance, frozen) after update.
+    pub async fn release_frozen(&self, user_id: i64, asset: &str, amount: f64) -> Result<(f64, f64)> {
+        let row: Option<(f64, f64)> = sqlx::query_as(
             "UPDATE accounts SET frozen = GREATEST(frozen - $1, 0), updated_at = NOW()
-             WHERE user_id = $2 AND asset = $3",
+             WHERE user_id = $2 AND asset = $3
+             RETURNING balance, frozen",
         )
         .bind(amount)
         .bind(user_id)
         .bind(asset)
-        .execute(self.pool)
+        .fetch_optional(self.pool)
         .await?;
-        Ok(())
+
+        // If no row matched (account doesn't exist), treat as a no-op.
+        Ok(row.unwrap_or((0.0, 0.0)))
     }
 
     /// Settle a fill: debit quote asset from buyer, credit base asset; debit base from seller, credit quote.

@@ -17,9 +17,14 @@ use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+/// In-memory account cache: user_id → { asset → (balance, frozen) }.
+/// Updated after every DB write so GET /api/balances never hits the DB.
+pub type AccountCache = Arc<DashMap<i64, HashMap<String, (f64, f64)>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -43,6 +48,8 @@ pub struct AppState {
     pub last_depth: Arc<DashMap<String, serde_json::Value>>,
     /// Latency tracer checkpoints (desk-server side). None in standalone mode.
     pub tracer: Option<Arc<ExchangeTracer>>,
+    /// In-memory account balances: read path never touches DB after initial load.
+    pub account_cache: AccountCache,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -113,6 +120,10 @@ fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
 
 // ─── Accounts ─────────────────────────────────────────────────────────────────
 
+fn cache_set(cache: &AccountCache, user_id: i64, asset: &str, balance: f64, frozen: f64) {
+    cache.entry(user_id).or_insert_with(HashMap::new).insert(asset.to_string(), (balance, frozen));
+}
+
 async fn handle_accounts(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -121,9 +132,30 @@ async fn handle_accounts(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+
+    // Serve from in-memory cache when available (zero DB round-trip).
+    if let Some(assets) = s.account_cache.get(&user_id) {
+        let accounts: Vec<Value> = assets.iter()
+            .map(|(asset, &(balance, frozen))| json!({
+                "asset":     asset,
+                "balance":   balance,
+                "frozen":    frozen,
+                "available": balance - frozen,
+            }))
+            .collect();
+        return (StatusCode::OK, Json(json!(accounts))).into_response();
+    }
+
+    // Cold path: cache miss on first request after startup — load from DB and populate.
     let repo = AccountRepository::new(&s.db);
     match repo.get_all_accounts(user_id).await {
-        Ok(accounts) => (StatusCode::OK, Json(json!(accounts))).into_response(),
+        Ok(accounts) => {
+            let mut entry = s.account_cache.entry(user_id).or_insert_with(HashMap::new);
+            for a in &accounts {
+                entry.insert(a.asset.clone(), (a.balance, a.frozen));
+            }
+            (StatusCode::OK, Json(json!(accounts))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -344,19 +376,20 @@ async fn handle_place_order(
         0.0
     };
 
-    // Freeze funds before touching the engine.
+    // Freeze funds before touching the engine; update cache with RETURNING value.
     let repo = AccountRepository::new(s.db.as_ref());
-    let freeze_result = if req.side == "buy" {
+    if req.side == "buy" {
         if freeze_price > 0.0 {
-            repo.freeze_for_buy(user_id, quote_asset, freeze_price * req.quantity).await
-        } else {
-            Ok(())
+            match repo.freeze_for_buy(user_id, quote_asset, freeze_price * req.quantity).await {
+                Ok((bal, frz)) => { cache_set(&s.account_cache, user_id, quote_asset, bal, frz); }
+                Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+            }
         }
     } else {
-        repo.freeze_for_sell(user_id, base_asset, req.quantity).await
-    };
-    if let Err(e) = freeze_result {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+        match repo.freeze_for_sell(user_id, base_asset, req.quantity).await {
+            Ok((bal, frz)) => { cache_set(&s.account_cache, user_id, base_asset, bal, frz); }
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        }
     }
 
     // Insert into DB first to get a stable ID, then use that same ID for the engine order.
@@ -780,10 +813,14 @@ async fn handle_cancel_order(
     if side == "buy" {
         let freeze_price = price.unwrap_or(0.0);
         if freeze_price > 0.0 && remaining > 0.0 {
-            let _ = repo.release_frozen(user_id, quote_asset, freeze_price * remaining).await;
+            if let Ok((bal, frz)) = repo.release_frozen(user_id, quote_asset, freeze_price * remaining).await {
+                if bal > 0.0 || frz >= 0.0 { cache_set(&s.account_cache, user_id, quote_asset, bal, frz); }
+            }
         }
     } else if remaining > 0.0 {
-        let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+        if let Ok((bal, frz)) = repo.release_frozen(user_id, base_asset, remaining).await {
+            if bal > 0.0 || frz >= 0.0 { cache_set(&s.account_cache, user_id, base_asset, bal, frz); }
+        }
     }
 
     // Notify the user's WS subscribers (other tabs, etc.) that the order is
@@ -1020,7 +1057,10 @@ async fn handle_test_funds(
     .await;
 
     match result {
-        Ok(_) => (StatusCode::OK, Json(json!({"message": "Test funds granted: 10,000 USDT + 1 BTC + 10 ETH + 100 SOL", "usdt": 10000, "btc": 1, "eth": 10, "sol": 100}))).into_response(),
+        Ok(_) => {
+            s.account_cache.remove(&user_id); // reload on next read
+            (StatusCode::OK, Json(json!({"message": "Test funds granted: 10,000 USDT + 1 BTC + 10 ETH + 100 SOL", "usdt": 10000, "btc": 1, "eth": 10, "sol": 100}))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -1047,7 +1087,10 @@ async fn handle_robot_funds(
     .await;
 
     match result {
-        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Ok(_) => {
+            s.account_cache.remove(&user_id); // reload on next read
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

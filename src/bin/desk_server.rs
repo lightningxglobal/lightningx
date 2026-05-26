@@ -23,6 +23,303 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
+// ── DB status byte constants ──────────────────────────────────────────────────
+mod db_cmd {
+    pub const STATUS_PENDING:   u8 = 0;
+    pub const STATUS_TRADING:   u8 = 1;
+    pub const STATUS_COMPLETED: u8 = 2;
+    pub const STATUS_CANCELED:  u8 = 3;
+    pub const STATUS_REJECTED:  u8 = 4;
+
+    pub fn status_str(s: u8) -> &'static str {
+        match s {
+            0 => "PENDING",
+            1 => "TRADING",
+            2 => "COMPLETED",
+            3 => "CANCELED",
+            _ => "REJECTED",
+        }
+    }
+
+    pub fn str_bytes<const N: usize>(s: &str) -> [u8; N] {
+        let mut buf = [0u8; N];
+        let b = s.as_bytes();
+        let n = b.len().min(N);
+        buf[..n].copy_from_slice(&b[..n]);
+        buf
+    }
+}
+
+// ── DbCmd: fixed-size Copy type for rtrb spin thread → DB worker ─────────────
+/// No heap allocation; zero Arc clones on the hot path.
+#[derive(Clone, Copy)]
+enum DbCmd {
+    /// INSERT INTO orders … ON CONFLICT DO UPDATE.
+    /// do_freeze=true → also call freeze_for_buy/sell after INSERT (GTC ACCEPTED path).
+    UpsertOrder {
+        id:              i64,
+        user_id:         i64,
+        symbol:          [u8; 16],
+        side:            u8,          // 0=buy 1=sell
+        order_type:      [u8; 16],
+        price:           f64,
+        qty:             f64,
+        filled:          f64,
+        status:          u8,          // db_cmd::STATUS_*
+        freeze_price:    f64,
+        do_freeze:       bool,
+        client_order_id: [u8; 32],    // null-padded, max 31 chars
+    },
+    /// UPDATE orders SET status, filled WHERE id  (REST / subsequent update path).
+    UpdateStatus {
+        id:     i64,
+        status: u8,
+        filled: f64,
+    },
+    /// INSERT trade + settle accounts + push maker WS.
+    SettleTrade {
+        taker_id:  i64,
+        maker_id:  i64,
+        taker_uid: i64,  // 0 → DB worker resolves via SELECT
+        maker_uid: i64,  // 0 → DB worker resolves via SELECT
+        price:     f64,
+        qty:       f64,
+        side:      u8,   // 0=buy taker, 1=sell taker
+        symbol:    [u8; 16],
+    },
+}
+
+// ── process_db_cmd: runs in the tokio runtime, off the spin thread ────────────
+async fn process_db_cmd(
+    cmd: DbCmd,
+    db: std::sync::Arc<sqlx::PgPool>,
+    account_cache: lightning_exchange::api::AccountCache,
+    user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
+    market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+) {
+    use lightning_exchange::account_repository::AccountRepository;
+    match cmd {
+        DbCmd::UpsertOrder {
+            id, user_id, symbol, side, order_type, price, qty, filled,
+            status, freeze_price, do_freeze, client_order_id,
+        } => {
+            let sym_end  = symbol.iter().position(|&b| b == 0).unwrap_or(16);
+            let ot_end   = order_type.iter().position(|&b| b == 0).unwrap_or(16);
+            let coid_end = client_order_id.iter().position(|&b| b == 0).unwrap_or(32);
+            let sym_str  = std::str::from_utf8(&symbol[..sym_end]).unwrap_or("BTC_USDT");
+            let ot_str   = std::str::from_utf8(&order_type[..ot_end]).unwrap_or("limit");
+            let coid_str = std::str::from_utf8(&client_order_id[..coid_end])
+                .ok().filter(|s| !s.is_empty()).map(|s| s.to_owned());
+            let side_str   = if side == 0 { "buy" } else { "sell" };
+            let status_str = db_cmd::status_str(status);
+
+            let _ = sqlx::query(
+                "INSERT INTO orders \
+                 (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                 ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()",
+            )
+            .bind(id).bind(user_id).bind(sym_str)
+            .bind(side_str).bind(ot_str)
+            .bind(price).bind(qty).bind(filled).bind(status_str).bind(freeze_price)
+            .bind(coid_str)
+            .execute(db.as_ref()).await;
+
+            if do_freeze {
+                let repo = AccountRepository::new(&db);
+                let parts: Vec<&str> = sym_str.splitn(2, '_').collect();
+                let base  = parts.first().copied().unwrap_or("BTC");
+                let quote = parts.last().copied().unwrap_or("USDT");
+                if side == 0 {
+                    // buy: freeze quote
+                    let amount = freeze_price * qty;
+                    if amount > 0.0 {
+                        if let Ok((bal, frz)) = repo.freeze_for_buy(user_id, quote, amount).await {
+                            account_cache.entry(user_id).or_insert_with(HashMap::new)
+                                .insert(quote.to_string(), (bal, frz));
+                        }
+                    }
+                } else {
+                    // sell: freeze base
+                    if let Ok((bal, frz)) = repo.freeze_for_sell(user_id, base, qty).await {
+                        account_cache.entry(user_id).or_insert_with(HashMap::new)
+                            .insert(base.to_string(), (bal, frz));
+                    }
+                }
+            }
+        }
+
+        DbCmd::UpdateStatus { id, status, filled } => {
+            let _ = sqlx::query(
+                "UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3",
+            )
+            .bind(db_cmd::status_str(status)).bind(filled).bind(id)
+            .execute(db.as_ref()).await;
+        }
+
+        DbCmd::SettleTrade {
+            taker_id, maker_id, mut taker_uid, mut maker_uid,
+            price, qty, side, symbol,
+        } => {
+            let sym_end  = symbol.iter().position(|&b| b == 0).unwrap_or(16);
+            let symbol   = std::str::from_utf8(&symbol[..sym_end]).unwrap_or("BTC_USDT").to_owned();
+            let side_str = if side == 0 { "buy" } else { "sell" };
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64).unwrap_or(0);
+
+            let trade_msg = format!(
+                r#"{{"type":"trade","symbol":"{symbol}","price":{price},"qty":{qty},"side":"{side_str}","ts":{ts}}}"#
+            );
+            let _ = market_tx.send(trade_msg);
+
+            // Resolve UIDs if cache missed.
+            if taker_uid == 0 {
+                taker_uid = sqlx::query_scalar("SELECT user_id FROM orders WHERE id = $1")
+                    .bind(taker_id).fetch_optional(db.as_ref()).await
+                    .ok().flatten().unwrap_or(0);
+            }
+            if maker_uid == 0 {
+                maker_uid = sqlx::query_scalar("SELECT user_id FROM orders WHERE id = $1")
+                    .bind(maker_id).fetch_optional(db.as_ref()).await
+                    .ok().flatten().unwrap_or(0);
+            }
+
+            let (buy_oid, sell_oid) = if side == 0 { (taker_id, maker_id) } else { (maker_id, taker_id) };
+
+            // INSERT trade (retry once on FK race with taker's UpsertOrder).
+            let trade_res = sqlx::query(
+                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at) \
+                 VALUES ($1,$2,$3,$4,$5,NOW())",
+            ).bind(&symbol).bind(buy_oid).bind(sell_oid).bind(price).bind(qty)
+            .execute(db.as_ref()).await;
+            if trade_res.is_err() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+                let _ = sqlx::query(
+                    "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at) \
+                     VALUES ($1,$2,$3,$4,$5,NOW())",
+                ).bind(&symbol).bind(buy_oid).bind(sell_oid).bind(price).bind(qty)
+                .execute(db.as_ref()).await;
+            }
+
+            // UPDATE maker order filled/status and capture new state for WS push.
+            let maker_row: Option<(String, f64)> = sqlx::query_as(
+                "UPDATE orders SET filled = filled + $1, \
+                 status = CASE WHEN quantity - (filled + $1) < 1e-9 THEN 'COMPLETED' ELSE 'TRADING' END, \
+                 updated_at = NOW() \
+                 WHERE id = $2 \
+                 RETURNING status, filled",
+            ).bind(qty).bind(maker_id)
+            .fetch_optional(db.as_ref()).await.unwrap_or(None);
+
+            if let (Some((ref new_status, new_filled)), uid) = (&maker_row, maker_uid) {
+                if uid != 0 {
+                    let ws_status = if new_status == "COMPLETED" { "FILLED" } else { "PARTIAL_FILL" };
+                    if let Some(tx) = user_tx.get(&uid) {
+                        let upd = serde_json::json!({
+                            "type": "order_update", "order_id": maker_id,
+                            "status": ws_status, "filled_qty": new_filled,
+                            "avg_price": price, "ts": ts,
+                        }).to_string();
+                        let _ = tx.try_send(upd);
+                    }
+                }
+            }
+
+            if taker_uid == 0 || maker_uid == 0 { return; }
+
+            let parts: Vec<&str> = symbol.splitn(2, '_').collect();
+            let base  = *parts.first().unwrap_or(&"BTC");
+            let quote = *parts.last().unwrap_or(&"USDT");
+            let cost = price * qty;
+            let (buyer_id, seller_id) = if side == 0 { (taker_uid, maker_uid) } else { (maker_uid, taker_uid) };
+
+            let ((bq, bb), (sb, sq)) = tokio::join!(
+                async {
+                    let q: Option<(f64, f64)> = sqlx::query_as(
+                        "UPDATE accounts SET balance = balance - $1, updated_at = NOW() \
+                         WHERE user_id = $2 AND asset = $3 RETURNING balance, frozen",
+                    ).bind(cost).bind(buyer_id).bind(quote)
+                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
+                    let b: Option<(f64, f64)> = sqlx::query_as(
+                        "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1,$2,$3,0) \
+                         ON CONFLICT (user_id, asset) DO UPDATE \
+                         SET balance = accounts.balance + $3, updated_at = NOW() \
+                         RETURNING balance, frozen",
+                    ).bind(buyer_id).bind(base).bind(qty)
+                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
+                    (q, b)
+                },
+                async {
+                    let b: Option<(f64, f64)> = sqlx::query_as(
+                        "UPDATE accounts SET balance = balance - $1, \
+                         frozen = GREATEST(frozen - $1, 0), updated_at = NOW() \
+                         WHERE user_id = $2 AND asset = $3 RETURNING balance, frozen",
+                    ).bind(qty).bind(seller_id).bind(base)
+                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
+                    let q: Option<(f64, f64)> = sqlx::query_as(
+                        "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1,$2,$3,0) \
+                         ON CONFLICT (user_id, asset) DO UPDATE \
+                         SET balance = accounts.balance + $3, updated_at = NOW() \
+                         RETURNING balance, frozen",
+                    ).bind(seller_id).bind(quote).bind(cost)
+                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
+                    (b, q)
+                }
+            );
+
+            for (uid, updates) in [
+                (buyer_id,  [(quote, bq), (base,  bb)]),
+                (seller_id, [(base,  sb), (quote, sq)]),
+            ] {
+                for (asset, row) in updates {
+                    if let Some((bal, frz)) = row {
+                        account_cache.entry(uid).or_insert_with(HashMap::new)
+                            .insert(asset.to_string(), (bal, frz));
+                        if let Some(tx) = user_tx.get(&uid) {
+                            let msg = serde_json::json!({
+                                "type": "balance_update", "asset": asset,
+                                "balance": bal, "available": bal - frz, "frozen": frz,
+                            }).to_string();
+                            let _ = tx.try_send(msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── spawn_db_worker: drain rtrb DbCmd ring buffer off the spin thread ─────────
+fn spawn_db_worker(
+    mut db_rx: rtrb::Consumer<DbCmd>,
+    rt: tokio::runtime::Handle,
+    db: std::sync::Arc<sqlx::PgPool>,
+    account_cache: lightning_exchange::api::AccountCache,
+    user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
+    market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+) {
+    std::thread::Builder::new().name("db-worker".to_string()).spawn(move || {
+        let mut idle_us: u64 = 0;
+        loop {
+            let mut did_work = false;
+            while let Ok(cmd) = db_rx.pop() {
+                did_work = true;
+                idle_us = 0;
+                let db2 = db.clone();
+                let ac2 = account_cache.clone();
+                let ut2 = user_tx.clone();
+                let mt2 = market_tx.clone();
+                rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2));
+            }
+            if !did_work {
+                idle_us = (idle_us * 2 + 10).min(200);
+                std::thread::sleep(std::time::Duration::from_micros(idle_us));
+            }
+        }
+    }).unwrap();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -115,6 +412,17 @@ async fn main() -> anyhow::Result<()> {
         account_cache: account_cache.clone(),
     };
 
+    // ── DB worker: rtrb ring buffer spin thread → DB worker thread ───────────
+    let (mut db_tx, db_rx) = rtrb::RingBuffer::<DbCmd>::new(8 * 1024);
+    spawn_db_worker(
+        db_rx,
+        tokio::runtime::Handle::current(),
+        state.db.clone(),
+        account_cache.clone(),
+        state.user_tx.clone(),
+        state.market_tx.clone(),
+    );
+
     // ── Aeron spin thread: WS command drain + inbound event loop ─────────────
     // order_pub lives here exclusively — no mutex needed.
     {
@@ -123,8 +431,6 @@ async fn main() -> anyhow::Result<()> {
         let pending_meta = state.pending_meta.clone();
         let user_tx = state.user_tx.clone();
         let last_depth = state.last_depth.clone();
-        let db = state.db.clone();
-        let account_cache = account_cache.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
         // order_id → user_id: populated synchronously in the spin thread when
@@ -209,81 +515,59 @@ async fn main() -> anyhow::Result<()> {
 
                         if let Some(meta) = ws_meta {
                             if kind == order_update_kind::ACCEPTED {
-                                let oid = order_id as i64;
-                                let db4 = db.clone();
-                                let cache4 = account_cache.clone();
-                                let coid = ws_client_oid.clone();
-                                rt.spawn(async move {
-                                    // Upsert: covers the race where REST path also ran.
-                                    let _ = sqlx::query(
-                                        "INSERT INTO orders \
-                                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
-                                         VALUES ($1,$2,$3,$4,$5,$6,$7,0,'PENDING',$8,$9) \
-                                         ON CONFLICT (id) DO UPDATE SET status='PENDING', updated_at=NOW()"
-                                    )
-                                    .bind(oid).bind(meta.user_id).bind(&meta.symbol)
-                                    .bind(&meta.side).bind(&meta.order_type)
-                                    .bind(meta.price).bind(meta.qty).bind(meta.freeze_price)
-                                    .bind(coid)
-                                    .execute(&*db4).await;
-
-                                    // Freeze funds after engine accepts; update cache with RETURNING value.
-                                    let repo = lightning_exchange::account_repository::AccountRepository::new(&db4);
-                                    let sym: Vec<&str> = meta.symbol.splitn(2, '_').collect();
-                                    let base = sym.first().copied().unwrap_or("BTC");
-                                    let quote = sym.last().copied().unwrap_or("USDT");
-                                    if meta.side == "buy" {
-                                        let amount = meta.freeze_price * meta.qty;
-                                        if amount > 0.0 {
-                                            if let Ok((bal, frz)) = repo.freeze_for_buy(meta.user_id, quote, amount).await {
-                                                cache4.entry(meta.user_id).or_insert_with(HashMap::new).insert(quote.to_string(), (bal, frz));
-                                            }
-                                        }
-                                    } else if let Ok((bal, frz)) = repo.freeze_for_sell(meta.user_id, base, meta.qty).await {
-                                        cache4.entry(meta.user_id).or_insert_with(HashMap::new).insert(base.to_string(), (bal, frz));
-                                    }
+                                // Upsert: covers the race where REST path also ran.
+                                let _ = db_tx.push(DbCmd::UpsertOrder {
+                                    id:              order_id as i64,
+                                    user_id:         meta.user_id,
+                                    symbol:          db_cmd::str_bytes(&meta.symbol),
+                                    side:            if meta.side == "buy" { 0 } else { 1 },
+                                    order_type:      db_cmd::str_bytes(&meta.order_type),
+                                    price:           meta.price.unwrap_or(0.0),
+                                    qty:             meta.qty,
+                                    filled:          0.0,
+                                    status:          db_cmd::STATUS_PENDING,
+                                    freeze_price:    meta.freeze_price,
+                                    do_freeze:       true,
+                                    client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
                                 });
                             } else if kind == order_update_kind::FILLED || kind == order_update_kind::PARTIAL_FILL {
                                 // Market / IOC order filled immediately — no ACCEPTED was sent.
                                 // Insert the order row now so the fills JOIN and order history work.
-                                let db_status = if kind == order_update_kind::FILLED { "COMPLETED" } else { "TRADING" };
-                                let oid = order_id as i64;
-                                let db4 = db.clone();
-                                let coid = ws_client_oid.clone();
-                                rt.spawn(async move {
-                                    let _ = sqlx::query(
-                                        "INSERT INTO orders \
-                                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
-                                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                                         ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()"
-                                    )
-                                    .bind(oid).bind(meta.user_id).bind(&meta.symbol)
-                                    .bind(&meta.side).bind(&meta.order_type)
-                                    .bind(meta.price).bind(meta.qty)
-                                    .bind(fill_qty).bind(db_status).bind(meta.freeze_price)
-                                    .bind(coid)
-                                    .execute(&*db4).await;
+                                let status = if kind == order_update_kind::FILLED {
+                                    db_cmd::STATUS_COMPLETED
+                                } else {
+                                    db_cmd::STATUS_TRADING
+                                };
+                                let _ = db_tx.push(DbCmd::UpsertOrder {
+                                    id:              order_id as i64,
+                                    user_id:         meta.user_id,
+                                    symbol:          db_cmd::str_bytes(&meta.symbol),
+                                    side:            if meta.side == "buy" { 0 } else { 1 },
+                                    order_type:      db_cmd::str_bytes(&meta.order_type),
+                                    price:           meta.price.unwrap_or(0.0),
+                                    qty:             meta.qty,
+                                    filled:          fill_qty,
+                                    status,
+                                    freeze_price:    meta.freeze_price,
+                                    do_freeze:       false,
+                                    client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
                                 });
                             }
                             // REJECTED / CANCELLED with meta: no DB row and no frozen
                             // funds, so nothing else to do.
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).
-                            let db_status = match kind {
-                                k if k == order_update_kind::ACCEPTED     => "PENDING",
-                                k if k == order_update_kind::PARTIAL_FILL => "TRADING",
-                                k if k == order_update_kind::FILLED       => "COMPLETED",
-                                k if k == order_update_kind::CANCELLED    => "CANCELED",
-                                _                                         => "REJECTED",
+                            let status = match kind {
+                                k if k == order_update_kind::ACCEPTED     => db_cmd::STATUS_PENDING,
+                                k if k == order_update_kind::PARTIAL_FILL => db_cmd::STATUS_TRADING,
+                                k if k == order_update_kind::FILLED       => db_cmd::STATUS_COMPLETED,
+                                k if k == order_update_kind::CANCELLED    => db_cmd::STATUS_CANCELED,
+                                _                                          => db_cmd::STATUS_REJECTED,
                             };
-                            let oid = order_id as i64;
-                            let db3 = db.clone();
-                            rt.spawn(async move {
-                                let _ = sqlx::query(
-                                    "UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3",
-                                )
-                                .bind(db_status).bind(fill_qty).bind(oid)
-                                .execute(&*db3).await;
+                            let _ = db_tx.push(DbCmd::UpdateStatus {
+                                id:     order_id as i64,
+                                status,
+                                filled: fill_qty,
                             });
                         }
 
@@ -326,190 +610,26 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Process trade notifications — offload JSON + broadcast + DB to tokio.
-                    // Spin thread only extracts raw fields (~100ns); heavy work runs async.
+                    // Process trade notifications — push a fixed-size DbCmd to the
+                    // DB worker ring buffer (~10ns, no heap alloc, no Arc clone here).
                     while let Some(trade) = trade_sub.poll() {
                         did_work = true;
-                        let end = trade.symbol.iter().position(|&b| b == 0).unwrap_or(16);
-                        let symbol: String = String::from_utf8_lossy(&trade.symbol[..end]).into_owned();
-                        let price: f64 = trade.price;
-                        let quantity: f64 = trade.quantity;
-                        let side: u8 = trade.side;
-                        let taker_id: u64 = trade.taker_order_id;
-                        let maker_id: u64 = trade.maker_order_id;
+                        let price: f64   = trade.price;
+                        let qty: f64     = trade.quantity;
+                        let side: u8     = trade.side;
+                        let taker_id     = trade.taker_order_id as i64;
+                        let maker_id     = trade.maker_order_id as i64;
 
-                        // Capture UIDs synchronously from the in-memory cache so
-                        // the spawned task never needs a DB lookup for user_id.
-                        // Maker orders are resting in the book and were inserted in
-                        // a prior cycle so their cache entry may not exist — fall
-                        // back to a single DB SELECT (no retry, no sleep).
-                        let taker_uid_cached = order_uid_cache.get(&taker_id).map(|v| *v);
-                        let maker_uid_cached = order_uid_cache.remove(&maker_id).map(|(_, v)| v);
-                        // Taker entry is consumed once settlement runs.
-                        order_uid_cache.remove(&taker_id);
+                        let taker_uid = order_uid_cache.get(&(taker_id as u64)).map(|v| *v).unwrap_or(0);
+                        let maker_uid = order_uid_cache.remove(&(maker_id as u64)).map(|(_, v)| v).unwrap_or(0);
+                        order_uid_cache.remove(&(taker_id as u64));
 
-                        let market_tx2 = market_tx.clone();
-                        let db2 = db.clone();
-                        let user_tx2 = user_tx.clone();
-                        let account_cache2 = account_cache.clone();
-                        rt.spawn(async move {
-                            let side_str = if side == 0 { "buy" } else { "sell" };
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros() as u64)
-                                .unwrap_or(0);
-                            let trade_msg = format!(
-                                r#"{{"type":"trade","symbol":"{symbol}","price":{price},"qty":{quantity},"side":"{side_str}","ts":{ts}}}"#
-                            );
-                            let _ = market_tx2.send(trade_msg);
+                        let mut sym = [0u8; 16];
+                        sym.copy_from_slice(&trade.symbol[..16]);
 
-                            let taker_oid = taker_id as i64;
-                            let maker_oid = maker_id as i64;
-
-                            // Resolve UIDs: use cache for taker (just placed this cycle),
-                            // DB for maker (resting order from a prior cycle).
-                            let (taker_uid, maker_uid) = match (taker_uid_cached, maker_uid_cached) {
-                                (Some(t), Some(m)) => (Some(t), Some(m)),
-                                (t_opt, m_opt) => {
-                                    let t = if t_opt.is_some() { t_opt } else {
-                                        sqlx::query_scalar("SELECT user_id FROM orders WHERE id = $1")
-                                            .bind(taker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None)
-                                    };
-                                    let m = if m_opt.is_some() { m_opt } else {
-                                        sqlx::query_scalar("SELECT user_id FROM orders WHERE id = $1")
-                                            .bind(maker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None)
-                                    };
-                                    (t, m)
-                                }
-                            };
-
-                            let (buy_oid, sell_oid): (i64, i64) = if side == 0 {
-                                (taker_oid, maker_oid)
-                            } else {
-                                (maker_oid, taker_oid)
-                            };
-                            // FK on trades(buy_order_id, sell_order_id) requires both order
-                            // rows to exist. The taker's INSERT runs in a concurrent task so
-                            // there is a small race; retry once with a 2ms pause if needed.
-                            let trade_res = sqlx::query(
-                                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
-                                 VALUES ($1, $2, $3, $4, $5, NOW())"
-                            )
-                            .bind(&symbol).bind(buy_oid).bind(sell_oid).bind(price).bind(quantity)
-                            .execute(db2.as_ref()).await;
-                            if trade_res.is_err() {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
-                                let _ = sqlx::query(
-                                    "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
-                                     VALUES ($1, $2, $3, $4, $5, NOW())"
-                                )
-                                .bind(&symbol).bind(buy_oid).bind(sell_oid).bind(price).bind(quantity)
-                                .execute(db2.as_ref()).await;
-                            }
-
-                            // Update maker order's filled qty and status — the engine only
-                            // sends order_update for the taker; maker updates must come from here.
-                            let maker_row: Option<(String, f64)> = sqlx::query_as(
-                                "UPDATE orders SET filled = filled + $1, \
-                                 status = CASE WHEN quantity - (filled + $1) < 1e-9 THEN 'COMPLETED' ELSE 'TRADING' END, \
-                                 updated_at = NOW() \
-                                 WHERE id = $2 \
-                                 RETURNING status, filled"
-                            )
-                            .bind(quantity).bind(maker_oid)
-                            .fetch_optional(db2.as_ref()).await.unwrap_or(None);
-
-                            // Push order_update WS event to the maker's user so the UI updates.
-                            if let (Some((ref new_status, new_filled)), Some(maker_uid)) = (&maker_row, maker_uid) {
-                                let ws_maker_status = if new_status == "COMPLETED" { "FILLED" } else { "PARTIAL_FILL" };
-                                if let Some(tx) = user_tx2.get(&maker_uid) {
-                                    let upd = serde_json::json!({
-                                        "type": "order_update",
-                                        "order_id": maker_oid,
-                                        "status": ws_maker_status,
-                                        "filled_qty": new_filled,
-                                        "avg_price": price,
-                                        "ts": ts,
-                                    }).to_string();
-                                    let _ = tx.try_send(upd);
-                                }
-                            }
-
-                            if let (Some(taker_uid), Some(maker_uid)) = (taker_uid, maker_uid) {
-                                let cost = price * quantity;
-                                let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
-                                let base = *sym_parts.first().unwrap_or(&"BTC");
-                                let quote = *sym_parts.last().unwrap_or(&"USDT");
-                                let (buyer_id, seller_id) = if side == 0 {
-                                    (taker_uid, maker_uid)
-                                } else {
-                                    (maker_uid, taker_uid)
-                                };
-
-                                // Settle buyer and seller in parallel; use RETURNING to get
-                                // the new balance without a separate SELECT.
-                                let ((bq_row, bb_row), (sb_row, sq_row)) = tokio::join!(
-                                    async {
-                                        // Buyer: debit quote, credit base
-                                        let q: Option<(f64, f64)> = sqlx::query_as(
-                                            "UPDATE accounts SET balance = balance - $1, updated_at = NOW() \
-                                             WHERE user_id = $2 AND asset = $3 \
-                                             RETURNING balance, frozen"
-                                        ).bind(cost).bind(buyer_id).bind(quote)
-                                        .fetch_optional(db2.as_ref()).await.unwrap_or(None);
-                                        let b: Option<(f64, f64)> = sqlx::query_as(
-                                            "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1, $2, $3, 0) \
-                                             ON CONFLICT (user_id, asset) DO UPDATE \
-                                             SET balance = accounts.balance + $3, updated_at = NOW() \
-                                             RETURNING balance, frozen"
-                                        ).bind(buyer_id).bind(base).bind(quantity)
-                                        .fetch_optional(db2.as_ref()).await.unwrap_or(None);
-                                        (q, b)
-                                    },
-                                    async {
-                                        // Seller: debit base (release frozen), credit quote
-                                        let b: Option<(f64, f64)> = sqlx::query_as(
-                                            "UPDATE accounts SET balance = balance - $1, \
-                                             frozen = GREATEST(frozen - $1, 0), updated_at = NOW() \
-                                             WHERE user_id = $2 AND asset = $3 \
-                                             RETURNING balance, frozen"
-                                        ).bind(quantity).bind(seller_id).bind(base)
-                                        .fetch_optional(db2.as_ref()).await.unwrap_or(None);
-                                        let q: Option<(f64, f64)> = sqlx::query_as(
-                                            "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1, $2, $3, 0) \
-                                             ON CONFLICT (user_id, asset) DO UPDATE \
-                                             SET balance = accounts.balance + $3, updated_at = NOW() \
-                                             RETURNING balance, frozen"
-                                        ).bind(seller_id).bind(quote).bind(cost)
-                                        .fetch_optional(db2.as_ref()).await.unwrap_or(None);
-                                        (b, q)
-                                    }
-                                );
-
-                                // Update cache and push balance_update WS using RETURNING data.
-                                for (uid, updates) in [
-                                    (buyer_id,  [(quote, bq_row), (base,  bb_row)]),
-                                    (seller_id, [(base,  sb_row), (quote, sq_row)]),
-                                ] {
-                                    for (asset, row) in updates {
-                                        if let Some((bal, frz)) = row {
-                                            // Keep in-memory cache authoritative.
-                                            account_cache2.entry(uid).or_insert_with(HashMap::new).insert(asset.to_string(), (bal, frz));
-                                            // Push WS balance_update if user is connected.
-                                            if let Some(tx) = user_tx2.get(&uid) {
-                                                let msg = serde_json::json!({
-                                                    "type": "balance_update",
-                                                    "asset": asset,
-                                                    "balance": bal,
-                                                    "available": bal - frz,
-                                                    "frozen": frz,
-                                                }).to_string();
-                                                let _ = tx.try_send(msg);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        let _ = db_tx.push(DbCmd::SettleTrade {
+                            taker_id, maker_id, taker_uid, maker_uid,
+                            price, qty, side, symbol: sym,
                         });
                     }
 

@@ -62,8 +62,9 @@ pub fn router(state: AppState) -> Router {
         // Orders
         .route("/api/orders", get(handle_orders).post(handle_place_order))
         .route("/api/orders/:order_id", get(handle_order).delete(handle_cancel_order))
-        // Trades & tickers
+        // Trades, positions & tickers
         .route("/api/trades", get(handle_trades))
+        .route("/api/positions", get(handle_positions))
         .route("/api/tickers", get(handle_tickers))
         // K-lines
         .route("/api/klines", get(handle_klines))
@@ -251,6 +252,18 @@ async fn handle_trades(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
+}
+
+async fn handle_positions(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let positions = crate::positions::all_positions_for_user(s.db.as_ref(), user_id).await;
+    (StatusCode::OK, Json(json!(positions))).into_response()
 }
 
 // ─── Order placement ──────────────────────────────────────────────────────────

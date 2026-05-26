@@ -425,10 +425,14 @@ async fn handle_client_message(
             };
 
             // Persist to DB as PENDING before running through engine.
+            // Use the shared AtomicU64 counter (same as REST path) to avoid
+            // depending on a PostgreSQL sequence that doesn't exist for BIGINT PKs.
+            let db_order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed) as i64;
             let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
                 "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
-                 VALUES (nextval('orders_id_seq'), $1, $2, $3, $4, $5, $6, 0, 'PENDING', $7) RETURNING *",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8) RETURNING *",
             )
+            .bind(db_order_id)
             .bind(user_id)
             .bind(&symbol)
             .bind(&side)
@@ -439,22 +443,18 @@ async fn handle_client_message(
             .fetch_one(state.db.as_ref())
             .await;
 
-            let db_order_id = match db_result {
-                Ok(o) => o.id,
-                Err(e) => {
-                    return Some(json!({
-                        "type": "order_rejected",
-                        "client_order_id": client_order_id,
-                        "reason": format!("DB error: {}", e)
-                    }).to_string());
-                }
-            };
+            if let Err(e) = db_result {
+                return Some(json!({
+                    "type": "order_rejected",
+                    "client_order_id": client_order_id,
+                    "reason": format!("DB error: {}", e)
+                }).to_string());
+            }
             let engine_order = if order_type == "market" {
                 Order::new_market(db_order_id as u64, engine_side, qty, now_ns)
             } else {
                 Order::new(db_order_id as u64, engine_side, price.unwrap_or(0.0), qty, tif, now_ns)
             };
-            state.next_order_id.fetch_max(db_order_id as u64 + 1, Ordering::Relaxed);
 
             // Freeze funds before sending to engine.
             let repo = AccountRepository::new(state.db.as_ref());

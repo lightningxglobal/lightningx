@@ -315,6 +315,25 @@ async fn main() -> anyhow::Result<()> {
 
                             let taker_oid = taker_id as i64;
                             let maker_oid = maker_id as i64;
+
+                            // Look up user IDs with retry for the taker: the trade event
+                            // arrives on Aeron BEFORE the order_update event (engine publishes
+                            // fills first), so the taker order row may not be committed yet.
+                            // This retry also acts as a barrier that satisfies the FK constraints
+                            // on trades(buy_order_id, sell_order_id) REFERENCES orders(id).
+                            let mut retries = 0u32;
+                            let (taker_uid, maker_uid) = loop {
+                                let t: Option<i64> = sqlx::query_scalar(
+                                    "SELECT user_id FROM orders WHERE id = $1"
+                                ).bind(taker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None);
+                                let m: Option<i64> = sqlx::query_scalar(
+                                    "SELECT user_id FROM orders WHERE id = $1"
+                                ).bind(maker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None);
+                                if (t.is_some() && m.is_some()) || retries >= 5 { break (t, m); }
+                                retries += 1;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                            };
+
                             let (buy_oid, sell_oid): (i64, i64) = if side == 0 {
                                 (taker_oid, maker_oid)
                             } else {
@@ -331,21 +350,6 @@ async fn main() -> anyhow::Result<()> {
                             .bind(quantity)
                             .execute(db2.as_ref())
                             .await;
-
-                            // Settle accounts. Retry a few times to handle the race where the
-                            // immediately-filled taker order INSERT hasn't committed yet.
-                            let mut retries = 0u32;
-                            let (taker_uid, maker_uid) = loop {
-                                let t: Option<i64> = sqlx::query_scalar(
-                                    "SELECT user_id FROM orders WHERE id = $1"
-                                ).bind(taker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None);
-                                let m: Option<i64> = sqlx::query_scalar(
-                                    "SELECT user_id FROM orders WHERE id = $1"
-                                ).bind(maker_oid).fetch_optional(db2.as_ref()).await.unwrap_or(None);
-                                if (t.is_some() && m.is_some()) || retries >= 5 { break (t, m); }
-                                retries += 1;
-                                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                            };
 
                             if let (Some(taker_uid), Some(maker_uid)) = (taker_uid, maker_uid) {
                                 let cost = price * quantity;

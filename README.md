@@ -14,7 +14,7 @@ Live demo: **https://www.lightningx.global**
 
 ![LightningX end-to-end latency on M4 Mac](lightningx-latency-m4.jpg)
 
-*Full system round-trip (client → nginx → desk-server → Aeron → matching engine → Aeron → desk-server → client) measured on an M4 MacBook Pro. p50 ≈ 88 μs, p99 ≈ 215 μs.*
+*Full system round-trip (client → nginx → desk-server → Aeron → matching engine → Aeron → desk-server → client) measured on an M4 MacBook Pro. p50 ≈ 42 μs, p99 ≈ 95 μs.*
 
 ---
 
@@ -35,7 +35,7 @@ nginx  (TLS termination, reverse proxy)
                         │
                         ├─ order_update  ──►  desk-server  ──►  WebSocket push
                         ├─ depth / trades ──►  desk-server  ──►  WebSocket broadcast
-                        └─ metrics  ──►  beacon sidecar  ──►  VictoriaMetrics
+                        └─ metrics  ──►  beacon  ──►  VictoriaMetrics
                                                                      │
                         PostgreSQL  ◄──  desk-server (persistence)  Grafana
 ```
@@ -61,7 +61,7 @@ nginx  (TLS termination, reverse proxy)
 | `market-maker` | Mirrors Binance top-20 depth into LightningX via diff-based order management |
 | `kline` | Aggregates trades from Aeron into OHLCV candles and persists to PostgreSQL |
 | `trade-bot` | Demo user that places random orders to keep the book active |
-| `beacon` | Latency sidecar: reads HDR histogram traces from engine, pushes `latency_us` to VictoriaMetrics |
+| `beacon` | Reads HDR histogram latency traces from the engine, pushes `latency_us` metrics to VictoriaMetrics |
 
 ---
 
@@ -153,7 +153,7 @@ Benchmarked on Apple M4 MacBook Pro (single core):
 | Market orders (IOC) | ~5.1M orders/sec |
 | Deep order book (400 levels) | ~21M orders/sec |
 
-End-to-end latency (M4 localhost, p50/p99): **88 μs / 215 μs**
+End-to-end latency (M4 localhost, p50/p99): **42 μs / 95 μs**
 
 ---
 

@@ -98,6 +98,65 @@ enum DbCmd {
     },
 }
 
+#[derive(Clone, Copy)]
+struct OrderRuntimeMeta {
+    user_id: i64,
+}
+
+fn remember_runtime_order(cache: &mut HashMap<u64, OrderRuntimeMeta>, order_id: u64, user_id: i64) {
+    cache.insert(order_id, OrderRuntimeMeta { user_id });
+}
+
+fn remap_runtime_order_id(cache: &mut HashMap<u64, OrderRuntimeMeta>, from: u64, to: u64) {
+    if from != to {
+        if let Some(meta) = cache.remove(&from) {
+            cache.insert(to, meta);
+        }
+    }
+}
+
+fn runtime_user_id(cache: &HashMap<u64, OrderRuntimeMeta>, order_id: u64) -> i64 {
+    cache.get(&order_id).map(|m| m.user_id).unwrap_or(0)
+}
+
+fn remove_runtime_order(cache: &mut HashMap<u64, OrderRuntimeMeta>, order_id: u64, client_id: u64) {
+    cache.remove(&order_id);
+    if order_id != client_id {
+        cache.remove(&client_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_meta_survives_until_terminal_remove() {
+        let mut cache = HashMap::new();
+        remember_runtime_order(&mut cache, 10, 7);
+
+        assert_eq!(runtime_user_id(&cache, 10), 7);
+        assert_eq!(runtime_user_id(&cache, 11), 0);
+
+        remove_runtime_order(&mut cache, 10, 10);
+        assert_eq!(runtime_user_id(&cache, 10), 0);
+    }
+
+    #[test]
+    fn runtime_meta_remaps_client_id_to_engine_order_id() {
+        let mut cache = HashMap::new();
+        remember_runtime_order(&mut cache, 10, 7);
+
+        remap_runtime_order_id(&mut cache, 10, 99);
+
+        assert_eq!(runtime_user_id(&cache, 10), 0);
+        assert_eq!(runtime_user_id(&cache, 99), 7);
+
+        remove_runtime_order(&mut cache, 99, 10);
+        assert_eq!(runtime_user_id(&cache, 99), 0);
+    }
+}
+
 fn push_db_cmd(db_tx: &mut rtrb::Producer<DbCmd>, mut cmd: DbCmd, context: &'static str) {
     let mut attempts: u64 = 0;
     loop {
@@ -636,6 +695,22 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Account cache loaded ({} rows)", account_cache.len());
     }
 
+    let mut open_order_meta: HashMap<u64, OrderRuntimeMeta> = HashMap::new();
+    {
+        let rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT id, user_id FROM orders WHERE status IN ('PENDING','TRADING')")
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+        for (id, user_id) in rows {
+            open_order_meta.insert(id as u64, OrderRuntimeMeta { user_id });
+        }
+        tracing::info!(
+            "Order runtime cache preloaded ({} open orders)",
+            open_order_meta.len()
+        );
+    }
+
     // ── Aeron setup ───────────────────────────────────────────────────────────
     let client = Arc::new(
         AeronClient::new(&aeron_dir())
@@ -748,10 +823,7 @@ async fn main() -> anyhow::Result<()> {
         let last_depth = state.last_depth.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
-        // order_id → user_id: populated synchronously in the spin thread when
-        // each order is accepted so the trade handler never needs a DB lookup
-        // for user_id (eliminates the 20ms retry-sleep entirely).
-        let order_uid_cache: Arc<DashMap<u64, i64>> = Arc::new(DashMap::new());
+        let mut order_meta_cache = open_order_meta;
         // DESK_SPIN=false → exponential backoff (EC2/CPU-constrained hosts).
         // Default: spin_loop() for lowest latency on dedicated cores.
         let use_spin = std::env::var("DESK_SPIN")
@@ -776,6 +848,11 @@ async fn main() -> anyhow::Result<()> {
                             AeronCmd::NewOrder(req) => {
                                 let sym = std::str::from_utf8(&req.symbol)
                                     .unwrap_or("").trim_end_matches('\0');
+                                remember_runtime_order(
+                                    &mut order_meta_cache,
+                                    req.client_order_id,
+                                    req.participant_id as i64,
+                                );
                                 if let Some(pub_) = order_pubs.get_mut(sym) {
                                     let _ = pub_.publish_new_order(&req);
                                 } else {
@@ -784,6 +861,7 @@ async fn main() -> anyhow::Result<()> {
                                     let coid: u64 = req.client_order_id;
                                     let uid: u64  = req.participant_id;
                                     let ws_meta = pending_meta.remove(&coid).map(|(_, m)| m);
+                                    remove_runtime_order(&mut order_meta_cache, coid, coid);
                                     let client_oid = ws_meta.as_ref().map(|m| m.client_order_id.as_str()).unwrap_or("");
                                     if let Some(tx) = user_tx.get(&(uid as i64)) {
                                         let msg = serde_json::json!({
@@ -821,6 +899,29 @@ async fn main() -> anyhow::Result<()> {
                     trade_sub.do_work();
                     depth_sub.do_work();
 
+                    // Process trade notifications before terminal order updates remove
+                    // runtime metadata. Engine publishes trades before the corresponding
+                    // update, and this keeps settlement off the DB lookup path.
+                    while let Some(trade) = trade_sub.poll() {
+                        did_work = true;
+                        let price: f64 = trade.price;
+                        let qty: f64 = trade.quantity;
+                        let side: u8 = trade.side;
+                        let taker_id = trade.taker_order_id as i64;
+                        let maker_id = trade.maker_order_id as i64;
+
+                        let taker_uid = runtime_user_id(&order_meta_cache, taker_id as u64);
+                        let maker_uid = runtime_user_id(&order_meta_cache, maker_id as u64);
+
+                        let mut sym = [0u8; 16];
+                        sym.copy_from_slice(&trade.symbol[..16]);
+
+                        push_db_cmd(&mut db_tx, DbCmd::SettleTrade {
+                            taker_id, maker_id, taker_uid, maker_uid,
+                            price, qty, side, symbol: sym,
+                        }, "settle trade");
+                    }
+
                     // Process order updates — complete pending REST/WS requests.
                     while let Some(msg) = order_update_sub.poll() {
                         did_work = true;
@@ -849,16 +950,21 @@ async fn main() -> anyhow::Result<()> {
                         if let Some((_, tx)) = pending_orders.remove(&lookup_id) {
                             let _ = tx.send(msg);
                         }
+                        if kind == order_update_kind::ACCEPTED {
+                            remap_runtime_order_id(
+                                &mut order_meta_cache,
+                                client_order_id,
+                                order_id,
+                            );
+                        }
                         if let Some(meta_ref) = pending_meta.get(&lookup_id) {
                             if kind != order_update_kind::REJECTED {
-                                order_uid_cache.insert(order_id, meta_ref.user_id);
+                                remember_runtime_order(
+                                    &mut order_meta_cache,
+                                    order_id,
+                                    meta_ref.user_id,
+                                );
                             }
-                        }
-                        if kind == order_update_kind::FILLED
-                            || kind == order_update_kind::CANCELLED
-                            || kind == order_update_kind::REJECTED
-                        {
-                            order_uid_cache.remove(&order_id);
                         }
                         let ws_meta = pending_meta.remove(&lookup_id).map(|(_, m)| m);
                         // client_order_id is only available on the first event (ACCEPTED).
@@ -978,28 +1084,13 @@ async fn main() -> anyhow::Result<()> {
                                 tracing::warn!("personal channel full for user {user_id}, dropping order_update {order_id}");
                             }
                         }
-                    }
 
-                    // Process trade notifications — push a fixed-size DbCmd to the
-                    // DB worker ring buffer (~10ns, no heap alloc, no Arc clone here).
-                    while let Some(trade) = trade_sub.poll() {
-                        did_work = true;
-                        let price: f64   = trade.price;
-                        let qty: f64     = trade.quantity;
-                        let side: u8     = trade.side;
-                        let taker_id     = trade.taker_order_id as i64;
-                        let maker_id     = trade.maker_order_id as i64;
-
-                        let taker_uid = order_uid_cache.get(&(taker_id as u64)).map(|v| *v).unwrap_or(0);
-                        let maker_uid = order_uid_cache.get(&(maker_id as u64)).map(|v| *v).unwrap_or(0);
-
-                        let mut sym = [0u8; 16];
-                        sym.copy_from_slice(&trade.symbol[..16]);
-
-                        push_db_cmd(&mut db_tx, DbCmd::SettleTrade {
-                            taker_id, maker_id, taker_uid, maker_uid,
-                            price, qty, side, symbol: sym,
-                        }, "settle trade");
+                        if kind == order_update_kind::FILLED
+                            || kind == order_update_kind::CANCELLED
+                            || kind == order_update_kind::REJECTED
+                        {
+                            remove_runtime_order(&mut order_meta_cache, order_id, client_order_id);
+                        }
                     }
 
                     // Process depth snapshots — spin thread copies raw arrays (~320B memcpy),

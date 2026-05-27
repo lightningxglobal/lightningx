@@ -31,7 +31,7 @@ Acceptance:
 
 ## Phase 2: UID Cache Lifetime
 
-Status: Pending
+Status: Completed in `src/bin/desk_server.rs` and `src/bin/exchange_engine.rs`.
 
 Goal: multi-fill settlement must not depend on DB lookup races.
 
@@ -43,8 +43,9 @@ Design:
 - Preload open orders into the cache during desk startup.
 
 Acceptance:
-- One taker consuming multiple makers settles all fills without retry sleeps.
+- One taker consuming multiple makers settles all fills without relying on DB lookup on the hot event path.
 - Maker metadata survives partial fills until terminal state.
+- Desk startup preloads open order metadata into the runtime cache.
 
 ## Phase 3: Central Order State Machine
 

@@ -231,9 +231,8 @@ fn spawn_symbol_thread(
                                             ts,
                                         ),
                                     };
-                                    let _ = ou_pub.publish(&update);
-                                    // Publish trade notifications AFTER order update so the
-                                    // desk server's uid cache is populated before trade arrives.
+                                    // Publish trades before the terminal order update so desk can
+                                    // settle while runtime order metadata is still live.
                                     for &(maker_order_id, fill_price, fill_qty) in &result.fills {
                                         trade_seq += 1;
                                         let trade = TradeNotification {
@@ -248,6 +247,7 @@ fn spawn_symbol_thread(
                                         };
                                         let _ = trade_pub.publish(&trade);
                                     }
+                                    let _ = ou_pub.publish(&update);
                                     if let Some(ref t) = tracer {
                                         t.record_sym(
                                             MS_AERON_UPDATE_SEND,

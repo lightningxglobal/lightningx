@@ -91,8 +91,8 @@ fn main() {
     println!("║        bench_baseline — ~5% fill rate, new performance baseline  ║");
     println!("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    // Warm-up
-    let _ = bench_single(PoolConfig::default(), 5_000, 100);
+    // Warm-up: 50K orders (same scale as measured runs) to bring CPU to full turbo
+    let _ = bench_single(PoolConfig::default(), 50_000, 500);
 
     println!("【Single order — 2M pool, ~5% fill】");
     let (tps, ns, ev) = bench_single(PoolConfig::default(), 50_000, 500);

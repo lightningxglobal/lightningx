@@ -113,6 +113,7 @@ pub struct AeronOrderSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>,
     rx: Consumer<InboundMsg>,
     dropped: Arc<AtomicU64>,
+    last_reported_dropped: u64,
     client: Arc<AeronClient>,
 }
 
@@ -146,6 +147,7 @@ impl AeronOrderSubscriber {
             subscriber: Arc::new(Mutex::new(subscriber)),
             rx,
             dropped,
+            last_reported_dropped: 0,
             client,
         })
     }
@@ -167,6 +169,15 @@ impl OrderSubscriber for AeronOrderSubscriber {
             let mut sub = self.subscriber.lock();
             let _ = sub.poll();
         } // 立即释放lock
+
+        let current_dropped = self.dropped.load(Ordering::Relaxed);
+        if current_dropped != self.last_reported_dropped {
+            tracing::warn!(
+                "Aeron order inbound ring full: {} messages dropped (total)",
+                current_dropped
+            );
+            self.last_reported_dropped = current_dropped;
+        }
 
         self.rx.pop().ok()
     }
@@ -418,6 +429,7 @@ pub struct DeskOrderUpdateSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderUpdateCallback>>>>,
     rx: Consumer<crate::transport::OrderUpdateMsg>,
     dropped: Arc<AtomicU64>,
+    last_reported_dropped: u64,
     client: Arc<AeronClient>,
 }
 
@@ -448,6 +460,7 @@ impl DeskOrderUpdateSubscriber {
             subscriber: Arc::new(Mutex::new(subscriber)),
             rx,
             dropped,
+            last_reported_dropped: 0,
             client,
         })
     }
@@ -460,6 +473,14 @@ impl DeskOrderUpdateSubscriber {
         {
             let mut sub = self.subscriber.lock();
             let _ = sub.poll();
+        }
+        let current_dropped = self.dropped.load(Ordering::Relaxed);
+        if current_dropped != self.last_reported_dropped {
+            tracing::warn!(
+                "Aeron order-update ring full: {} messages dropped (total)",
+                current_dropped
+            );
+            self.last_reported_dropped = current_dropped;
         }
         self.rx.pop().ok()
     }
@@ -501,6 +522,7 @@ pub struct DeskTradeSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<TradeNotificationCallback>>>>,
     rx: Consumer<TradeNotification>,
     dropped: Arc<AtomicU64>,
+    last_reported_dropped: u64,
     client: Arc<AeronClient>,
 }
 
@@ -528,6 +550,7 @@ impl DeskTradeSubscriber {
             subscriber: Arc::new(Mutex::new(subscriber)),
             rx,
             dropped,
+            last_reported_dropped: 0,
             client,
         })
     }
@@ -540,6 +563,14 @@ impl DeskTradeSubscriber {
         {
             let mut sub = self.subscriber.lock();
             let _ = sub.poll();
+        }
+        let current_dropped = self.dropped.load(Ordering::Relaxed);
+        if current_dropped != self.last_reported_dropped {
+            tracing::warn!(
+                "Aeron trade ring full: {} messages dropped (total)",
+                current_dropped
+            );
+            self.last_reported_dropped = current_dropped;
         }
         self.rx.pop().ok()
     }

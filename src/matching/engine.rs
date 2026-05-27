@@ -613,6 +613,10 @@ impl MatchingEngine {
 
         // 使用本地变量而非大结构体字段(缓存友好)
         let mut trade_indices: SmallVec<[usize; 64]> = SmallVec::new();
+        // Only build TradeEvents when a consumer is wired up. The engine works in
+        // integer tick/lot space and has no SymbolRules reference, so price/quantity
+        // here would be raw integers (e.g. 7_589_360) not actual values (75893.60).
+        let has_trade_sender = self.trade_event_sender.is_some();
         let mut trade_events: SmallVec<[TradeEvent; 128]> = SmallVec::new();
 
         // 外层循环：获取最优对手价
@@ -816,20 +820,20 @@ impl MatchingEngine {
                     timestamp: order.timestamp,
                 });
 
-                // 收集交易事件到batch（后续一次性发送到ring buffer）
-                let trade_event = TradeEvent::new(
-                    self.trade_sequence,
-                    order.id,
-                    counter_order_id,
-                    order.timestamp,
-                    best_price as f64,
-                    trade_lots as f64,
-                    order.side,
-                    order.id,
-                    counter_order_id,
-                );
                 self.trade_sequence += 1;
-                trade_events.push(trade_event);
+                if has_trade_sender {
+                    trade_events.push(TradeEvent::new(
+                        self.trade_sequence,
+                        order.id,
+                        counter_order_id,
+                        order.timestamp,
+                        best_price as f64, // raw ticks — caller must convert via SymbolRules
+                        trade_lots as f64, // raw lots — caller must convert via SymbolRules
+                        order.side,
+                        order.id,
+                        counter_order_id,
+                    ));
+                }
 
                 // 检查对手订单是否完全成交
                 if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
@@ -886,6 +890,7 @@ impl MatchingEngine {
         orders: SmallVec<[Order; 20]>,
     ) -> OrderResult<SmallVec<[(QuantityLots, Vec<Trade>); 20]>> {
         let mut results: SmallVec<[(QuantityLots, Vec<Trade>); 20]> = SmallVec::new();
+        let has_trade_sender = self.trade_event_sender.is_some();
         let mut all_trade_events: SmallVec<[TradeEvent; 256]> = SmallVec::new();
 
         // 处理每个订单，收集所有TradeEvent到共享的batch中
@@ -1064,20 +1069,20 @@ impl MatchingEngine {
 
                     trade_indices.push(trade_idx);
 
-                    // 收集TradeEvent到共享batch中（不立即发送）
-                    let trade_event = TradeEvent::new(
-                        self.trade_sequence,
-                        order.id,
-                        counter_order_id,
-                        order.timestamp,
-                        best_price as f64,
-                        trade_lots as f64,
-                        order.side,
-                        order.id,
-                        counter_order_id,
-                    );
                     self.trade_sequence += 1;
-                    all_trade_events.push(trade_event);
+                    if has_trade_sender {
+                        all_trade_events.push(TradeEvent::new(
+                            self.trade_sequence,
+                            order.id,
+                            counter_order_id,
+                            order.timestamp,
+                            best_price as f64, // raw ticks — caller must convert via SymbolRules
+                            trade_lots as f64, // raw lots — caller must convert via SymbolRules
+                            order.side,
+                            order.id,
+                            counter_order_id,
+                        ));
+                    }
 
                     if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
                         if let Some(counter) = self.pools.orders.get(counter_pool_idx) {
@@ -1119,29 +1124,8 @@ impl MatchingEngine {
                 let mut remaining_order = order;
                 remaining_order.filled_lots = filled;
 
-                // 优化：先检查价位是否已存在，避免redundant insert_level
-                let book = match remaining_order.side {
-                    Side::Buy => &mut self.buy_book,
-                    Side::Sell => &mut self.sell_book,
-                };
-
-                if book
-                    .get_node_at_price(remaining_order.price_ticks)
-                    .is_none()
-                {
-                    // 价位不存在，需要插入
-                    let _ = book.insert_level(remaining_order.price_ticks);
-                }
-
-                // 添加订单到价位
-                book.add_order_at_level(
-                    remaining_order.price_ticks,
-                    remaining_order.id,
-                    remaining_order.quantity_lots - remaining_order.filled_lots,
-                )
-                .map_err(|_| MatchingEngineError::NodePoolExhausted)?;
-
-                // 储存池索引
+                // Acquire pool slot FIRST (matches add_to_book order) so that pool
+                // exhaustion never leaves an orphan entry in the price-level list.
                 let pool_idx = self
                     .pools
                     .orders
@@ -1151,6 +1135,31 @@ impl MatchingEngine {
                 if let Some(o) = self.pools.orders.get_mut(pool_idx) {
                     *o = remaining_order;
                 }
+
+                let book = match remaining_order.side {
+                    Side::Buy => &mut self.buy_book,
+                    Side::Sell => &mut self.sell_book,
+                };
+
+                if book
+                    .get_node_at_price(remaining_order.price_ticks)
+                    .is_none()
+                {
+                    let _ = book.insert_level(remaining_order.price_ticks);
+                }
+
+                if book
+                    .add_order_at_level(
+                        remaining_order.price_ticks,
+                        remaining_order.id,
+                        remaining_order.quantity_lots - remaining_order.filled_lots,
+                    )
+                    .is_err()
+                {
+                    self.pools.orders.release(pool_idx);
+                    return Err(MatchingEngineError::NodePoolExhausted);
+                }
+
                 self.orders.insert(remaining_order.id, pool_idx);
             }
 

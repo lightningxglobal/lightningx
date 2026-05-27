@@ -20,6 +20,8 @@ use std::sync::mpsc::{channel, Sender, Receiver};
 pub enum AeronCmd {
     NewOrder(NewOrderRequest),
     Cancel(CancelOrderRequest),
+    /// Batch-cancel: all requests published in one tight loop inside the spin thread.
+    BatchCancel(smallvec::SmallVec<[CancelOrderRequest; 64]>),
 }
 
 /// Order metadata stored by the WS handler so the Aeron event loop can

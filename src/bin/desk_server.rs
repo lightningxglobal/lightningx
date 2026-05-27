@@ -805,6 +805,15 @@ async fn main() -> anyhow::Result<()> {
                                     let _ = pub_.publish_cancel(&req);
                                 }
                             }
+                            AeronCmd::BatchCancel(reqs) => {
+                                // Publish all cancels in one tight inner loop per publisher,
+                                // avoiding per-cancel channel overhead.
+                                for req in &reqs {
+                                    for pub_ in order_pubs.values_mut() {
+                                        let _ = pub_.publish_cancel(req);
+                                    }
+                                }
+                            }
                         }
                     }
 

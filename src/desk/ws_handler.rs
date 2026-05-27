@@ -56,6 +56,9 @@ enum ClientMsg {
     CancelOrder {
         order_id: i64,
     },
+    BatchCancel {
+        order_ids: Vec<i64>,
+    },
     CancelSymbol {
         symbol: String,
     },
@@ -110,6 +113,13 @@ impl ClientMsg {
             "cancel_order" => Some(ClientMsg::CancelOrder {
                 order_id: v.get("order_id")?.as_i64()?,
             }),
+            "batch_cancel" => {
+                let ids = v.get("order_ids")?.as_array()?
+                    .iter()
+                    .filter_map(|x| x.as_i64())
+                    .collect();
+                Some(ClientMsg::BatchCancel { order_ids: ids })
+            }
             "cancel_symbol" => Some(ClientMsg::CancelSymbol {
                 symbol: v.get("symbol")?.as_str()?.to_owned(),
             }),
@@ -1269,7 +1279,118 @@ async fn handle_client_message(
 
             Some(json!({"type": "order_update", "order_id": order_id, "status": "CANCELED", "ts": unix_now()}).to_string())
         }
+
+        ClientMsg::BatchCancel { order_ids } => {
+            let user_id = match session.user_id {
+                Some(id) => id,
+                None => return Some(json!({"type":"error","message":"Not authenticated"}).to_string()),
+            };
+            if order_ids.is_empty() {
+                return Some(json!({"type":"batch_cancel_ok","cancelled":0}).to_string());
+            }
+            let n = batch_cancel_by_ids(user_id, &order_ids, state, &personal_tx).await;
+            Some(json!({"type":"batch_cancel_ok","cancelled":n}).to_string())
+        }
     }
+}
+
+/// Cancel a specific list of orders by ID for `user_id`.
+/// Sends all cancel requests to Aeron in one BatchCancel command, then updates DB
+/// and releases frozen funds per order.
+/// Returns the number of orders cancelled.
+async fn batch_cancel_by_ids(
+    user_id: i64,
+    order_ids: &[i64],
+    state: &AppState,
+    personal_tx: &tokio::sync::mpsc::Sender<String>,
+) -> usize {
+    #[derive(sqlx::FromRow)]
+    struct OpenOrder {
+        id: i64,
+        symbol: String,
+        side: String,
+        freeze_price: f64,
+        quantity: f64,
+        filled: f64,
+    }
+
+    let rows: Vec<OpenOrder> = sqlx::query_as(
+        "SELECT id, symbol, side,
+                COALESCE(freeze_price, COALESCE(price, 0.0)) as freeze_price,
+                quantity, filled FROM orders
+         WHERE id = ANY($1) AND user_id = $2 AND status IN ('PENDING','TRADING')",
+    )
+    .bind(order_ids)
+    .bind(user_id)
+    .fetch_all(state.db.as_ref())
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        return 0;
+    }
+
+    // Send all cancel requests to Aeron in one BatchCancel — single channel send.
+    if let Some(engines) = &state.engines {
+        for order in &rows {
+            if let Some(engine) = engines.get(&order.symbol) {
+                let _ = {
+                    let mut eng = engine.lock().unwrap();
+                    eng.cancel_order(order.id as u64)
+                };
+            }
+        }
+    } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+        let mut reqs = smallvec::SmallVec::<[crate::sbe::CancelOrderRequest; 64]>::new();
+        for order in &rows {
+            reqs.push(crate::sbe::CancelOrderRequest { order_id: order.id as u64 });
+        }
+        let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::BatchCancel(reqs));
+    }
+
+    // Batch UPDATE all matching orders in one query.
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let _ = sqlx::query(
+        "UPDATE orders SET status='CANCELED', updated_at=NOW()
+         WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
+    )
+    .bind(&ids[..])
+    .execute(state.db.as_ref())
+    .await;
+
+    let repo = crate::account_repository::AccountRepository::new(state.db.as_ref());
+    let ts = unix_now();
+    let count = rows.len();
+
+    for order in rows {
+        let remaining = (order.quantity - order.filled).max(0.0);
+        let sym_parts: Vec<&str> = order.symbol.splitn(2, '_').collect();
+        let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+        let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+
+        if order.side == "buy" {
+            if order.freeze_price > 0.0 && remaining > 0.0 {
+                let _ = repo
+                    .release_frozen(user_id, quote_asset, order.freeze_price * remaining)
+                    .await;
+            }
+        } else if remaining > 0.0 {
+            let _ = repo.release_frozen(user_id, base_asset, remaining).await;
+        }
+
+        let _ = personal_tx.try_send(
+            json!({
+                "type": "order_update",
+                "order_id": order.id,
+                "status": "CANCELED",
+                "filled_qty": order.filled,
+                "ts": ts,
+            })
+            .to_string(),
+        );
+    }
+
+    count
 }
 
 /// Cancel all open orders for `user_id`, optionally filtered to a single symbol.
@@ -1317,39 +1438,43 @@ async fn bulk_cancel(
         return 0;
     }
 
-    let repo = crate::account_repository::AccountRepository::new(state.db.as_ref());
-    let ts = unix_now();
-    let mut count = 0usize;
-
-    for order in rows {
-        let remaining = (order.quantity - order.filled).max(0.0);
-
-        // Cancel in matching engine (best-effort, fire-and-forget).
-        if let Some(engines) = &state.engines {
+    // Send all Aeron cancels in one BatchCancel — single channel send.
+    if let Some(engines) = &state.engines {
+        for order in &rows {
             if let Some(engine) = engines.get(&order.symbol) {
                 let _ = {
                     let mut eng = engine.lock().unwrap();
                     eng.cancel_order(order.id as u64)
                 };
             }
-        } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
-            let req = crate::sbe::CancelOrderRequest {
-                order_id: order.id as u64,
-            };
-            let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(req));
-            // Fall through to update DB and release frozen immediately.
-            // If the engine also sends CancelConfirm, the desk_server handler
-            // will find the order already CANCELED and skip the second release.
         }
+    } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+        let mut reqs = smallvec::SmallVec::<[crate::sbe::CancelOrderRequest; 64]>::new();
+        for order in &rows {
+            reqs.push(crate::sbe::CancelOrderRequest { order_id: order.id as u64 });
+        }
+        // Single channel send covers all cancels. DB update + frozen release
+        // happen below; if engine also sends CancelConfirm, the handler will
+        // find the order already CANCELED and skip the second release.
+        let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::BatchCancel(reqs));
+    }
 
-        // Update DB — idempotent (WHERE guards against double-cancel).
-        let _ = sqlx::query(
-            "UPDATE orders SET status='CANCELED', updated_at=NOW()
-             WHERE id=$1 AND status IN ('PENDING','TRADING')",
-        )
-        .bind(order.id)
-        .execute(state.db.as_ref())
-        .await;
+    // Batch UPDATE all matching orders in one query.
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let _ = sqlx::query(
+        "UPDATE orders SET status='CANCELED', updated_at=NOW()
+         WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
+    )
+    .bind(&ids[..])
+    .execute(state.db.as_ref())
+    .await;
+
+    let repo = crate::account_repository::AccountRepository::new(state.db.as_ref());
+    let ts = unix_now();
+    let count = rows.len();
+
+    for order in rows {
+        let remaining = (order.quantity - order.filled).max(0.0);
 
         // Release frozen funds for the unfilled portion.
         let sym_parts: Vec<&str> = order.symbol.splitn(2, '_').collect();
@@ -1377,8 +1502,6 @@ async fn bulk_cancel(
             })
             .to_string(),
         );
-
-        count += 1;
     }
 
     count

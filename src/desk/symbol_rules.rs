@@ -39,7 +39,9 @@ fn aligned(value: f64, step: f64) -> bool {
         return true;
     }
     let units = value / step;
-    (units - units.round()).abs() < FLOAT_EPS * 10.0
+    // Use a relative tolerance so division by small steps (e.g. 1e-6) doesn't
+    // accumulate floating-point error past the fixed threshold.
+    (units - units.round()).abs() < units.abs().max(1.0) * 1e-9
 }
 
 pub fn validate_order_shape(

@@ -90,9 +90,15 @@ pub fn router(state: AppState) -> Router {
 
 async fn handle_register(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    match user_service::register(&s.db, req).await {
+    let ip = headers
+        .get("x-real-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+    match user_service::register(&s.db, req, ip).await {
         Ok(resp) => (StatusCode::CREATED, Json(json!(resp))),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
     }

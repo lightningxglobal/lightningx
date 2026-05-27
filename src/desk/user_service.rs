@@ -32,18 +32,19 @@ pub struct AuthResponse {
     pub user: User,
 }
 
-pub async fn register(pool: &PgPool, req: RegisterRequest) -> Result<AuthResponse> {
+pub async fn register(pool: &PgPool, req: RegisterRequest, ip: Option<String>) -> Result<AuthResponse> {
     let hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)
         .map_err(|e| anyhow!("Hash error: {}", e))?;
 
     let user = sqlx::query_as::<_, User>(
-        "INSERT INTO users (email, password_hash, full_name)
-         VALUES ($1, $2, $3)
+        "INSERT INTO users (email, password_hash, full_name, registration_ip)
+         VALUES ($1, $2, $3, $4)
          RETURNING *",
     )
     .bind(&req.email)
     .bind(&hash)
     .bind(&req.full_name)
+    .bind(&ip)
     .fetch_one(pool)
     .await
     .map_err(|e| anyhow!("Register failed: {}", e))?;

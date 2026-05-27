@@ -9,6 +9,7 @@ pub struct User {
     pub password_hash: String,
     pub full_name: Option<String>,
     pub kyc_status: String,
+    pub registration_ip: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

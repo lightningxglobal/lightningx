@@ -725,10 +725,15 @@ async fn refresh_book(
             .await
         {
             warn!(
-                "[{}] cancel confirmation timeout for {} orders; skip new placements this cycle",
+                "[{}] cancel confirmation timeout for {} orders; removing from local book to avoid permanent stall",
                 cfg.our_symbol,
                 all_cancels.len()
             );
+            // Remove the timed-out order IDs from the local book even without confirmation.
+            // If the engine is restarting, orders are already gone; if it's just slow the
+            // cancel will still execute and any CANCELED echo is harmless in dead_orders.
+            bid_book.retain(|_, (id, _)| !bid_cancels.contains(id));
+            ask_book.retain(|_, (id, _)| !ask_cancels.contains(id));
             return;
         }
     }

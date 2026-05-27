@@ -638,6 +638,7 @@ pub struct DeskDepthSubscriber {
     level2_rx: Consumer<DeskDepthMsg>,
     dropped: Arc<AtomicU64>,
     client: Arc<AeronClient>,
+    poll_counter: u64,
 }
 
 impl DeskDepthSubscriber {
@@ -707,6 +708,7 @@ impl DeskDepthSubscriber {
             level2_rx,
             dropped,
             client,
+            poll_counter: 0,
         })
     }
 
@@ -727,11 +729,21 @@ impl DeskDepthSubscriber {
             let mut s = self.level2_sub.lock();
             let _ = s.poll();
         }
-        self.depth_rx
-            .pop()
-            .or_else(|_| self.depth50_rx.pop())
-            .or_else(|_| self.level2_rx.pop())
-            .ok()
+        // Round-robin across the three rings so depth20 bursts cannot starve depth50/level2.
+        let r = self.poll_counter % 3;
+        self.poll_counter = self.poll_counter.wrapping_add(1);
+        match r {
+            0 => self.depth_rx.pop()
+                    .or_else(|_| self.depth50_rx.pop())
+                    .or_else(|_| self.level2_rx.pop()),
+            1 => self.depth50_rx.pop()
+                    .or_else(|_| self.level2_rx.pop())
+                    .or_else(|_| self.depth_rx.pop()),
+            _ => self.level2_rx.pop()
+                    .or_else(|_| self.depth_rx.pop())
+                    .or_else(|_| self.depth50_rx.pop()),
+        }
+        .ok()
     }
 
     pub fn dropped_messages(&self) -> u64 {

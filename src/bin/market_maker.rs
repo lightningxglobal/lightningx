@@ -294,6 +294,12 @@ impl WsExchangeClient {
         let _ = self.ws_tx.send(msg).await;
     }
 
+    async fn batch_cancel_orders(&self, order_ids: &[i64]) {
+        if order_ids.is_empty() { return; }
+        let msg = json!({"type": "batch_cancel", "order_ids": order_ids}).to_string();
+        let _ = self.ws_tx.send(msg).await;
+    }
+
     async fn cancel_symbol(&self, symbol: &str) {
         let msg = json!({"type": "cancel_symbol", "symbol": symbol}).to_string();
         let _ = self.ws_tx.send(msg).await;
@@ -551,18 +557,15 @@ async fn refresh_book(
         return;
     }
 
-    // Fire cancels (fire-and-forget) + places (await order_id) all simultaneously.
-    let mut cancel_futs = Vec::with_capacity(bid_cancels.len() + ask_cancels.len());
-    for &id in &bid_cancels { cancel_futs.push(client.cancel_order(id)); }
-    for &id in &ask_cancels { cancel_futs.push(client.cancel_order(id)); }
-
+    // Batch-cancel in one WS message + place all new orders concurrently.
+    let all_cancels: Vec<i64> = bid_cancels.iter().chain(ask_cancels.iter()).copied().collect();
     let bid_place_futs: Vec<_> = bid_adds.iter()
         .map(|(p, q)| client.place_order(cfg.our_symbol, "buy",  *p, *q)).collect();
     let ask_place_futs: Vec<_> = ask_adds.iter()
         .map(|(p, q)| client.place_order(cfg.our_symbol, "sell", *p, *q)).collect();
 
     let (_, bid_results, ask_results) = tokio::join!(
-        future::join_all(cancel_futs),
+        client.batch_cancel_orders(&all_cancels),
         future::join_all(bid_place_futs),
         future::join_all(ask_place_futs),
     );

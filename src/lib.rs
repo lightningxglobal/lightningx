@@ -70,7 +70,9 @@ pub use order_state::{
 pub use rate_limit::{RateLimitPolicy, RateLimiter};
 pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use snowflake::SnowflakeIdGenerator;
-pub use symbol_rules::{normalize_order_shape, validate_order_shape, FixedOrderShape, SymbolRules};
+pub use symbol_rules::{
+    normalize_order_shape, validate_order_shape, FixedOrderInput, FixedOrderShape, SymbolRules,
+};
 pub use trade::Trade;
 
 #[cfg(test)]

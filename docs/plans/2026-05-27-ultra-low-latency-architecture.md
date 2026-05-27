@@ -65,7 +65,7 @@ Acceptance:
 
 ## Phase 4: Fixed-Point Matching
 
-Status: In progress. Phase 4a adds fixed-point boundary normalization.
+Status: In progress. Phase 4a adds fixed-point boundary normalization; Phase 4b adds a fixed-order bridge for standalone engine entry.
 
 Goal: remove `f64` from engine price/quantity arithmetic.
 
@@ -77,8 +77,9 @@ Design:
 
 Acceptance:
 - API and WS order entry normalize price/quantity to integer ticks/lots before accepting an order.
+- Standalone engine entry can construct the legacy `Order` through fixed ticks/lots without changing `Order` layout.
 - Misaligned price/quantity inputs are rejected at the boundary.
-- Matching benchmark p50/p99 does not regress for Phase 4a.
+- Matching benchmark p50/p99 does not regress for Phase 4a/4b.
 
 ## Phase 5: Event Log And Replay Recovery
 

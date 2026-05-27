@@ -76,7 +76,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 async fn apply_migration(pool: &PgPool, version: &str, sql: &str) -> Result<(), sqlx::Error> {
-    let already_applied: Option<i64> =
+    let already_applied: Option<i32> =
         sqlx::query_scalar("SELECT 1 FROM _schema_migrations WHERE version=$1")
             .bind(version)
             .fetch_optional(pool)

@@ -6,7 +6,7 @@
 
 A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with **5 µs median end-to-end latency**.
 
-Live demo: **https://www.lightningx.global**
+Live demo with very limited resources: **https://www.lightningx.global**
 
 ---
 

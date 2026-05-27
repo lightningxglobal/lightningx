@@ -180,20 +180,6 @@ fn spawn_symbol_thread(
                                             &req.symbol,
                                         );
                                     }
-                                    for &(maker_order_id, fill_price, fill_qty) in &result.fills {
-                                        trade_seq += 1;
-                                        let trade = TradeNotification {
-                                            sequence: trade_seq,
-                                            taker_order_id: req.client_order_id,
-                                            maker_order_id,
-                                            price: fill_price,
-                                            quantity: fill_qty,
-                                            side: req.side,
-                                            _pad: [0; 7],
-                                            symbol: sym_bytes_fixed,
-                                        };
-                                        let _ = trade_pub.publish(&trade);
-                                    }
                                     let last_price =
                                         result.fills.last().map(|f| f.1).unwrap_or(req.price);
                                     let update = match result.status {
@@ -246,6 +232,22 @@ fn spawn_symbol_thread(
                                         ),
                                     };
                                     let _ = ou_pub.publish(&update);
+                                    // Publish trade notifications AFTER order update so the
+                                    // desk server's uid cache is populated before trade arrives.
+                                    for &(maker_order_id, fill_price, fill_qty) in &result.fills {
+                                        trade_seq += 1;
+                                        let trade = TradeNotification {
+                                            sequence: trade_seq,
+                                            taker_order_id: req.client_order_id,
+                                            maker_order_id,
+                                            price: fill_price,
+                                            quantity: fill_qty,
+                                            side: req.side,
+                                            _pad: [0; 7],
+                                            symbol: sym_bytes_fixed,
+                                        };
+                                        let _ = trade_pub.publish(&trade);
+                                    }
                                     if let Some(ref t) = tracer {
                                         t.record_sym(
                                             MS_AERON_UPDATE_SEND,

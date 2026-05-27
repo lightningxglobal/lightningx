@@ -205,6 +205,10 @@ struct WsExchangeClient {
     order_counter: Arc<AtomicU64>,
     /// Latency probes: coid → resolve with recv_us when order_update OPEN arrives.
     latency_pending: Arc<DashMap<u64, oneshot::Sender<u64>>>,
+    /// Incremented each time ws_manager reconnects. run_symbol clears its local
+    /// bid_book/ask_book when it detects a new generation to avoid placing duplicate
+    /// orders on top of stale engine state from the previous session.
+    session_gen: Arc<AtomicU64>,
 }
 
 fn now_us() -> u64 {
@@ -309,6 +313,7 @@ async fn ws_manager(
     pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
     dead_orders: Arc<DashMap<i64, ()>>,
     latency_pending: Arc<DashMap<u64, oneshot::Sender<u64>>>,
+    session_gen: Arc<AtomicU64>,
     cleanup_symbols: &'static [&'static str],
 ) {
     let mut backoff = Duration::from_secs(1);
@@ -342,6 +347,9 @@ async fn ws_manager(
                 break;
             }
         }
+        // Signal run_symbol tasks to discard stale bid/ask tracking (they may have
+        // orders that the engine no longer knows about after a reconnect).
+        session_gen.fetch_add(1, Ordering::Relaxed);
         info!("Desk WS connected, authenticated, stale orders cleared");
 
         'conn: loop {
@@ -586,6 +594,7 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
     let mut ask_book: HashMap<u64, (i64, f64)> = HashMap::new();
     let mut cycle: u32 = 0;
     let mut reconnect_delay = Duration::from_secs(1);
+    let mut last_session_gen: u64 = client.session_gen.load(Ordering::Relaxed);
 
     info!("[{}] market-making started (stream: {})", cfg.our_symbol, cfg.binance_stream);
 
@@ -617,6 +626,19 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
                 OpCode::Close => break,
                 _ => continue,
             };
+
+            // Desk WS reconnected: cancel_symbol was sent, so engine has cleared our
+            // old orders. Clear local tracking so the diff places fresh orders.
+            let cur_gen = client.session_gen.load(Ordering::Relaxed);
+            if cur_gen != last_session_gen {
+                if !bid_book.is_empty() || !ask_book.is_empty() {
+                    warn!("[{}] desk reconnected (gen {} → {}), clearing {} bids + {} asks from local book",
+                        cfg.our_symbol, last_session_gen, cur_gen, bid_book.len(), ask_book.len());
+                }
+                bid_book.clear();
+                ask_book.clear();
+                last_session_gen = cur_gen;
+            }
 
             let depth: BinanceDepthMsg = match serde_json::from_str(&text) {
                 Ok(d) => d,
@@ -747,6 +769,7 @@ async fn main() -> anyhow::Result<()> {
     let pending        = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
     let dead_orders    = Arc::new(DashMap::<i64, ()>::new());
     let latency_pending = Arc::new(DashMap::<u64, oneshot::Sender<u64>>::new());
+    let session_gen    = Arc::new(AtomicU64::new(0));
 
     let client = WsExchangeClient {
         ws_tx,
@@ -754,12 +777,13 @@ async fn main() -> anyhow::Result<()> {
         dead_orders: dead_orders.clone(),
         order_counter: Arc::new(AtomicU64::new(0)),
         latency_pending: latency_pending.clone(),
+        session_gen: session_gen.clone(),
     };
 
     // WS manager: handles connection lifecycle, auth, send/recv, reconnect.
     let ws_url = exchange_ws_url();
     const SYMBOL_NAMES: &[&str] = &["BTC_USDT", "ETH_USDT", "SOL_USDT"];
-    tokio::spawn(ws_manager(ws_url, token, ws_rx, pending, dead_orders, latency_pending, SYMBOL_NAMES));
+    tokio::spawn(ws_manager(ws_url, token, ws_rx, pending, dead_orders, latency_pending, session_gen, SYMBOL_NAMES));
 
     // Brief pause for the WS manager to connect and authenticate.
     tokio::time::sleep(Duration::from_millis(500)).await;

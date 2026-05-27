@@ -46,7 +46,7 @@ fn engine_host() -> String {
 fn channel(port: u16) -> String {
     match std::env::var("AERON_TRANSPORT").as_deref() {
         Ok("udp") => format!("aeron:udp?endpoint={}:{}", engine_host(), port),
-        _          => "aeron:ipc".to_string(),   // default: IPC
+        _ => "aeron:ipc".to_string(), // default: IPC
     }
 }
 
@@ -55,37 +55,62 @@ fn channel(port: u16) -> String {
 /// Desk → Engine: NewOrder / CancelOrder (SBE)
 /// Per-symbol streams start at ORDERS_STREAM_BASE (10, 11, 12 …).
 /// Stream 1 is kept as a legacy fallback for unknown symbols.
-pub fn orders_channel()       -> String { channel(20121) }
-pub const ORDERS_STREAM: i32 = 1;          // legacy / unknown-symbol fallback
-pub const ORDERS_STREAM_BASE: i32 = 10;    // per-symbol streams: base + sorted_index
+pub fn orders_channel() -> String {
+    channel(20121)
+}
+pub const ORDERS_STREAM: i32 = 1; // legacy / unknown-symbol fallback
+pub const ORDERS_STREAM_BASE: i32 = 10; // per-symbol streams: base + sorted_index
 
 /// Deterministic stream ID for a given symbol.
 /// Both desk_server (publisher) and exchange_engine (subscriber) call this function
 /// so they always agree on which stream carries which symbol's orders.
 /// Unknown symbols fall back to ORDERS_STREAM (1) so old single-engine deploys still work.
 pub fn orders_stream_for_symbol(symbol: &str) -> i32 {
+    if let Ok(symbols) = std::env::var("SYMBOLS") {
+        let mut configured: Vec<&str> = symbols
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        configured.sort_unstable();
+        configured.dedup();
+        if let Some(index) = configured.iter().position(|s| *s == symbol) {
+            return ORDERS_STREAM_BASE + index as i32;
+        }
+    }
+
     // Sorted alphabetically so the mapping is stable regardless of SYMBOLS env ordering.
     const TABLE: &[(&str, i32)] = &[
         ("BTC_USDT", ORDERS_STREAM_BASE),
         ("ETH_USDT", ORDERS_STREAM_BASE + 1),
         ("SOL_USDT", ORDERS_STREAM_BASE + 2),
     ];
-    TABLE.iter().find(|(s, _)| *s == symbol).map(|(_, id)| *id).unwrap_or(ORDERS_STREAM)
+    TABLE
+        .iter()
+        .find(|(s, _)| *s == symbol)
+        .map(|(_, id)| *id)
+        .unwrap_or(ORDERS_STREAM)
 }
 
 /// Engine → Desk: OrderUpdate (SBE)
-pub fn order_update_channel() -> String { channel(20122) }
+pub fn order_update_channel() -> String {
+    channel(20122)
+}
 pub const ORDER_UPDATE_STREAM: i32 = 2;
 
 /// Engine → Desk + kline_service: TradeNotification (SBE)
 /// Multiple subscribers share the same Aeron media driver at /tmp/aeron,
 /// so both receive every message from a single UDP socket.
-pub fn trade_channel()        -> String { channel(20123) }
+pub fn trade_channel() -> String {
+    channel(20123)
+}
 pub const TRADE_STREAM: i32 = 3;
 
 /// Engine → Desk: depth snapshots (10-level / 50-level / 400-level on streams 4/5/6)
 /// All three depth tiers share one channel; stream ID distinguishes the tier.
-pub fn depth_channel()        -> String { channel(20124) }
+pub fn depth_channel() -> String {
+    channel(20124)
+}
 pub const DEPTH_STREAM: i32 = 4;
 pub const DEPTH50_STREAM: i32 = 5;
 pub const LEVEL2_STREAM: i32 = 6;

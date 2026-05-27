@@ -15,6 +15,7 @@ pub const TEMPLATE_ORDER_FILLED: u16 = 11;
 pub const TEMPLATE_ORDER_PARTIAL_FILL: u16 = 12;
 pub const TEMPLATE_ORDER_CANCELLED: u16 = 13;
 pub const TEMPLATE_ORDER_REJECTED: u16 = 14;
+pub const TEMPLATE_ORDER_UPDATE: u16 = 15;
 pub const TEMPLATE_TRADE_NOTIFICATION: u16 = 20;
 pub const TEMPLATE_DEPTH_SNAPSHOT: u16 = 30;
 pub const TEMPLATE_DEPTH50_SNAPSHOT: u16 = 31;
@@ -49,8 +50,8 @@ pub struct NewOrderRequest {
     pub participant_id: u64,
     pub price: f64,
     pub quantity: f64,
-    pub side: u8,           // 0=Buy, 1=Sell
-    pub time_in_force: u8,  // 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
+    pub side: u8,          // 0=Buy, 1=Sell
+    pub time_in_force: u8, // 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
     pub _pad: [u8; 14],
     pub symbol: [u8; 16],
 }
@@ -133,7 +134,7 @@ pub struct TradeNotification {
     pub maker_order_id: u64,
     pub price: f64,
     pub quantity: f64,
-    pub side: u8,  // taker side: 0=Buy, 1=Sell
+    pub side: u8, // taker side: 0=Buy, 1=Sell
     pub _pad: [u8; 7],
     /// Symbol as null-padded ASCII, e.g. b"ETH_USDT\0\0\0\0\0\0\0\0"
     pub symbol: [u8; 16],
@@ -162,9 +163,8 @@ pub fn encode_new_order(msg: &NewOrderRequest, buf: &mut [u8]) -> Result<usize, 
     // 写 header
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_NEW_ORDER, 64));
     // 写消息体
-    let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const NewOrderRequest as *const u8, 64)
-    };
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const NewOrderRequest as *const u8, 64) };
     buf[8..72].copy_from_slice(msg_bytes);
 
     Ok(72)
@@ -177,9 +177,8 @@ pub fn encode_cancel_order(msg: &CancelOrderRequest, buf: &mut [u8]) -> Result<u
     }
 
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_CANCEL_ORDER, 8));
-    let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const CancelOrderRequest as *const u8, 8)
-    };
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const CancelOrderRequest as *const u8, 8) };
     buf[8..16].copy_from_slice(msg_bytes);
 
     Ok(16)
@@ -192,9 +191,8 @@ pub fn encode_accepted(msg: &OrderAccepted, buf: &mut [u8]) -> Result<usize, ()>
     }
 
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_ACCEPTED, 32));
-    let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const OrderAccepted as *const u8, 32)
-    };
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const OrderAccepted as *const u8, 32) };
     buf[8..40].copy_from_slice(msg_bytes);
 
     Ok(40)
@@ -207,9 +205,8 @@ pub fn encode_filled(msg: &OrderFilled, buf: &mut [u8]) -> Result<usize, ()> {
     }
 
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_FILLED, 32));
-    let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const OrderFilled as *const u8, 32)
-    };
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const OrderFilled as *const u8, 32) };
     buf[8..40].copy_from_slice(msg_bytes);
 
     Ok(40)
@@ -222,9 +219,8 @@ pub fn encode_partial_fill(msg: &OrderPartialFill, buf: &mut [u8]) -> Result<usi
     }
 
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_PARTIAL_FILL, 32));
-    let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const OrderPartialFill as *const u8, 32)
-    };
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const OrderPartialFill as *const u8, 32) };
     buf[8..40].copy_from_slice(msg_bytes);
 
     Ok(40)
@@ -237,9 +233,8 @@ pub fn encode_cancelled(msg: &OrderCancelled, buf: &mut [u8]) -> Result<usize, (
     }
 
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_CANCELLED, 24));
-    let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const OrderCancelled as *const u8, 24)
-    };
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const OrderCancelled as *const u8, 24) };
     buf[8..32].copy_from_slice(msg_bytes);
 
     Ok(32)
@@ -252,9 +247,8 @@ pub fn encode_rejected(msg: &OrderRejected, buf: &mut [u8]) -> Result<usize, ()>
     }
 
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_REJECTED, 16));
-    let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const OrderRejected as *const u8, 16)
-    };
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const OrderRejected as *const u8, 16) };
     buf[8..24].copy_from_slice(msg_bytes);
 
     Ok(24)
@@ -267,8 +261,29 @@ pub fn encode_trade_notification(msg: &TradeNotification, buf: &mut [u8]) -> Res
     }
 
     buf[0..8].copy_from_slice(&encode_header(TEMPLATE_TRADE_NOTIFICATION, 64));
+    let msg_bytes =
+        unsafe { std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 64) };
+    buf[8..72].copy_from_slice(msg_bytes);
+
+    Ok(72)
+}
+
+pub fn encode_order_update(
+    msg: &crate::transport::OrderUpdateMsg,
+    buf: &mut [u8],
+) -> Result<usize, ()> {
+    let size =
+        std::mem::size_of::<SbeHeader>() + std::mem::size_of::<crate::transport::OrderUpdateMsg>();
+    if buf.len() < size {
+        return Err(());
+    }
+
+    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_UPDATE, 64));
     let msg_bytes = unsafe {
-        std::slice::from_raw_parts(msg as *const TradeNotification as *const u8, 64)
+        std::slice::from_raw_parts(
+            msg as *const crate::transport::OrderUpdateMsg as *const u8,
+            64,
+        )
     };
     buf[8..72].copy_from_slice(msg_bytes);
 
@@ -309,6 +324,18 @@ pub fn decode_cancel_order(buf: &[u8]) -> Option<CancelOrderRequest> {
     }
 }
 
+pub fn decode_order_update(buf: &[u8]) -> Option<crate::transport::OrderUpdateMsg> {
+    if buf.len() < 8 + 64 {
+        return None;
+    }
+    unsafe {
+        let msg = std::ptr::read_unaligned(
+            (buf.as_ptr().add(8)) as *const crate::transport::OrderUpdateMsg,
+        );
+        Some(msg)
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -324,8 +351,8 @@ mod tests {
             participant_id: 456,
             price: 100.5,
             quantity: 50.0,
-            side: 0,  // Buy
-            time_in_force: 0,  // GTC
+            side: 0,          // Buy
+            time_in_force: 0, // GTC
             _pad: [0; 14],
             symbol: [0; 16],
         };
@@ -367,7 +394,7 @@ mod tests {
             maker_order_id: 2000,
             price: 100.5,
             quantity: 50.0,
-            side: 0,  // Buy
+            side: 0, // Buy
             _pad: [0; 7],
             symbol: *b"ETH_USDT        ",
         };
@@ -395,7 +422,7 @@ mod tests {
             symbol: [0; 16],
         };
 
-        let mut buf = [0u8; 30];  // too small
+        let mut buf = [0u8; 30]; // too small
         let result = encode_new_order(&req, &mut buf);
         assert!(result.is_err());
     }

@@ -10,58 +10,62 @@ pub mod transport;
 pub mod desk;
 
 // ── Flat re-exports: preserve all existing `crate::module` paths ──────────────
-pub use matching::float_ext;
 pub use matching::engine;
+pub use matching::error;
+pub use matching::event;
+pub use matching::float_ext;
+pub use matching::list_pool;
+pub use matching::market_data;
 pub use matching::order;
-pub use matching::trade;
 pub use matching::orderbook;
 pub use matching::orderbook_impl;
+pub use matching::pools;
 pub use matching::skiplist;
 pub use matching::snapshot;
-pub use matching::market_data;
-pub use matching::pools;
-pub use matching::list_pool;
-pub use matching::event;
-pub use matching::error;
 pub use matching::time_provider;
+pub use matching::trade;
 
-pub use transport::sbe;
-pub use transport::order_update;
-pub use transport::aeron_transport;
 pub use transport::aeron_channels;
+pub use transport::aeron_transport;
+pub use transport::order_update;
+pub use transport::sbe;
 pub use transport::tracer;
 
-pub use desk::db;
-pub use desk::models;
 pub use desk::account;
 pub use desk::account_repository;
+pub use desk::api;
+pub use desk::db;
+pub use desk::models;
 pub use desk::positions;
-pub use desk::user_service;
 pub use desk::rate_limit;
 pub use desk::snowflake;
-pub use desk::api;
+pub use desk::symbol_rules;
+pub use desk::user_service;
 pub use desk::ws_handler;
 
 #[cfg(test)]
-mod sbe_tests;
-#[cfg(test)]
 mod boundary_tests;
+#[cfg(test)]
+mod sbe_tests;
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
-pub use engine::{MatchingEngine, PoolConfig, EngineStats, PlaceOrderResult, OrderStatus, CancelOrderResult};
-pub use trade::Trade;
-pub use order::{Order, Side, TimeInForce};
+pub use account::{Account, AccountId, AccountManager, Position};
+pub use engine::{
+    CancelOrderResult, EngineStats, MatchingEngine, OrderStatus, PlaceOrderResult, PoolConfig,
+};
 pub use error::{MatchingEngineError, OrderResult};
 pub use event::MatchingEvent;
-pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use market_data::{
-    TradeEvent, MarketDataEngine, BBOSnapshot, Level2Snapshot, AggregateTrade, Statistics24h,
-    PublishedSnapshot, SnapshotTimer,
-    DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent, MarketDataConfig,
+    AggregateTrade, BBOSnapshot, Depth50SnapshotEvent, DepthSnapshotEvent, Level2Snapshot,
+    Level2SnapshotEvent, MarketDataConfig, MarketDataEngine, PublishedSnapshot, SnapshotTimer,
+    Statistics24h, TradeEvent,
 };
-pub use account::{Account, AccountManager, Position, AccountId};
-pub use rate_limit::{RateLimiter, RateLimitPolicy};
+pub use order::{Order, Side, TimeInForce};
+pub use rate_limit::{RateLimitPolicy, RateLimiter};
+pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use snowflake::SnowflakeIdGenerator;
+pub use symbol_rules::{validate_order_shape, SymbolRules};
+pub use trade::Trade;
 
 #[cfg(test)]
 mod tests {

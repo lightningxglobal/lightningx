@@ -1,17 +1,14 @@
+use aeron_wrapper::AeronClient;
 use lightning_exchange::{
     account_repository::AccountRepository,
     aeron_channels::{
-        aeron_dir,
-        orders_channel, orders_stream_for_symbol,
-        order_update_channel, ORDER_UPDATE_STREAM,
-        trade_channel, TRADE_STREAM,
-        depth_channel, DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
-        METRICS_CHANNEL, METRICS_STREAM,
+        aeron_dir, depth_channel, order_update_channel, orders_channel, orders_stream_for_symbol,
+        trade_channel, DEPTH50_STREAM, DEPTH_STREAM, LEVEL2_STREAM, METRICS_CHANNEL,
+        METRICS_STREAM, ORDER_UPDATE_STREAM, TRADE_STREAM,
     },
-    tracer::{spawn_tracer, MS_AERON_ORDER_RECV, MS_MATCHING_DONE, MS_AERON_UPDATE_SEND, ENGINE_INSTANCE_ID},
     aeron_transport::{
-        AeronOrderSubscriber, AeronOrderUpdatePublisher,
-        AeronTradePublisher, AeronMarketDataPublisher,
+        AeronMarketDataPublisher, AeronOrderSubscriber, AeronOrderUpdatePublisher,
+        AeronTradePublisher,
     },
     db,
     engine::{MatchingEngine, OrderStatus, PoolConfig},
@@ -19,12 +16,15 @@ use lightning_exchange::{
     models::DbOrder,
     order::{Order, Side, TimeInForce},
     sbe::TradeNotification,
+    tracer::{
+        spawn_tracer, ENGINE_INSTANCE_ID, MS_AERON_ORDER_RECV, MS_AERON_UPDATE_SEND,
+        MS_MATCHING_DONE,
+    },
     transport::{
         InboundMsg, MarketDataPublisher, OrderSubscriber, OrderUpdateMsg, OrderUpdatePublisher,
         TradePublisher,
     },
 };
-use aeron_wrapper::AeronClient;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +44,11 @@ fn symbol_bytes(symbol: &str) -> [u8; 16] {
     out
 }
 
+fn symbol_from_bytes(bytes: &[u8; 16]) -> &str {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(16);
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
 /// Spawn one fully-independent matching thread for a single symbol.
 ///
 /// Each thread creates its own AeronClient connection — this avoids the 3rd
@@ -57,22 +62,28 @@ fn spawn_symbol_thread(
     std::thread::Builder::new()
         .name(format!("match-{}", symbol))
         .spawn(move || {
-            let client = Arc::new(
-                AeronClient::new(&aeron_dir()).expect("AeronClient"),
-            );
+            let client = Arc::new(AeronClient::new(&aeron_dir()).expect("AeronClient"));
             let orders_stream = orders_stream_for_symbol(&symbol);
-            let mut subscriber = AeronOrderSubscriber::new(
-                client.clone(), &orders_channel(), orders_stream,
-            ).unwrap_or_else(|e| panic!("[{}] subscriber: {}", symbol, e));
+            let mut subscriber =
+                AeronOrderSubscriber::new(client.clone(), &orders_channel(), orders_stream)
+                    .unwrap_or_else(|e| panic!("[{}] subscriber: {}", symbol, e));
             let mut ou_pub = AeronOrderUpdatePublisher::new(
-                client.clone(), &order_update_channel(), ORDER_UPDATE_STREAM,
-            ).unwrap_or_else(|e| panic!("[{}] ou_pub: {}", symbol, e));
-            let mut trade_pub = AeronTradePublisher::new(
-                client.clone(), &trade_channel(), TRADE_STREAM,
-            ).unwrap_or_else(|e| panic!("[{}] trade_pub: {}", symbol, e));
+                client.clone(),
+                &order_update_channel(),
+                ORDER_UPDATE_STREAM,
+            )
+            .unwrap_or_else(|e| panic!("[{}] ou_pub: {}", symbol, e));
+            let mut trade_pub =
+                AeronTradePublisher::new(client.clone(), &trade_channel(), TRADE_STREAM)
+                    .unwrap_or_else(|e| panic!("[{}] trade_pub: {}", symbol, e));
             let mut md_pub = AeronMarketDataPublisher::new(
-                client.clone(), &depth_channel(), DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM,
-            ).unwrap_or_else(|e| panic!("[{}] md_pub: {}", symbol, e));
+                client.clone(),
+                &depth_channel(),
+                DEPTH_STREAM,
+                DEPTH50_STREAM,
+                LEVEL2_STREAM,
+            )
+            .unwrap_or_else(|e| panic!("[{}] md_pub: {}", symbol, e));
 
             let mut engine = engine;
             // order_id → participant_id: populated on ACCEPTED, used on CANCEL to route
@@ -94,6 +105,24 @@ fn spawn_symbol_thread(
                 while let Some(msg) = subscriber.poll() {
                     match msg {
                         InboundMsg::NewOrder(req) => {
+                            let req_symbol = symbol_from_bytes(&req.symbol);
+                            if req_symbol != symbol {
+                                let client_order_id = req.client_order_id;
+                                let participant_id = req.participant_id;
+                                tracing::warn!(
+                                    "[{}] rejecting order {} for mismatched symbol {}",
+                                    symbol,
+                                    client_order_id,
+                                    req_symbol,
+                                );
+                                let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
+                                    client_order_id,
+                                    participant_id,
+                                    4,
+                                    now_ns(),
+                                ));
+                                continue;
+                            }
                             if let Some(ref t) = tracer {
                                 t.record_sym(MS_AERON_ORDER_RECV, req.client_order_id, &req.symbol);
                             }
@@ -109,25 +138,47 @@ fn spawn_symbol_thread(
                             let order = if req.price == 0.0 {
                                 Order::new_market(req.client_order_id, side, req.quantity, ts)
                             } else {
-                                Order::new(req.client_order_id, side, req.price, req.quantity, tif, ts)
+                                Order::new(
+                                    req.client_order_id,
+                                    side,
+                                    req.price,
+                                    req.quantity,
+                                    tif,
+                                    ts,
+                                )
                             };
 
                             match engine.place_order(order) {
                                 Err(e) => {
                                     tracing::warn!("[{}] place_order failed: {:?}", symbol, e);
                                     if let Some(ref t) = tracer {
-                                        t.record_sym(MS_MATCHING_DONE, req.client_order_id, &req.symbol);
+                                        t.record_sym(
+                                            MS_MATCHING_DONE,
+                                            req.client_order_id,
+                                            &req.symbol,
+                                        );
                                     }
                                     let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
-                                        req.client_order_id, req.participant_id, 2, ts,
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        2,
+                                        ts,
                                     ));
                                     if let Some(ref t) = tracer {
-                                        t.record_sym(MS_AERON_UPDATE_SEND, req.client_order_id, &req.symbol);
+                                        t.record_sym(
+                                            MS_AERON_UPDATE_SEND,
+                                            req.client_order_id,
+                                            &req.symbol,
+                                        );
                                     }
                                 }
                                 Ok(result) => {
                                     if let Some(ref t) = tracer {
-                                        t.record_sym(MS_MATCHING_DONE, req.client_order_id, &req.symbol);
+                                        t.record_sym(
+                                            MS_MATCHING_DONE,
+                                            req.client_order_id,
+                                            &req.symbol,
+                                        );
                                     }
                                     for &(maker_order_id, fill_price, fill_qty) in &result.fills {
                                         trade_seq += 1;
@@ -143,39 +194,64 @@ fn spawn_symbol_thread(
                                         };
                                         let _ = trade_pub.publish(&trade);
                                     }
-                                    let last_price = result.fills.last().map(|f| f.1).unwrap_or(req.price);
+                                    let last_price =
+                                        result.fills.last().map(|f| f.1).unwrap_or(req.price);
                                     let update = match result.status {
                                         OrderStatus::Accepted => {
                                             uid_map.insert(result.order_id, req.participant_id);
                                             OrderUpdateMsg::accepted(
-                                                result.order_id, req.client_order_id, req.participant_id, ts,
+                                                result.order_id,
+                                                req.client_order_id,
+                                                req.participant_id,
+                                                ts,
                                             )
                                         }
                                         OrderStatus::Filled => {
                                             uid_map.remove(&result.order_id);
                                             OrderUpdateMsg::filled(
-                                                result.order_id, req.client_order_id, req.participant_id,
-                                                last_price, result.filled, ts,
+                                                result.order_id,
+                                                req.client_order_id,
+                                                req.participant_id,
+                                                last_price,
+                                                result.filled,
+                                                ts,
                                             )
                                         }
-                                        OrderStatus::PartiallyFilled => OrderUpdateMsg::partial_fill(
-                                            result.order_id, req.client_order_id, req.participant_id,
-                                            last_price, result.filled, req.quantity - result.filled, ts,
-                                        ),
+                                        OrderStatus::PartiallyFilled => {
+                                            OrderUpdateMsg::partial_fill(
+                                                result.order_id,
+                                                req.client_order_id,
+                                                req.participant_id,
+                                                last_price,
+                                                result.filled,
+                                                req.quantity - result.filled,
+                                                ts,
+                                            )
+                                        }
                                         OrderStatus::Cancelled => {
                                             uid_map.remove(&result.order_id);
                                             OrderUpdateMsg::cancelled(
-                                                result.order_id, req.client_order_id, req.participant_id,
-                                                req.quantity - result.filled, ts,
+                                                result.order_id,
+                                                req.client_order_id,
+                                                req.participant_id,
+                                                req.quantity - result.filled,
+                                                ts,
                                             )
                                         }
                                         OrderStatus::Rejected => OrderUpdateMsg::rejected(
-                                            req.client_order_id, req.participant_id, 3, ts,
+                                            req.client_order_id,
+                                            req.participant_id,
+                                            3,
+                                            ts,
                                         ),
                                     };
                                     let _ = ou_pub.publish(&update);
                                     if let Some(ref t) = tracer {
-                                        t.record_sym(MS_AERON_UPDATE_SEND, req.client_order_id, &req.symbol);
+                                        t.record_sym(
+                                            MS_AERON_UPDATE_SEND,
+                                            req.client_order_id,
+                                            &req.symbol,
+                                        );
                                     }
                                 }
                             }
@@ -187,7 +263,11 @@ fn spawn_symbol_thread(
                             if let Ok(res) = engine.cancel_order(cancel_oid) {
                                 let participant_id = uid_map.remove(&cancel_oid).unwrap_or(0);
                                 let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
-                                    req.order_id, 0, participant_id, res.cancelled_quantity, ts,
+                                    req.order_id,
+                                    0,
+                                    participant_id,
+                                    res.cancelled_quantity,
+                                    ts,
                                 ));
                             }
                             // If this engine doesn't own the order, cancel_order() returns Err
@@ -203,12 +283,18 @@ fn spawn_symbol_thread(
                     depth_seq += 1;
                     let mut snap = DepthSnapshotEvent::new(now_ns(), depth_seq);
                     snap.symbol = sym_bytes_fixed;
-                    let bids = engine.get_top_levels(20, true);
-                    let asks = engine.get_top_levels(20, false);
-                    for (i, (p, q)) in bids.iter().take(20).enumerate() { snap.bids[i] = (*p, *q); }
-                    for (i, (p, q)) in asks.iter().take(20).enumerate() { snap.asks[i] = (*p, *q); }
-                    snap.num_bids = bids.len().min(20) as u8;
-                    snap.num_asks = asks.len().min(20) as u8;
+                    let mut bids = [(0.0, 0.0); 20];
+                    let mut asks = [(0.0, 0.0); 20];
+                    let num_bids = engine.fill_top_levels(true, &mut bids);
+                    let num_asks = engine.fill_top_levels(false, &mut asks);
+                    for (i, (p, q)) in bids.iter().take(num_bids).enumerate() {
+                        snap.bids[i] = (*p, *q);
+                    }
+                    for (i, (p, q)) in asks.iter().take(num_asks).enumerate() {
+                        snap.asks[i] = (*p, *q);
+                    }
+                    snap.num_bids = num_bids as u8;
+                    snap.num_asks = num_asks as u8;
                     let _ = md_pub.publish_depth(&snap);
                 }
 
@@ -258,7 +344,9 @@ async fn main() -> anyhow::Result<()> {
                 if side == "sell" {
                     let _ = repo.release_frozen(*user_id, base_asset, remaining).await;
                 } else if *per_unit_price > 0.0 {
-                    let _ = repo.release_frozen(*user_id, quote_asset, per_unit_price * remaining).await;
+                    let _ = repo
+                        .release_frozen(*user_id, quote_asset, per_unit_price * remaining)
+                        .await;
                 }
             }
         }
@@ -269,13 +357,18 @@ async fn main() -> anyhow::Result<()> {
                  WHERE id = ANY($1)",
             )
             .bind(&ids)
-            .execute(&pool).await;
-            tracing::warn!("Canceled {} stale bot orders from previous session", bot_stale.len());
+            .execute(&pool)
+            .await;
+            tracing::warn!(
+                "Canceled {} stale bot orders from previous session",
+                bot_stale.len()
+            );
         }
     }
 
     // Restore active limit orders from DB into per-symbol engines.
-    let mut engines: HashMap<String, MatchingEngine> = symbols.iter()
+    let mut engines: HashMap<String, MatchingEngine> = symbols
+        .iter()
         .map(|s| {
             let eng = MatchingEngine::new(PoolConfig::default()).expect("engine");
             (s.clone(), eng)
@@ -289,31 +382,51 @@ async fn main() -> anyhow::Result<()> {
     let rows = sqlx::query_as::<_, DbOrder>(
         "SELECT * FROM orders WHERE status IN ('PENDING', 'TRADING') ORDER BY id ASC",
     )
-    .fetch_all(&pool).await.unwrap_or_default();
+    .fetch_all(&pool)
+    .await
+    .unwrap_or_default();
 
     let mut restored = 0usize;
     let mut skipped = 0usize;
     for db_order in &rows {
-        if db_order.order_type == "market" || (db_order.order_type == "ioc" && db_order.price.is_none()) {
-            skipped += 1; continue;
+        if db_order.order_type == "market"
+            || (db_order.order_type == "ioc" && db_order.price.is_none())
+        {
+            skipped += 1;
+            continue;
         }
         let remaining = db_order.quantity - db_order.filled;
-        if remaining <= 0.0 { continue; }
-        let side = if db_order.side == "buy" { Side::Buy } else { Side::Sell };
+        if remaining <= 0.0 {
+            continue;
+        }
+        let side = if db_order.side == "buy" {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
         let order = Order::new(
-            db_order.id as u64, side, db_order.price.unwrap_or(0.0),
-            remaining, TimeInForce::GTC, 0,
+            db_order.id as u64,
+            side,
+            db_order.price.unwrap_or(0.0),
+            remaining,
+            TimeInForce::GTC,
+            0,
         );
         if let Some(eng) = engines.get_mut(&db_order.symbol) {
             if eng.add_to_book(order).is_ok() {
-                uid_maps.entry(db_order.symbol.clone())
+                uid_maps
+                    .entry(db_order.symbol.clone())
                     .or_default()
                     .insert(db_order.id as u64, db_order.user_id as u64);
                 restored += 1;
             }
         }
     }
-    tracing::info!("Restored {} active orders ({} non-restable skipped)", restored, skipped);
+    tracing::info!(
+        "Restored {} active orders ({} non-restable skipped)",
+        restored,
+        skipped
+    );
 
     // Detect crossed books after restoration: can happen if the engine crashed between
     // desk-server writing an order to DB and the engine receiving it via Aeron.
@@ -326,7 +439,9 @@ async fn main() -> anyhow::Result<()> {
             let asks = eng.get_top_levels(1, false);
             let crossed = matches!((bids.first(), asks.first()),
                 (Some(&(bid, _)), Some(&(ask, _))) if bid >= ask);
-            if !crossed { continue; }
+            if !crossed {
+                continue;
+            }
 
             let best_bid = bids.first().map(|&(p, _)| p).unwrap_or(0.0);
             let best_ask = asks.first().map(|&(p, _)| p).unwrap_or(f64::MAX);
@@ -336,13 +451,14 @@ async fn main() -> anyhow::Result<()> {
             );
 
             #[allow(clippy::type_complexity)]
-            let open_orders: Vec<(i64, i64, String, f64, f64, Option<f64>, f64)> =
-                sqlx::query_as(
-                    "SELECT id, user_id, side, quantity, filled, price, freeze_price
+            let open_orders: Vec<(i64, i64, String, f64, f64, Option<f64>, f64)> = sqlx::query_as(
+                "SELECT id, user_id, side, quantity, filled, price, freeze_price
                      FROM orders WHERE symbol=$1 AND status IN ('PENDING','TRADING')",
-                )
-                .bind(sym.as_str())
-                .fetch_all(&pool).await.unwrap_or_default();
+            )
+            .bind(sym.as_str())
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
 
             let sym_parts: Vec<&str> = sym.splitn(2, '_').collect();
             let base_asset = sym_parts.first().copied().unwrap_or("BTC");
@@ -354,14 +470,24 @@ async fn main() -> anyhow::Result<()> {
                     if side == "sell" {
                         let _ = repo.release_frozen(*user_id, base_asset, remaining).await;
                     } else {
-                        let fp = if *freeze_price > 0.0 { Some(*freeze_price) } else { price.filter(|&p| p > 0.0) };
+                        let fp = if *freeze_price > 0.0 {
+                            Some(*freeze_price)
+                        } else {
+                            price.filter(|&p| p > 0.0)
+                        };
                         if let Some(p) = fp {
-                            let _ = repo.release_frozen(*user_id, quote_asset, p * remaining).await;
+                            let _ = repo
+                                .release_frozen(*user_id, quote_asset, p * remaining)
+                                .await;
                         }
                     }
                 }
-                let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
-                    .bind(id).execute(&pool).await;
+                let _ = sqlx::query(
+                    "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1",
+                )
+                .bind(id)
+                .execute(&pool)
+                .await;
             }
 
             *eng = MatchingEngine::new(PoolConfig::default()).expect("engine");
@@ -369,7 +495,10 @@ async fn main() -> anyhow::Result<()> {
             crossed_fixed += open_orders.len();
         }
         if crossed_fixed > 0 {
-            tracing::warn!("Fixed crossed book(s): cancelled {} orders total", crossed_fixed);
+            tracing::warn!(
+                "Fixed crossed book(s): cancelled {} orders total",
+                crossed_fixed
+            );
         }
     }
 
@@ -380,7 +509,9 @@ async fn main() -> anyhow::Result<()> {
             "SELECT id, user_id, symbol, side, quantity, filled, price, freeze_price
              FROM orders WHERE status IN ('PENDING','TRADING') AND order_type='market'",
         )
-        .fetch_all(&pool).await.unwrap_or_default();
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
 
         let mut cleaned = 0usize;
         for (id, user_id, symbol, side, quantity, filled, row_price, freeze_price) in stale {
@@ -392,27 +523,49 @@ async fn main() -> anyhow::Result<()> {
                 if side == "sell" {
                     let _ = repo.release_frozen(user_id, base_asset, remaining).await;
                 } else {
-                    let p = if freeze_price > 0.0 { Some(freeze_price) } else { row_price.filter(|p| *p > 0.0) };
+                    let p = if freeze_price > 0.0 {
+                        Some(freeze_price)
+                    } else {
+                        row_price.filter(|p| *p > 0.0)
+                    };
                     if let Some(p) = p {
-                        let _ = repo.release_frozen(user_id, quote_asset, p * remaining).await;
+                        let _ = repo
+                            .release_frozen(user_id, quote_asset, p * remaining)
+                            .await;
                     }
                 }
             }
-            let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
-                .bind(id).execute(&pool).await;
+            let _ =
+                sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
             cleaned += 1;
         }
-        if cleaned > 0 { tracing::warn!("Cleaned up {} stale market orders", cleaned); }
+        if cleaned > 0 {
+            tracing::warn!("Cleaned up {} stale market orders", cleaned);
+        }
     }
 
     drop(pool);
 
-    tracing::info!("Exchange engine started — spawning {} symbol threads", symbols.len());
+    tracing::info!(
+        "Exchange engine started — spawning {} symbol threads",
+        symbols.len()
+    );
 
     // ----- Latency tracer (optional) -----------------------------------------
-    let tracer = spawn_tracer(&aeron_dir(), METRICS_CHANNEL, METRICS_STREAM, ENGINE_INSTANCE_ID);
+    let tracer = spawn_tracer(
+        &aeron_dir(),
+        METRICS_CHANNEL,
+        METRICS_STREAM,
+        ENGINE_INSTANCE_ID,
+    );
     if tracer.is_some() {
-        tracing::info!("Exchange tracer connected (instance_id={})", ENGINE_INSTANCE_ID);
+        tracing::info!(
+            "Exchange tracer connected (instance_id={})",
+            ENGINE_INSTANCE_ID
+        );
     }
 
     // ----- Spawn one independent matching thread per symbol ------------------

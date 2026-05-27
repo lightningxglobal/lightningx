@@ -18,8 +18,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// In-memory account cache: user_id → { asset → (balance, frozen) }.
@@ -65,14 +65,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/register", post(handle_register))
         .route("/api/auth/login", post(handle_login))
         // User profile & KYC
-        .route("/api/user/profile", get(handle_get_profile).patch(handle_update_profile))
+        .route(
+            "/api/user/profile",
+            get(handle_get_profile).patch(handle_update_profile),
+        )
         .route("/api/kyc", post(handle_submit_kyc))
         // Accounts / balances
         .route("/api/accounts", get(handle_accounts))
         .route("/api/balances", get(handle_accounts))
         // Orders
         .route("/api/orders", get(handle_orders).post(handle_place_order))
-        .route("/api/orders/:order_id", get(handle_order).delete(handle_cancel_order))
+        .route(
+            "/api/orders/:order_id",
+            get(handle_order).delete(handle_cancel_order),
+        )
         // Trades, positions & tickers
         .route("/api/trades", get(handle_trades))
         .route("/api/positions", get(handle_positions))
@@ -100,7 +106,10 @@ async fn handle_register(
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
     match user_service::register(&s.db, req, ip).await {
         Ok(resp) => (StatusCode::CREATED, Json(json!(resp))),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -110,7 +119,10 @@ async fn handle_login(
 ) -> impl IntoResponse {
     match user_service::login(&s.db, req).await {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))),
-        Err(e) => (StatusCode::UNAUTHORIZED, Json(json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -121,9 +133,18 @@ fn auth_claims(headers: &HeaderMap) -> Result<user_service::Claims, (StatusCode,
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(json!({"error": "Missing token"}))))?;
-    user_service::verify_token(token)
-        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({"error": e.to_string()}))))
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Missing token"})),
+            )
+        })?;
+    user_service::verify_token(token).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": e.to_string()})),
+        )
+    })
 }
 
 fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
@@ -133,13 +154,13 @@ fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
 // ─── Accounts ─────────────────────────────────────────────────────────────────
 
 fn cache_set(cache: &AccountCache, user_id: i64, asset: &str, balance: f64, frozen: f64) {
-    cache.entry(user_id).or_insert_with(HashMap::new).insert(asset.to_string(), (balance, frozen));
+    cache
+        .entry(user_id)
+        .or_insert_with(HashMap::new)
+        .insert(asset.to_string(), (balance, frozen));
 }
 
-async fn handle_accounts(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match auth_user(&headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -147,13 +168,16 @@ async fn handle_accounts(
 
     // Serve from in-memory cache when available (zero DB round-trip).
     if let Some(assets) = s.account_cache.get(&user_id) {
-        let accounts: Vec<Value> = assets.iter()
-            .map(|(asset, &(balance, frozen))| json!({
-                "asset":     asset,
-                "balance":   balance,
-                "frozen":    frozen,
-                "available": balance - frozen,
-            }))
+        let accounts: Vec<Value> = assets
+            .iter()
+            .map(|(asset, &(balance, frozen))| {
+                json!({
+                    "asset":     asset,
+                    "balance":   balance,
+                    "frozen":    frozen,
+                    "available": balance - frozen,
+                })
+            })
             .collect();
         return (StatusCode::OK, Json(json!(accounts))).into_response();
     }
@@ -168,7 +192,11 @@ async fn handle_accounts(
             }
             (StatusCode::OK, Json(json!(accounts))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -192,10 +220,10 @@ async fn handle_orders(
     };
     let limit = q.limit.unwrap_or(50).min(500);
     let status_filter: Option<Vec<&str>> = match q.status.as_deref() {
-        Some("open")    => Some(vec!["PENDING", "TRADING"]),
+        Some("open") => Some(vec!["PENDING", "TRADING"]),
         Some("history") => Some(vec!["COMPLETED", "CANCELED", "REJECTED"]),
-        Some(s)         => Some(vec![s]),
-        None            => None,
+        Some(s) => Some(vec![s]),
+        None => None,
     };
     let orders = match status_filter {
         Some(statuses) => sqlx::query_as::<_, DbOrder>(
@@ -207,7 +235,11 @@ async fn handle_orders(
     };
     match orders {
         Ok(rows) => (StatusCode::OK, Json(json!(rows))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -220,18 +252,24 @@ async fn handle_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let row = sqlx::query_as::<_, DbOrder>(
-        "SELECT * FROM orders WHERE id = $1 AND user_id = $2",
-    )
-    .bind(order_id)
-    .bind(user_id)
-    .fetch_optional(s.db.as_ref())
-    .await;
+    let row = sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id = $1 AND user_id = $2")
+        .bind(order_id)
+        .bind(user_id)
+        .fetch_optional(s.db.as_ref())
+        .await;
 
     match row {
         Ok(Some(order)) => (StatusCode::OK, Json(json!(order))).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "Order not found"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Order not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -279,35 +317,39 @@ async fn handle_trades(
 
     match trades {
         Ok(rows) => {
-            let out: Vec<Value> = rows.iter().map(|r| {
-                use sqlx::Row;
-                let price: f64 = r.get("price");
-                let quantity: f64 = r.get("quantity");
-                let client_order_id: Option<String> = r.get("client_order_id");
-                let mut obj = json!({
-                    "id":         r.get::<i64, _>("id"),
-                    "symbol":     r.get::<String, _>("symbol"),
-                    "price":      price,
-                    "quantity":   quantity,
-                    "value":      price * quantity,
-                    "side":       r.get::<String, _>("side"),
-                    "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                });
-                if let Some(coid) = client_order_id {
-                    obj["client_order_id"] = serde_json::Value::String(coid);
-                }
-                obj
-            }).collect();
+            let out: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    use sqlx::Row;
+                    let price: f64 = r.get("price");
+                    let quantity: f64 = r.get("quantity");
+                    let client_order_id: Option<String> = r.get("client_order_id");
+                    let mut obj = json!({
+                        "id":         r.get::<i64, _>("id"),
+                        "symbol":     r.get::<String, _>("symbol"),
+                        "price":      price,
+                        "quantity":   quantity,
+                        "value":      price * quantity,
+                        "side":       r.get::<String, _>("side"),
+                        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    });
+                    if let Some(coid) = client_order_id {
+                        obj["client_order_id"] = serde_json::Value::String(coid);
+                    }
+                    obj
+                })
+                .collect();
             (StatusCode::OK, Json(json!(out))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
-async fn handle_positions(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_positions(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match auth_user(&headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -337,38 +379,82 @@ async fn handle_place_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    if req.quantity <= 0.0 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "quantity must be > 0"}))).into_response();
+    if let Err(reason) = crate::symbol_rules::validate_order_shape(
+        &req.symbol,
+        &req.order_type,
+        req.price,
+        req.quantity,
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
     }
-    if req.order_type != "market" && req.price.map(|p| p <= 0.0).unwrap_or(true) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "price required for non-market orders"}))).into_response();
+
+    if let Some(client_order_id) = req.client_order_id.as_deref() {
+        if !client_order_id.is_empty() {
+            let existing = sqlx::query_as::<_, DbOrder>(
+                "SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2",
+            )
+            .bind(user_id)
+            .bind(client_order_id)
+            .fetch_optional(s.db.as_ref())
+            .await;
+            match existing {
+                Ok(Some(order)) => {
+                    return (StatusCode::OK, Json(json!(order))).into_response();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                        .into_response();
+                }
+            }
+        }
     }
 
     let engine_side = match req.side.as_str() {
-        "buy"  => Side::Buy,
+        "buy" => Side::Buy,
         "sell" => Side::Sell,
-        _      => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid side"}))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid side"})),
+            )
+                .into_response()
+        }
     };
     let tif = match req.order_type.as_str() {
-        "limit" | "gtc"   => TimeInForce::GTC,
-        "ioc"             => TimeInForce::IOC,
-        "fok"             => TimeInForce::FOK,
-        "post_only"       => TimeInForce::PostOnly,
-        "market"          => TimeInForce::IOC,
-        _                 => return (StatusCode::BAD_REQUEST, Json(json!({"error": "unknown order_type"}))).into_response(),
+        "limit" | "gtc" => TimeInForce::GTC,
+        "ioc" => TimeInForce::IOC,
+        "fok" => TimeInForce::FOK,
+        "post_only" => TimeInForce::PostOnly,
+        "market" => TimeInForce::IOC,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "unknown order_type"})),
+            )
+                .into_response()
+        }
     };
 
     // In Aeron mode we don't have a local engine; in standalone mode we do.
-    let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = s.engines
+    let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = s
+        .engines
         .as_ref()
         .and_then(|m| m.get(&req.symbol).map(|e| e.value().clone()));
 
     if s.engines.is_some() && engine_opt.is_none() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("Unknown symbol: {}", req.symbol)}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown symbol: {}", req.symbol)})),
+        )
+            .into_response();
     }
 
     let sym_parts: Vec<&str> = req.symbol.splitn(2, '_').collect();
-    let base_asset  = sym_parts.first().copied().unwrap_or("BTC");
+    let base_asset = sym_parts.first().copied().unwrap_or("BTC");
     let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
 
     // Best opposing price (for market orders that need a freeze estimate).
@@ -393,15 +479,37 @@ async fn handle_place_order(
     let repo = AccountRepository::new(s.db.as_ref());
     if req.side == "buy" {
         if freeze_price > 0.0 {
-            match repo.freeze_for_buy(user_id, quote_asset, freeze_price * req.quantity).await {
-                Ok((bal, frz)) => { cache_set(&s.account_cache, user_id, quote_asset, bal, frz); }
-                Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+            match repo
+                .freeze_for_buy(user_id, quote_asset, freeze_price * req.quantity)
+                .await
+            {
+                Ok((bal, frz)) => {
+                    cache_set(&s.account_cache, user_id, quote_asset, bal, frz);
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                        .into_response()
+                }
             }
         }
     } else {
-        match repo.freeze_for_sell(user_id, base_asset, req.quantity).await {
-            Ok((bal, frz)) => { cache_set(&s.account_cache, user_id, base_asset, bal, frz); }
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        match repo
+            .freeze_for_sell(user_id, base_asset, req.quantity)
+            .await
+        {
+            Ok((bal, frz)) => {
+                cache_set(&s.account_cache, user_id, base_asset, bal, frz);
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response()
+            }
         }
     }
 
@@ -430,11 +538,19 @@ async fn handle_place_order(
             // Roll back freeze.
             if req.side == "buy" {
                 let p = req.price.or(best_opposing).unwrap_or(0.0);
-                if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+                if p > 0.0 {
+                    let _ = repo
+                        .release_frozen(user_id, quote_asset, p * req.quantity)
+                        .await;
+                }
             } else {
                 let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
             }
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
         }
     };
     let db_order_id = db_order.id;
@@ -445,7 +561,14 @@ async fn handle_place_order(
         let engine_order = if req.order_type == "market" {
             Order::new_market(db_order_id as u64, engine_side, req.quantity, now_ns)
         } else {
-            Order::new(db_order_id as u64, engine_side, req.price.unwrap_or(0.0), req.quantity, tif, now_ns)
+            Order::new(
+                db_order_id as u64,
+                engine_side,
+                req.price.unwrap_or(0.0),
+                req.quantity,
+                tif,
+                now_ns,
+            )
         };
 
         let engine_result = {
@@ -456,47 +579,77 @@ async fn handle_place_order(
         let result = match engine_result {
             Ok(r) => r,
             Err(e) => {
-                let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
-                    .bind(db_order_id).execute(s.db.as_ref()).await;
+                let _ = sqlx::query(
+                    "UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1",
+                )
+                .bind(db_order_id)
+                .execute(s.db.as_ref())
+                .await;
                 if req.side == "buy" {
                     let p = req.price.or(best_opposing).unwrap_or(0.0);
-                    if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+                    if p > 0.0 {
+                        let _ = repo
+                            .release_frozen(user_id, quote_asset, p * req.quantity)
+                            .await;
+                    }
                 } else {
                     let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
                 }
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
             }
         };
 
         let db_status = match result.status {
-            OrderStatus::Accepted        => "PENDING",
+            OrderStatus::Accepted => "PENDING",
             OrderStatus::PartiallyFilled => "TRADING",
-            OrderStatus::Filled          => "COMPLETED",
-            OrderStatus::Rejected        => "REJECTED",
-            OrderStatus::Cancelled       => "CANCELED",
+            OrderStatus::Filled => "COMPLETED",
+            OrderStatus::Rejected => "REJECTED",
+            OrderStatus::Cancelled => "CANCELED",
         };
 
         let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
-            .bind(db_status).bind(result.filled).bind(db_order_id)
-            .execute(s.db.as_ref()).await;
+            .bind(db_status)
+            .bind(result.filled)
+            .bind(db_order_id)
+            .execute(s.db.as_ref())
+            .await;
 
         if result.status == OrderStatus::Rejected {
             if req.side == "buy" {
                 let p = req.price.or(best_opposing).unwrap_or(0.0);
-                if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+                if p > 0.0 {
+                    let _ = repo
+                        .release_frozen(user_id, quote_asset, p * req.quantity)
+                        .await;
+                }
             } else {
                 let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
             }
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "Rejected by matching engine"}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Rejected by matching engine"})),
+            )
+                .into_response();
         }
 
         // ── Settle fills (standalone path) ────────────────────────────────────
-        let mut notified_maker_uids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut notified_maker_uids: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
         for &(maker_order_id, fp, fq) in &result.fills {
-            if fp <= 0.0 || fq <= 0.0 { continue; }
+            if fp <= 0.0 || fq <= 0.0 {
+                continue;
+            }
 
-            let maker_uid: Option<i64> = sqlx::query_scalar("SELECT user_id FROM orders WHERE id=$1")
-                .bind(maker_order_id as i64).fetch_optional(s.db.as_ref()).await.unwrap_or(None);
+            let maker_uid: Option<i64> =
+                sqlx::query_scalar("SELECT user_id FROM orders WHERE id=$1")
+                    .bind(maker_order_id as i64)
+                    .fetch_optional(s.db.as_ref())
+                    .await
+                    .unwrap_or(None);
 
             let (buyer_id, seller_id) = if req.side == "buy" {
                 (user_id, maker_uid.unwrap_or(0))
@@ -507,9 +660,22 @@ async fn handle_place_order(
             if buyer_id > 0 && seller_id > 0 {
                 if req.side == "buy" {
                     let over = req.price.map(|lp| (lp - fp) * fq).unwrap_or(0.0).max(0.0);
-                    if over > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, over).await; }
+                    if over > 0.0 {
+                        let _ = repo.release_frozen(user_id, quote_asset, over).await;
+                    }
                 }
-                let _ = repo.settle_trade(buyer_id, seller_id, base_asset, quote_asset, fp, fq, 0.0, 0.0).await;
+                let _ = repo
+                    .settle_trade(
+                        buyer_id,
+                        seller_id,
+                        base_asset,
+                        quote_asset,
+                        fp,
+                        fq,
+                        0.0,
+                        0.0,
+                    )
+                    .await;
             }
 
             let _ = sqlx::query(
@@ -517,7 +683,10 @@ async fn handle_place_order(
                  status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
                  updated_at = NOW() WHERE id = $2",
             )
-            .bind(fq).bind(maker_order_id as i64).execute(s.db.as_ref()).await;
+            .bind(fq)
+            .bind(maker_order_id as i64)
+            .execute(s.db.as_ref())
+            .await;
 
             let (buy_oid, sell_oid): (Option<i64>, Option<i64>) = if req.side == "buy" {
                 (Some(db_order_id), Some(maker_order_id as i64))
@@ -531,18 +700,25 @@ async fn handle_place_order(
             .bind(&req.symbol).bind(buy_oid).bind(sell_oid).bind(fp).bind(fq)
             .execute(s.db.as_ref()).await;
 
-            if let Some(uid) = maker_uid { notified_maker_uids.insert(uid); }
+            if let Some(uid) = maker_uid {
+                notified_maker_uids.insert(uid);
+            }
         }
 
         if result.status == OrderStatus::Cancelled {
             let unfilled = req.quantity - result.filled;
             if unfilled > 0.0 {
                 let (rel_asset, rel_amount) = if req.side == "buy" {
-                    (quote_asset, req.price.or(best_opposing).unwrap_or(0.0) * unfilled)
+                    (
+                        quote_asset,
+                        req.price.or(best_opposing).unwrap_or(0.0) * unfilled,
+                    )
                 } else {
                     (base_asset, unfilled)
                 };
-                if rel_amount > 0.0 { let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await; }
+                if rel_amount > 0.0 {
+                    let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await;
+                }
             }
         }
 
@@ -560,7 +736,8 @@ async fn handle_place_order(
                             "balance": acc.balance,
                             "available": acc.balance - acc.frozen,
                             "frozen": acc.frozen,
-                        }).to_string();
+                        })
+                        .to_string();
                         let _ = tx.send(msg).await;
                     }
                 }
@@ -590,7 +767,8 @@ async fn handle_place_order(
                 "qty": result.filled,
                 "side": &req.side,
                 "ts": now_us,
-            }).to_string();
+            })
+            .to_string();
             let _ = s.market_tx.send(trade_msg);
 
             let sym_clone = req.symbol.clone();
@@ -615,7 +793,8 @@ async fn handle_place_order(
                     "symbol": sym_clone,
                     "last": avg_fill_price,
                     "change": change,
-                }).to_string();
+                })
+                .to_string();
                 let _ = mtx_clone.send(ticker);
             });
         }
@@ -624,15 +803,17 @@ async fn handle_place_order(
         if result.filled > 0.0 {
             let s2 = s.clone();
             let sym2 = req.symbol.clone();
-            tokio::spawn(async move { crate::ws_handler::broadcast_kline_pub(&s2, &sym2).await; });
+            tokio::spawn(async move {
+                crate::ws_handler::broadcast_kline_pub(&s2, &sym2).await;
+            });
         }
 
         let ws_status = match result.status {
-            OrderStatus::Accepted        => "OPEN",
+            OrderStatus::Accepted => "OPEN",
             OrderStatus::PartiallyFilled => "PARTIAL",
-            OrderStatus::Filled          => "FILLED",
-            OrderStatus::Cancelled       => "CANCELED",
-            OrderStatus::Rejected        => "REJECTED",
+            OrderStatus::Filled => "FILLED",
+            OrderStatus::Cancelled => "CANCELED",
+            OrderStatus::Rejected => "REJECTED",
         };
         if let Some(tx) = s.user_tx.get(&user_id) {
             let ts = std::time::SystemTime::now()
@@ -646,12 +827,15 @@ async fn handle_place_order(
                 "filled": result.filled,
                 "filled_qty": result.filled,
                 "ts": ts,
-            }).to_string();
+            })
+            .to_string();
             let _ = tx.send(msg).await;
         }
 
         return match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
-            .bind(db_order_id).fetch_one(s.db.as_ref()).await
+            .bind(db_order_id)
+            .fetch_one(s.db.as_ref())
+            .await
         {
             Ok(o) => (StatusCode::CREATED, Json(json!(o))).into_response(),
             Err(_) => (StatusCode::CREATED, Json(json!({"id": db_order_id}))).into_response(),
@@ -660,14 +844,14 @@ async fn handle_place_order(
 
     // ── Aeron mode: publish order to exchange_engine, await OrderUpdate ───────
     if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
-        use crate::sbe::{NewOrderRequest as SbeNewOrder};
+        use crate::sbe::NewOrderRequest as SbeNewOrder;
         use crate::transport::order_update_kind;
 
         let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
         let tif_byte: u8 = match tif {
-            TimeInForce::GTC      => 0,
-            TimeInForce::IOC      => 1,
-            TimeInForce::FOK      => 2,
+            TimeInForce::GTC => 0,
+            TimeInForce::IOC => 1,
+            TimeInForce::FOK => 2,
             TimeInForce::PostOnly => 3,
         };
         let mut sym_bytes = [0u8; 16];
@@ -691,43 +875,65 @@ async fn handle_place_order(
 
         if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
             s.pending_orders.remove(&(db_order_id as u64));
-            let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
-                .bind(db_order_id).execute(s.db.as_ref()).await;
+            let _ =
+                sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
+                    .bind(db_order_id)
+                    .execute(s.db.as_ref())
+                    .await;
             if req.side == "buy" {
                 let p = req.price.or(best_opposing).unwrap_or(0.0);
-                if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * req.quantity).await; }
+                if p > 0.0 {
+                    let _ = repo
+                        .release_frozen(user_id, quote_asset, p * req.quantity)
+                        .await;
+                }
             } else {
                 let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
             }
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": "Aeron channel closed"}))).into_response();
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "Aeron channel closed"})),
+            )
+                .into_response();
         }
 
         let update = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(_)) => {
                 s.pending_orders.remove(&(db_order_id as u64));
-                return (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error": "Order response channel closed"}))).into_response();
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({"error": "Order response channel closed"})),
+                )
+                    .into_response();
             }
             Err(_) => {
                 s.pending_orders.remove(&(db_order_id as u64));
-                return (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error": "Order response timeout"}))).into_response();
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({"error": "Order response timeout"})),
+                )
+                    .into_response();
             }
         };
 
         let (db_status, ws_status) = match update.kind {
-            k if k == order_update_kind::ACCEPTED      => ("PENDING",    "OPEN"),
-            k if k == order_update_kind::PARTIAL_FILL  => ("TRADING",    "PARTIAL"),
-            k if k == order_update_kind::FILLED        => ("COMPLETED",  "FILLED"),
-            k if k == order_update_kind::CANCELLED     => ("CANCELED",   "CANCELED"),
-            _                                          => ("REJECTED",   "REJECTED"),
+            k if k == order_update_kind::ACCEPTED => ("PENDING", "OPEN"),
+            k if k == order_update_kind::PARTIAL_FILL => ("TRADING", "PARTIAL"),
+            k if k == order_update_kind::FILLED => ("COMPLETED", "FILLED"),
+            k if k == order_update_kind::CANCELLED => ("CANCELED", "CANCELED"),
+            _ => ("REJECTED", "REJECTED"),
         };
 
         // Copy packed struct fields to locals before use (avoids misaligned ref).
         let fill_qty: f64 = update.fill_qty;
 
         let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
-            .bind(db_status).bind(fill_qty).bind(db_order_id)
-            .execute(s.db.as_ref()).await;
+            .bind(db_status)
+            .bind(fill_qty)
+            .bind(db_order_id)
+            .execute(s.db.as_ref())
+            .await;
 
         if let Some(tx) = s.user_tx.get(&user_id) {
             let ts = std::time::SystemTime::now()
@@ -740,12 +946,15 @@ async fn handle_place_order(
                 "status": ws_status,
                 "filled_qty": fill_qty,
                 "ts": ts,
-            }).to_string();
+            })
+            .to_string();
             let _ = tx.send(msg).await;
         }
 
         return match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
-            .bind(db_order_id).fetch_one(s.db.as_ref()).await
+            .bind(db_order_id)
+            .fetch_one(s.db.as_ref())
+            .await
         {
             Ok(o) => (StatusCode::CREATED, Json(json!(o))).into_response(),
             Err(_) => (StatusCode::CREATED, Json(json!({"id": db_order_id}))).into_response(),
@@ -753,9 +962,12 @@ async fn handle_place_order(
     }
 
     // Neither engine nor Aeron — should not happen.
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "No matching engine configured"}))).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "No matching engine configured"})),
+    )
+        .into_response()
 }
-
 
 async fn handle_cancel_order(
     State(s): State<AppState>,
@@ -779,8 +991,20 @@ async fn handle_cancel_order(
 
     let order_row = match order_row {
         Ok(Some(r)) => r,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Order not found or already closed"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Order not found or already closed"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
 
     use sqlx::Row;
@@ -791,30 +1015,71 @@ async fn handle_cancel_order(
     let filled: f64 = order_row.get("filled");
     let remaining = quantity - filled;
 
+    if s.engines.is_none() {
+        if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
+            let cancel_req = crate::sbe::CancelOrderRequest {
+                order_id: order_id as u64,
+            };
+            if aeron_cmd_tx.send(AeronCmd::Cancel(cancel_req)).is_err() {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "Aeron channel closed"})),
+                )
+                    .into_response();
+            }
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "cancel_submitted": order_id
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let upd = sqlx::query(
         "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
          WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
     )
-    .bind(order_id).bind(user_id)
-    .execute(s.db.as_ref()).await;
+    .bind(order_id)
+    .bind(user_id)
+    .execute(s.db.as_ref())
+    .await;
 
     match upd {
         Ok(r) if r.rows_affected() > 0 => {}
-        Ok(_) => return (StatusCode::NOT_FOUND, Json(json!({"error": "Order not found or already closed"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Order not found or already closed"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     }
 
     // Best-effort cancel in engine for this symbol (standalone mode only).
     if let Some(engines) = &s.engines {
         if let Some(engine) = engines.get(&symbol) {
-            let res = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+            let res = {
+                let mut eng = engine.lock().unwrap();
+                eng.cancel_order(order_id as u64)
+            };
             if let Err(e) = res {
                 tracing::warn!("engine cancel_order({}) failed: {:?}", order_id, e);
             }
         }
     } else if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
         // Aeron mode: send cancel to exchange_engine via lock-free channel.
-        let cancel_req = crate::sbe::CancelOrderRequest { order_id: order_id as u64 };
+        let cancel_req = crate::sbe::CancelOrderRequest {
+            order_id: order_id as u64,
+        };
         let _ = aeron_cmd_tx.send(AeronCmd::Cancel(cancel_req));
     }
 
@@ -826,13 +1091,20 @@ async fn handle_cancel_order(
     if side == "buy" {
         let freeze_price = price.unwrap_or(0.0);
         if freeze_price > 0.0 && remaining > 0.0 {
-            if let Ok((bal, frz)) = repo.release_frozen(user_id, quote_asset, freeze_price * remaining).await {
-                if bal > 0.0 || frz >= 0.0 { cache_set(&s.account_cache, user_id, quote_asset, bal, frz); }
+            if let Ok((bal, frz)) = repo
+                .release_frozen(user_id, quote_asset, freeze_price * remaining)
+                .await
+            {
+                if bal > 0.0 || frz >= 0.0 {
+                    cache_set(&s.account_cache, user_id, quote_asset, bal, frz);
+                }
             }
         }
     } else if remaining > 0.0 {
         if let Ok((bal, frz)) = repo.release_frozen(user_id, base_asset, remaining).await {
-            if bal > 0.0 || frz >= 0.0 { cache_set(&s.account_cache, user_id, base_asset, bal, frz); }
+            if bal > 0.0 || frz >= 0.0 {
+                cache_set(&s.account_cache, user_id, base_asset, bal, frz);
+            }
         }
     }
 
@@ -848,7 +1120,8 @@ async fn handle_cancel_order(
             "order_id": order_id,
             "status": "CANCELED",
             "ts": ts,
-        }).to_string();
+        })
+        .to_string();
         let _ = tx.send(msg).await;
     }
 
@@ -872,34 +1145,38 @@ async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
     match rows {
         Ok(rows) => {
             use sqlx::Row;
-            let tickers: Vec<Value> = rows.iter().map(|r| {
-                let last: Option<f64> = r.get("last_price");
-                let open: Option<f64> = r.get("open_24h");
-                let change = match (last, open) {
-                    (Some(l), Some(o)) if o != 0.0 => (l - o) / o * 100.0,
-                    _ => 0.0,
-                };
-                json!({
-                    "symbol": r.get::<String, _>("symbol"),
-                    "last":   last,
-                    "high":   r.get::<Option<f64>, _>("high_24h"),
-                    "low":    r.get::<Option<f64>, _>("low_24h"),
-                    "volume": r.get::<Option<f64>, _>("vol_24h"),
-                    "change": change,
+            let tickers: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    let last: Option<f64> = r.get("last_price");
+                    let open: Option<f64> = r.get("open_24h");
+                    let change = match (last, open) {
+                        (Some(l), Some(o)) if o != 0.0 => (l - o) / o * 100.0,
+                        _ => 0.0,
+                    };
+                    json!({
+                        "symbol": r.get::<String, _>("symbol"),
+                        "last":   last,
+                        "high":   r.get::<Option<f64>, _>("high_24h"),
+                        "low":    r.get::<Option<f64>, _>("low_24h"),
+                        "volume": r.get::<Option<f64>, _>("vol_24h"),
+                        "change": change,
+                    })
                 })
-            }).collect();
+                .collect();
             (StatusCode::OK, Json(json!(tickers))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 // ─── User profile ─────────────────────────────────────────────────────────────
 
-async fn handle_get_profile(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_get_profile(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match auth_user(&headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -910,8 +1187,16 @@ async fn handle_get_profile(
         .await
     {
         Ok(Some(u)) => (StatusCode::OK, Json(json!(u))).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "User not found"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "User not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -939,8 +1224,16 @@ async fn handle_update_profile(
     .await
     {
         Ok(Some(u)) => (StatusCode::OK, Json(json!(u))).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "User not found"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "User not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -961,7 +1254,11 @@ async fn handle_submit_kyc(
         Err(e) => return e.into_response(),
     };
     if req.full_name.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "full_name required"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "full_name required"})),
+        )
+            .into_response();
     }
     match sqlx::query_as::<_, User>(
         "UPDATE users SET full_name = $1, kyc_status = 'PENDING', updated_at = NOW()
@@ -972,12 +1269,24 @@ async fn handle_submit_kyc(
     .fetch_optional(s.db.as_ref())
     .await
     {
-        Ok(Some(u)) => (StatusCode::OK, Json(json!({
-            "kyc_status": u.kyc_status,
-            "message": "KYC submitted, pending review"
-        }))).into_response(),
-        Ok(None) => (StatusCode::BAD_REQUEST, Json(json!({"error": "KYC already submitted or user not found"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(Some(u)) => (
+            StatusCode::OK,
+            Json(json!({
+                "kyc_status": u.kyc_status,
+                "message": "KYC submitted, pending review"
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "KYC already submitted or user not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -999,7 +1308,11 @@ async fn handle_change_password(
         Err(e) => return e.into_response(),
     };
     if req.new_password.len() < 8 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "new_password must be at least 8 characters"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "new_password must be at least 8 characters"})),
+        )
+            .into_response();
     }
     // Fetch current hash
     let row = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
@@ -1008,18 +1321,42 @@ async fn handle_change_password(
         .await;
     let user = match row {
         Ok(Some(u)) => u,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "User not found"}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "User not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     // Verify current password
     match bcrypt::verify(&req.current_password, &user.password_hash) {
-        Ok(true) => {},
-        _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Current password is incorrect"}))).into_response(),
+        Ok(true) => {}
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Current password is incorrect"})),
+            )
+                .into_response()
+        }
     }
     // Hash and save new password
     let new_hash = match bcrypt::hash(&req.new_password, bcrypt::DEFAULT_COST) {
         Ok(h) => h,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
     match sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
         .bind(&new_hash)
@@ -1028,7 +1365,11 @@ async fn handle_change_password(
         .await
     {
         Ok(_) => (StatusCode::OK, Json(json!({"message": "Password updated"}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1036,23 +1377,19 @@ async fn handle_change_password(
 
 /// Grant test funds to the authenticated user.
 /// Only works when total USDT balance is below 100 (prevents repeated claims).
-async fn handle_test_funds(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_test_funds(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match auth_user(&headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
 
     // Check current USDT balance
-    let usdt_balance: Option<f64> = sqlx::query_scalar(
-        "SELECT balance FROM accounts WHERE user_id = $1 AND asset = 'USDT'",
-    )
-    .bind(user_id)
-    .fetch_optional(s.db.as_ref())
-    .await
-    .unwrap_or(None);
+    let usdt_balance: Option<f64> =
+        sqlx::query_scalar("SELECT balance FROM accounts WHERE user_id = $1 AND asset = 'USDT'")
+            .bind(user_id)
+            .fetch_optional(s.db.as_ref())
+            .await
+            .unwrap_or(None);
 
     if usdt_balance.unwrap_or(0.0) >= 100.0 {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "You already have funds. Test funds can only be claimed when USDT balance is below 100."}))).into_response();
@@ -1074,16 +1411,17 @@ async fn handle_test_funds(
             s.account_cache.remove(&user_id); // reload on next read
             (StatusCode::OK, Json(json!({"message": "Test funds granted: 10,000 USDT + 1 BTC + 10 ETH + 100 SOL", "usdt": 10000, "btc": 1, "eth": 10, "sol": 100}))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
 /// Top up robot account to maintain sufficient inventory for market-making.
 /// Restricted to the robot service account — rejects all other callers.
-async fn handle_robot_funds(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_robot_funds(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let claims = match auth_claims(&headers) {
         Ok(c) => c,
         Err(e) => return e.into_response(),
@@ -1108,7 +1446,11 @@ async fn handle_robot_funds(
             s.account_cache.remove(&user_id); // reload on next read
             (StatusCode::OK, Json(json!({"ok": true}))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1149,17 +1491,26 @@ async fn handle_klines(
     match rows {
         Ok(rows) => {
             use sqlx::Row;
-            let candles: Vec<Value> = rows.iter().map(|r| json!({
-                "time":   r.get::<i64, _>("time"),
-                "open":   r.get::<f64, _>("open"),
-                "high":   r.get::<f64, _>("high"),
-                "low":    r.get::<f64, _>("low"),
-                "close":  r.get::<f64, _>("close"),
-                "volume": r.get::<f64, _>("volume"),
-            })).collect();
+            let candles: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "time":   r.get::<i64, _>("time"),
+                        "open":   r.get::<f64, _>("open"),
+                        "high":   r.get::<f64, _>("high"),
+                        "low":    r.get::<f64, _>("low"),
+                        "close":  r.get::<f64, _>("close"),
+                        "volume": r.get::<f64, _>("volume"),
+                    })
+                })
+                .collect();
             (StatusCode::OK, Json(json!(candles))).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1178,7 +1529,13 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
     .await
     {
         Ok(id) => id,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
     };
 
     // Upsert demo balances (including BTC).
@@ -1194,12 +1551,54 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
 
     // (symbol, side, prices, qty, base, quote)
     let plans: Vec<(&str, &str, Vec<f64>, f64, &str, &str)> = vec![
-        ("ETH_USDT", "buy",  vec![2990.0, 2980.0, 2970.0, 2960.0, 2950.0], 0.5, "ETH", "USDT"),
-        ("ETH_USDT", "sell", vec![3010.0, 3020.0, 3030.0, 3040.0, 3050.0], 0.5, "ETH", "USDT"),
-        ("SOL_USDT", "buy",  vec![149.0,  148.0,  147.0,  146.0,  145.0],  10.0, "SOL", "USDT"),
-        ("SOL_USDT", "sell", vec![151.0,  152.0,  153.0,  154.0,  155.0],  10.0, "SOL", "USDT"),
-        ("BTC_USDT", "buy",  vec![50800.0, 50700.0, 50600.0, 50500.0, 50400.0], 0.1, "BTC", "USDT"),
-        ("BTC_USDT", "sell", vec![51200.0, 51300.0, 51400.0, 51500.0, 51600.0], 0.1, "BTC", "USDT"),
+        (
+            "ETH_USDT",
+            "buy",
+            vec![2990.0, 2980.0, 2970.0, 2960.0, 2950.0],
+            0.5,
+            "ETH",
+            "USDT",
+        ),
+        (
+            "ETH_USDT",
+            "sell",
+            vec![3010.0, 3020.0, 3030.0, 3040.0, 3050.0],
+            0.5,
+            "ETH",
+            "USDT",
+        ),
+        (
+            "SOL_USDT",
+            "buy",
+            vec![149.0, 148.0, 147.0, 146.0, 145.0],
+            10.0,
+            "SOL",
+            "USDT",
+        ),
+        (
+            "SOL_USDT",
+            "sell",
+            vec![151.0, 152.0, 153.0, 154.0, 155.0],
+            10.0,
+            "SOL",
+            "USDT",
+        ),
+        (
+            "BTC_USDT",
+            "buy",
+            vec![50800.0, 50700.0, 50600.0, 50500.0, 50400.0],
+            0.1,
+            "BTC",
+            "USDT",
+        ),
+        (
+            "BTC_USDT",
+            "sell",
+            vec![51200.0, 51300.0, 51400.0, 51500.0, 51600.0],
+            0.1,
+            "BTC",
+            "USDT",
+        ),
     ];
 
     let repo = AccountRepository::new(&s.db);
@@ -1212,9 +1611,12 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
         )
         .bind(symbol).bind(demo_user_id)
         .fetch_optional(s.db.as_ref()).await.unwrap_or(None);
-        if already.is_some() { continue; }
+        if already.is_some() {
+            continue;
+        }
 
-        let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = s.engines
+        let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = s
+            .engines
             .as_ref()
             .and_then(|m| m.get(symbol).map(|e| e.value().clone()));
         // In Aeron mode there is no local engine; seed is DB-only (no orderbook).
@@ -1228,7 +1630,13 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
                 repo.freeze_for_sell(demo_user_id, base, qty).await
             };
             if let Err(e) = freeze {
-                tracing::warn!("seed-demo freeze failed for {} {} @ {}: {}", symbol, side, price, e);
+                tracing::warn!(
+                    "seed-demo freeze failed for {} {} @ {}: {}",
+                    symbol,
+                    side,
+                    price,
+                    e
+                );
                 continue;
             }
 
@@ -1252,7 +1660,13 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
             let db_order = match inserted {
                 Ok(o) => o,
                 Err(e) => {
-                    tracing::warn!("seed-demo insert failed for {} {} @ {}: {}", symbol, side, price, e);
+                    tracing::warn!(
+                        "seed-demo insert failed for {} {} @ {}: {}",
+                        symbol,
+                        side,
+                        price,
+                        e
+                    );
                     // Roll back the freeze we just did.
                     let asset = if side == "buy" { quote } else { base };
                     let amount = if side == "buy" { price * qty } else { qty };
@@ -1264,7 +1678,14 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
             // Place into the engine book directly (no matching, no fund effects).
             // In Aeron mode we skip local book insertion; the exchange_engine manages its own book.
             if let Some(ref engine) = engine_opt {
-                let order = Order::new(db_order.id as u64, engine_side, price, qty, TimeInForce::GTC, 0);
+                let order = Order::new(
+                    db_order.id as u64,
+                    engine_side,
+                    price,
+                    qty,
+                    TimeInForce::GTC,
+                    0,
+                );
                 let mut eng = engine.lock().unwrap();
                 let _ = eng.add_to_book(order);
             }
@@ -1272,5 +1693,9 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
         }
     }
 
-    (StatusCode::OK, Json(json!({"status": "seeded", "orders_placed": placed, "demo_user_id": demo_user_id}))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({"status": "seeded", "orders_placed": placed, "demo_user_id": demo_user_id})),
+    )
+        .into_response()
 }

@@ -5,10 +5,10 @@ use crate::order::{Order, Side, TimeInForce};
 use crate::user_service;
 use axum::extract::{Request, State};
 use axum::response::Response;
+use dashmap::DashMap;
 use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use dashmap::DashMap;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -35,9 +35,15 @@ fn unix_secs() -> i64 {
 
 #[derive(Debug)]
 enum ClientMsg {
-    Auth { token: String },
-    Subscribe { channels: Vec<String> },
-    Unsubscribe { channels: Vec<String> },
+    Auth {
+        token: String,
+    },
+    Subscribe {
+        channels: Vec<String>,
+    },
+    Unsubscribe {
+        channels: Vec<String>,
+    },
     PlaceOrder {
         client_order_id: String,
         symbol: String,
@@ -47,8 +53,12 @@ enum ClientMsg {
         price: Option<f64>,
         qty: f64,
     },
-    CancelOrder { order_id: i64 },
-    CancelSymbol { symbol: String },
+    CancelOrder {
+        order_id: i64,
+    },
+    CancelSymbol {
+        symbol: String,
+    },
     CancelAll,
     Ping,
 }
@@ -62,7 +72,8 @@ impl ClientMsg {
                 token: v.get("token")?.as_str()?.to_owned(),
             }),
             "subscribe" => {
-                let channels = v.get("channels")?
+                let channels = v
+                    .get("channels")?
                     .as_array()?
                     .iter()
                     .filter_map(|c| c.as_str().map(|s| s.to_owned()))
@@ -70,7 +81,8 @@ impl ClientMsg {
                 Some(ClientMsg::Subscribe { channels })
             }
             "unsubscribe" => {
-                let channels = v.get("channels")?
+                let channels = v
+                    .get("channels")?
                     .as_array()?
                     .iter()
                     .filter_map(|c| c.as_str().map(|s| s.to_owned()))
@@ -81,13 +93,15 @@ impl ClientMsg {
                 client_order_id: v.get("client_order_id")?.as_str()?.to_owned(),
                 symbol: v.get("symbol")?.as_str()?.to_owned(),
                 side: v.get("side")?.as_str()?.to_owned(),
-                order_type: v.get("order_type")
+                order_type: v
+                    .get("order_type")
                     .and_then(|x| x.as_str())
                     .unwrap_or("limit")
                     .to_owned(),
                 // Optional separate time_in_force field (e.g. "GTC", "IOC", "FOK").
                 // Takes effect only when order_type is "limit" or "gtc".
-                time_in_force: v.get("time_in_force")
+                time_in_force: v
+                    .get("time_in_force")
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_ascii_lowercase()),
                 price: v.get("price").and_then(|p| p.as_f64()),
@@ -124,10 +138,7 @@ impl WsSession {
 
 // ─── Upgrade handler ──────────────────────────────────────────────────────────
 
-pub async fn ws_handler(
-    State(state): State<AppState>,
-    mut req: Request,
-) -> Response {
+pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Response {
     let (response, fut) = upgrade::upgrade(&mut req).expect("WS upgrade failed");
     tokio::spawn(async move {
         match fut.await {
@@ -242,6 +253,12 @@ fn msg_symbol(msg: &str) -> Option<&str> {
     Some(&msg[start..end])
 }
 
+fn best_opposing_from_depth(state: &AppState, symbol: &str, side: &str) -> Option<f64> {
+    let depth = state.last_depth.get(symbol)?;
+    let levels_key = if side == "buy" { "asks" } else { "bids" };
+    depth.get(levels_key)?.as_array()?.first()?.get(0)?.as_f64()
+}
+
 // ─── Per-message handler ──────────────────────────────────────────────────────
 
 async fn handle_client_message(
@@ -252,25 +269,26 @@ async fn handle_client_message(
 ) -> Option<String> {
     let msg: ClientMsg = match ClientMsg::parse(text) {
         Some(m) => m,
-        None => return Some(json!({"type": "error", "message": "Invalid message format"}).to_string()),
+        None => {
+            return Some(json!({"type": "error", "message": "Invalid message format"}).to_string())
+        }
     };
 
     match msg {
-        ClientMsg::Auth { token } => {
-            match user_service::verify_token(&token) {
-                Ok(claims) => {
-                    session.user_id = Some(claims.sub);
-                    state.user_tx.insert(claims.sub, personal_tx);
-                    Some(json!({"type": "auth_ok"}).to_string())
-                }
-                Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
+        ClientMsg::Auth { token } => match user_service::verify_token(&token) {
+            Ok(claims) => {
+                session.user_id = Some(claims.sub);
+                state.user_tx.insert(claims.sub, personal_tx);
+                Some(json!({"type": "auth_ok"}).to_string())
             }
-        }
+            Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
+        },
 
         ClientMsg::Subscribe { channels } => {
             // Collect depth symbols before moving `channels` into the subscribed set,
             // so we can push an immediate snapshot for each new depth.* channel.
-            let depth_symbols: Vec<String> = channels.iter()
+            let depth_symbols: Vec<String> = channels
+                .iter()
                 .filter_map(|c| c.strip_prefix("depth.").map(str::to_string))
                 .collect();
             for ch in channels {
@@ -298,18 +316,71 @@ async fn handle_client_message(
 
         ClientMsg::Ping => Some(json!({"type": "pong"}).to_string()),
 
-        ClientMsg::PlaceOrder { client_order_id, symbol, side, order_type, time_in_force, price, qty } => {
+        ClientMsg::PlaceOrder {
+            client_order_id,
+            symbol,
+            side,
+            order_type,
+            time_in_force,
+            price,
+            qty,
+        } => {
             let user_id = match session.user_id {
                 Some(id) => id,
                 None => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
             };
 
-            // Basic validation
-            if qty <= 0.0 {
-                return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "qty must be > 0"}).to_string());
+            if !client_order_id.is_empty() {
+                let existing = sqlx::query_as::<_, crate::models::DbOrder>(
+                    "SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2",
+                )
+                .bind(user_id)
+                .bind(&client_order_id)
+                .fetch_optional(state.db.as_ref())
+                .await;
+                match existing {
+                    Ok(Some(order)) => {
+                        return Some(
+                            json!({
+                                "type": "order_submitted",
+                                "client_order_id": client_order_id,
+                                "order_id": order.id,
+                                "symbol": order.symbol,
+                                "side": order.side,
+                                "order_type": order.order_type,
+                                "price": order.price,
+                                "quantity": order.quantity,
+                                "status": order.status,
+                                "ts": unix_now()
+                            })
+                            .to_string(),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Some(
+                            json!({
+                                "type": "order_rejected",
+                                "client_order_id": client_order_id,
+                                "reason": e.to_string()
+                            })
+                            .to_string(),
+                        )
+                    }
+                }
             }
-            if order_type != "market" && price.map(|p| p <= 0.0).unwrap_or(true) {
-                return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "price required for limit orders"}).to_string());
+
+            if let Err(reason) =
+                crate::symbol_rules::validate_order_shape(&symbol, &order_type, price, qty)
+            {
+                return Some(
+                    json!({
+                        "type": "order_rejected",
+                        "client_order_id": client_order_id,
+                        "reason": reason
+                    })
+                    .to_string(),
+                );
             }
 
             let engine_side = match side.as_str() {
@@ -336,16 +407,20 @@ async fn handle_client_message(
             };
 
             // Look up the matching engine for this symbol; only available in standalone mode.
-            let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = state.engines
+            let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = state
+                .engines
                 .as_ref()
                 .and_then(|m| m.get(&symbol).map(|e| e.value().clone()));
             // In standalone mode, reject unknown symbols up front.
             if state.engines.is_some() && engine_opt.is_none() {
-                return Some(json!({
-                    "type": "order_rejected",
-                    "client_order_id": client_order_id,
-                    "reason": format!("Unknown symbol: {}", symbol)
-                }).to_string());
+                return Some(
+                    json!({
+                        "type": "order_rejected",
+                        "client_order_id": client_order_id,
+                        "reason": format!("Unknown symbol: {}", symbol)
+                    })
+                    .to_string(),
+                );
             }
 
             let now_ns = std::time::SystemTime::now()
@@ -365,6 +440,8 @@ async fn handle_client_message(
                 let eng = engine.lock().unwrap();
                 let levels = eng.get_top_levels(1, engine_side == Side::Sell);
                 levels.first().map(|(p, _)| *p)
+            } else if state.aeron_cmd_tx.is_some() {
+                best_opposing_from_depth(state, &symbol, &side)
             } else {
                 None
             };
@@ -389,11 +466,68 @@ async fn handle_client_message(
                 // so clients don't track phantom orders waiting for a response that
                 // arrives as order_rejected after the pending entry is gone.
                 if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
-                    return Some(json!({
-                        "type": "order_rejected",
-                        "client_order_id": client_order_id,
-                        "reason": format!("No engine for symbol: {}", symbol)
-                    }).to_string());
+                    return Some(
+                        json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": format!("No engine for symbol: {}", symbol)
+                        })
+                        .to_string(),
+                    );
+                }
+
+                let repo = AccountRepository::new(state.db.as_ref());
+                let reservation = if side == "buy" {
+                    let freeze_amount = freeze_price_val * qty;
+                    if freeze_amount <= 0.0 {
+                        return Some(
+                            json!({
+                                "type": "order_rejected",
+                                "client_order_id": client_order_id,
+                                "reason": "Unable to determine buy reservation price"
+                            })
+                            .to_string(),
+                        );
+                    }
+                    repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
+                        .await
+                        .map(|row| (quote_asset, row, freeze_amount))
+                } else {
+                    repo.freeze_for_sell(user_id, base_asset, qty)
+                        .await
+                        .map(|row| (base_asset, row, qty))
+                };
+
+                let (reserved_asset, (reserved_bal, reserved_frz), reserved_amount) =
+                    match reservation {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Some(
+                                json!({
+                                    "type": "order_rejected",
+                                    "client_order_id": client_order_id,
+                                    "reason": e.to_string()
+                                })
+                                .to_string(),
+                            )
+                        }
+                    };
+                state
+                    .account_cache
+                    .entry(user_id)
+                    .or_insert_with(std::collections::HashMap::new)
+                    .insert(reserved_asset.to_string(), (reserved_bal, reserved_frz));
+                if let Some(tx) = state.user_tx.get(&user_id) {
+                    let _ = tx.try_send(
+                        json!({
+                            "type": "balance_update",
+                            "asset": reserved_asset,
+                            "balance": reserved_bal,
+                            "available": reserved_bal - reserved_frz,
+                            "frozen": reserved_frz,
+                        })
+                        .to_string(),
+                    );
                 }
 
                 let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
@@ -406,9 +540,9 @@ async fn handle_client_message(
                 }
                 let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
                 let tif_byte: u8 = match tif {
-                    TimeInForce::GTC      => 0,
-                    TimeInForce::IOC      => 1,
-                    TimeInForce::FOK      => 2,
+                    TimeInForce::GTC => 0,
+                    TimeInForce::IOC => 1,
+                    TimeInForce::FOK => 2,
                     TimeInForce::PostOnly => 3,
                 };
 
@@ -423,47 +557,64 @@ async fn handle_client_message(
                     symbol: sym_bytes,
                 };
 
-                state.pending_meta.insert(order_id, Box::new(OrderMeta {
-                    user_id,
-                    symbol: symbol.clone(),
-                    side: side.clone(),
-                    order_type: order_type.clone(),
-                    price,
-                    qty,
-                    client_order_id: client_order_id.clone(),
-                    freeze_price: freeze_price_val,
-                }));
+                state.pending_meta.insert(
+                    order_id,
+                    Box::new(OrderMeta {
+                        user_id,
+                        symbol: symbol.clone(),
+                        side: side.clone(),
+                        order_type: order_type.clone(),
+                        price,
+                        qty,
+                        client_order_id: client_order_id.clone(),
+                        freeze_price: freeze_price_val,
+                    }),
+                );
 
                 if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
                     state.pending_meta.remove(&order_id);
-                    return Some(json!({
-                        "type": "order_rejected",
-                        "client_order_id": client_order_id,
-                        "reason": "Aeron channel closed"
-                    }).to_string());
+                    let _ = repo
+                        .release_frozen(user_id, reserved_asset, reserved_amount)
+                        .await;
+                    return Some(
+                        json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": "Aeron channel closed"
+                        })
+                        .to_string(),
+                    );
                 }
 
-                return Some(json!({
-                    "type": "order_submitted",
-                    "client_order_id": client_order_id,
-                    "order_id": order_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "order_type": order_type,
-                    "price": price,
-                    "quantity": qty,
-                    "ts": unix_now()
-                }).to_string());
+                return Some(
+                    json!({
+                        "type": "order_submitted",
+                        "client_order_id": client_order_id,
+                        "order_id": order_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "order_type": order_type,
+                        "price": price,
+                        "quantity": qty,
+                        "ts": unix_now()
+                    })
+                    .to_string(),
+                );
             }
 
             // ── Standalone engine path: DB + freeze + local matching ─────────────
             let engine = match engine_opt {
                 Some(e) => e,
-                None => return Some(json!({
-                    "type": "order_rejected",
-                    "client_order_id": client_order_id,
-                    "reason": "No matching engine configured"
-                }).to_string()),
+                None => {
+                    return Some(
+                        json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": "No matching engine configured"
+                        })
+                        .to_string(),
+                    )
+                }
             };
 
             // Persist to DB as PENDING before running through engine.
@@ -486,16 +637,26 @@ async fn handle_client_message(
             .await;
 
             if let Err(e) = db_result {
-                return Some(json!({
-                    "type": "order_rejected",
-                    "client_order_id": client_order_id,
-                    "reason": format!("DB error: {}", e)
-                }).to_string());
+                return Some(
+                    json!({
+                        "type": "order_rejected",
+                        "client_order_id": client_order_id,
+                        "reason": format!("DB error: {}", e)
+                    })
+                    .to_string(),
+                );
             }
             let engine_order = if order_type == "market" {
                 Order::new_market(db_order_id as u64, engine_side, qty, now_ns)
             } else {
-                Order::new(db_order_id as u64, engine_side, price.unwrap_or(0.0), qty, tif, now_ns)
+                Order::new(
+                    db_order_id as u64,
+                    engine_side,
+                    price.unwrap_or(0.0),
+                    qty,
+                    tif,
+                    now_ns,
+                )
             };
 
             // Freeze funds before sending to engine.
@@ -503,7 +664,8 @@ async fn handle_client_message(
             let freeze_result = if side == "buy" {
                 let freeze_amount = freeze_price_val * qty;
                 if freeze_amount > 0.0 {
-                    repo.freeze_for_buy(user_id, quote_asset, freeze_amount).await
+                    repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
+                        .await
                 } else {
                     Ok((0.0, 0.0))
                 }
@@ -511,29 +673,46 @@ async fn handle_client_message(
                 repo.freeze_for_sell(user_id, base_asset, qty).await
             };
             {
-                let frozen_asset = if side == "buy" { quote_asset } else { base_asset };
+                let frozen_asset = if side == "buy" {
+                    quote_asset
+                } else {
+                    base_asset
+                };
                 match freeze_result {
                     Err(e) => {
-                        let _ = sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
-                            .bind(db_order_id).execute(state.db.as_ref()).await;
-                        return Some(json!({
-                            "type": "order_rejected",
-                            "client_order_id": client_order_id,
-                            "reason": e.to_string()
-                        }).to_string());
+                        let _ = sqlx::query(
+                            "UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1",
+                        )
+                        .bind(db_order_id)
+                        .execute(state.db.as_ref())
+                        .await;
+                        return Some(
+                            json!({
+                                "type": "order_rejected",
+                                "client_order_id": client_order_id,
+                                "reason": e.to_string()
+                            })
+                            .to_string(),
+                        );
                     }
                     Ok((bal, frz)) if bal > 0.0 || frz >= 0.0 => {
                         // Update cache and push WS balance_update from RETURNING values.
-                        state.account_cache.entry(user_id).or_insert_with(std::collections::HashMap::new)
+                        state
+                            .account_cache
+                            .entry(user_id)
+                            .or_insert_with(std::collections::HashMap::new)
                             .insert(frozen_asset.to_string(), (bal, frz));
                         if let Some(tx) = state.user_tx.get(&user_id) {
-                            let _ = tx.try_send(json!({
-                                "type": "balance_update",
-                                "asset": frozen_asset,
-                                "balance": bal,
-                                "available": bal - frz,
-                                "frozen": frz,
-                            }).to_string());
+                            let _ = tx.try_send(
+                                json!({
+                                    "type": "balance_update",
+                                    "asset": frozen_asset,
+                                    "balance": bal,
+                                    "available": bal - frz,
+                                    "frozen": frz,
+                                })
+                                .to_string(),
+                            );
                         }
                     }
                     Ok(_) => {} // no-op freeze (zero amount)
@@ -556,15 +735,20 @@ async fn handle_client_message(
                         .await;
                         if side == "buy" {
                             let p = price.or(best_opposing_price).unwrap_or(0.0);
-                            if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * qty).await; }
+                            if p > 0.0 {
+                                let _ = repo.release_frozen(user_id, quote_asset, p * qty).await;
+                            }
                         } else {
                             let _ = repo.release_frozen(user_id, base_asset, qty).await;
                         }
-                        return Some(json!({
-                            "type": "order_rejected",
-                            "client_order_id": client_order_id,
-                            "reason": e.to_string()
-                        }).to_string());
+                        return Some(
+                            json!({
+                                "type": "order_rejected",
+                                "client_order_id": client_order_id,
+                                "reason": e.to_string()
+                            })
+                            .to_string(),
+                        );
                     }
                 }
             };
@@ -574,12 +758,12 @@ async fn handle_client_message(
             // meaningful event for the trader is the partial fill, not the
             // trailing cancel of the remainder, so surface PARTIAL_FILL.
             let (db_status, ws_status) = match (result.status, result.filled > 0.0) {
-                (OrderStatus::Accepted, _)          => ("TRADING",  "OPEN"),
-                (OrderStatus::PartiallyFilled, _)   => ("TRADING",  "PARTIAL_FILL"),
-                (OrderStatus::Filled, _)            => ("COMPLETED","FILLED"),
-                (OrderStatus::Rejected, _)          => ("REJECTED", "REJECTED"),
-                (OrderStatus::Cancelled, true)      => ("CANCELED", "PARTIAL_FILL"),
-                (OrderStatus::Cancelled, false)     => ("CANCELED", "CANCELED"),
+                (OrderStatus::Accepted, _) => ("TRADING", "OPEN"),
+                (OrderStatus::PartiallyFilled, _) => ("TRADING", "PARTIAL_FILL"),
+                (OrderStatus::Filled, _) => ("COMPLETED", "FILLED"),
+                (OrderStatus::Rejected, _) => ("REJECTED", "REJECTED"),
+                (OrderStatus::Cancelled, true) => ("CANCELED", "PARTIAL_FILL"),
+                (OrderStatus::Cancelled, false) => ("CANCELED", "CANCELED"),
             };
 
             // Update DB with fill info.
@@ -596,15 +780,20 @@ async fn handle_client_message(
                 // Release frozen funds — no fills occurred.
                 if side == "buy" {
                     let p = price.or(best_opposing_price).unwrap_or(0.0);
-                    if p > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, p * qty).await; }
+                    if p > 0.0 {
+                        let _ = repo.release_frozen(user_id, quote_asset, p * qty).await;
+                    }
                 } else {
                     let _ = repo.release_frozen(user_id, base_asset, qty).await;
                 }
-                return Some(json!({
-                    "type": "order_rejected",
-                    "client_order_id": client_order_id,
-                    "reason": "Rejected by matching engine"
-                }).to_string());
+                return Some(
+                    json!({
+                        "type": "order_rejected",
+                        "client_order_id": client_order_id,
+                        "reason": "Rejected by matching engine"
+                    })
+                    .to_string(),
+                );
             }
 
             let ts = unix_now();
@@ -623,15 +812,16 @@ async fn handle_client_message(
 
                 // Per-fill: settle both taker and maker atomically, record trade, update maker order.
                 for &(maker_order_id, fp, fq) in &result.fills {
-                    if fp <= 0.0 || fq <= 0.0 { continue; }
+                    if fp <= 0.0 || fq <= 0.0 {
+                        continue;
+                    }
 
-                    let maker_uid: Option<i64> = sqlx::query_scalar(
-                        "SELECT user_id FROM orders WHERE id = $1",
-                    )
-                    .bind(maker_order_id as i64)
-                    .fetch_optional(state.db.as_ref())
-                    .await
-                    .unwrap_or(None);
+                    let maker_uid: Option<i64> =
+                        sqlx::query_scalar("SELECT user_id FROM orders WHERE id = $1")
+                            .bind(maker_order_id as i64)
+                            .fetch_optional(state.db.as_ref())
+                            .await
+                            .unwrap_or(None);
 
                     let (buyer_id, seller_id) = if side == "buy" {
                         (user_id, maker_uid.unwrap_or(0))
@@ -643,23 +833,48 @@ async fn handle_client_message(
                         // Release taker's over-frozen (limit buy filled at better price).
                         if side == "buy" {
                             let over = price.map(|lp| (lp - fp) * fq).unwrap_or(0.0).max(0.0);
-                            if over > 0.0 { let _ = repo.release_frozen(user_id, quote_asset, over).await; }
+                            if over > 0.0 {
+                                let _ = repo.release_frozen(user_id, quote_asset, over).await;
+                            }
                         }
-                        let _ = repo.settle_trade(buyer_id, seller_id, base_asset, quote_asset, fp, fq, 0.0, 0.0).await;
+                        let _ = repo
+                            .settle_trade(
+                                buyer_id,
+                                seller_id,
+                                base_asset,
+                                quote_asset,
+                                fp,
+                                fq,
+                                0.0,
+                                0.0,
+                            )
+                            .await;
 
                         // Notify maker of balance change and position change.
                         if let Some(maker_id) = maker_uid {
-                            let (m_debit, m_credit) = if side == "buy" { (base_asset, quote_asset) } else { (quote_asset, base_asset) };
+                            let (m_debit, m_credit) = if side == "buy" {
+                                (base_asset, quote_asset)
+                            } else {
+                                (quote_asset, base_asset)
+                            };
                             for asset in [m_debit, m_credit] {
                                 if let Ok(acc) = repo.get_account(maker_id, asset).await {
                                     let msg = json!({"type":"balance_update","asset":asset,"balance":acc.balance,"available":acc.balance-acc.frozen,"frozen":acc.frozen}).to_string();
-                                    if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.try_send(msg); }
+                                    if let Some(tx) = state.user_tx.get(&maker_id) {
+                                        let _ = tx.try_send(msg);
+                                    }
                                 }
                             }
                             if let Some(pos_msg) = crate::positions::position_update_msg(
-                                state.db.as_ref(), maker_id, base_asset,
-                            ).await {
-                                if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.try_send(pos_msg); }
+                                state.db.as_ref(),
+                                maker_id,
+                                base_asset,
+                            )
+                            .await
+                            {
+                                if let Some(tx) = state.user_tx.get(&maker_id) {
+                                    let _ = tx.try_send(pos_msg);
+                                }
                             }
                         }
                     }
@@ -680,11 +895,12 @@ async fn handle_client_message(
                     .unwrap_or(None);
 
                     // Notify maker of their order state change.
-                    if let (Some(maker_id), Some((new_status, new_filled))) = (maker_uid, maker_row) {
+                    if let (Some(maker_id), Some((new_status, new_filled))) = (maker_uid, maker_row)
+                    {
                         let ws_maker_status = match new_status.as_str() {
                             "COMPLETED" => "FILLED",
-                            "TRADING"   => "PARTIAL_FILL",
-                            other        => other,
+                            "TRADING" => "PARTIAL_FILL",
+                            other => other,
                         };
                         let upd = json!({
                             "type": "order_update",
@@ -694,8 +910,11 @@ async fn handle_client_message(
                             "fill_delta": fq,
                             "avg_price": fp,
                             "ts": ts
-                        }).to_string();
-                        if let Some(tx) = state.user_tx.get(&maker_id) { let _ = tx.try_send(upd); }
+                        })
+                        .to_string();
+                        if let Some(tx) = state.user_tx.get(&maker_id) {
+                            let _ = tx.try_send(upd);
+                        }
                     }
 
                     // Insert trade record with both sides.
@@ -714,17 +933,26 @@ async fn handle_client_message(
                 }
 
                 // Release unfilled frozen amount for IOC/FOK that partially filled.
-                if result.status == OrderStatus::Cancelled || result.status == OrderStatus::Rejected {
+                if result.status == OrderStatus::Cancelled || result.status == OrderStatus::Rejected
+                {
                     let unfilled = qty - total_filled;
                     if unfilled > 0.0 {
                         let (rel_asset, rel_amount) = if side == "buy" {
-                            (quote_asset, price.or(best_opposing_price).unwrap_or(fill_price) * unfilled)
+                            (
+                                quote_asset,
+                                price.or(best_opposing_price).unwrap_or(fill_price) * unfilled,
+                            )
                         } else {
                             (base_asset, unfilled)
                         };
-                        if let Ok((bal, frz)) = repo.release_frozen(user_id, rel_asset, rel_amount).await {
+                        if let Ok((bal, frz)) =
+                            repo.release_frozen(user_id, rel_asset, rel_amount).await
+                        {
                             if bal > 0.0 || frz >= 0.0 {
-                                state.account_cache.entry(user_id).or_insert_with(std::collections::HashMap::new)
+                                state
+                                    .account_cache
+                                    .entry(user_id)
+                                    .or_insert_with(std::collections::HashMap::new)
                                     .insert(rel_asset.to_string(), (bal, frz));
                             }
                         }
@@ -738,7 +966,8 @@ async fn handle_client_message(
                     "qty": total_filled,
                     "side": side,
                     "ts": ts
-                }).to_string();
+                })
+                .to_string();
                 let _ = state.market_tx.send(trade_msg);
 
                 // Ticker updates are handled by the periodic market_data_broadcaster;
@@ -754,13 +983,18 @@ async fn handle_client_message(
                     "filled_qty": total_filled,
                     "avg_price": fill_price,
                     "ts": ts
-                }).to_string();
+                })
+                .to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {
                     let _ = tx.try_send(update_msg);
                 }
 
                 // Send balance_update so frontend can refresh balances.
-                let (debit_asset, credit_asset) = if side == "buy" { (quote_asset, base_asset) } else { (base_asset, quote_asset) };
+                let (debit_asset, credit_asset) = if side == "buy" {
+                    (quote_asset, base_asset)
+                } else {
+                    (base_asset, quote_asset)
+                };
                 for asset in [debit_asset, credit_asset] {
                     if let Ok(acc) = repo.get_account(user_id, asset).await {
                         let bal_msg = json!({
@@ -769,7 +1003,8 @@ async fn handle_client_message(
                             "balance": acc.balance,
                             "available": acc.balance - acc.frozen,
                             "frozen": acc.frozen
-                        }).to_string();
+                        })
+                        .to_string();
                         if let Some(tx) = state.user_tx.get(&user_id) {
                             let _ = tx.try_send(bal_msg);
                         }
@@ -777,9 +1012,10 @@ async fn handle_client_message(
                 }
 
                 // Position update for the base asset whose holdings just changed.
-                if let Some(pos_msg) = crate::positions::position_update_msg(
-                    state.db.as_ref(), user_id, base_asset,
-                ).await {
+                if let Some(pos_msg) =
+                    crate::positions::position_update_msg(state.db.as_ref(), user_id, base_asset)
+                        .await
+                {
                     if let Some(tx) = state.user_tx.get(&user_id) {
                         let _ = tx.try_send(pos_msg);
                     }
@@ -794,7 +1030,8 @@ async fn handle_client_message(
                     "status": "OPEN",
                     "filled_qty": 0.0,
                     "ts": ts
-                }).to_string();
+                })
+                .to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {
                     let _ = tx.try_send(open_msg);
                 }
@@ -821,7 +1058,8 @@ async fn handle_client_message(
                     "status": "CANCELED",
                     "filled_qty": 0.0,
                     "ts": ts
-                }).to_string();
+                })
+                .to_string();
                 if let Some(tx) = state.user_tx.get(&user_id) {
                     let _ = tx.try_send(cancel_msg);
                 }
@@ -835,7 +1073,8 @@ async fn handle_client_message(
                             "balance": acc.balance,
                             "available": acc.balance - acc.frozen,
                             "frozen": acc.frozen
-                        }).to_string();
+                        })
+                        .to_string();
                         if let Some(tx) = state.user_tx.get(&user_id) {
                             let _ = tx.try_send(bal_msg);
                         }
@@ -843,23 +1082,30 @@ async fn handle_client_message(
                 }
             }
 
-            Some(json!({
-                "type": "order_accepted",
-                "client_order_id": client_order_id,
-                "order_id": db_order_id,
-                "symbol": symbol,
-                "side": side,
-                "order_type": order_type,
-                "price": price,
-                "quantity": qty,
-                "ts": ts
-            }).to_string())
+            Some(
+                json!({
+                    "type": "order_accepted",
+                    "client_order_id": client_order_id,
+                    "order_id": db_order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "order_type": order_type,
+                    "price": price,
+                    "quantity": qty,
+                    "ts": ts
+                })
+                .to_string(),
+            )
         }
 
         ClientMsg::CancelSymbol { symbol } => {
             let user_id = match session.user_id {
                 Some(id) => id,
-                None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
+                None => {
+                    return Some(
+                        json!({"type": "error", "message": "Not authenticated"}).to_string(),
+                    )
+                }
             };
             // Run in background so the WS handler is not blocked on DB operations.
             // This lets queued place_order messages be processed immediately.
@@ -875,7 +1121,11 @@ async fn handle_client_message(
         ClientMsg::CancelAll => {
             let user_id = match session.user_id {
                 Some(id) => id,
-                None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
+                None => {
+                    return Some(
+                        json!({"type": "error", "message": "Not authenticated"}).to_string(),
+                    )
+                }
             };
             let n = bulk_cancel(user_id, None, state, &personal_tx).await;
             Some(json!({"type": "cancel_all_ok", "cancelled": n}).to_string())
@@ -884,7 +1134,11 @@ async fn handle_client_message(
         ClientMsg::CancelOrder { order_id } => {
             let user_id = match session.user_id {
                 Some(id) => id,
-                None => return Some(json!({"type": "error", "message": "Not authenticated"}).to_string()),
+                None => {
+                    return Some(
+                        json!({"type": "error", "message": "Not authenticated"}).to_string(),
+                    )
+                }
             };
 
             // Fetch order details before cancelling so we know what to unfreeze.
@@ -897,11 +1151,17 @@ async fn handle_client_message(
             .fetch_optional(state.db.as_ref())
             .await;
 
-            let order_row = match order_row {
-                Ok(Some(r)) => r,
-                Ok(None) => return Some(json!({"type": "error", "message": "Order not found or already closed"}).to_string()),
-                Err(e) => return Some(json!({"type": "error", "message": e.to_string()}).to_string()),
-            };
+            let order_row =
+                match order_row {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Some(
+                        json!({"type": "error", "message": "Order not found or already closed"})
+                            .to_string(),
+                    ),
+                    Err(e) => {
+                        return Some(json!({"type": "error", "message": e.to_string()}).to_string())
+                    }
+                };
 
             use sqlx::Row;
             let symbol: String = order_row.get("symbol");
@@ -910,6 +1170,30 @@ async fn handle_client_message(
             let quantity: f64 = order_row.get("quantity");
             let filled: f64 = order_row.get("filled");
             let remaining = quantity - filled;
+
+            if state.engines.is_none() {
+                if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+                    let cancel_req = crate::sbe::CancelOrderRequest {
+                        order_id: order_id as u64,
+                    };
+                    if aeron_cmd_tx
+                        .send(crate::transport::AeronCmd::Cancel(cancel_req))
+                        .is_err()
+                    {
+                        return Some(
+                            json!({"type": "error", "message": "Aeron channel closed"}).to_string(),
+                        );
+                    }
+                    return Some(
+                        json!({
+                            "type": "cancel_submitted",
+                            "order_id": order_id,
+                            "ts": unix_now()
+                        })
+                        .to_string(),
+                    );
+                }
+            }
 
             // Update DB status.
             let db_result = sqlx::query(
@@ -926,10 +1210,15 @@ async fn handle_client_message(
             // Best-effort cancel in engine (standalone) or via Aeron (desk mode).
             if let Some(engines) = &state.engines {
                 if let Some(engine) = engines.get(&symbol) {
-                    let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order_id as u64) };
+                    let _ = {
+                        let mut eng = engine.lock().unwrap();
+                        eng.cancel_order(order_id as u64)
+                    };
                 }
             } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
-                let cancel_req = crate::sbe::CancelOrderRequest { order_id: order_id as u64 };
+                let cancel_req = crate::sbe::CancelOrderRequest {
+                    order_id: order_id as u64,
+                };
                 let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(cancel_req));
             }
 
@@ -941,7 +1230,9 @@ async fn handle_client_message(
             let released_asset = if side == "buy" {
                 let freeze_price = price.unwrap_or(0.0);
                 if freeze_price > 0.0 && remaining > 0.0 {
-                    let _ = repo.release_frozen(user_id, quote_asset, freeze_price * remaining).await;
+                    let _ = repo
+                        .release_frozen(user_id, quote_asset, freeze_price * remaining)
+                        .await;
                 }
                 quote_asset
             } else {
@@ -953,15 +1244,25 @@ async fn handle_client_message(
 
             // Push balance_update so the frontend OrderForm reflects freed-up funds.
             if let Some(tx) = state.user_tx.get(&user_id) {
-                for asset in [released_asset, if released_asset == base_asset { quote_asset } else { base_asset }] {
+                for asset in [
+                    released_asset,
+                    if released_asset == base_asset {
+                        quote_asset
+                    } else {
+                        base_asset
+                    },
+                ] {
                     if let Ok(acc) = repo.get_account(user_id, asset).await {
-                        let _ = tx.try_send(json!({
-                            "type": "balance_update",
-                            "asset": acc.asset,
-                            "balance": acc.balance,
-                            "available": acc.balance - acc.frozen,
-                            "frozen": acc.frozen,
-                        }).to_string());
+                        let _ = tx.try_send(
+                            json!({
+                                "type": "balance_update",
+                                "asset": acc.asset,
+                                "balance": acc.balance,
+                                "available": acc.balance - acc.frozen,
+                                "frozen": acc.frozen,
+                            })
+                            .to_string(),
+                        );
                     }
                 }
             }
@@ -982,23 +1283,35 @@ async fn bulk_cancel(
     personal_tx: &tokio::sync::mpsc::Sender<String>,
 ) -> usize {
     #[derive(sqlx::FromRow)]
-    struct OpenOrder { id: i64, symbol: String, side: String, price: Option<f64>, quantity: f64, filled: f64 }
+    struct OpenOrder {
+        id: i64,
+        symbol: String,
+        side: String,
+        price: Option<f64>,
+        quantity: f64,
+        filled: f64,
+    }
 
     let rows: Vec<OpenOrder> = match symbol {
         Some(sym) => sqlx::query_as(
             "SELECT id, symbol, side, price, quantity, filled FROM orders
              WHERE user_id=$1 AND symbol=$2 AND status IN ('PENDING','TRADING')",
-        ).bind(user_id).bind(sym),
+        )
+        .bind(user_id)
+        .bind(sym),
         None => sqlx::query_as(
             "SELECT id, symbol, side, price, quantity, filled FROM orders
              WHERE user_id=$1 AND status IN ('PENDING','TRADING')",
-        ).bind(user_id),
+        )
+        .bind(user_id),
     }
     .fetch_all(state.db.as_ref())
     .await
     .unwrap_or_default();
 
-    if rows.is_empty() { return 0; }
+    if rows.is_empty() {
+        return 0;
+    }
 
     let repo = crate::account_repository::AccountRepository::new(state.db.as_ref());
     let ts = unix_now();
@@ -1010,20 +1323,33 @@ async fn bulk_cancel(
         // Cancel in matching engine (best-effort).
         if let Some(engines) = &state.engines {
             if let Some(engine) = engines.get(&order.symbol) {
-                let _ = { let mut eng = engine.lock().unwrap(); eng.cancel_order(order.id as u64) };
+                let _ = {
+                    let mut eng = engine.lock().unwrap();
+                    eng.cancel_order(order.id as u64)
+                };
             }
         } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
-            let req = crate::sbe::CancelOrderRequest { order_id: order.id as u64 };
+            let req = crate::sbe::CancelOrderRequest {
+                order_id: order.id as u64,
+            };
             let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(req));
+            let _ = personal_tx.try_send(
+                json!({
+                    "type": "cancel_submitted",
+                    "order_id": order.id,
+                    "ts": ts,
+                })
+                .to_string(),
+            );
+            count += 1;
+            continue;
         }
 
         // Update DB.
-        let _ = sqlx::query(
-            "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1",
-        )
-        .bind(order.id)
-        .execute(state.db.as_ref())
-        .await;
+        let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
+            .bind(order.id)
+            .execute(state.db.as_ref())
+            .await;
 
         // Release frozen funds for the unfilled portion.
         let sym_parts: Vec<&str> = order.symbol.splitn(2, '_').collect();
@@ -1033,20 +1359,25 @@ async fn bulk_cancel(
         if order.side == "buy" {
             let fp = order.price.unwrap_or(0.0);
             if fp > 0.0 && remaining > 0.0 {
-                let _ = repo.release_frozen(user_id, quote_asset, fp * remaining).await;
+                let _ = repo
+                    .release_frozen(user_id, quote_asset, fp * remaining)
+                    .await;
             }
         } else if remaining > 0.0 {
             let _ = repo.release_frozen(user_id, base_asset, remaining).await;
         }
 
         // Push order_update to the caller's personal channel.
-        let _ = personal_tx.try_send(json!({
-            "type": "order_update",
-            "order_id": order.id,
-            "status": "CANCELED",
-            "filled_qty": order.filled,
-            "ts": ts,
-        }).to_string());
+        let _ = personal_tx.try_send(
+            json!({
+                "type": "order_update",
+                "order_id": order.id,
+                "status": "CANCELED",
+                "filled_qty": order.filled,
+                "ts": ts,
+            })
+            .to_string(),
+        );
 
         count += 1;
     }
@@ -1068,14 +1399,17 @@ fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
         "bids": bids,
         "asks": asks,
         "ts": unix_now()
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// Build and broadcast a depth snapshot for the given symbol.
 pub fn broadcast_depth_pub(state: &AppState, symbol: &str) {
     if let Some(engines) = &state.engines {
         if let Some(engine) = engines.get(symbol) {
-            let _ = state.market_tx.send(build_depth_json(engine.value(), symbol));
+            let _ = state
+                .market_tx
+                .send(build_depth_json(engine.value(), symbol));
         }
     } else if let Some(depth_json) = state.last_depth.get(symbol) {
         let _ = state.market_tx.send(depth_json.to_string());
@@ -1134,8 +1468,16 @@ fn snapshot_all_engines(
         .map(|entry| {
             let symbol = entry.key().clone();
             let eng = entry.value().lock().unwrap();
-            let bids: Vec<_> = eng.get_top_levels(10, true).into_iter().filter(|(_, q)| *q > 0.0).collect();
-            let asks: Vec<_> = eng.get_top_levels(10, false).into_iter().filter(|(_, q)| *q > 0.0).collect();
+            let bids: Vec<_> = eng
+                .get_top_levels(10, true)
+                .into_iter()
+                .filter(|(_, q)| *q > 0.0)
+                .collect();
+            let asks: Vec<_> = eng
+                .get_top_levels(10, false)
+                .into_iter()
+                .filter(|(_, q)| *q > 0.0)
+                .collect();
             (symbol, bids, asks)
         })
         .collect()
@@ -1394,18 +1736,13 @@ pub async fn market_data_broadcaster(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_depth_json, snapshot_all_engines};
+    use super::build_depth_json;
     use crate::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
-    use dashmap::DashMap;
     use serde_json::Value;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     fn empty_engine() -> Mutex<MatchingEngine> {
         Mutex::new(MatchingEngine::new(PoolConfig::default()).unwrap())
-    }
-
-    fn engine_arc() -> Arc<Mutex<MatchingEngine>> {
-        Arc::new(Mutex::new(MatchingEngine::new(PoolConfig::default()).unwrap()))
     }
 
     #[test]
@@ -1426,8 +1763,10 @@ mod tests {
         {
             let mut eng = engine.lock().unwrap();
             // Resting bid at 100, resting ask at 101 — won't cross.
-            eng.place_order(Order::new(1, Side::Buy, 100.0, 2.0, TimeInForce::GTC, 0)).unwrap();
-            eng.place_order(Order::new(2, Side::Sell, 101.0, 3.0, TimeInForce::GTC, 0)).unwrap();
+            eng.place_order(Order::new(1, Side::Buy, 100.0, 2.0, TimeInForce::GTC, 0))
+                .unwrap();
+            eng.place_order(Order::new(2, Side::Sell, 101.0, 3.0, TimeInForce::GTC, 0))
+                .unwrap();
         }
 
         let v: Value = serde_json::from_str(&build_depth_json(&engine, "BTC_USDT")).unwrap();

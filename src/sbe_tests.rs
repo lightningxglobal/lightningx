@@ -1,9 +1,7 @@
 #[cfg(test)]
 mod sbe_encoding_tests {
+    use crate::sbe::{self, TradeNotification, TEMPLATE_ORDER_UPDATE, TEMPLATE_TRADE_NOTIFICATION};
     use crate::transport::OrderUpdateMsg;
-    use crate::sbe::TradeNotification;
-
-    const SBE_HEADER_SIZE: usize = 8;
 
     // Test OrderUpdateMsg SBE encoding (with header)
     #[test]
@@ -21,33 +19,32 @@ mod sbe_encoding_tests {
             timestamp: 1234567890,
         };
 
-        // Simulate server-side encoding (what AeronOrderUpdatePublisher does)
-        let mut data = vec![0u8; 72]; // 8-byte header + 64-byte body
-
-        // SBE Header (8 bytes)
-        data[0..2].copy_from_slice(&56u16.to_le_bytes()); // block_length
-        data[2..4].copy_from_slice(&2u16.to_le_bytes()); // template_id = 2
-        data[4..6].copy_from_slice(&1u16.to_le_bytes()); // schema_id
-        data[6..8].copy_from_slice(&0u16.to_le_bytes()); // version
-
-        // Copy OrderUpdateMsg into body
-        let msg_bytes = unsafe {
-            std::slice::from_raw_parts(&msg as *const OrderUpdateMsg as *const u8, 64)
-        };
-        data[8..72].copy_from_slice(msg_bytes);
+        let mut data = [0u8; 72];
+        sbe::encode_order_update(&msg, &mut data).unwrap();
 
         // Verify header
-        assert_eq!(u16::from_le_bytes([data[0], data[1]]), 56); // block_length
-        assert_eq!(u16::from_le_bytes([data[2], data[3]]), 2); // template_id
+        assert_eq!(u16::from_le_bytes([data[0], data[1]]), 64); // block_length
+        assert_eq!(
+            u16::from_le_bytes([data[2], data[3]]),
+            TEMPLATE_ORDER_UPDATE
+        ); // template_id
         assert_eq!(u16::from_le_bytes([data[4], data[5]]), 1); // schema_id
         assert_eq!(u16::from_le_bytes([data[6], data[7]]), 0); // version
 
         // Verify message fields (read from byte 8 onward)
         assert_eq!(data[8], 1); // kind
-        assert_eq!(u64::from_le_bytes([data[16], data[17], data[18], data[19],
-                                       data[20], data[21], data[22], data[23]]), 12345); // order_id
-        assert_eq!(u64::from_le_bytes([data[24], data[25], data[26], data[27],
-                                       data[28], data[29], data[30], data[31]]), 67890); // client_order_id
+        assert_eq!(
+            u64::from_le_bytes([
+                data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23]
+            ]),
+            12345
+        ); // order_id
+        assert_eq!(
+            u64::from_le_bytes([
+                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31]
+            ]),
+            67890
+        ); // client_order_id
     }
 
     // Test OrderUpdateMsg SBE decoding (client-side)
@@ -57,8 +54,8 @@ mod sbe_encoding_tests {
         let mut data = vec![0u8; 72];
 
         // Header
-        data[0..2].copy_from_slice(&56u16.to_le_bytes());
-        data[2..4].copy_from_slice(&2u16.to_le_bytes());
+        data[0..2].copy_from_slice(&64u16.to_le_bytes());
+        data[2..4].copy_from_slice(&TEMPLATE_ORDER_UPDATE.to_le_bytes());
         data[4..6].copy_from_slice(&1u16.to_le_bytes());
         data[6..8].copy_from_slice(&0u16.to_le_bytes());
 
@@ -119,7 +116,7 @@ mod sbe_encoding_tests {
 
         // SBE Header
         data[0..2].copy_from_slice(&64u16.to_le_bytes());
-        data[2..4].copy_from_slice(&20u16.to_le_bytes()); // template_id = 20 (TEMPLATE_TRADE_NOTIFICATION)
+        data[2..4].copy_from_slice(&TEMPLATE_TRADE_NOTIFICATION.to_le_bytes());
         data[4..6].copy_from_slice(&1u16.to_le_bytes());
         data[6..8].copy_from_slice(&0u16.to_le_bytes());
 
@@ -131,7 +128,10 @@ mod sbe_encoding_tests {
 
         // Verify header
         assert_eq!(u16::from_le_bytes([data[0], data[1]]), 64);
-        assert_eq!(u16::from_le_bytes([data[2], data[3]]), 20); // template_id
+        assert_eq!(
+            u16::from_le_bytes([data[2], data[3]]),
+            TEMPLATE_TRADE_NOTIFICATION
+        );
 
         // Verify body
         let sequence = u64::from_le_bytes(data[8..16].try_into().unwrap());
@@ -157,7 +157,7 @@ mod sbe_encoding_tests {
 
         // Header
         data[0..2].copy_from_slice(&64u16.to_le_bytes());
-        data[2..4].copy_from_slice(&20u16.to_le_bytes());
+        data[2..4].copy_from_slice(&TEMPLATE_TRADE_NOTIFICATION.to_le_bytes());
         data[4..6].copy_from_slice(&1u16.to_le_bytes());
         data[6..8].copy_from_slice(&0u16.to_le_bytes());
 
@@ -173,8 +173,8 @@ mod sbe_encoding_tests {
         let quantity: f64 = 15.0;
         data[40..48].copy_from_slice(&quantity.to_le_bytes());
         data[48] = 1; // side = SELL
-        // bytes 49..56 = _pad
-        // bytes 56..72 = symbol
+                      // bytes 49..56 = _pad
+                      // bytes 56..72 = symbol
         let sym = b"ETH_USDT\0\0\0\0\0\0\0\0";
         data[56..72].copy_from_slice(sym);
 
@@ -220,16 +220,8 @@ mod sbe_encoding_tests {
         };
 
         // Encode
-        let mut encoded = vec![0u8; 72];
-        encoded[0..2].copy_from_slice(&56u16.to_le_bytes());
-        encoded[2..4].copy_from_slice(&2u16.to_le_bytes());
-        encoded[4..6].copy_from_slice(&1u16.to_le_bytes());
-        encoded[6..8].copy_from_slice(&0u16.to_le_bytes());
-
-        let msg_bytes = unsafe {
-            std::slice::from_raw_parts(&original as *const OrderUpdateMsg as *const u8, 64)
-        };
-        encoded[8..72].copy_from_slice(msg_bytes);
+        let mut encoded = [0u8; 72];
+        sbe::encode_order_update(&original, &mut encoded).unwrap();
 
         // Decode
         let kind = encoded[8];

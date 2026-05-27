@@ -13,6 +13,8 @@ pub enum MatchingEngineError {
     AlreadyFilled,
     /// 订单已取消
     AlreadyCancelled,
+    /// 订单ID已存在
+    DuplicateOrderId(u64),
     /// 委托类型无效
     InvalidTimeInForce,
     /// 订单池已耗尽
@@ -37,6 +39,7 @@ impl fmt::Display for MatchingEngineError {
             Self::InvalidQuantity(q) => write!(f, "Invalid quantity: {}", q),
             Self::AlreadyFilled => write!(f, "Order already filled"),
             Self::AlreadyCancelled => write!(f, "Order already cancelled"),
+            Self::DuplicateOrderId(id) => write!(f, "Duplicate order id: {}", id),
             Self::InvalidTimeInForce => write!(f, "Invalid time in force"),
             Self::OrderPoolExhausted => write!(f, "Order pool exhausted"),
             Self::NodePoolExhausted => write!(f, "Node pool exhausted"),

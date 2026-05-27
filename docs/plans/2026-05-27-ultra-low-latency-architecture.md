@@ -14,7 +14,7 @@ This plan covers the remaining large architecture items from the system review. 
 
 ## Phase 1: Aeron Subscriber SPSC Rings
 
-Status: Pending
+Status: Completed in `src/transport/aeron_transport.rs`.
 
 Goal: remove `Arc<Mutex<VecDeque<_>>` from Aeron callbacks.
 
@@ -26,7 +26,7 @@ Design:
 
 Acceptance:
 - No per-message mutex in order update, trade, depth, or inbound order subscribers.
-- Ring-full behavior is deterministic per message class.
+- Ring-full behavior is deterministic per message class and increments dropped counters.
 - `cargo test --lib` plus targeted subscriber tests pass.
 
 ## Phase 2: UID Cache Lifetime

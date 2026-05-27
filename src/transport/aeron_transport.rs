@@ -18,10 +18,15 @@ use crate::transport::{
 
 use aeron_wrapper::{AeronClient, Error as AeronError, NoopLifecycle, PollCallback, Pub};
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use rtrb::{Consumer, Producer, RingBuffer};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAX_BACKPRESSURE_SPINS: u32 = 100_000;
+const ORDER_INBOUND_RING: usize = 16 * 1024;
+const ORDER_UPDATE_RING: usize = 16 * 1024;
+const TRADE_RING: usize = 16 * 1024;
+const DEPTH_RING: usize = 4 * 1024;
 
 fn publish_with_retry(
     publisher: &mut aeron_wrapper::Publisher,
@@ -54,7 +59,8 @@ fn publish_with_retry(
 // ============================================================================
 
 struct OrderInboundCallback {
-    message_queue: Arc<Mutex<VecDeque<InboundMsg>>>,
+    tx: Producer<InboundMsg>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl PollCallback for OrderInboundCallback {
@@ -75,8 +81,11 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const NewOrderRequest,
                         );
-                        let mut queue = self.message_queue.lock();
-                        queue.push_back(InboundMsg::NewOrder(req));
+                        if let Err(rtrb::PushError::Full(_)) =
+                            self.tx.push(InboundMsg::NewOrder(req))
+                        {
+                            self.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -87,8 +96,11 @@ impl PollCallback for OrderInboundCallback {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const CancelOrderRequest,
                         );
-                        let mut queue = self.message_queue.lock();
-                        queue.push_back(InboundMsg::CancelOrder(req));
+                        if let Err(rtrb::PushError::Full(_)) =
+                            self.tx.push(InboundMsg::CancelOrder(req))
+                        {
+                            self.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -99,13 +111,15 @@ impl PollCallback for OrderInboundCallback {
 
 pub struct AeronOrderSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>,
-    message_queue: Arc<Mutex<VecDeque<InboundMsg>>>,
+    rx: Consumer<InboundMsg>,
+    dropped: Arc<AtomicU64>,
     client: Arc<AeronClient>,
 }
 
 impl AeronOrderSubscriber {
     pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let message_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let (tx, rx) = RingBuffer::<InboundMsg>::new(ORDER_INBOUND_RING);
+        let dropped = Arc::new(AtomicU64::new(0));
 
         let subscriber = client
             .add_subscription(
@@ -113,7 +127,8 @@ impl AeronOrderSubscriber {
                 stream_id,
                 10_000,
                 OrderInboundCallback {
-                    message_queue: message_queue.clone(),
+                    tx,
+                    dropped: dropped.clone(),
                 },
                 NoopLifecycle,
             )
@@ -129,9 +144,14 @@ impl AeronOrderSubscriber {
 
         Ok(Self {
             subscriber: Arc::new(Mutex::new(subscriber)),
-            message_queue,
+            rx,
+            dropped,
             client,
         })
+    }
+
+    pub fn dropped_messages(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -142,14 +162,13 @@ impl OrderSubscriber for AeronOrderSubscriber {
 
     fn poll(&mut self) -> Option<InboundMsg> {
         // Aeron回调需要显式的poll()调用来触发
-        // poll()会调用on_data()回调，回调写入消息到Arc<Mutex<>>
+        // poll()会调用on_data()回调，回调写入SPSC ring。
         {
             let mut sub = self.subscriber.lock();
-            let _ = sub.poll(); // 触发回调，消息进入VecDeque
+            let _ = sub.poll();
         } // 立即释放lock
 
-        // 从队列中pop回调写入的消息
-        self.message_queue.lock().pop_front()
+        self.rx.pop().ok()
     }
 
     fn is_connected(&self) -> bool {
@@ -374,7 +393,8 @@ impl DeskOrderPublisher {
 // ============================================================================
 
 struct OrderUpdateCallback {
-    queue: Arc<Mutex<VecDeque<crate::transport::OrderUpdateMsg>>>,
+    tx: Producer<crate::transport::OrderUpdateMsg>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl PollCallback for OrderUpdateCallback {
@@ -386,8 +406,9 @@ impl PollCallback for OrderUpdateCallback {
         let template_id = u16::from_le_bytes([data[2], data[3]]);
         if template_id == TEMPLATE_ORDER_UPDATE {
             if let Some(msg) = sbe::decode_order_update(data) {
-                let mut q = self.queue.lock();
-                q.push_back(msg);
+                if let Err(rtrb::PushError::Full(_)) = self.tx.push(msg) {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -395,20 +416,23 @@ impl PollCallback for OrderUpdateCallback {
 
 pub struct DeskOrderUpdateSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderUpdateCallback>>>>,
-    queue: Arc<Mutex<VecDeque<crate::transport::OrderUpdateMsg>>>,
+    rx: Consumer<crate::transport::OrderUpdateMsg>,
+    dropped: Arc<AtomicU64>,
     client: Arc<AeronClient>,
 }
 
 impl DeskOrderUpdateSubscriber {
     pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let (tx, rx) = RingBuffer::<crate::transport::OrderUpdateMsg>::new(ORDER_UPDATE_RING);
+        let dropped = Arc::new(AtomicU64::new(0));
         let subscriber = client
             .add_subscription(
                 channel,
                 stream_id,
                 10_000,
                 OrderUpdateCallback {
-                    queue: queue.clone(),
+                    tx,
+                    dropped: dropped.clone(),
                 },
                 NoopLifecycle,
             )
@@ -422,7 +446,8 @@ impl DeskOrderUpdateSubscriber {
 
         Ok(Self {
             subscriber: Arc::new(Mutex::new(subscriber)),
-            queue,
+            rx,
+            dropped,
             client,
         })
     }
@@ -436,7 +461,11 @@ impl DeskOrderUpdateSubscriber {
             let mut sub = self.subscriber.lock();
             let _ = sub.poll();
         }
-        self.queue.lock().pop_front()
+        self.rx.pop().ok()
+    }
+
+    pub fn dropped_messages(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -445,7 +474,8 @@ impl DeskOrderUpdateSubscriber {
 // ============================================================================
 
 struct TradeNotificationCallback {
-    queue: Arc<Mutex<VecDeque<TradeNotification>>>,
+    tx: Producer<TradeNotification>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl PollCallback for TradeNotificationCallback {
@@ -459,7 +489,9 @@ impl PollCallback for TradeNotificationCallback {
             unsafe {
                 let msg =
                     std::ptr::read_unaligned(&data[8] as *const u8 as *const TradeNotification);
-                self.queue.lock().push_back(msg);
+                if let Err(rtrb::PushError::Full(_)) = self.tx.push(msg) {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -467,20 +499,23 @@ impl PollCallback for TradeNotificationCallback {
 
 pub struct DeskTradeSubscriber {
     subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<TradeNotificationCallback>>>>,
-    queue: Arc<Mutex<VecDeque<TradeNotification>>>,
+    rx: Consumer<TradeNotification>,
+    dropped: Arc<AtomicU64>,
     client: Arc<AeronClient>,
 }
 
 impl DeskTradeSubscriber {
     pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let (tx, rx) = RingBuffer::<TradeNotification>::new(TRADE_RING);
+        let dropped = Arc::new(AtomicU64::new(0));
         let subscriber = client
             .add_subscription(
                 channel,
                 stream_id,
                 10_000,
                 TradeNotificationCallback {
-                    queue: queue.clone(),
+                    tx,
+                    dropped: dropped.clone(),
                 },
                 NoopLifecycle,
             )
@@ -491,7 +526,8 @@ impl DeskTradeSubscriber {
 
         Ok(Self {
             subscriber: Arc::new(Mutex::new(subscriber)),
-            queue,
+            rx,
+            dropped,
             client,
         })
     }
@@ -505,7 +541,11 @@ impl DeskTradeSubscriber {
             let mut sub = self.subscriber.lock();
             let _ = sub.poll();
         }
-        self.queue.lock().pop_front()
+        self.rx.pop().ok()
+    }
+
+    pub fn dropped_messages(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -513,6 +553,7 @@ impl DeskTradeSubscriber {
 // 柜台侧 - 接收深度行情 (Streams 4, 5, 6)
 // ============================================================================
 
+#[derive(Clone, Copy)]
 pub enum DeskDepthMsg {
     Depth(DepthSnapshotEvent),
     Depth50(Depth50SnapshotEvent),
@@ -520,7 +561,8 @@ pub enum DeskDepthMsg {
 }
 
 struct DepthCallback {
-    queue: Arc<Mutex<VecDeque<DeskDepthMsg>>>,
+    tx: Producer<DeskDepthMsg>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl PollCallback for DepthCallback {
@@ -549,7 +591,9 @@ impl PollCallback for DepthCallback {
         };
 
         if let Some(m) = msg {
-            self.queue.lock().push_back(m);
+            if let Err(rtrb::PushError::Full(_)) = self.tx.push(m) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -558,7 +602,10 @@ pub struct DeskDepthSubscriber {
     depth_sub: Arc<Mutex<Box<aeron_wrapper::Subscriber<DepthCallback>>>>,
     depth50_sub: Arc<Mutex<Box<aeron_wrapper::Subscriber<DepthCallback>>>>,
     level2_sub: Arc<Mutex<Box<aeron_wrapper::Subscriber<DepthCallback>>>>,
-    queue: Arc<Mutex<VecDeque<DeskDepthMsg>>>,
+    depth_rx: Consumer<DeskDepthMsg>,
+    depth50_rx: Consumer<DeskDepthMsg>,
+    level2_rx: Consumer<DeskDepthMsg>,
+    dropped: Arc<AtomicU64>,
     client: Arc<AeronClient>,
 }
 
@@ -570,7 +617,10 @@ impl DeskDepthSubscriber {
         depth50_stream: i32,
         level2_stream: i32,
     ) -> Result<Self, String> {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let (depth_tx, depth_rx) = RingBuffer::<DeskDepthMsg>::new(DEPTH_RING);
+        let (depth50_tx, depth50_rx) = RingBuffer::<DeskDepthMsg>::new(DEPTH_RING);
+        let (level2_tx, level2_rx) = RingBuffer::<DeskDepthMsg>::new(DEPTH_RING);
+        let dropped = Arc::new(AtomicU64::new(0));
 
         let depth_sub = client
             .add_subscription(
@@ -578,7 +628,8 @@ impl DeskDepthSubscriber {
                 depth_stream,
                 10_000,
                 DepthCallback {
-                    queue: queue.clone(),
+                    tx: depth_tx,
+                    dropped: dropped.clone(),
                 },
                 NoopLifecycle,
             )
@@ -590,7 +641,8 @@ impl DeskDepthSubscriber {
                 depth50_stream,
                 10_000,
                 DepthCallback {
-                    queue: queue.clone(),
+                    tx: depth50_tx,
+                    dropped: dropped.clone(),
                 },
                 NoopLifecycle,
             )
@@ -602,7 +654,8 @@ impl DeskDepthSubscriber {
                 level2_stream,
                 10_000,
                 DepthCallback {
-                    queue: queue.clone(),
+                    tx: level2_tx,
+                    dropped: dropped.clone(),
                 },
                 NoopLifecycle,
             )
@@ -618,7 +671,10 @@ impl DeskDepthSubscriber {
             depth_sub: Arc::new(Mutex::new(depth_sub)),
             depth50_sub: Arc::new(Mutex::new(depth50_sub)),
             level2_sub: Arc::new(Mutex::new(level2_sub)),
-            queue,
+            depth_rx,
+            depth50_rx,
+            level2_rx,
+            dropped,
             client,
         })
     }
@@ -640,7 +696,15 @@ impl DeskDepthSubscriber {
             let mut s = self.level2_sub.lock();
             let _ = s.poll();
         }
-        self.queue.lock().pop_front()
+        self.depth_rx
+            .pop()
+            .or_else(|_| self.depth50_rx.pop())
+            .or_else(|_| self.level2_rx.pop())
+            .ok()
+    }
+
+    pub fn dropped_messages(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -649,9 +713,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_order_inbound_callback() {
-        let message_queue = Arc::new(Mutex::new(VecDeque::new()));
-        let _callback = OrderInboundCallback { message_queue };
-        // Callback created successfully
+    fn order_inbound_callback_pushes_to_ring() {
+        let (tx, mut rx) = RingBuffer::<InboundMsg>::new(4);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut callback = OrderInboundCallback {
+            tx,
+            dropped: dropped.clone(),
+        };
+
+        let req = NewOrderRequest {
+            client_order_id: 42,
+            participant_id: 7,
+            price: 101.25,
+            quantity: 3.5,
+            side: 0,
+            time_in_force: 0,
+            _pad: [0; 14],
+            symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
+        };
+        let mut data = [0u8; 72];
+        sbe::encode_new_order(&req, &mut data).unwrap();
+
+        callback.on_data(&data);
+
+        match rx.pop().unwrap() {
+            InboundMsg::NewOrder(msg) => {
+                let client_order_id = msg.client_order_id;
+                let participant_id = msg.participant_id;
+                assert_eq!(client_order_id, 42);
+                assert_eq!(participant_id, 7);
+            }
+            InboundMsg::CancelOrder(_) => panic!("expected new order"),
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn order_inbound_callback_counts_full_ring() {
+        let (tx, mut rx) = RingBuffer::<InboundMsg>::new(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut callback = OrderInboundCallback {
+            tx,
+            dropped: dropped.clone(),
+        };
+
+        let req = CancelOrderRequest { order_id: 9 };
+        let mut data = [0u8; 16];
+        sbe::encode_cancel_order(&req, &mut data).unwrap();
+
+        callback.on_data(&data);
+        callback.on_data(&data);
+
+        assert!(matches!(rx.pop().unwrap(), InboundMsg::CancelOrder(_)));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn order_update_callback_pushes_to_ring() {
+        let (tx, mut rx) = RingBuffer::<crate::transport::OrderUpdateMsg>::new(4);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut callback = OrderUpdateCallback {
+            tx,
+            dropped: dropped.clone(),
+        };
+
+        let msg = crate::transport::OrderUpdateMsg::accepted(11, 22, 33, 44);
+        let mut data = [0u8; 72];
+        sbe::encode_order_update(&msg, &mut data).unwrap();
+
+        callback.on_data(&data);
+
+        let got = rx.pop().unwrap();
+        let order_id = got.order_id;
+        let client_order_id = got.client_order_id;
+        assert_eq!(order_id, 11);
+        assert_eq!(client_order_id, 22);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn trade_callback_pushes_to_ring() {
+        let (tx, mut rx) = RingBuffer::<TradeNotification>::new(4);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let mut callback = TradeNotificationCallback {
+            tx,
+            dropped: dropped.clone(),
+        };
+
+        let msg = TradeNotification {
+            sequence: 1,
+            taker_order_id: 2,
+            maker_order_id: 3,
+            price: 100.0,
+            quantity: 0.5,
+            side: 0,
+            _pad: [0; 7],
+            symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
+        };
+        let mut data = [0u8; 72];
+        sbe::encode_trade_notification(&msg, &mut data).unwrap();
+
+        callback.on_data(&data);
+
+        let got = rx.pop().unwrap();
+        let sequence = got.sequence;
+        let maker_order_id = got.maker_order_id;
+        assert_eq!(sequence, 1);
+        assert_eq!(maker_order_id, 3);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 }

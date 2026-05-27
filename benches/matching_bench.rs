@@ -1,26 +1,16 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use matching_engine::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
-use std::time::Instant;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use lightning_exchange::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
 
 fn create_test_order(id: u64, side: Side, price: f64) -> Order {
-    Order::new(
-        id,
-        side,
-        price,
-        1.0,
-        TimeInForce::GTC,
-        0,
-    )
+    Order::new(id, side, price, 1.0, TimeInForce::GTC, 0)
 }
 
 fn bench_place_order_only(c: &mut Criterion) {
     c.bench_function("place_order_10k", |b| {
         b.iter_batched(
-            || {
-                match MatchingEngine::new(PoolConfig::default()) {
-                    Ok(engine) => Some(engine),
-                    Err(_) => None,
-                }
+            || match MatchingEngine::new(PoolConfig::default()) {
+                Ok(engine) => Some(engine),
+                Err(_) => None,
             },
             |engine| {
                 if let Some(mut engine) = engine {
@@ -38,11 +28,9 @@ fn bench_place_order_only(c: &mut Criterion) {
 fn bench_matching_only(c: &mut Criterion) {
     c.bench_function("matching_10k", |b| {
         b.iter_batched(
-            || {
-                match MatchingEngine::new(PoolConfig::default()) {
-                    Ok(engine) => Some(engine),
-                    Err(_) => None,
-                }
+            || match MatchingEngine::new(PoolConfig::default()) {
+                Ok(engine) => Some(engine),
+                Err(_) => None,
             },
             |engine| {
                 if let Some(mut engine) = engine {
@@ -67,11 +55,9 @@ fn bench_matching_only(c: &mut Criterion) {
 fn bench_mixed_workload(c: &mut Criterion) {
     c.bench_function("mixed_workload_10k", |b| {
         b.iter_batched(
-            || {
-                match MatchingEngine::new(PoolConfig::default()) {
-                    Ok(engine) => Some(engine),
-                    Err(_) => None,
-                }
+            || match MatchingEngine::new(PoolConfig::default()) {
+                Ok(engine) => Some(engine),
+                Err(_) => None,
             },
             |engine| {
                 if let Some(mut engine) = engine {
@@ -97,5 +83,10 @@ fn bench_mixed_workload(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_place_order_only, bench_matching_only, bench_mixed_workload);
+criterion_group!(
+    benches,
+    bench_place_order_only,
+    bench_matching_only,
+    bench_mixed_workload
+);
 criterion_main!(benches);

@@ -114,7 +114,9 @@ impl ClientMsg {
                 order_id: v.get("order_id")?.as_i64()?,
             }),
             "batch_cancel" => {
-                let ids = v.get("order_ids")?.as_array()?
+                let ids = v
+                    .get("order_ids")?
+                    .as_array()?
                     .iter()
                     .filter_map(|x| x.as_i64())
                     .collect();
@@ -1283,7 +1285,9 @@ async fn handle_client_message(
         ClientMsg::BatchCancel { order_ids } => {
             let user_id = match session.user_id {
                 Some(id) => id,
-                None => return Some(json!({"type":"error","message":"Not authenticated"}).to_string()),
+                None => {
+                    return Some(json!({"type":"error","message":"Not authenticated"}).to_string())
+                }
             };
             if order_ids.is_empty() {
                 return Some(json!({"type":"batch_cancel_ok","cancelled":0}).to_string());
@@ -1295,8 +1299,8 @@ async fn handle_client_message(
 }
 
 /// Cancel a specific list of orders by ID for `user_id`.
-/// Sends all cancel requests to Aeron in one BatchCancel command, then updates DB
-/// and releases frozen funds per order.
+/// Sends all cancel requests to Aeron in one BatchCancel command. In Aeron mode,
+/// DB/funds/WS updates wait for engine-confirmed CANCELLED events.
 /// Returns the number of orders cancelled.
 async fn batch_cancel_by_ids(
     user_id: i64,
@@ -1330,7 +1334,25 @@ async fn batch_cancel_by_ids(
         return 0;
     }
 
-    // Send all cancel requests to Aeron in one BatchCancel — single channel send.
+    if state.engines.is_none() {
+        if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+            let mut reqs = smallvec::SmallVec::<[crate::sbe::CancelOrderRequest; 64]>::new();
+            for order in &rows {
+                reqs.push(crate::sbe::CancelOrderRequest {
+                    order_id: order.id as u64,
+                });
+            }
+            return if aeron_cmd_tx
+                .send(crate::transport::AeronCmd::BatchCancel(reqs))
+                .is_ok()
+            {
+                rows.len()
+            } else {
+                0
+            };
+        }
+    }
+
     if let Some(engines) = &state.engines {
         for order in &rows {
             if let Some(engine) = engines.get(&order.symbol) {
@@ -1340,12 +1362,6 @@ async fn batch_cancel_by_ids(
                 };
             }
         }
-    } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
-        let mut reqs = smallvec::SmallVec::<[crate::sbe::CancelOrderRequest; 64]>::new();
-        for order in &rows {
-            reqs.push(crate::sbe::CancelOrderRequest { order_id: order.id as u64 });
-        }
-        let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::BatchCancel(reqs));
     }
 
     // Batch UPDATE all matching orders in one query.
@@ -1394,8 +1410,8 @@ async fn batch_cancel_by_ids(
 }
 
 /// Cancel all open orders for `user_id`, optionally filtered to a single symbol.
-/// Cancels each order in the engine, updates DB, releases frozen funds, and
-/// pushes an `order_update CANCELED` event to the user's personal WS channel.
+/// Cancels each order. In Aeron mode, DB/funds/WS updates wait for
+/// engine-confirmed CANCELLED events.
 /// Returns the number of orders cancelled.
 async fn bulk_cancel(
     user_id: i64,
@@ -1438,7 +1454,25 @@ async fn bulk_cancel(
         return 0;
     }
 
-    // Send all Aeron cancels in one BatchCancel — single channel send.
+    if state.engines.is_none() {
+        if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+            let mut reqs = smallvec::SmallVec::<[crate::sbe::CancelOrderRequest; 64]>::new();
+            for order in &rows {
+                reqs.push(crate::sbe::CancelOrderRequest {
+                    order_id: order.id as u64,
+                });
+            }
+            return if aeron_cmd_tx
+                .send(crate::transport::AeronCmd::BatchCancel(reqs))
+                .is_ok()
+            {
+                rows.len()
+            } else {
+                0
+            };
+        }
+    }
+
     if let Some(engines) = &state.engines {
         for order in &rows {
             if let Some(engine) = engines.get(&order.symbol) {
@@ -1448,15 +1482,6 @@ async fn bulk_cancel(
                 };
             }
         }
-    } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
-        let mut reqs = smallvec::SmallVec::<[crate::sbe::CancelOrderRequest; 64]>::new();
-        for order in &rows {
-            reqs.push(crate::sbe::CancelOrderRequest { order_id: order.id as u64 });
-        }
-        // Single channel send covers all cancels. DB update + frozen release
-        // happen below; if engine also sends CancelConfirm, the handler will
-        // find the order already CANCELED and skip the second release.
-        let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::BatchCancel(reqs));
     }
 
     // Batch UPDATE all matching orders in one query.

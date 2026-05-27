@@ -13,14 +13,18 @@ use dashmap::DashMap;
 use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
 use futures_util::future;
 use http_body_util::Empty;
-use hyper::{body::Bytes, Request, header::{CONNECTION, UPGRADE}};
+use hyper::{
+    body::Bytes,
+    header::{CONNECTION, UPGRADE},
+    Request,
+};
 use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -35,7 +39,9 @@ where
     Fut: std::future::Future + Send + 'static,
     Fut::Output: Send + 'static,
 {
-    fn execute(&self, fut: Fut) { tokio::spawn(fut); }
+    fn execute(&self, fut: Fut) {
+        tokio::spawn(fut);
+    }
 }
 
 // Parse a ws:// or wss:// URL into (is_tls, host, port, path_with_query).
@@ -47,7 +53,9 @@ fn parse_ws_url(url: &str) -> (bool, String, u16, String) {
         None => (rest, "/".to_string()),
     };
     let (host, port) = if let Some(colon) = authority.rfind(':') {
-        let port = authority[colon + 1..].parse().unwrap_or(if tls { 443 } else { 80 });
+        let port = authority[colon + 1..]
+            .parse()
+            .unwrap_or(if tls { 443 } else { 80 });
         (authority[..colon].to_string(), port)
     } else {
         (authority.to_string(), if tls { 443 } else { 80 })
@@ -80,9 +88,7 @@ async fn ws_connect_plain(
 }
 
 // Connect to a TLS wss:// WebSocket endpoint using system root certs.
-async fn ws_connect_tls(
-    url: &str,
-) -> anyhow::Result<WebSocket<TokioIo<hyper::upgrade::Upgraded>>> {
+async fn ws_connect_tls(url: &str) -> anyhow::Result<WebSocket<TokioIo<hyper::upgrade::Upgraded>>> {
     use std::sync::Arc;
     use tokio_rustls::rustls;
 
@@ -131,6 +137,7 @@ const ROBOT_PASSWORD: &str = "robot_secret_2026";
 const DEPTH_LEVELS: usize = 20;
 const QTY_SCALE: f64 = 1.0;
 const MAX_USDT_PER_SIDE: f64 = 2_000_000.0;
+const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
 const BINANCE_WS_BASE: &str = "wss://fstream.binance.com/ws";
 
 struct SymbolConfig {
@@ -140,47 +147,131 @@ struct SymbolConfig {
 }
 
 const SYMBOLS: &[SymbolConfig] = &[
-    SymbolConfig { our_symbol: "BTC_USDT", binance_stream: "btcusdt@depth20@500ms", min_qty: 0.0001 },
-    SymbolConfig { our_symbol: "ETH_USDT", binance_stream: "ethusdt@depth20@500ms", min_qty: 0.001 },
+    SymbolConfig {
+        our_symbol: "BTC_USDT",
+        binance_stream: "btcusdt@depth20@500ms",
+        min_qty: 0.0001,
+    },
+    SymbolConfig {
+        our_symbol: "ETH_USDT",
+        binance_stream: "ethusdt@depth20@500ms",
+        min_qty: 0.001,
+    },
 ];
 
 // ── REST helpers (login + robot-funds only) ────────────────────────────────────
 
-#[derive(Deserialize)] struct LoginResponse { token: String }
-#[derive(Serialize)] struct LoginRequest<'a> { email: &'a str, password: &'a str }
-#[derive(Serialize)] struct RegisterRequest<'a> { email: &'a str, password: &'a str, full_name: &'a str }
+#[derive(Deserialize)]
+struct LoginResponse {
+    token: String,
+}
+#[derive(Serialize)]
+struct LoginRequest<'a> {
+    email: &'a str,
+    password: &'a str,
+}
+#[derive(Serialize)]
+struct RegisterRequest<'a> {
+    email: &'a str,
+    password: &'a str,
+    full_name: &'a str,
+}
+#[derive(Deserialize)]
+struct RestOrder {
+    id: i64,
+}
 
 async fn rest_login(http: &Client, base: &str) -> anyhow::Result<String> {
-    let resp = http.post(format!("{base}/api/auth/login"))
-        .json(&LoginRequest { email: ROBOT_EMAIL, password: ROBOT_PASSWORD })
-        .send().await?;
+    let resp = http
+        .post(format!("{base}/api/auth/login"))
+        .json(&LoginRequest {
+            email: ROBOT_EMAIL,
+            password: ROBOT_PASSWORD,
+        })
+        .send()
+        .await?;
     if resp.status().is_success() {
         return Ok(resp.json::<LoginResponse>().await?.token);
     }
     if resp.status() == 401 {
-        let reg = http.post(format!("{base}/api/auth/register"))
-            .json(&RegisterRequest { email: ROBOT_EMAIL, password: ROBOT_PASSWORD, full_name: "Market Maker Robot" })
-            .send().await?;
+        let reg = http
+            .post(format!("{base}/api/auth/register"))
+            .json(&RegisterRequest {
+                email: ROBOT_EMAIL,
+                password: ROBOT_PASSWORD,
+                full_name: "Market Maker Robot",
+            })
+            .send()
+            .await?;
         // 409 = already exists; any other non-2xx is a real error.
         if !reg.status().is_success() && reg.status().as_u16() != 409 {
             anyhow::bail!("register failed: {}", reg.status());
         }
-        let resp2 = http.post(format!("{base}/api/auth/login"))
-            .json(&LoginRequest { email: ROBOT_EMAIL, password: ROBOT_PASSWORD })
-            .send().await?;
+        let resp2 = http
+            .post(format!("{base}/api/auth/login"))
+            .json(&LoginRequest {
+                email: ROBOT_EMAIL,
+                password: ROBOT_PASSWORD,
+            })
+            .send()
+            .await?;
         return Ok(resp2.json::<LoginResponse>().await?.token);
     }
     anyhow::bail!("login failed: {}", resp.status())
 }
 
 async fn rest_ensure_funds(http: &Client, base: &str, token: &str) {
-    match http.post(format!("{base}/api/robot-funds"))
+    match http
+        .post(format!("{base}/api/robot-funds"))
         .header("Authorization", format!("Bearer {token}"))
-        .send().await
+        .send()
+        .await
     {
         Ok(r) if r.status().is_success() => info!("Robot inventory topped up"),
         Ok(r) => warn!("robot-funds returned {}", r.status()),
         Err(e) => warn!("robot-funds error: {e}"),
+    }
+}
+
+async fn rest_open_order_ids(
+    http: &Client,
+    base: &str,
+    token: &str,
+    symbol: &str,
+) -> anyhow::Result<Vec<i64>> {
+    let rows = http
+        .get(format!("{base}/api/orders"))
+        .query(&[("symbol", symbol), ("status", "open"), ("limit", "500")])
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Vec<RestOrder>>()
+        .await?;
+    Ok(rows.into_iter().map(|o| o.id).collect())
+}
+
+async fn rest_wait_no_open_orders(http: &Client, base: &str, token: &str, symbol: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match rest_open_order_ids(http, base, token, symbol).await {
+            Ok(ids) if ids.is_empty() => return true,
+            Ok(ids) => {
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        "[{}] {} open orders remain after startup cancel",
+                        symbol,
+                        ids.len()
+                    );
+                    return false;
+                }
+            }
+            Err(e) => {
+                warn!("[{}] open-order poll failed: {e}", symbol);
+                return false;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -205,9 +296,7 @@ struct WsExchangeClient {
     order_counter: Arc<AtomicU64>,
     /// Latency probes: coid → resolve with recv_us when order_update OPEN arrives.
     latency_pending: Arc<DashMap<u64, oneshot::Sender<u64>>>,
-    /// Incremented each time ws_manager reconnects. run_symbol clears its local
-    /// bid_book/ask_book when it detects a new generation to avoid placing duplicate
-    /// orders on top of stale engine state from the previous session.
+    /// Reserved for explicit session resets; reconnect alone must not bump it.
     session_gen: Arc<AtomicU64>,
 }
 
@@ -232,7 +321,8 @@ impl WsExchangeClient {
             "order_type": "limit",
             "price": price,
             "qty": qty,
-        }).to_string();
+        })
+        .to_string();
 
         if self.ws_tx.send(msg).await.is_err() {
             self.pending.remove(&coid);
@@ -241,7 +331,10 @@ impl WsExchangeClient {
 
         match tokio::time::timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(id)) => id,
-            _ => { self.pending.remove(&coid); None }
+            _ => {
+                self.pending.remove(&coid);
+                None
+            }
         }
     }
 
@@ -250,7 +343,10 @@ impl WsExchangeClient {
     /// Returns (order_id, latency_us).
     async fn place_order_timed(
         &self,
-        symbol: &str, side: &str, price: f64, qty: f64,
+        symbol: &str,
+        side: &str,
+        price: f64,
+        qty: f64,
     ) -> Option<(i64, u64)> {
         let coid = self.order_counter.fetch_add(1, Ordering::Relaxed);
         let (sub_tx, mut sub_rx) = oneshot::channel::<Option<i64>>();
@@ -268,7 +364,8 @@ impl WsExchangeClient {
             "order_type": "limit",
             "price": price,
             "qty": qty,
-        }).to_string();
+        })
+        .to_string();
 
         if self.ws_tx.send(msg).await.is_err() {
             self.pending.remove(&coid);
@@ -289,15 +386,29 @@ impl WsExchangeClient {
         Some((order_id, recv_ts.saturating_sub(send_ts)))
     }
 
-    async fn cancel_order(&self, order_id: i64) {
-        let msg = json!({"type": "cancel_order", "order_id": order_id}).to_string();
+    async fn batch_cancel_orders(&self, order_ids: &[i64]) {
+        if order_ids.is_empty() {
+            return;
+        }
+        let msg = json!({"type": "batch_cancel", "order_ids": order_ids}).to_string();
         let _ = self.ws_tx.send(msg).await;
     }
 
-    async fn batch_cancel_orders(&self, order_ids: &[i64]) {
-        if order_ids.is_empty() { return; }
-        let msg = json!({"type": "batch_cancel", "order_ids": order_ids}).to_string();
-        let _ = self.ws_tx.send(msg).await;
+    async fn wait_dead_orders(&self, order_ids: &[i64], timeout: Duration) -> bool {
+        if order_ids.is_empty() {
+            return true;
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if order_ids.iter().all(|id| self.dead_orders.contains_key(id)) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     async fn cancel_symbol(&self, symbol: &str) {
@@ -319,13 +430,16 @@ async fn ws_manager(
     pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
     dead_orders: Arc<DashMap<i64, ()>>,
     latency_pending: Arc<DashMap<u64, oneshot::Sender<u64>>>,
-    session_gen: Arc<AtomicU64>,
-    cleanup_symbols: &'static [&'static str],
+    _session_gen: Arc<AtomicU64>,
+    _cleanup_symbols: &'static [&'static str],
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let mut ws = match ws_connect_plain(&ws_url).await {
-            Ok(ws) => { backoff = Duration::from_secs(1); ws }
+            Ok(ws) => {
+                backoff = Duration::from_secs(1);
+                ws
+            }
             Err(e) => {
                 warn!("Desk WS connect failed: {e}, retry in {backoff:?}");
                 tokio::time::sleep(backoff).await;
@@ -339,24 +453,18 @@ async fn ws_manager(
 
         // Authenticate immediately on connect.
         let auth_msg = json!({"type":"auth","token":&token}).to_string();
-        if ws.write_frame(Frame::text(Payload::Owned(auth_msg.into_bytes()))).await.is_err() {
+        if ws
+            .write_frame(Frame::text(Payload::Owned(auth_msg.into_bytes())))
+            .await
+            .is_err()
+        {
             warn!("Desk WS auth send failed, reconnecting…");
             continue;
         }
 
-        // Cancel stale orders from any previous session (handles desk-server restarts
-        // where the market-maker process survives but loses order-update delivery).
-        for sym in cleanup_symbols {
-            let msg = json!({"type":"cancel_symbol","symbol":sym}).to_string();
-            if ws.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
-                warn!("Desk WS cancel_symbol send failed");
-                break;
-            }
-        }
-        // Signal run_symbol tasks to discard stale bid/ask tracking (they may have
-        // orders that the engine no longer knows about after a reconnect).
-        session_gen.fetch_add(1, Ordering::Relaxed);
-        info!("Desk WS connected, authenticated, stale orders cleared");
+        // Reconnect alone must not clear local books. Cancel confirmations are
+        // asynchronous; clearing before confirmation can create duplicate levels.
+        info!("Desk WS connected and authenticated");
 
         'conn: loop {
             tokio::select! {
@@ -407,13 +515,17 @@ fn route_desk_msg(
     dead_orders: &DashMap<i64, ()>,
     latency_pending: &DashMap<u64, oneshot::Sender<u64>>,
 ) {
-    let v: Value = match serde_json::from_str(text) { Ok(v) => v, _ => return };
+    let v: Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        _ => return,
+    };
     let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
     tracing::debug!("desk← type={msg_type} raw={}", &text[..text.len().min(120)]);
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "order_submitted" | "order_accepted" => {
             // Correlate by client_order_id and resolve the waiting place_order future.
-            let coid: u64 = v.get("client_order_id")
+            let coid: u64 = v
+                .get("client_order_id")
                 .and_then(|c| c.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(u64::MAX);
@@ -423,7 +535,8 @@ fn route_desk_msg(
             }
         }
         "order_rejected" => {
-            let coid: u64 = v.get("client_order_id")
+            let coid: u64 = v
+                .get("client_order_id")
                 .and_then(|c| c.as_str())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(u64::MAX);
@@ -439,7 +552,8 @@ fn route_desk_msg(
             // Resolve latency probe on OPEN (engine confirmed ACCEPTED).
             // client_order_id is only included for WS fast-path ACCEPTED events.
             if status == "OPEN" {
-                let coid: u64 = v.get("client_order_id")
+                let coid: u64 = v
+                    .get("client_order_id")
                     .and_then(|c| c.as_str())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(u64::MAX);
@@ -465,8 +579,10 @@ fn route_desk_msg(
 
 #[derive(Deserialize)]
 struct BinanceDepthMsg {
-    #[serde(rename = "b")] bids: Vec<[String; 2]>,
-    #[serde(rename = "a")] asks: Vec<[String; 2]>,
+    #[serde(rename = "b")]
+    bids: Vec<[String; 2]>,
+    #[serde(rename = "a")]
+    asks: Vec<[String; 2]>,
 }
 
 fn parse_levels(raw: &[[String; 2]]) -> Vec<(f64, f64)> {
@@ -494,6 +610,16 @@ async fn refresh_book(
     ask_book: &mut HashMap<u64, (i64, f64)>,
     cycle: u32,
 ) {
+    if let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) {
+        if best_bid >= best_ask {
+            warn!(
+                "[{}] source book crossed, skipping refresh: best_bid={} best_ask={}",
+                cfg.our_symbol, best_bid, best_ask
+            );
+            return;
+        }
+    }
+
     // Prune orders that the engine filled or canceled — they need to be re-placed.
     bid_book.retain(|_, (id, _)| client.dead_orders.remove(id).is_none());
     ask_book.retain(|_, (id, _)| client.dead_orders.remove(id).is_none());
@@ -510,64 +636,115 @@ async fn refresh_book(
     for &(price, binance_qty) in bids.iter().take(DEPTH_LEVELS) {
         let qty = round_qty((binance_qty * QTY_SCALE).max(cfg.min_qty), cfg.min_qty);
         let cost = price * qty;
-        if usdt_spent + cost > MAX_USDT_PER_SIDE { break; }
+        if usdt_spent + cost > MAX_USDT_PER_SIDE {
+            break;
+        }
         usdt_spent += cost;
         desired_bids.push((price, qty));
     }
-    let desired_asks: Vec<(f64, f64)> = asks.iter().take(DEPTH_LEVELS)
+    let desired_asks: Vec<(f64, f64)> = asks
+        .iter()
+        .take(DEPTH_LEVELS)
         .map(|&(p, q)| (p, round_qty((q * QTY_SCALE).max(cfg.min_qty), cfg.min_qty)))
         .collect();
 
     // Diff: cancel levels absent from desired, or whose qty drifted >15%.
     const QTY_DRIFT: f64 = 0.15;
 
-    let desired_bid_map: HashMap<u64, f64> = desired_bids.iter().map(|(p, q)| (p.to_bits(), *q)).collect();
-    let desired_ask_map: HashMap<u64, f64> = desired_asks.iter().map(|(p, q)| (p.to_bits(), *q)).collect();
+    let desired_bid_map: HashMap<u64, f64> = desired_bids
+        .iter()
+        .map(|(p, q)| (p.to_bits(), *q))
+        .collect();
+    let desired_ask_map: HashMap<u64, f64> = desired_asks
+        .iter()
+        .map(|(p, q)| (p.to_bits(), *q))
+        .collect();
 
-    let bid_cancels: Vec<i64> = bid_book.iter()
+    let bid_cancels: Vec<i64> = bid_book
+        .iter()
         .filter(|(k, (_, pq))| match desired_bid_map.get(k) {
             None => true,
             Some(dq) => (dq - pq).abs() / pq > QTY_DRIFT,
         })
-        .map(|(_, (id, _))| *id).collect();
-    let ask_cancels: Vec<i64> = ask_book.iter()
+        .map(|(_, (id, _))| *id)
+        .collect();
+    let ask_cancels: Vec<i64> = ask_book
+        .iter()
         .filter(|(k, (_, pq))| match desired_ask_map.get(k) {
             None => true,
             Some(dq) => (dq - pq).abs() / pq > QTY_DRIFT,
         })
-        .map(|(_, (id, _))| *id).collect();
+        .map(|(_, (id, _))| *id)
+        .collect();
 
     // Prices being cancelled so they can be re-placed with updated qty.
-    let bid_cancel_prices: HashSet<u64> = bid_book.iter()
+    let bid_cancel_prices: HashSet<u64> = bid_book
+        .iter()
         .filter(|(_, (id, _))| bid_cancels.contains(id))
-        .map(|(k, _)| *k).collect();
-    let ask_cancel_prices: HashSet<u64> = ask_book.iter()
+        .map(|(k, _)| *k)
+        .collect();
+    let ask_cancel_prices: HashSet<u64> = ask_book
+        .iter()
         .filter(|(_, (id, _))| ask_cancels.contains(id))
-        .map(|(k, _)| *k).collect();
+        .map(|(k, _)| *k)
+        .collect();
 
-    let bid_adds: Vec<(f64, f64)> = desired_bids.iter()
-        .filter(|(p, _)| !bid_book.contains_key(&p.to_bits()) || bid_cancel_prices.contains(&p.to_bits()))
-        .copied().collect();
-    let ask_adds: Vec<(f64, f64)> = desired_asks.iter()
-        .filter(|(p, _)| !ask_book.contains_key(&p.to_bits()) || ask_cancel_prices.contains(&p.to_bits()))
-        .copied().collect();
+    let bid_adds: Vec<(f64, f64)> = desired_bids
+        .iter()
+        .filter(|(p, _)| {
+            !bid_book.contains_key(&p.to_bits()) || bid_cancel_prices.contains(&p.to_bits())
+        })
+        .copied()
+        .collect();
+    let ask_adds: Vec<(f64, f64)> = desired_asks
+        .iter()
+        .filter(|(p, _)| {
+            !ask_book.contains_key(&p.to_bits()) || ask_cancel_prices.contains(&p.to_bits())
+        })
+        .copied()
+        .collect();
 
-    if bid_cancels.is_empty() && ask_cancels.is_empty()
-        && bid_adds.is_empty() && ask_adds.is_empty() {
+    if bid_cancels.is_empty()
+        && ask_cancels.is_empty()
+        && bid_adds.is_empty()
+        && ask_adds.is_empty()
+    {
         return;
     }
 
-    // Batch-cancel in one WS message + place all new orders concurrently.
-    let all_cancels: Vec<i64> = bid_cancels.iter().chain(ask_cancels.iter()).copied().collect();
-    let bid_place_futs: Vec<_> = bid_adds.iter()
-        .map(|(p, q)| client.place_order(cfg.our_symbol, "buy",  *p, *q)).collect();
-    let ask_place_futs: Vec<_> = ask_adds.iter()
-        .map(|(p, q)| client.place_order(cfg.our_symbol, "sell", *p, *q)).collect();
+    let all_cancels: Vec<i64> = bid_cancels
+        .iter()
+        .chain(ask_cancels.iter())
+        .copied()
+        .collect();
 
-    let (_, bid_results, ask_results) = tokio::join!(
-        client.batch_cancel_orders(&all_cancels),
+    if !all_cancels.is_empty() {
+        client.batch_cancel_orders(&all_cancels).await;
+        if !client
+            .wait_dead_orders(&all_cancels, CANCEL_CONFIRM_TIMEOUT)
+            .await
+        {
+            warn!(
+                "[{}] cancel confirmation timeout for {} orders; skip new placements this cycle",
+                cfg.our_symbol,
+                all_cancels.len()
+            );
+            return;
+        }
+    }
+
+    let bid_place_futs: Vec<_> = bid_adds
+        .iter()
+        .map(|(p, q)| client.place_order(cfg.our_symbol, "buy", *p, *q))
+        .collect();
+    let ask_place_futs: Vec<_> = ask_adds
+        .iter()
+        .map(|(p, q)| client.place_order(cfg.our_symbol, "sell", *p, *q))
+        .collect();
+
+    let (bid_results, ask_results) = tokio::join!(
         future::join_all(bid_place_futs),
-        future::join_all(ask_place_futs),
+        future::join_all(ask_place_futs)
     );
 
     // Update local books.
@@ -575,18 +752,25 @@ async fn refresh_book(
     ask_book.retain(|_, (id, _)| !ask_cancels.contains(id));
 
     for ((p, q), result) in bid_adds.iter().zip(bid_results) {
-        if let Some(id) = result { bid_book.insert(p.to_bits(), (id, *q)); }
+        if let Some(id) = result {
+            bid_book.insert(p.to_bits(), (id, *q));
+        }
     }
     for ((p, q), result) in ask_adds.iter().zip(ask_results) {
-        if let Some(id) = result { ask_book.insert(p.to_bits(), (id, *q)); }
+        if let Some(id) = result {
+            ask_book.insert(p.to_bits(), (id, *q));
+        }
     }
 
     info!(
         "[{}] diff  −{}bid −{}ask  +{}bid +{}ask  book {}b {}a",
         cfg.our_symbol,
-        bid_cancels.len(), ask_cancels.len(),
-        bid_adds.len(), ask_adds.len(),
-        bid_book.len(), ask_book.len(),
+        bid_cancels.len(),
+        ask_cancels.len(),
+        bid_adds.len(),
+        ask_adds.len(),
+        bid_book.len(),
+        ask_book.len(),
     );
 }
 
@@ -599,14 +783,23 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
     let mut reconnect_delay = Duration::from_secs(1);
     let mut last_session_gen: u64 = client.session_gen.load(Ordering::Relaxed);
 
-    info!("[{}] market-making started (stream: {})", cfg.our_symbol, cfg.binance_stream);
+    info!(
+        "[{}] market-making started (stream: {})",
+        cfg.our_symbol, cfg.binance_stream
+    );
 
     loop {
         let url = format!("{BINANCE_WS_BASE}/{}", cfg.binance_stream);
         let mut ws = match ws_connect_tls(&url).await {
-            Ok(ws) => { reconnect_delay = Duration::from_secs(1); ws }
+            Ok(ws) => {
+                reconnect_delay = Duration::from_secs(1);
+                ws
+            }
             Err(e) => {
-                warn!("[{}] Binance WS connect failed: {e}, retry in {reconnect_delay:?}", cfg.our_symbol);
+                warn!(
+                    "[{}] Binance WS connect failed: {e}, retry in {reconnect_delay:?}",
+                    cfg.our_symbol
+                );
                 tokio::time::sleep(reconnect_delay).await;
                 reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
                 continue;
@@ -619,7 +812,10 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
         loop {
             let frame = match ws.read_frame().await {
                 Ok(f) => f,
-                Err(e) => { warn!("[{}] Binance WS error: {e}", cfg.our_symbol); break; }
+                Err(e) => {
+                    warn!("[{}] Binance WS error: {e}", cfg.our_symbol);
+                    break;
+                }
             };
             let text = match frame.opcode {
                 OpCode::Text => match std::str::from_utf8(&frame.payload) {
@@ -630,12 +826,12 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
                 _ => continue,
             };
 
-            // Desk WS reconnected: cancel_symbol was sent, so engine has cleared our
-            // old orders. Clear local tracking so the diff places fresh orders.
+            // Reserved for future explicit session resets. Reconnect alone must not
+            // clear local tracking because engine cancel confirmations are async.
             let cur_gen = client.session_gen.load(Ordering::Relaxed);
             if cur_gen != last_session_gen {
                 if !bid_book.is_empty() || !ask_book.is_empty() {
-                    warn!("[{}] desk reconnected (gen {} → {}), clearing {} bids + {} asks from local book",
+                    warn!("[{}] explicit session reset (gen {} → {}), clearing {} bids + {} asks from local book",
                         cfg.our_symbol, last_session_gen, cur_gen, bid_book.len(), ask_book.len());
                 }
                 bid_book.clear();
@@ -650,23 +846,55 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
 
             let bids = parse_levels(&depth.bids);
             let asks = parse_levels(&depth.asks);
-            if bids.is_empty() || asks.is_empty() { continue; }
+            if bids.is_empty() || asks.is_empty() {
+                continue;
+            }
 
             cycle = cycle.wrapping_add(1);
 
-            refresh_book(cfg, &client, &bids, &asks, &mut bid_book, &mut ask_book, cycle).await;
+            refresh_book(
+                cfg,
+                &client,
+                &bids,
+                &asks,
+                &mut bid_book,
+                &mut ask_book,
+                cycle,
+            )
+            .await;
         }
 
         // On disconnect, cancel all open orders for this symbol — prices may
         // have moved while we were offline and the stale book would mislead the diff.
         let n = bid_book.len() + ask_book.len();
         if n > 0 {
-            warn!("[{}] Binance WS disconnected, cancelling {} stale orders…", cfg.our_symbol, n);
-            client.cancel_symbol(cfg.our_symbol).await;
-            bid_book.clear();
-            ask_book.clear();
+            warn!(
+                "[{}] Binance WS disconnected, cancelling {} stale orders…",
+                cfg.our_symbol, n
+            );
+            let stale_orders: Vec<i64> = bid_book
+                .values()
+                .chain(ask_book.values())
+                .map(|(id, _)| *id)
+                .collect();
+            client.batch_cancel_orders(&stale_orders).await;
+            if client
+                .wait_dead_orders(&stale_orders, CANCEL_CONFIRM_TIMEOUT)
+                .await
+            {
+                bid_book.clear();
+                ask_book.clear();
+            } else {
+                warn!(
+                    "[{}] stale cancel confirmation timeout; keeping local tracking for retry",
+                    cfg.our_symbol
+                );
+            }
         } else {
-            warn!("[{}] Binance WS disconnected, reconnecting in {reconnect_delay:?}…", cfg.our_symbol);
+            warn!(
+                "[{}] Binance WS disconnected, reconnecting in {reconnect_delay:?}…",
+                cfg.our_symbol
+            );
         }
         tokio::time::sleep(reconnect_delay).await;
         reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
@@ -674,7 +902,9 @@ async fn run_symbol(cfg: &'static SymbolConfig, client: WsExchangeClient) {
 }
 
 fn round_qty(qty: f64, min_qty: f64) -> f64 {
-    if min_qty <= 0.0 { return qty; }
+    if min_qty <= 0.0 {
+        return qty;
+    }
     (((qty / min_qty).floor() * min_qty) * 1e8).round() / 1e8
 }
 
@@ -702,9 +932,12 @@ async fn run_latency_probe(client: WsExchangeClient) {
 
     for i in 0..PROBE_COUNT {
         // Far-off-market bid: $1 for BTC — accepted but never fills.
-        match client.place_order_timed("BTC_USDT", "buy", 1.0, 0.0001).await {
+        match client
+            .place_order_timed("BTC_USDT", "buy", 1.0, 0.0001)
+            .await
+        {
             Some((_oid, us)) => samples.push(us),
-            None             => timeouts += 1,
+            None => timeouts += 1,
         }
 
         if i > 0 && i % 20_000 == 0 {
@@ -726,14 +959,14 @@ async fn run_latency_probe(client: WsExchangeClient) {
     }
 
     samples.sort_unstable();
-    let p50   = samples[n * 50 / 100];
-    let p90   = samples[n * 90 / 100];
-    let p95   = samples[n * 95 / 100];
-    let p99   = samples[n * 99 / 100];
-    let p999  = samples[(n * 999 / 1000).min(n - 1)];
-    let min   = samples[0];
-    let max   = samples[n - 1];
-    let mean  = samples.iter().sum::<u64>() / n as u64;
+    let p50 = samples[n * 50 / 100];
+    let p90 = samples[n * 90 / 100];
+    let p95 = samples[n * 95 / 100];
+    let p99 = samples[n * 99 / 100];
+    let p999 = samples[(n * 999 / 1000).min(n - 1)];
+    let min = samples[0];
+    let max = samples[n - 1];
+    let mean = samples.iter().sum::<u64>() / n as u64;
     let throughput = n as f64 / elapsed.as_secs_f64();
     info!(
         "[latency] RESULTS ({n} samples, {timeouts} timeouts, {throughput:.0} orders/sec, elapsed={:.1}s): \
@@ -756,9 +989,14 @@ async fn main() -> anyhow::Result<()> {
     let mut token = String::new();
     for attempt in 1..=5u32 {
         match rest_login(&http, &base).await {
-            Ok(t) => { token = t; break; }
+            Ok(t) => {
+                token = t;
+                break;
+            }
             Err(e) => {
-                if attempt == 5 { anyhow::bail!("cannot authenticate after 5 attempts: {e}"); }
+                if attempt == 5 {
+                    anyhow::bail!("cannot authenticate after 5 attempts: {e}");
+                }
                 warn!("auth failed ({e}), retry in 3s…");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
@@ -769,10 +1007,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Shared WS client: one TCP connection, shared by all symbol tasks.
     let (ws_tx, ws_rx) = mpsc::channel::<String>(8192);
-    let pending        = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
-    let dead_orders    = Arc::new(DashMap::<i64, ()>::new());
+    let pending = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
+    let dead_orders = Arc::new(DashMap::<i64, ()>::new());
     let latency_pending = Arc::new(DashMap::<u64, oneshot::Sender<u64>>::new());
-    let session_gen    = Arc::new(AtomicU64::new(0));
+    let session_gen = Arc::new(AtomicU64::new(0));
 
     let client = WsExchangeClient {
         ws_tx,
@@ -786,7 +1024,16 @@ async fn main() -> anyhow::Result<()> {
     // WS manager: handles connection lifecycle, auth, send/recv, reconnect.
     let ws_url = exchange_ws_url();
     const SYMBOL_NAMES: &[&str] = &["BTC_USDT", "ETH_USDT", "SOL_USDT"];
-    tokio::spawn(ws_manager(ws_url, token, ws_rx, pending, dead_orders, latency_pending, session_gen, SYMBOL_NAMES));
+    tokio::spawn(ws_manager(
+        ws_url,
+        token.clone(),
+        ws_rx,
+        pending,
+        dead_orders,
+        latency_pending,
+        session_gen,
+        SYMBOL_NAMES,
+    ));
 
     // Brief pause for the WS manager to connect and authenticate.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -796,16 +1043,19 @@ async fn main() -> anyhow::Result<()> {
     for cfg in SYMBOLS {
         client.cancel_symbol(cfg.our_symbol).await;
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for cfg in SYMBOLS {
+        let _ = rest_wait_no_open_orders(&http, &base, &token, cfg.our_symbol).await;
+    }
 
     let probe_only = std::env::var("PROBE_ONLY").is_ok();
-    let run_probe  = probe_only || std::env::var("RUN_PROBE").is_ok();
+    let run_probe = probe_only || std::env::var("RUN_PROBE").is_ok();
     let mut handles: Vec<_> = if probe_only {
         info!("PROBE_ONLY mode — skipping market-making");
         vec![]
     } else {
         info!("Starting market-making on {} symbols", SYMBOLS.len());
-        SYMBOLS.iter()
+        SYMBOLS
+            .iter()
             .map(|cfg| {
                 let c = client.clone();
                 tokio::spawn(async move { run_symbol(cfg, c).await })
@@ -821,7 +1071,9 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down…");
-    for h in handles { h.abort(); }
+    for h in handles {
+        h.abort();
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     info!("Done.");
     Ok(())

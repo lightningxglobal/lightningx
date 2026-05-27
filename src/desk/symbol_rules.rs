@@ -1,5 +1,3 @@
-use crate::float_ext::FLOAT_EPS;
-
 #[derive(Debug, Clone, Copy)]
 pub struct SymbolRules {
     pub price_tick: f64,

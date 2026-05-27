@@ -1287,20 +1287,24 @@ async fn bulk_cancel(
         id: i64,
         symbol: String,
         side: String,
-        price: Option<f64>,
+        freeze_price: f64,
         quantity: f64,
         filled: f64,
     }
 
     let rows: Vec<OpenOrder> = match symbol {
         Some(sym) => sqlx::query_as(
-            "SELECT id, symbol, side, price, quantity, filled FROM orders
+            "SELECT id, symbol, side,
+                    COALESCE(freeze_price, COALESCE(price, 0.0)) as freeze_price,
+                    quantity, filled FROM orders
              WHERE user_id=$1 AND symbol=$2 AND status IN ('PENDING','TRADING')",
         )
         .bind(user_id)
         .bind(sym),
         None => sqlx::query_as(
-            "SELECT id, symbol, side, price, quantity, filled FROM orders
+            "SELECT id, symbol, side,
+                    COALESCE(freeze_price, COALESCE(price, 0.0)) as freeze_price,
+                    quantity, filled FROM orders
              WHERE user_id=$1 AND status IN ('PENDING','TRADING')",
         )
         .bind(user_id),
@@ -1318,9 +1322,9 @@ async fn bulk_cancel(
     let mut count = 0usize;
 
     for order in rows {
-        let remaining = order.quantity - order.filled;
+        let remaining = (order.quantity - order.filled).max(0.0);
 
-        // Cancel in matching engine (best-effort).
+        // Cancel in matching engine (best-effort, fire-and-forget).
         if let Some(engines) = &state.engines {
             if let Some(engine) = engines.get(&order.symbol) {
                 let _ = {
@@ -1333,23 +1337,19 @@ async fn bulk_cancel(
                 order_id: order.id as u64,
             };
             let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(req));
-            let _ = personal_tx.try_send(
-                json!({
-                    "type": "cancel_submitted",
-                    "order_id": order.id,
-                    "ts": ts,
-                })
-                .to_string(),
-            );
-            count += 1;
-            continue;
+            // Fall through to update DB and release frozen immediately.
+            // If the engine also sends CancelConfirm, the desk_server handler
+            // will find the order already CANCELED and skip the second release.
         }
 
-        // Update DB.
-        let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
-            .bind(order.id)
-            .execute(state.db.as_ref())
-            .await;
+        // Update DB — idempotent (WHERE guards against double-cancel).
+        let _ = sqlx::query(
+            "UPDATE orders SET status='CANCELED', updated_at=NOW()
+             WHERE id=$1 AND status IN ('PENDING','TRADING')",
+        )
+        .bind(order.id)
+        .execute(state.db.as_ref())
+        .await;
 
         // Release frozen funds for the unfilled portion.
         let sym_parts: Vec<&str> = order.symbol.splitn(2, '_').collect();
@@ -1357,10 +1357,9 @@ async fn bulk_cancel(
         let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
 
         if order.side == "buy" {
-            let fp = order.price.unwrap_or(0.0);
-            if fp > 0.0 && remaining > 0.0 {
+            if order.freeze_price > 0.0 && remaining > 0.0 {
                 let _ = repo
-                    .release_frozen(user_id, quote_asset, fp * remaining)
+                    .release_frozen(user_id, quote_asset, order.freeze_price * remaining)
                     .await;
             }
         } else if remaining > 0.0 {

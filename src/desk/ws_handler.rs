@@ -385,18 +385,24 @@ async fn handle_client_message(
                 }
             }
 
-            if let Err(reason) =
-                crate::symbol_rules::validate_order_shape(&symbol, &order_type, price, qty)
-            {
-                return Some(
-                    json!({
-                        "type": "order_rejected",
-                        "client_order_id": client_order_id,
-                        "reason": reason
-                    })
-                    .to_string(),
-                );
-            }
+            let _fixed_shape = match crate::symbol_rules::normalize_order_shape(
+                &symbol,
+                &order_type,
+                price,
+                qty,
+            ) {
+                Ok(shape) => shape,
+                Err(reason) => {
+                    return Some(
+                        json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": reason
+                        })
+                        .to_string(),
+                    )
+                }
+            };
 
             let engine_side = match side.as_str() {
                 "buy" => Side::Buy,

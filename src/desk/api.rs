@@ -383,14 +383,17 @@ async fn handle_place_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    if let Err(reason) = crate::symbol_rules::validate_order_shape(
+    let _fixed_shape = match crate::symbol_rules::normalize_order_shape(
         &req.symbol,
         &req.order_type,
         req.price,
         req.quantity,
     ) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
-    }
+        Ok(shape) => shape,
+        Err(reason) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
+        }
+    };
 
     if let Some(client_order_id) = req.client_order_id.as_deref() {
         if !client_order_id.is_empty() {

@@ -65,7 +65,7 @@ Acceptance:
 
 ## Phase 4: Fixed-Point Matching
 
-Status: Pending
+Status: In progress. Phase 4a adds fixed-point boundary normalization.
 
 Goal: remove `f64` from engine price/quantity arithmetic.
 
@@ -76,9 +76,9 @@ Design:
 - DB keeps legacy float columns for display initially, with integer columns as source of truth.
 
 Acceptance:
-- No epsilon checks are needed for engine remaining/fill comparisons.
-- Replay checksums are stable across platforms.
-- Matching benchmark p50/p99 does not regress.
+- API and WS order entry normalize price/quantity to integer ticks/lots before accepting an order.
+- Misaligned price/quantity inputs are rejected at the boundary.
+- Matching benchmark p50/p99 does not regress for Phase 4a.
 
 ## Phase 5: Event Log And Replay Recovery
 

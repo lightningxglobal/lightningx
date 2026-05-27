@@ -96,6 +96,7 @@ async fn process_db_cmd(
     account_cache: lightning_exchange::api::AccountCache,
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
     market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
 ) {
     use lightning_exchange::account_repository::AccountRepository;
     match cmd {
@@ -130,20 +131,55 @@ async fn process_db_cmd(
                 let parts: Vec<&str> = sym_str.splitn(2, '_').collect();
                 let base  = parts.first().copied().unwrap_or("BTC");
                 let quote = parts.last().copied().unwrap_or("USDT");
-                if side == 0 {
+                let freeze_ok = if side == 0 {
                     // buy: freeze quote
                     let amount = freeze_price * qty;
                     if amount > 0.0 {
-                        if let Ok((bal, frz)) = repo.freeze_for_buy(user_id, quote, amount).await {
-                            account_cache.entry(user_id).or_insert_with(HashMap::new)
-                                .insert(quote.to_string(), (bal, frz));
+                        match repo.freeze_for_buy(user_id, quote, amount).await {
+                            Ok((bal, frz)) => {
+                                account_cache.entry(user_id).or_insert_with(HashMap::new)
+                                    .insert(quote.to_string(), (bal, frz));
+                                true
+                            }
+                            Err(_) => false,
                         }
-                    }
+                    } else { true }
                 } else {
                     // sell: freeze base
-                    if let Ok((bal, frz)) = repo.freeze_for_sell(user_id, base, qty).await {
-                        account_cache.entry(user_id).or_insert_with(HashMap::new)
-                            .insert(base.to_string(), (bal, frz));
+                    match repo.freeze_for_sell(user_id, base, qty).await {
+                        Ok((bal, frz)) => {
+                            account_cache.entry(user_id).or_insert_with(HashMap::new)
+                                .insert(base.to_string(), (bal, frz));
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                };
+
+                if !freeze_ok {
+                    // Insufficient funds: cancel the resting order so it doesn't
+                    // fill without backing funds. Update DB, notify user, and tell
+                    // the engine to remove it from the book.
+                    tracing::warn!("freeze failed for order {id} user {user_id} — cancelling");
+                    let _ = sqlx::query(
+                        "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1",
+                    ).bind(id).execute(db.as_ref()).await;
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros() as u64).unwrap_or(0);
+                    if let Some(tx) = user_tx.get(&(user_id as u64 as i64)) {
+                        let _ = tx.try_send(serde_json::json!({
+                            "type": "order_update",
+                            "order_id": id,
+                            "status": "CANCELED",
+                            "reason": "insufficient_balance",
+                            "ts": ts,
+                        }).to_string());
+                    }
+                    if let Some(ref tx) = aeron_cancel_tx {
+                        let _ = tx.send(AeronCmd::Cancel(
+                            lightning_exchange::sbe::CancelOrderRequest { order_id: id as u64 },
+                        ));
                     }
                 }
             }
@@ -187,22 +223,46 @@ async fn process_db_cmd(
 
             let (buy_oid, sell_oid) = if side == 0 { (taker_id, maker_id) } else { (maker_id, taker_id) };
 
-            // INSERT trade (retry once on FK race with taker's UpsertOrder).
-            let trade_res = sqlx::query(
+            if taker_uid == 0 || maker_uid == 0 { return; }
+
+            let parts: Vec<&str> = symbol.splitn(2, '_').collect();
+            let base  = *parts.first().unwrap_or(&"BTC");
+            let quote = *parts.last().unwrap_or(&"USDT");
+            let cost = price * qty;
+            let (buyer_id, seller_id) = if side == 0 { (taker_uid, maker_uid) } else { (maker_uid, taker_uid) };
+
+            // All settlement mutations in one transaction: trade insert + maker order
+            // update + all 4 balance changes. Rolls back entirely if any step fails.
+            let mut txn = match db.begin().await {
+                Ok(t) => t,
+                Err(e) => { tracing::error!("settle txn begin: {e}"); return; }
+            };
+
+            // INSERT trade — retry once to handle FK race with taker's UpsertOrder.
+            let trade_ok = sqlx::query(
                 "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at) \
                  VALUES ($1,$2,$3,$4,$5,NOW())",
             ).bind(&symbol).bind(buy_oid).bind(sell_oid).bind(price).bind(qty)
-            .execute(db.as_ref()).await;
-            if trade_res.is_err() {
+            .execute(&mut *txn).await.is_ok();
+            if !trade_ok {
+                let _ = txn.rollback().await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
-                let _ = sqlx::query(
+                txn = match db.begin().await {
+                    Ok(t) => t,
+                    Err(e) => { tracing::error!("settle txn retry begin: {e}"); return; }
+                };
+                if let Err(e) = sqlx::query(
                     "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at) \
                      VALUES ($1,$2,$3,$4,$5,NOW())",
                 ).bind(&symbol).bind(buy_oid).bind(sell_oid).bind(price).bind(qty)
-                .execute(db.as_ref()).await;
+                .execute(&mut *txn).await {
+                    tracing::error!("trade insert failed: {e}");
+                    let _ = txn.rollback().await;
+                    return;
+                }
             }
 
-            // UPDATE maker order filled/status and capture new state for WS push.
+            // UPDATE maker order filled/status.
             let maker_row: Option<(String, f64)> = sqlx::query_as(
                 "UPDATE orders SET filled = filled + $1, \
                  status = CASE WHEN quantity - (filled + $1) < 1e-9 THEN 'COMPLETED' ELSE 'TRADING' END, \
@@ -210,8 +270,46 @@ async fn process_db_cmd(
                  WHERE id = $2 \
                  RETURNING status, filled",
             ).bind(qty).bind(maker_id)
-            .fetch_optional(db.as_ref()).await.unwrap_or(None);
+            .fetch_optional(&mut *txn).await.unwrap_or(None);
 
+            // Buyer: debit quote (decrement both balance AND frozen), credit base.
+            let bq: Option<(f64, f64)> = sqlx::query_as(
+                "UPDATE accounts SET balance = balance - $1, \
+                 frozen = GREATEST(frozen - $1, 0), updated_at = NOW() \
+                 WHERE user_id = $2 AND asset = $3 RETURNING balance, frozen",
+            ).bind(cost).bind(buyer_id).bind(quote)
+            .fetch_optional(&mut *txn).await.unwrap_or(None);
+
+            let bb: Option<(f64, f64)> = sqlx::query_as(
+                "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1,$2,$3,0) \
+                 ON CONFLICT (user_id, asset) DO UPDATE \
+                 SET balance = accounts.balance + $3, updated_at = NOW() \
+                 RETURNING balance, frozen",
+            ).bind(buyer_id).bind(base).bind(qty)
+            .fetch_optional(&mut *txn).await.unwrap_or(None);
+
+            // Seller: debit base (decrement both balance AND frozen), credit quote.
+            let sb: Option<(f64, f64)> = sqlx::query_as(
+                "UPDATE accounts SET balance = balance - $1, \
+                 frozen = GREATEST(frozen - $1, 0), updated_at = NOW() \
+                 WHERE user_id = $2 AND asset = $3 RETURNING balance, frozen",
+            ).bind(qty).bind(seller_id).bind(base)
+            .fetch_optional(&mut *txn).await.unwrap_or(None);
+
+            let sq: Option<(f64, f64)> = sqlx::query_as(
+                "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1,$2,$3,0) \
+                 ON CONFLICT (user_id, asset) DO UPDATE \
+                 SET balance = accounts.balance + $3, updated_at = NOW() \
+                 RETURNING balance, frozen",
+            ).bind(seller_id).bind(quote).bind(cost)
+            .fetch_optional(&mut *txn).await.unwrap_or(None);
+
+            if let Err(e) = txn.commit().await {
+                tracing::error!("settle txn commit: {e}");
+                return;
+            }
+
+            // WS push: maker order update.
             if let (Some((ref new_status, new_filled)), uid) = (&maker_row, maker_uid) {
                 if uid != 0 {
                     let ws_status = if new_status == "COMPLETED" { "FILLED" } else { "PARTIAL_FILL" };
@@ -226,48 +324,7 @@ async fn process_db_cmd(
                 }
             }
 
-            if taker_uid == 0 || maker_uid == 0 { return; }
-
-            let parts: Vec<&str> = symbol.splitn(2, '_').collect();
-            let base  = *parts.first().unwrap_or(&"BTC");
-            let quote = *parts.last().unwrap_or(&"USDT");
-            let cost = price * qty;
-            let (buyer_id, seller_id) = if side == 0 { (taker_uid, maker_uid) } else { (maker_uid, taker_uid) };
-
-            let ((bq, bb), (sb, sq)) = tokio::join!(
-                async {
-                    let q: Option<(f64, f64)> = sqlx::query_as(
-                        "UPDATE accounts SET balance = balance - $1, updated_at = NOW() \
-                         WHERE user_id = $2 AND asset = $3 RETURNING balance, frozen",
-                    ).bind(cost).bind(buyer_id).bind(quote)
-                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
-                    let b: Option<(f64, f64)> = sqlx::query_as(
-                        "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1,$2,$3,0) \
-                         ON CONFLICT (user_id, asset) DO UPDATE \
-                         SET balance = accounts.balance + $3, updated_at = NOW() \
-                         RETURNING balance, frozen",
-                    ).bind(buyer_id).bind(base).bind(qty)
-                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
-                    (q, b)
-                },
-                async {
-                    let b: Option<(f64, f64)> = sqlx::query_as(
-                        "UPDATE accounts SET balance = balance - $1, \
-                         frozen = GREATEST(frozen - $1, 0), updated_at = NOW() \
-                         WHERE user_id = $2 AND asset = $3 RETURNING balance, frozen",
-                    ).bind(qty).bind(seller_id).bind(base)
-                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
-                    let q: Option<(f64, f64)> = sqlx::query_as(
-                        "INSERT INTO accounts (user_id, asset, balance, frozen) VALUES ($1,$2,$3,0) \
-                         ON CONFLICT (user_id, asset) DO UPDATE \
-                         SET balance = accounts.balance + $3, updated_at = NOW() \
-                         RETURNING balance, frozen",
-                    ).bind(seller_id).bind(quote).bind(cost)
-                    .fetch_optional(db.as_ref()).await.unwrap_or(None);
-                    (b, q)
-                }
-            );
-
+            // WS push: balance updates for both sides.
             for (uid, updates) in [
                 (buyer_id,  [(quote, bq), (base,  bb)]),
                 (seller_id, [(base,  sb), (quote, sq)]),
@@ -298,6 +355,7 @@ fn spawn_db_worker(
     account_cache: lightning_exchange::api::AccountCache,
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
     market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
 ) {
     std::thread::Builder::new().name("db-worker".to_string()).spawn(move || {
         let mut idle_us: u64 = 0;
@@ -310,7 +368,8 @@ fn spawn_db_worker(
                 let ac2 = account_cache.clone();
                 let ut2 = user_tx.clone();
                 let mt2 = market_tx.clone();
-                rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2));
+                let at2 = aeron_cancel_tx.clone();
+                rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, at2));
             }
             if !did_work {
                 idle_us = (idle_us * 2 + 10).min(200);
@@ -389,6 +448,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Command channel: async WS handlers → Aeron spin thread ───────────────
     let (aeron_cmd_tx, mut aeron_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<AeronCmd>();
+    // Clone for DB worker so it can cancel orders when fund freeze fails post-ACCEPTED.
+    let db_worker_aeron_tx = aeron_cmd_tx.clone();
 
     // ── Sync next_order_id from DB so WS atomic IDs don't collide ─────────────
     let max_db_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM orders")
@@ -425,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
         account_cache.clone(),
         state.user_tx.clone(),
         state.market_tx.clone(),
+        Some(db_worker_aeron_tx),
     );
 
     // ── Aeron spin thread: WS command drain + inbound event loop ─────────────

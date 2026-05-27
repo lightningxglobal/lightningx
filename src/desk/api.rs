@@ -116,16 +116,18 @@ async fn handle_login(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
+fn auth_claims(headers: &HeaderMap) -> Result<user_service::Claims, (StatusCode, Json<Value>)> {
     let token = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(json!({"error": "Missing token"}))))?;
-
     user_service::verify_token(token)
-        .map(|c| c.sub)
         .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({"error": e.to_string()}))))
+}
+
+fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
+    auth_claims(headers).map(|c| c.sub)
 }
 
 // ─── Accounts ─────────────────────────────────────────────────────────────────
@@ -1077,15 +1079,19 @@ async fn handle_test_funds(
 }
 
 /// Top up robot account to maintain sufficient inventory for market-making.
-/// Always sets balances to at least the specified floor amounts.
+/// Restricted to the robot service account — rejects all other callers.
 async fn handle_robot_funds(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let user_id = match auth_user(&headers) {
-        Ok(id) => id,
+    let claims = match auth_claims(&headers) {
+        Ok(c) => c,
         Err(e) => return e.into_response(),
     };
+    if claims.email != "robot@lightningx.exchange" {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "Forbidden"}))).into_response();
+    }
+    let user_id = claims.sub;
 
     let result = sqlx::query(
         "INSERT INTO accounts (user_id, asset, balance, frozen)

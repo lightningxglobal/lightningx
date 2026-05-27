@@ -27,5 +27,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(include_str!("../../migrations/006_client_order_id.sql"))
         .execute(pool)
         .await?;
+    sqlx::raw_sql(include_str!("../../migrations/007_trades_composite_index.sql"))
+        .execute(pool)
+        .await?;
+    sqlx::raw_sql(include_str!("../../migrations/008_user_registration_ip.sql"))
+        .execute(pool)
+        .await?;
     Ok(())
 }

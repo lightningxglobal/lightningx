@@ -762,6 +762,11 @@ async fn main() -> anyhow::Result<()> {
             .name("aeron-event-loop".to_string())
             .spawn(move || {
                 let mut idle_us: u64 = 0;
+                // Per-symbol timestamp of the last non-empty depth snapshot.
+                // Used to suppress empty snapshots during the cancel-all phase of
+                // market-maker refresh cycles (which momentarily empties the book).
+                let mut last_nonempty_depth: std::collections::HashMap<String, std::time::Instant> =
+                    std::collections::HashMap::new();
                 loop {
                     let mut did_work = false;
                     // Drain outbound commands (WS/REST → engine) without blocking.
@@ -1005,6 +1010,19 @@ async fn main() -> anyhow::Result<()> {
                                 let symbol = std::str::from_utf8(&evt.symbol[..end])
                                     .unwrap_or("BTC_USDT").to_string();
                                 let symbol = if symbol.is_empty() { "BTC_USDT".to_string() } else { symbol };
+
+                                // Suppress empty snapshots that arrive within 2s of
+                                // a non-empty one — they are artifacts of the market-maker
+                                // cancel-all cycle, not a genuinely empty book.
+                                if nb == 0 && na == 0 {
+                                    if let Some(&t) = last_nonempty_depth.get(&symbol) {
+                                        if t.elapsed() < std::time::Duration::from_secs(2) {
+                                            continue; // skip this empty snapshot
+                                        }
+                                    }
+                                } else {
+                                    last_nonempty_depth.insert(symbol.clone(), std::time::Instant::now());
+                                }
 
                                 let market_tx2 = market_tx.clone();
                                 let last_depth2 = last_depth.clone();

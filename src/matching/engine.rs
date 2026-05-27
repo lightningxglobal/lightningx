@@ -1280,9 +1280,15 @@ pub struct PoolConfig {
 
 impl Default for PoolConfig {
     fn default() -> Self {
+        // POOL_CAPACITY env var allows smaller pre-allocation on memory-constrained hosts.
+        // Default 2M is tuned for high-throughput benchmarks; set to e.g. 200000 on t3.small.
+        let cap = std::env::var("POOL_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2_000_000);
         Self {
-            order_capacity: 2_000_000,
-            queue_capacity: 2_000_000,
+            order_capacity: cap,
+            queue_capacity: cap,
         }
     }
 }

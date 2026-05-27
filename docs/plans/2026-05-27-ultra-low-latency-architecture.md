@@ -65,7 +65,7 @@ Acceptance:
 
 ## Phase 4: Fixed-Point Matching
 
-Status: In progress. Phase 4a adds fixed-point boundary normalization; Phase 4b adds a fixed-order bridge for standalone engine entry.
+Status: In progress. Phase 4a adds fixed-point boundary normalization. The temporary fixed-to-legacy bridge was removed because the system is still in development and the matching hot path should move directly to integer ticks/lots.
 
 Goal: remove `f64` from engine price/quantity arithmetic.
 
@@ -77,9 +77,10 @@ Design:
 
 Acceptance:
 - API and WS order entry normalize price/quantity to integer ticks/lots before accepting an order.
-- Standalone engine entry can construct the legacy `Order` through fixed ticks/lots without changing `Order` layout.
+- Engine order state, book keys, fill accounting, and matching comparisons use integer ticks/lots directly.
+- Float conversion exists only at external projection boundaries such as REST/WS JSON, DB legacy display columns, and market-data publishing.
 - Misaligned price/quantity inputs are rejected at the boundary.
-- Matching benchmark p50/p99 does not regress for Phase 4a/4b.
+- Matching benchmark p50/p99 does not regress for each Phase 4 step.
 
 ## Phase 5: Event Log And Replay Recovery
 

@@ -1,7 +1,7 @@
 use crate::account_repository::AccountRepository;
 use crate::api::AppState;
 use crate::engine::{MatchingEngine, OrderStatus};
-use crate::order::{Side, TimeInForce};
+use crate::order::{Order, Side, TimeInForce};
 use crate::order_state::{
     db_status_from_engine, maker_ws_status_from_db_status, ws_status_from_engine,
 };
@@ -667,30 +667,18 @@ async fn handle_client_message(
                     .to_string(),
                 );
             }
-            let fixed_order = match crate::symbol_rules::FixedOrderInput::from_order_fields(
-                db_order_id as u64,
-                &symbol,
-                engine_side,
-                &order_type,
-                price,
-                qty,
-                tif,
-                now_ns,
-            ) {
-                Ok(order) => order,
-                Err(reason) => {
-                    return Some(
-                        json!({
-                            "type": "order_rejected",
-                            "client_order_id": client_order_id,
-                            "reason": reason
-                        })
-                        .to_string(),
-                    )
-                }
+            let engine_order = if order_type == "market" {
+                Order::new_market(db_order_id as u64, engine_side, qty, now_ns)
+            } else {
+                Order::new(
+                    db_order_id as u64,
+                    engine_side,
+                    price.unwrap_or(0.0),
+                    qty,
+                    tif,
+                    now_ns,
+                )
             };
-            let engine_order =
-                fixed_order.to_order(crate::symbol_rules::SymbolRules::for_symbol(&symbol));
 
             // Freeze funds before sending to engine.
             let repo = AccountRepository::new(state.db.as_ref());

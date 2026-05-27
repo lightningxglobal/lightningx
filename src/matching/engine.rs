@@ -1203,6 +1203,15 @@ impl MatchingEngine {
     /// 撤销订单（热路径 - 使用List实现，真正删除）
     #[inline]
     pub fn cancel_order(&mut self, order_id: u64) -> OrderResult<CancelOrderResult> {
+        self.cancel_order_inner(order_id, true)
+    }
+
+    #[inline]
+    fn cancel_order_inner(
+        &mut self,
+        order_id: u64,
+        sample_depth: bool,
+    ) -> OrderResult<CancelOrderResult> {
         // 查询订单池索引
         let pool_idx = self
             .orders
@@ -1241,11 +1250,31 @@ impl MatchingEngine {
             timestamp,
         });
 
-        self.maybe_sample_depth();
+        if sample_depth {
+            self.maybe_sample_depth();
+        }
         Ok(CancelOrderResult {
             order_id,
             cancelled_quantity: remaining,
         })
+    }
+
+    /// Cancel multiple orders in one pass. Returns (order_id, cancelled_qty) for each
+    /// successfully cancelled order; silently skips orders not found or already filled.
+    pub fn cancel_orders_batch(
+        &mut self,
+        order_ids: &[u64],
+    ) -> smallvec::SmallVec<[(u64, f64); 64]> {
+        let mut results = smallvec::SmallVec::new();
+        for &id in order_ids {
+            if let Ok(r) = self.cancel_order_inner(id, false) {
+                results.push((id, r.cancelled_quantity));
+            }
+        }
+        if !results.is_empty() {
+            self.maybe_sample_depth();
+        }
+        results
     }
 
     /// 从订单簿移除未成交订单（取消订单时调用）

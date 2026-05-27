@@ -1,4 +1,4 @@
-use crate::order::{Order, Side, TimeInForce};
+use crate::order::{Side, TimeInForce};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SymbolRules {
@@ -46,26 +46,6 @@ impl FixedOrderInput {
             is_market: shape.price_ticks.is_none(),
         })
     }
-
-    pub fn to_order(self, rules: SymbolRules) -> Order {
-        if self.is_market {
-            Order::new_market(
-                self.id,
-                self.side,
-                rules.lots_to_quantity(self.quantity_lots),
-                self.timestamp,
-            )
-        } else {
-            Order::new(
-                self.id,
-                self.side,
-                rules.ticks_to_price(self.price_ticks),
-                rules.lots_to_quantity(self.quantity_lots),
-                self.time_in_force,
-                self.timestamp,
-            )
-        }
-    }
 }
 
 impl SymbolRules {
@@ -104,14 +84,6 @@ impl SymbolRules {
             self.quantity_step,
             "quantity does not match lot size",
         )
-    }
-
-    pub fn ticks_to_price(self, ticks: i64) -> f64 {
-        ticks as f64 * self.price_tick
-    }
-
-    pub fn lots_to_quantity(self, lots: i64) -> f64 {
-        lots as f64 * self.quantity_step
     }
 }
 
@@ -205,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_order_input_roundtrips_to_existing_order() {
+    fn fixed_order_input_keeps_integer_shape() {
         let fixed = FixedOrderInput::from_order_fields(
             9,
             "BTC_USDT",
@@ -220,24 +192,10 @@ mod tests {
         assert_eq!(fixed.price_ticks, 7_589_360);
         assert_eq!(fixed.quantity_lots, 123);
         assert!(!fixed.is_market);
-
-        let order = fixed.to_order(SymbolRules::for_symbol("BTC_USDT"));
-        assert_eq!(order.id, 9);
-        assert_eq!(order.side, Side::Buy);
-        assert_eq!(order.price, 75893.60);
-        assert_eq!(
-            SymbolRules::for_symbol("BTC_USDT")
-                .quantity_to_lots(order.quantity)
-                .unwrap(),
-            123
-        );
-        assert_eq!(order.time_in_force, TimeInForce::GTC);
-        assert_eq!(order.timestamp, 12345);
-        assert!(!order.is_market);
     }
 
     #[test]
-    fn fixed_market_order_roundtrips_to_market_order() {
+    fn fixed_market_order_keeps_integer_shape() {
         let fixed = FixedOrderInput::from_order_fields(
             10,
             "ETH_USDT",
@@ -252,13 +210,5 @@ mod tests {
         assert_eq!(fixed.price_ticks, 0);
         assert_eq!(fixed.quantity_lots, 10);
         assert!(fixed.is_market);
-
-        let order = fixed.to_order(SymbolRules::for_symbol("ETH_USDT"));
-        assert_eq!(order.id, 10);
-        assert_eq!(order.side, Side::Sell);
-        assert_eq!(order.price, 0.0);
-        assert_eq!(order.quantity, 0.001);
-        assert_eq!(order.time_in_force, TimeInForce::IOC);
-        assert!(order.is_market);
     }
 }

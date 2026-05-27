@@ -565,23 +565,18 @@ async fn handle_place_order(
     // ── Route to engine: local (standalone) vs Aeron (desk) ──────────────────
     if let Some(engine) = engine_opt {
         // Standalone mode: run through local matching engine.
-        let fixed_order = match crate::symbol_rules::FixedOrderInput::from_order_fields(
-            db_order_id as u64,
-            &req.symbol,
-            engine_side,
-            &req.order_type,
-            req.price,
-            req.quantity,
-            tif,
-            now_ns,
-        ) {
-            Ok(order) => order,
-            Err(reason) => {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
-            }
+        let engine_order = if req.order_type == "market" {
+            Order::new_market(db_order_id as u64, engine_side, req.quantity, now_ns)
+        } else {
+            Order::new(
+                db_order_id as u64,
+                engine_side,
+                req.price.unwrap_or(0.0),
+                req.quantity,
+                tif,
+                now_ns,
+            )
         };
-        let engine_order =
-            fixed_order.to_order(crate::symbol_rules::SymbolRules::for_symbol(&req.symbol));
 
         let engine_result = {
             let mut eng = engine.lock().unwrap();

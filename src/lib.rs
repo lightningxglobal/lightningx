@@ -36,6 +36,7 @@ pub use desk::account_repository;
 pub use desk::api;
 pub use desk::db;
 pub use desk::models;
+pub use desk::order_state;
 pub use desk::positions;
 pub use desk::rate_limit;
 pub use desk::snowflake;
@@ -61,6 +62,11 @@ pub use market_data::{
     Statistics24h, TradeEvent,
 };
 pub use order::{Order, Side, TimeInForce};
+pub use order_state::{
+    db_status_from_engine, db_status_from_update_kind, maker_ws_status_from_db_status,
+    ws_status_from_engine, ws_status_from_update_kind, DbOrderStatus, WsOrderStatus,
+    HISTORY_DB_STATUSES, OPEN_DB_STATUSES,
+};
 pub use rate_limit::{RateLimitPolicy, RateLimiter};
 pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use snowflake::SnowflakeIdGenerator;

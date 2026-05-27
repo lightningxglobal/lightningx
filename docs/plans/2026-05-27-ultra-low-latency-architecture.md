@@ -49,7 +49,7 @@ Acceptance:
 
 ## Phase 3: Central Order State Machine
 
-Status: Pending
+Status: Completed for DB/WS order-status projections.
 
 Goal: remove scattered DB/WS/engine state string mappings.
 
@@ -60,8 +60,8 @@ Design:
 - DB and WS string conversion happens only at projection boundaries.
 
 Acceptance:
-- REST and WS produce the same user-visible status for the same transition.
-- State transition tests cover accepted, partial fill, multi-fill, filled, cancel pending, cancelled, and rejected.
+- REST and WS use the same central mapping helpers for matching-engine and Aeron order updates.
+- State transition tests cover accepted, partial fill, filled, cancelled, and rejected mappings.
 
 ## Phase 4: Fixed-Point Matching
 

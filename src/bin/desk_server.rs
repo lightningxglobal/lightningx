@@ -11,6 +11,10 @@ use lightning_exchange::{
     },
     api::{router, AccountCache, AppState},
     db,
+    order_state::{
+        db_status_from_update_kind, maker_ws_status_from_db_status, ws_status_from_update_kind,
+        DbOrderStatus,
+    },
     tracer::{
         spawn_tracer, DESK_INSTANCE_ID, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV,
         MS_WS_UPDATE_SEND,
@@ -27,19 +31,15 @@ use tower_http::cors::{Any, CorsLayer};
 
 // ── DB status byte constants ──────────────────────────────────────────────────
 mod db_cmd {
-    pub const STATUS_PENDING: u8 = 0;
-    pub const STATUS_TRADING: u8 = 1;
-    pub const STATUS_COMPLETED: u8 = 2;
-    pub const STATUS_CANCELED: u8 = 3;
-    pub const STATUS_REJECTED: u8 = 4;
+    use lightning_exchange::DbOrderStatus;
 
-    pub fn status_str(s: u8) -> &'static str {
-        match s {
-            0 => "PENDING",
-            1 => "TRADING",
-            2 => "COMPLETED",
-            3 => "CANCELED",
-            _ => "REJECTED",
+    pub fn status_str(status: u8) -> &'static str {
+        match status {
+            0 => DbOrderStatus::Pending.as_str(),
+            1 => DbOrderStatus::Trading.as_str(),
+            2 => DbOrderStatus::Completed.as_str(),
+            3 => DbOrderStatus::Canceled.as_str(),
+            _ => DbOrderStatus::Rejected.as_str(),
         }
     }
 
@@ -67,7 +67,7 @@ enum DbCmd {
         price: f64,
         qty: f64,
         filled: f64,
-        status: u8, // db_cmd::STATUS_*
+        status: u8, // DbOrderStatus as u8
         freeze_price: f64,
         do_freeze: bool,
         client_order_id: [u8; 32], // null-padded, max 31 chars
@@ -587,11 +587,7 @@ async fn process_db_cmd(
             // WS push: maker order update.
             if let (Some((ref new_status, new_filled)), uid) = (&maker_row, maker_uid) {
                 if uid != 0 {
-                    let ws_status = if new_status == "COMPLETED" {
-                        "FILLED"
-                    } else {
-                        "PARTIAL_FILL"
-                    };
+                    let ws_status = maker_ws_status_from_db_status(new_status).as_str();
                     if let Some(tx) = user_tx.get(&uid) {
                         let upd = serde_json::json!({
                             "type": "order_update", "order_id": maker_id,
@@ -982,7 +978,7 @@ async fn main() -> anyhow::Result<()> {
                                     price:           meta.price.unwrap_or(0.0),
                                     qty:             meta.qty,
                                     filled:          0.0,
-                                    status:          db_cmd::STATUS_PENDING,
+                                    status:          DbOrderStatus::Pending.as_u8(),
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       false,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
@@ -991,9 +987,9 @@ async fn main() -> anyhow::Result<()> {
                                 // Market / IOC order filled immediately — no ACCEPTED was sent.
                                 // Insert the order row now so the fills JOIN and order history work.
                                 let status = if kind == order_update_kind::FILLED {
-                                    db_cmd::STATUS_COMPLETED
+                                    DbOrderStatus::Completed.as_u8()
                                 } else {
-                                    db_cmd::STATUS_TRADING
+                                    DbOrderStatus::Trading.as_u8()
                                 };
                                 push_db_cmd(&mut db_tx, DbCmd::UpsertOrder {
                                     id:              order_id as i64,
@@ -1023,13 +1019,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).
-                            let status = match kind {
-                                k if k == order_update_kind::ACCEPTED     => db_cmd::STATUS_PENDING,
-                                k if k == order_update_kind::PARTIAL_FILL => db_cmd::STATUS_TRADING,
-                                k if k == order_update_kind::FILLED       => db_cmd::STATUS_COMPLETED,
-                                k if k == order_update_kind::CANCELLED    => db_cmd::STATUS_CANCELED,
-                                _                                          => db_cmd::STATUS_REJECTED,
-                            };
+                            let status = db_status_from_update_kind(kind).as_u8();
                             if kind == order_update_kind::CANCELLED {
                                 push_db_cmd(&mut db_tx, DbCmd::CancelConfirmed {
                                     id: order_id as i64,
@@ -1056,13 +1046,7 @@ async fn main() -> anyhow::Result<()> {
                             tracing::warn!("no WS channel for user {user_id}, order_update {order_id} lost");
                         }
                         if let Some(tx) = user_tx.get(&user_id) {
-                            let ws_status = match kind {
-                                k if k == order_update_kind::ACCEPTED     => "OPEN",
-                                k if k == order_update_kind::PARTIAL_FILL => "PARTIAL",
-                                k if k == order_update_kind::FILLED       => "FILLED",
-                                k if k == order_update_kind::CANCELLED    => "CANCELED",
-                                _                                         => "REJECTED",
-                            };
+                            let ws_status = ws_status_from_update_kind(kind).as_str();
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_micros() as u64)

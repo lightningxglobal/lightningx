@@ -3,6 +3,10 @@ use crate::account_repository::AccountRepository;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::models::{DbOrder, User};
 use crate::order::{Order, Side, TimeInForce};
+use crate::order_state::{
+    db_status_from_engine, db_status_from_update_kind, ws_status_from_engine,
+    ws_status_from_update_kind,
+};
 use crate::tracer::ExchangeTracer;
 use crate::transport::{AeronCmd, OrderMeta, OrderUpdateMsg};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
@@ -603,13 +607,7 @@ async fn handle_place_order(
             }
         };
 
-        let db_status = match result.status {
-            OrderStatus::Accepted => "PENDING",
-            OrderStatus::PartiallyFilled => "TRADING",
-            OrderStatus::Filled => "COMPLETED",
-            OrderStatus::Rejected => "REJECTED",
-            OrderStatus::Cancelled => "CANCELED",
-        };
+        let db_status = db_status_from_engine(result.status).as_str();
 
         let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
             .bind(db_status)
@@ -808,13 +806,7 @@ async fn handle_place_order(
             });
         }
 
-        let ws_status = match result.status {
-            OrderStatus::Accepted => "OPEN",
-            OrderStatus::PartiallyFilled => "PARTIAL",
-            OrderStatus::Filled => "FILLED",
-            OrderStatus::Cancelled => "CANCELED",
-            OrderStatus::Rejected => "REJECTED",
-        };
+        let ws_status = ws_status_from_engine(result.status, false).as_str();
         if let Some(tx) = s.user_tx.get(&user_id) {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -845,7 +837,6 @@ async fn handle_place_order(
     // ── Aeron mode: publish order to exchange_engine, await OrderUpdate ───────
     if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
         use crate::sbe::NewOrderRequest as SbeNewOrder;
-        use crate::transport::order_update_kind;
 
         let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
         let tif_byte: u8 = match tif {
@@ -917,13 +908,8 @@ async fn handle_place_order(
             }
         };
 
-        let (db_status, ws_status) = match update.kind {
-            k if k == order_update_kind::ACCEPTED => ("PENDING", "OPEN"),
-            k if k == order_update_kind::PARTIAL_FILL => ("TRADING", "PARTIAL"),
-            k if k == order_update_kind::FILLED => ("COMPLETED", "FILLED"),
-            k if k == order_update_kind::CANCELLED => ("CANCELED", "CANCELED"),
-            _ => ("REJECTED", "REJECTED"),
-        };
+        let db_status = db_status_from_update_kind(update.kind).as_str();
+        let ws_status = ws_status_from_update_kind(update.kind).as_str();
 
         // Copy packed struct fields to locals before use (avoids misaligned ref).
         let fill_qty: f64 = update.fill_qty;

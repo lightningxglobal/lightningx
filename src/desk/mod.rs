@@ -3,6 +3,7 @@ pub mod account_repository;
 pub mod api;
 pub mod db;
 pub mod models;
+pub mod order_state;
 pub mod positions;
 pub mod rate_limit;
 pub mod snowflake;

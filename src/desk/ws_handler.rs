@@ -2,6 +2,9 @@ use crate::account_repository::AccountRepository;
 use crate::api::AppState;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::order::{Order, Side, TimeInForce};
+use crate::order_state::{
+    db_status_from_engine, maker_ws_status_from_db_status, ws_status_from_engine,
+};
 use crate::user_service;
 use axum::extract::{Request, State};
 use axum::response::Response;
@@ -769,14 +772,8 @@ async fn handle_client_message(
             // partially fill come back as Cancelled with filled>0 — the
             // meaningful event for the trader is the partial fill, not the
             // trailing cancel of the remainder, so surface PARTIAL_FILL.
-            let (db_status, ws_status) = match (result.status, result.filled > 0.0) {
-                (OrderStatus::Accepted, _) => ("TRADING", "OPEN"),
-                (OrderStatus::PartiallyFilled, _) => ("TRADING", "PARTIAL_FILL"),
-                (OrderStatus::Filled, _) => ("COMPLETED", "FILLED"),
-                (OrderStatus::Rejected, _) => ("REJECTED", "REJECTED"),
-                (OrderStatus::Cancelled, true) => ("CANCELED", "PARTIAL_FILL"),
-                (OrderStatus::Cancelled, false) => ("CANCELED", "CANCELED"),
-            };
+            let db_status = db_status_from_engine(result.status).as_str();
+            let ws_status = ws_status_from_engine(result.status, result.filled > 0.0).as_str();
 
             // Update DB with fill info.
             let _ = sqlx::query(
@@ -909,11 +906,8 @@ async fn handle_client_message(
                     // Notify maker of their order state change.
                     if let (Some(maker_id), Some((new_status, new_filled))) = (maker_uid, maker_row)
                     {
-                        let ws_maker_status = match new_status.as_str() {
-                            "COMPLETED" => "FILLED",
-                            "TRADING" => "PARTIAL_FILL",
-                            other => other,
-                        };
+                        let ws_maker_status =
+                            maker_ws_status_from_db_status(new_status.as_str()).as_str();
                         let upd = json!({
                             "type": "order_update",
                             "order_id": maker_order_id as i64,

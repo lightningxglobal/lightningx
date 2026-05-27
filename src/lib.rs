@@ -81,27 +81,27 @@ mod tests {
 
     #[test]
     fn test_order_creation() {
-        let order = Order::new(1, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
+        let order = Order::new(1, Side::Buy, 50000, 10, TimeInForce::GTC, 0);
         assert_eq!(order.id, 1);
         assert_eq!(order.side, Side::Buy);
-        assert_eq!(order.price, 50000.0);
-        assert_eq!(order.quantity, 10.0);
-        assert_eq!(order.filled, 0.0);
+        assert_eq!(order.price_ticks, 50000);
+        assert_eq!(order.quantity_lots, 10);
+        assert_eq!(order.filled_lots, 0);
     }
 
     #[test]
     fn test_order_remaining() {
-        let mut order = Order::new(1, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
-        assert_eq!(order.remaining(), 10.0);
-        order.filled = 5.0;
-        assert_eq!(order.remaining(), 5.0);
+        let mut order = Order::new(1, Side::Buy, 50000, 10, TimeInForce::GTC, 0);
+        assert_eq!(order.remaining_lots(), 10);
+        order.filled_lots = 5;
+        assert_eq!(order.remaining_lots(), 5);
     }
 
     #[test]
     fn test_order_is_filled() {
-        let mut order = Order::new(1, Side::Buy, 50000.0, 10.0, TimeInForce::GTC, 0);
+        let mut order = Order::new(1, Side::Buy, 50000, 10, TimeInForce::GTC, 0);
         assert!(!order.is_filled());
-        order.filled = 10.0;
+        order.filled_lots = 10;
         assert!(order.is_filled());
     }
 

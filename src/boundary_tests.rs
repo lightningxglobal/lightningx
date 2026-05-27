@@ -10,7 +10,7 @@ mod tests {
     #[test]
     fn test_zero_quantity_order() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        let order = Order::new(1, Side::Buy, 100.0, 0.0, TimeInForce::GTC, 0);
+        let order = Order::new(1, Side::Buy, 100, 0, TimeInForce::GTC, 0);
 
         let result = engine.place_order(order);
         assert!(
@@ -22,7 +22,7 @@ mod tests {
     #[test]
     fn test_negative_price_order() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        let order = Order::new(1, Side::Buy, -100.0, 10.0, TimeInForce::GTC, 0);
+        let order = Order::new(1, Side::Buy, -100, 10, TimeInForce::GTC, 0);
 
         let result = engine.place_order(order);
         assert!(
@@ -34,7 +34,7 @@ mod tests {
     #[test]
     fn test_zero_price_order() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        let order = Order::new(1, Side::Buy, 0.0, 10.0, TimeInForce::GTC, 0);
+        let order = Order::new(1, Side::Buy, 0, 10, TimeInForce::GTC, 0);
 
         let result = engine.place_order(order);
         assert!(
@@ -46,7 +46,7 @@ mod tests {
     #[test]
     fn test_nan_price_order() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        let order = Order::new(1, Side::Buy, f64::NAN, 10.0, TimeInForce::GTC, 0);
+        let order = Order::new(1, Side::Buy, -1, 10, TimeInForce::GTC, 0);
 
         let result = engine.place_order(order);
         assert!(
@@ -58,8 +58,8 @@ mod tests {
     #[test]
     fn test_duplicate_order_id() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        let order1 = Order::new(1, Side::Buy, 100.0, 10.0, TimeInForce::GTC, 0);
-        let order2 = Order::new(1, Side::Sell, 101.0, 10.0, TimeInForce::GTC, 0);
+        let order1 = Order::new(1, Side::Buy, 100, 10, TimeInForce::GTC, 0);
+        let order2 = Order::new(1, Side::Sell, 101, 10, TimeInForce::GTC, 0);
 
         let result1 = engine.place_order(order1);
         assert!(result1.is_ok(), "第一个订单应该成功");
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn test_very_large_quantity() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        let order = Order::new(1, Side::Buy, 100.0, f64::MAX, TimeInForce::GTC, 0);
+        let order = Order::new(1, Side::Buy, 100, i64::MAX, TimeInForce::GTC, 0);
 
         let result = engine.place_order(order);
         // 应该能够处理极大的数字（可能溢出或被限制）
@@ -85,7 +85,7 @@ mod tests {
     #[test]
     fn test_very_small_quantity() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        let order = Order::new(1, Side::Buy, 100.0, 1e-10, TimeInForce::GTC, 0);
+        let order = Order::new(1, Side::Buy, 100, 1, TimeInForce::GTC, 0);
 
         let result = engine.place_order(order);
         // 应该能够处理极小的数字
@@ -106,19 +106,12 @@ mod tests {
 
         // 快速下单和成交
         for i in 0..100 {
-            let buy = Order::new(
-                i * 2,
-                Side::Buy,
-                100.0 + (i as f64),
-                10.0,
-                TimeInForce::GTC,
-                0,
-            );
+            let buy = Order::new(i * 2, Side::Buy, 100 + i as i64, 10, TimeInForce::GTC, 0);
             let sell = Order::new(
                 i * 2 + 1,
                 Side::Sell,
-                100.0 + (i as f64),
-                10.0,
+                100 + i as i64,
+                10,
                 TimeInForce::IOC,
                 0,
             );
@@ -140,7 +133,7 @@ mod tests {
 
         // 尝试添加超过容量的订单
         for i in 0..20 {
-            let order = Order::new(i, Side::Buy, 100.0 + (i as f64), 10.0, TimeInForce::GTC, 0);
+            let order = Order::new(i, Side::Buy, 100 + i as i64, 10, TimeInForce::GTC, 0);
             let result = engine.place_order(order);
             // 应该能够优雅地处理，而不是崩溃
             if result.is_err() {

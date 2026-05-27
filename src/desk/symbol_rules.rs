@@ -85,6 +85,14 @@ impl SymbolRules {
             "quantity does not match lot size",
         )
     }
+
+    pub fn ticks_to_price(self, ticks: i64) -> f64 {
+        ticks as f64 * self.price_tick
+    }
+
+    pub fn lots_to_quantity(self, lots: i64) -> f64 {
+        lots as f64 * self.quantity_step
+    }
 }
 
 fn to_units(value: f64, step: f64, misaligned_error: &'static str) -> Result<i64, &'static str> {

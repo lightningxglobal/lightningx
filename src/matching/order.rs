@@ -1,4 +1,5 @@
-use crate::float_ext::{FloatExt};
+pub type PriceTicks = i64;
+pub type QuantityLots = i64;
 
 /// 订单方向
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,9 +27,9 @@ pub enum TimeInForce {
 pub struct Order {
     pub id: u64,
     pub side: Side,
-    pub price: f64,
-    pub quantity: f64,
-    pub filled: f64,
+    pub price_ticks: PriceTicks,
+    pub quantity_lots: QuantityLots,
+    pub filled_lots: QuantityLots,
     pub time_in_force: TimeInForce,
     pub timestamp: u64,
     pub is_market: bool,
@@ -40,17 +41,17 @@ impl Order {
     pub fn new(
         id: u64,
         side: Side,
-        price: f64,
-        quantity: f64,
+        price_ticks: PriceTicks,
+        quantity_lots: QuantityLots,
         time_in_force: TimeInForce,
         timestamp: u64,
     ) -> Self {
         Self {
             id,
             side,
-            price,
-            quantity,
-            filled: 0.0,
+            price_ticks,
+            quantity_lots,
+            filled_lots: 0,
             time_in_force,
             timestamp,
             is_market: false,
@@ -59,18 +60,13 @@ impl Order {
     }
 
     /// 创建新市价订单
-    pub fn new_market(
-        id: u64,
-        side: Side,
-        quantity: f64,
-        timestamp: u64,
-    ) -> Self {
+    pub fn new_market(id: u64, side: Side, quantity_lots: QuantityLots, timestamp: u64) -> Self {
         Self {
             id,
             side,
-            price: 0.0,
-            quantity,
-            filled: 0.0,
+            price_ticks: 0,
+            quantity_lots,
+            filled_lots: 0,
             time_in_force: TimeInForce::IOC,
             timestamp,
             is_market: true,
@@ -80,14 +76,14 @@ impl Order {
 
     /// 获取剩余数量
     #[inline(always)]
-    pub fn remaining(&self) -> f64 {
-        self.quantity - self.filled
+    pub fn remaining_lots(&self) -> QuantityLots {
+        self.quantity_lots - self.filled_lots
     }
 
     /// 检查是否完全成交（使用 epsilon 避免浮点残差导致的幽灵委托）
     #[inline(always)]
     pub fn is_filled(&self) -> bool {
-        !self.remaining().positive()
+        self.remaining_lots() <= 0
     }
 
     /// 检查订单是否有效
@@ -96,9 +92,9 @@ impl Order {
         let price_valid = if self.is_market {
             true
         } else {
-            self.price.positive() && !self.price.is_nan()
+            self.price_ticks > 0
         };
-        price_valid && self.quantity.positive() && !self.quantity.is_nan()
+        price_valid && self.quantity_lots > 0
     }
 }
 
@@ -107,9 +103,9 @@ impl Default for Order {
         Self {
             id: 0,
             side: Side::Buy,
-            price: 0.0,
-            quantity: 0.0,
-            filled: 0.0,
+            price_ticks: 0,
+            quantity_lots: 0,
+            filled_lots: 0,
             time_in_force: TimeInForce::GTC,
             timestamp: 0,
             is_market: false,

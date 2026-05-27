@@ -1,3 +1,4 @@
+use crate::order::{PriceTicks, QuantityLots};
 use std::fmt;
 
 /// 撮合引擎错误类型
@@ -6,9 +7,9 @@ pub enum MatchingEngineError {
     /// 订单不存在
     OrderNotFound,
     /// 价格无效
-    InvalidPrice(f64),
+    InvalidPrice(PriceTicks),
     /// 数量无效
-    InvalidQuantity(f64),
+    InvalidQuantity(QuantityLots),
     /// 订单已成交
     AlreadyFilled,
     /// 订单已取消

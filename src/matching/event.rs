@@ -1,4 +1,4 @@
-use crate::order::Side;
+use crate::order::{PriceTicks, QuantityLots, Side};
 
 /// 撮合引擎事件，发布到Aeron
 #[repr(C, align(64))]
@@ -8,21 +8,18 @@ pub enum MatchingEvent {
     OrderPlaced {
         order_id: u64,
         side: Side,
-        price: f64,
-        quantity: f64,
+        price_ticks: PriceTicks,
+        quantity_lots: QuantityLots,
         timestamp: u64,
     },
     /// 订单已取消
-    OrderCancelled {
-        order_id: u64,
-        timestamp: u64,
-    },
+    OrderCancelled { order_id: u64, timestamp: u64 },
     /// 成交事件
     Trade {
         taker_order_id: u64,
         maker_order_id: u64,
-        price: f64,
-        quantity: f64,
+        price_ticks: PriceTicks,
+        quantity_lots: QuantityLots,
         timestamp: u64,
     },
 }

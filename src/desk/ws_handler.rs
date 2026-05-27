@@ -453,6 +453,7 @@ async fn handle_client_message(
             let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
             let base_asset = sym_parts.first().copied().unwrap_or("BTC");
             let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+            let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
 
             // Capture best opposing price before matching — used as the fill
             // price for market orders AND persisted as freeze_price so the
@@ -460,7 +461,7 @@ async fn handle_client_message(
             let best_opposing_price: Option<f64> = if let Some(ref engine) = engine_opt {
                 let eng = engine.lock().unwrap();
                 let levels = eng.get_top_levels(1, engine_side == Side::Sell);
-                levels.first().map(|(p, _)| *p)
+                levels.first().map(|(p, _)| rules.ticks_to_price(*p))
             } else if state.aeron_cmd_tx.is_some() {
                 best_opposing_from_depth(state, &symbol, &side)
             } else {
@@ -667,16 +668,43 @@ async fn handle_client_message(
                     .to_string(),
                 );
             }
-            let engine_order = if order_type == "market" {
-                Order::new_market(db_order_id as u64, engine_side, qty, now_ns)
+            let fixed_order = match crate::symbol_rules::FixedOrderInput::from_order_fields(
+                db_order_id as u64,
+                &symbol,
+                engine_side,
+                &order_type,
+                price,
+                qty,
+                tif,
+                now_ns,
+            ) {
+                Ok(order) => order,
+                Err(reason) => {
+                    return Some(
+                        json!({
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": reason
+                        })
+                        .to_string(),
+                    )
+                }
+            };
+            let engine_order = if fixed_order.is_market {
+                Order::new_market(
+                    fixed_order.id,
+                    fixed_order.side,
+                    fixed_order.quantity_lots,
+                    fixed_order.timestamp,
+                )
             } else {
                 Order::new(
-                    db_order_id as u64,
-                    engine_side,
-                    price.unwrap_or(0.0),
-                    qty,
-                    tif,
-                    now_ns,
+                    fixed_order.id,
+                    fixed_order.side,
+                    fixed_order.price_ticks,
+                    fixed_order.quantity_lots,
+                    fixed_order.time_in_force,
+                    fixed_order.timestamp,
                 )
             };
 
@@ -779,14 +807,15 @@ async fn handle_client_message(
             // meaningful event for the trader is the partial fill, not the
             // trailing cancel of the remainder, so surface PARTIAL_FILL.
             let db_status = db_status_from_engine(result.status).as_str();
-            let ws_status = ws_status_from_engine(result.status, result.filled > 0.0).as_str();
+            let filled_qty = rules.lots_to_quantity(result.filled_lots);
+            let ws_status = ws_status_from_engine(result.status, filled_qty > 0.0).as_str();
 
             // Update DB with fill info.
             let _ = sqlx::query(
                 "UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3",
             )
             .bind(db_status)
-            .bind(result.filled)
+            .bind(filled_qty)
             .bind(db_order_id)
             .execute(state.db.as_ref())
             .await;
@@ -814,11 +843,15 @@ async fn handle_client_message(
             let ts = unix_now();
 
             // Settle fills and broadcast trade events.
-            if result.filled > 0.0 {
-                let total_filled = result.filled;
+            if filled_qty > 0.0 {
+                let total_filled = filled_qty;
                 // Weighted average price across all fills for market-event broadcasting.
                 let avg_fill_price = if !result.fills.is_empty() {
-                    let cost: f64 = result.fills.iter().map(|&(_, p, q)| p * q).sum();
+                    let cost: f64 = result
+                        .fills
+                        .iter()
+                        .map(|&(_, p, q)| rules.ticks_to_price(p) * rules.lots_to_quantity(q))
+                        .sum();
                     cost / total_filled
                 } else {
                     price.or(best_opposing_price).unwrap_or(0.0)
@@ -826,10 +859,12 @@ async fn handle_client_message(
                 let fill_price = avg_fill_price;
 
                 // Per-fill: settle both taker and maker atomically, record trade, update maker order.
-                for &(maker_order_id, fp, fq) in &result.fills {
-                    if fp <= 0.0 || fq <= 0.0 {
+                for &(maker_order_id, fp_ticks, fq_lots) in &result.fills {
+                    if fp_ticks <= 0 || fq_lots <= 0 {
                         continue;
                     }
+                    let fp = rules.ticks_to_price(fp_ticks);
+                    let fq = rules.lots_to_quantity(fq_lots);
 
                     let maker_uid: Option<i64> =
                         sqlx::query_scalar("SELECT user_id FROM orders WHERE id = $1")
@@ -1534,12 +1569,21 @@ async fn bulk_cancel(
 
 /// Build a depth snapshot JSON for the given symbol from the matching engine.
 fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
+    let rules = crate::symbol_rules::SymbolRules::for_symbol(symbol);
     let (bids, asks) = {
         let eng = engine.lock().unwrap();
         (eng.get_top_levels(10, true), eng.get_top_levels(10, false))
     };
-    let bids: Vec<_> = bids.into_iter().filter(|(_, q)| *q > 0.0).collect();
-    let asks: Vec<_> = asks.into_iter().filter(|(_, q)| *q > 0.0).collect();
+    let bids: Vec<_> = bids
+        .into_iter()
+        .filter(|(_, q)| *q > 0)
+        .map(|(p, q)| (rules.ticks_to_price(p), rules.lots_to_quantity(q)))
+        .collect();
+    let asks: Vec<_> = asks
+        .into_iter()
+        .filter(|(_, q)| *q > 0)
+        .map(|(p, q)| (rules.ticks_to_price(p), rules.lots_to_quantity(q)))
+        .collect();
     json!({
         "type": "depth",
         "symbol": symbol,
@@ -1614,16 +1658,19 @@ fn snapshot_all_engines(
         .iter()
         .map(|entry| {
             let symbol = entry.key().clone();
+            let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
             let eng = entry.value().lock().unwrap();
             let bids: Vec<_> = eng
                 .get_top_levels(10, true)
                 .into_iter()
-                .filter(|(_, q)| *q > 0.0)
+                .filter(|(_, q)| *q > 0)
+                .map(|(p, q)| (rules.ticks_to_price(p), rules.lots_to_quantity(q)))
                 .collect();
             let asks: Vec<_> = eng
                 .get_top_levels(10, false)
                 .into_iter()
-                .filter(|(_, q)| *q > 0.0)
+                .filter(|(_, q)| *q > 0)
+                .map(|(p, q)| (rules.ticks_to_price(p), rules.lots_to_quantity(q)))
                 .collect();
             (symbol, bids, asks)
         })
@@ -1910,9 +1957,9 @@ mod tests {
         {
             let mut eng = engine.lock().unwrap();
             // Resting bid at 100, resting ask at 101 — won't cross.
-            eng.place_order(Order::new(1, Side::Buy, 100.0, 2.0, TimeInForce::GTC, 0))
+            eng.place_order(Order::new(1, Side::Buy, 100, 2, TimeInForce::GTC, 0))
                 .unwrap();
-            eng.place_order(Order::new(2, Side::Sell, 101.0, 3.0, TimeInForce::GTC, 0))
+            eng.place_order(Order::new(2, Side::Sell, 101, 3, TimeInForce::GTC, 0))
                 .unwrap();
         }
 
@@ -1923,10 +1970,10 @@ mod tests {
         assert_eq!(bids.len(), 1);
         assert_eq!(asks.len(), 1);
         // Each level is serialized as a [price, qty] tuple.
-        assert_eq!(bids[0][0].as_f64().unwrap(), 100.0);
-        assert_eq!(bids[0][1].as_f64().unwrap(), 2.0);
-        assert_eq!(asks[0][0].as_f64().unwrap(), 101.0);
-        assert_eq!(asks[0][1].as_f64().unwrap(), 3.0);
+        assert_eq!(bids[0][0].as_f64().unwrap(), 1.0);
+        assert_eq!(bids[0][1].as_f64().unwrap(), 0.000002);
+        assert_eq!(asks[0][0].as_f64().unwrap(), 1.01);
+        assert_eq!(asks[0][1].as_f64().unwrap(), 0.000003);
     }
 
     #[test]

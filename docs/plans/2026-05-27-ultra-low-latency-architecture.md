@@ -65,14 +65,15 @@ Acceptance:
 
 ## Phase 4: Fixed-Point Matching
 
-Status: In progress. Phase 4a adds fixed-point boundary normalization. The temporary fixed-to-legacy bridge was removed because the system is still in development and the matching hot path should move directly to integer ticks/lots.
+Status: In progress. Phase 4a adds fixed-point boundary normalization. Phase 4b removes the temporary bridge and migrates the matching core to integer ticks/lots.
 
 Goal: remove `f64` from engine price/quantity arithmetic.
 
 Design:
 - API receives floats but validates and converts to integer ticks/lots at the boundary.
 - Engine `Order` uses `i64 price_ticks`, `i64 quantity_lots`, `i64 filled_lots`.
-- SBE gets a v2 template with integer fields.
+- SkipList book keys, visible queue quantity, order fill accounting, and matching comparisons use integer ticks/lots.
+- SBE still accepts legacy float wire fields at the gateway boundary; a v2 template with integer fields remains the next transport step.
 - DB keeps legacy float columns for display initially, with integer columns as source of truth.
 
 Acceptance:

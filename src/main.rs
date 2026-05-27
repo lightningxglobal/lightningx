@@ -6,6 +6,7 @@ use lightning_exchange::{
     engine::{MatchingEngine, PoolConfig},
     models::DbOrder,
     order::{Order, Side, TimeInForce},
+    symbol_rules::SymbolRules,
     ws_handler::market_data_broadcaster,
 };
 use sqlx::PgPool;
@@ -210,12 +211,27 @@ async fn main() -> anyhow::Result<()> {
             if remaining <= 0.0 { continue; }
 
             let side = if db_order.side == "buy" { Side::Buy } else { Side::Sell };
+            let rules = SymbolRules::for_symbol(&db_order.symbol);
+            let price_ticks = match rules.price_to_ticks(db_order.price.unwrap_or(0.0)) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let quantity_lots = match rules.quantity_to_lots(remaining) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
             // Only GTC orders can survive in the book; restore everything as GTC.
             let order = Order::new(
                 order_id,
                 side,
-                db_order.price.unwrap_or(0.0),
-                remaining,
+                price_ticks,
+                quantity_lots,
                 TimeInForce::GTC,
                 0,
             );
@@ -267,9 +283,12 @@ async fn main() -> anyhow::Result<()> {
                     } else if let Some(p) = row_price.filter(|p| *p > 0.0) {
                         Some(p)
                     } else {
+                        let rules = SymbolRules::for_symbol(&symbol);
                         engines.get(&symbol).and_then(|e| {
                             let eng = e.value().lock().unwrap();
-                            eng.get_top_levels(1, false).first().map(|(p, _)| *p)
+                            eng.get_top_levels(1, false)
+                                .first()
+                                .map(|(p, _)| rules.ticks_to_price(*p))
                         })
                     };
                     if let Some(p) = resolved_price {

@@ -16,6 +16,7 @@ use lightning_exchange::{
     models::DbOrder,
     order::{Order, Side, TimeInForce},
     sbe::TradeNotification,
+    symbol_rules::SymbolRules,
     tracer::{
         spawn_tracer, ENGINE_INSTANCE_ID, MS_AERON_ORDER_RECV, MS_AERON_UPDATE_SEND,
         MS_MATCHING_DONE,
@@ -86,6 +87,7 @@ fn spawn_symbol_thread(
             .unwrap_or_else(|e| panic!("[{}] md_pub: {}", symbol, e));
 
             let mut engine = engine;
+            let rules = SymbolRules::for_symbol(&symbol);
             // order_id → participant_id: populated on ACCEPTED, used on CANCEL to route
             // the update back to the correct user even when cancel doesn't carry uid.
             let mut uid_map = uid_map;
@@ -135,14 +137,38 @@ fn spawn_symbol_thread(
                                 3 => TimeInForce::PostOnly,
                                 _ => TimeInForce::GTC,
                             };
+                            let quantity_lots = match rules.quantity_to_lots(req.quantity) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        2,
+                                        ts,
+                                    ));
+                                    continue;
+                                }
+                            };
                             let order = if req.price == 0.0 {
-                                Order::new_market(req.client_order_id, side, req.quantity, ts)
+                                Order::new_market(req.client_order_id, side, quantity_lots, ts)
                             } else {
+                                let price_ticks = match rules.price_to_ticks(req.price) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
+                                            req.client_order_id,
+                                            req.participant_id,
+                                            2,
+                                            ts,
+                                        ));
+                                        continue;
+                                    }
+                                };
                                 Order::new(
                                     req.client_order_id,
                                     side,
-                                    req.price,
-                                    req.quantity,
+                                    price_ticks,
+                                    quantity_lots,
                                     tif,
                                     ts,
                                 )
@@ -180,8 +206,12 @@ fn spawn_symbol_thread(
                                             &req.symbol,
                                         );
                                     }
-                                    let last_price =
-                                        result.fills.last().map(|f| f.1).unwrap_or(req.price);
+                                    let last_price = result
+                                        .fills
+                                        .last()
+                                        .map(|f| rules.ticks_to_price(f.1))
+                                        .unwrap_or(req.price);
+                                    let filled_qty = rules.lots_to_quantity(result.filled_lots);
                                     let update = match result.status {
                                         OrderStatus::Accepted => {
                                             uid_map.insert(result.order_id, req.participant_id);
@@ -199,7 +229,7 @@ fn spawn_symbol_thread(
                                                 req.client_order_id,
                                                 req.participant_id,
                                                 last_price,
-                                                result.filled,
+                                                filled_qty,
                                                 ts,
                                             )
                                         }
@@ -209,8 +239,8 @@ fn spawn_symbol_thread(
                                                 req.client_order_id,
                                                 req.participant_id,
                                                 last_price,
-                                                result.filled,
-                                                req.quantity - result.filled,
+                                                filled_qty,
+                                                req.quantity - filled_qty,
                                                 ts,
                                             )
                                         }
@@ -220,7 +250,7 @@ fn spawn_symbol_thread(
                                                 result.order_id,
                                                 req.client_order_id,
                                                 req.participant_id,
-                                                req.quantity - result.filled,
+                                                req.quantity - filled_qty,
                                                 ts,
                                             )
                                         }
@@ -233,8 +263,12 @@ fn spawn_symbol_thread(
                                     };
                                     // Publish trades before the terminal order update so desk can
                                     // settle while runtime order metadata is still live.
-                                    for &(maker_order_id, fill_price, fill_qty) in &result.fills {
+                                    for &(maker_order_id, fill_price_ticks, fill_qty_lots) in
+                                        &result.fills
+                                    {
                                         trade_seq += 1;
+                                        let fill_price = rules.ticks_to_price(fill_price_ticks);
+                                        let fill_qty = rules.lots_to_quantity(fill_qty_lots);
                                         let trade = TradeNotification {
                                             sequence: trade_seq,
                                             taker_order_id: req.client_order_id,
@@ -268,7 +302,7 @@ fn spawn_symbol_thread(
                                     req.order_id,
                                     0,
                                     participant_id,
-                                    res.cancelled_quantity,
+                                    rules.lots_to_quantity(res.cancelled_quantity),
                                     ts,
                                 ));
                             }
@@ -285,15 +319,15 @@ fn spawn_symbol_thread(
                     depth_seq += 1;
                     let mut snap = DepthSnapshotEvent::new(now_ns(), depth_seq);
                     snap.symbol = sym_bytes_fixed;
-                    let mut bids = [(0.0, 0.0); 20];
-                    let mut asks = [(0.0, 0.0); 20];
+                    let mut bids = [(0, 0); 20];
+                    let mut asks = [(0, 0); 20];
                     let num_bids = engine.fill_top_levels(true, &mut bids);
                     let num_asks = engine.fill_top_levels(false, &mut asks);
                     for (i, (p, q)) in bids.iter().take(num_bids).enumerate() {
-                        snap.bids[i] = (*p, *q);
+                        snap.bids[i] = (rules.ticks_to_price(*p), rules.lots_to_quantity(*q));
                     }
                     for (i, (p, q)) in asks.iter().take(num_asks).enumerate() {
-                        snap.asks[i] = (*p, *q);
+                        snap.asks[i] = (rules.ticks_to_price(*p), rules.lots_to_quantity(*q));
                     }
                     snap.num_bids = num_bids as u8;
                     snap.num_asks = num_asks as u8;
@@ -406,11 +440,26 @@ async fn main() -> anyhow::Result<()> {
         } else {
             Side::Sell
         };
+        let rules = SymbolRules::for_symbol(&db_order.symbol);
+        let price_ticks = match rules.price_to_ticks(db_order.price.unwrap_or(0.0)) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let quantity_lots = match rules.quantity_to_lots(remaining) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
         let order = Order::new(
             db_order.id as u64,
             side,
-            db_order.price.unwrap_or(0.0),
-            remaining,
+            price_ticks,
+            quantity_lots,
             TimeInForce::GTC,
             0,
         );
@@ -445,8 +494,15 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            let best_bid = bids.first().map(|&(p, _)| p).unwrap_or(0.0);
-            let best_ask = asks.first().map(|&(p, _)| p).unwrap_or(f64::MAX);
+            let rules = SymbolRules::for_symbol(sym);
+            let best_bid = bids
+                .first()
+                .map(|&(p, _)| rules.ticks_to_price(p))
+                .unwrap_or(0.0);
+            let best_ask = asks
+                .first()
+                .map(|&(p, _)| rules.ticks_to_price(p))
+                .unwrap_or(f64::MAX);
             tracing::warn!(
                 "Crossed book for {} (bid={} >= ask={}) — cancelling all open orders and rebuilding",
                 sym, best_bid, best_ask

@@ -463,12 +463,13 @@ async fn handle_place_order(
     let sym_parts: Vec<&str> = req.symbol.splitn(2, '_').collect();
     let base_asset = sym_parts.first().copied().unwrap_or("BTC");
     let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+    let rules = crate::symbol_rules::SymbolRules::for_symbol(&req.symbol);
 
     // Best opposing price (for market orders that need a freeze estimate).
     let best_opposing = if let Some(ref engine) = engine_opt {
         let eng = engine.lock().unwrap();
         let levels = eng.get_top_levels(1, engine_side == Side::Sell);
-        levels.first().map(|(p, _)| *p)
+        levels.first().map(|(p, _)| rules.ticks_to_price(*p))
     } else {
         None
     };
@@ -565,16 +566,36 @@ async fn handle_place_order(
     // ── Route to engine: local (standalone) vs Aeron (desk) ──────────────────
     if let Some(engine) = engine_opt {
         // Standalone mode: run through local matching engine.
-        let engine_order = if req.order_type == "market" {
-            Order::new_market(db_order_id as u64, engine_side, req.quantity, now_ns)
+        let fixed_order = match crate::symbol_rules::FixedOrderInput::from_order_fields(
+            db_order_id as u64,
+            &req.symbol,
+            engine_side,
+            &req.order_type,
+            req.price,
+            req.quantity,
+            tif,
+            now_ns,
+        ) {
+            Ok(order) => order,
+            Err(reason) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
+            }
+        };
+        let engine_order = if fixed_order.is_market {
+            Order::new_market(
+                fixed_order.id,
+                fixed_order.side,
+                fixed_order.quantity_lots,
+                fixed_order.timestamp,
+            )
         } else {
             Order::new(
-                db_order_id as u64,
-                engine_side,
-                req.price.unwrap_or(0.0),
-                req.quantity,
-                tif,
-                now_ns,
+                fixed_order.id,
+                fixed_order.side,
+                fixed_order.price_ticks,
+                fixed_order.quantity_lots,
+                fixed_order.time_in_force,
+                fixed_order.timestamp,
             )
         };
 
@@ -611,10 +632,11 @@ async fn handle_place_order(
         };
 
         let db_status = db_status_from_engine(result.status).as_str();
+        let filled_qty = rules.lots_to_quantity(result.filled_lots);
 
         let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
             .bind(db_status)
-            .bind(result.filled)
+            .bind(filled_qty)
             .bind(db_order_id)
             .execute(s.db.as_ref())
             .await;
@@ -640,10 +662,12 @@ async fn handle_place_order(
         // ── Settle fills (standalone path) ────────────────────────────────────
         let mut notified_maker_uids: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
-        for &(maker_order_id, fp, fq) in &result.fills {
-            if fp <= 0.0 || fq <= 0.0 {
+        for &(maker_order_id, fp_ticks, fq_lots) in &result.fills {
+            if fp_ticks <= 0 || fq_lots <= 0 {
                 continue;
             }
+            let fp = rules.ticks_to_price(fp_ticks);
+            let fq = rules.lots_to_quantity(fq_lots);
 
             let maker_uid: Option<i64> =
                 sqlx::query_scalar("SELECT user_id FROM orders WHERE id=$1")
@@ -707,7 +731,7 @@ async fn handle_place_order(
         }
 
         if result.status == OrderStatus::Cancelled {
-            let unfilled = req.quantity - result.filled;
+            let unfilled = req.quantity - filled_qty;
             if unfilled > 0.0 {
                 let (rel_asset, rel_amount) = if req.side == "buy" {
                     (
@@ -750,10 +774,14 @@ async fn handle_place_order(
             }
         }
 
-        if result.filled > 0.0 {
+        if filled_qty > 0.0 {
             let avg_fill_price = if !result.fills.is_empty() {
-                let cost: f64 = result.fills.iter().map(|&(_, p, q)| p * q).sum();
-                cost / result.filled
+                let cost: f64 = result
+                    .fills
+                    .iter()
+                    .map(|&(_, p, q)| rules.ticks_to_price(p) * rules.lots_to_quantity(q))
+                    .sum();
+                cost / filled_qty
             } else {
                 req.price.or(best_opposing).unwrap_or(0.0)
             };
@@ -765,7 +793,7 @@ async fn handle_place_order(
                 "type": "trade",
                 "symbol": &req.symbol,
                 "price": avg_fill_price,
-                "qty": result.filled,
+                "qty": filled_qty,
                 "side": &req.side,
                 "ts": now_us,
             })
@@ -801,7 +829,7 @@ async fn handle_place_order(
         }
 
         crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
-        if result.filled > 0.0 {
+        if filled_qty > 0.0 {
             let s2 = s.clone();
             let sym2 = req.symbol.clone();
             tokio::spawn(async move {
@@ -819,8 +847,8 @@ async fn handle_place_order(
                 "type": "order_update",
                 "order_id": db_order_id,
                 "status": ws_status,
-                "filled": result.filled,
-                "filled_qty": result.filled,
+                "filled": filled_qty,
+                "filled_qty": filled_qty,
                 "ts": ts,
             })
             .to_string();
@@ -1667,11 +1695,20 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
             // Place into the engine book directly (no matching, no fund effects).
             // In Aeron mode we skip local book insertion; the exchange_engine manages its own book.
             if let Some(ref engine) = engine_opt {
+                let rules = crate::symbol_rules::SymbolRules::for_symbol(symbol);
+                let price_ticks = match rules.price_to_ticks(price) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let quantity_lots = match rules.quantity_to_lots(qty) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 let order = Order::new(
                     db_order.id as u64,
                     engine_side,
-                    price,
-                    qty,
+                    price_ticks,
+                    quantity_lots,
                     TimeInForce::GTC,
                     0,
                 );

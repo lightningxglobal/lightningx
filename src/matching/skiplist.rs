@@ -1,4 +1,5 @@
 use crate::list_pool::{ListNodePool, PooledList};
+use crate::order::{PriceTicks, QuantityLots};
 use crate::orderbook::{OrderBook, PriceLevel as OrderBookPriceLevel};
 
 const MAX_LEVEL: usize = 12;
@@ -7,8 +8,8 @@ const PROMOTION_PROBABILITY: f64 = 0.25;
 /// 跳表节点 - 使用原始指针支持多级链接
 #[repr(C)]
 pub struct SkipListNode {
-    pub price: f64,
-    pub total_quantity: f64,
+    pub price_ticks: PriceTicks,
+    pub total_quantity_lots: QuantityLots,
     pub orders: PooledList,
     pub level: usize,
     /// 指向各级下一个节点的原始指针数组
@@ -18,10 +19,10 @@ pub struct SkipListNode {
 
 impl SkipListNode {
     /// 创建新节点 - 用于在arena中初始化
-    fn new(price: f64, level: usize) -> Self {
+    fn new(price_ticks: PriceTicks, level: usize) -> Self {
         Self {
-            price,
-            total_quantity: 0.0,
+            price_ticks,
+            total_quantity_lots: 0,
             orders: PooledList::new(),
             level,
             forward: [std::ptr::null_mut(); MAX_LEVEL],
@@ -53,16 +54,16 @@ pub struct SkipList {
     /// Unlinked price-level nodes available for reuse.
     free_nodes: Vec<*mut SkipListNode>,
     /// 缓存最优价格
-    best_price: Option<f64>,
+    best_price: Option<PriceTicks>,
 }
 
 impl SkipList {
     /// 创建新跳表，指定链表节点池的容量
     pub fn new_with_pool(order: SortOrder, pool_capacity: usize) -> Self {
         let head_price = if order == SortOrder::Ascending {
-            f64::NEG_INFINITY
+            PriceTicks::MIN
         } else {
-            f64::INFINITY
+            PriceTicks::MAX
         };
 
         let mut head_node = Box::new(SkipListNode::new(head_price, 0));
@@ -97,7 +98,7 @@ impl SkipList {
     /// 安全性：只在self的生命周期内调用，所有指针都指向arena中的节点
     unsafe fn find_update(
         &self,
-        price: f64,
+        price: PriceTicks,
     ) -> ([*mut SkipListNode; MAX_LEVEL], *mut SkipListNode) {
         let mut update = [std::ptr::null_mut::<SkipListNode>(); MAX_LEVEL];
         let mut current = self.head;
@@ -110,10 +111,10 @@ impl SkipList {
                     break;
                 }
 
-                let fwd_price = (*fwd).price;
+                let fwd_price = (*fwd).price_ticks;
 
                 // 如果目标价格已经在下一个节点，停止
-                if (fwd_price - price).abs() < 1e-10 {
+                if fwd_price == price {
                     break;
                 }
 
@@ -144,7 +145,7 @@ impl SkipList {
 
     /// 检查价格是否应该插入到跳表中
     #[inline(always)]
-    fn should_insert(&self, new_price: f64, existing_price: f64) -> bool {
+    fn should_insert(&self, new_price: PriceTicks, existing_price: PriceTicks) -> bool {
         match self.order {
             SortOrder::Ascending => new_price < existing_price,
             SortOrder::Descending => new_price > existing_price,
@@ -153,7 +154,7 @@ impl SkipList {
 
     /// 获取指定价格的只读节点引用
     #[inline]
-    pub fn get_node_at_price(&self, price: f64) -> Option<&SkipListNode> {
+    pub fn get_node_at_price(&self, price: PriceTicks) -> Option<&SkipListNode> {
         unsafe {
             let mut current = self.head;
             // 从最高层向下遍历
@@ -164,9 +165,9 @@ impl SkipList {
                         break;
                     }
 
-                    let fwd_price = (*fwd).price;
+                    let fwd_price = (*fwd).price_ticks;
                     // 找到目标价格
-                    if (fwd_price - price).abs() < 1e-10 {
+                    if fwd_price == price {
                         return Some(&*fwd);
                     }
 
@@ -184,7 +185,7 @@ impl SkipList {
 
     /// 获取指定价格的可变节点引用
     #[inline]
-    pub fn get_node_mut(&mut self, price: f64) -> Option<&mut SkipListNode> {
+    pub fn get_node_mut(&mut self, price: PriceTicks) -> Option<&mut SkipListNode> {
         unsafe {
             let mut current = self.head;
             // 从最高层向下遍历
@@ -195,9 +196,9 @@ impl SkipList {
                         break;
                     }
 
-                    let fwd_price = (*fwd).price;
+                    let fwd_price = (*fwd).price_ticks;
                     // 找到目标价格
-                    if (fwd_price - price).abs() < 1e-10 {
+                    if fwd_price == price {
                         return Some(&mut *fwd);
                     }
 
@@ -214,7 +215,7 @@ impl SkipList {
     }
 
     /// 插入价格档位节点
-    pub fn insert_level(&mut self, price: f64) -> Result<(), String> {
+    pub fn insert_level(&mut self, price: PriceTicks) -> Result<(), String> {
         // 检查是否已存在
         if self.get_node_at_price(price).is_some() {
             return Err("Price level already exists".to_string());
@@ -254,7 +255,7 @@ impl SkipList {
     }
 
     /// 查找价格节点 - 简单包装，调用get_node_at_price
-    pub fn find_node(&self, price: f64) -> Result<(), String> {
+    pub fn find_node(&self, price: PriceTicks) -> Result<(), String> {
         if self.get_node_at_price(price).is_some() {
             Ok(())
         } else {
@@ -297,9 +298,9 @@ impl SkipList {
     #[inline]
     pub fn add_order_at_level(
         &mut self,
-        price: f64,
+        price: PriceTicks,
         order_id: u64,
-        quantity: f64,
+        quantity: QuantityLots,
     ) -> Result<(), String> {
         // 先从pool中获取节点，避免后续的借用冲突
         let node_idx = self
@@ -316,8 +317,8 @@ impl SkipList {
                     if fwd.is_null() {
                         break;
                     }
-                    let fwd_price = (*fwd).price;
-                    if (fwd_price - price).abs() < 1e-10 {
+                    let fwd_price = (*fwd).price_ticks;
+                    if fwd_price == price {
                         break;
                     }
                     if self.should_insert(price, fwd_price) {
@@ -329,9 +330,9 @@ impl SkipList {
 
             // 检查第0层的目标节点
             let next = (*current).forward[0];
-            if !next.is_null() && ((*next).price - price).abs() < 1e-10 {
+            if !next.is_null() && (*next).price_ticks == price {
                 (*next).orders.push_back(node_idx, &mut self.list_pool);
-                (*next).total_quantity += quantity;
+                (*next).total_quantity_lots += quantity;
                 return Ok(());
             }
         }
@@ -342,7 +343,11 @@ impl SkipList {
     }
 
     /// 从指定价格的订单队列中移除订单
-    pub fn remove_order_at_level(&mut self, price: f64, order_id: u64) -> Result<(), String> {
+    pub fn remove_order_at_level(
+        &mut self,
+        price: PriceTicks,
+        order_id: u64,
+    ) -> Result<(), String> {
         unsafe {
             // 查找目标价格节点
             let mut current = self.head;
@@ -352,8 +357,8 @@ impl SkipList {
                     if fwd.is_null() {
                         break;
                     }
-                    let fwd_price = (*fwd).price;
-                    if (fwd_price - price).abs() < 1e-10 {
+                    let fwd_price = (*fwd).price_ticks;
+                    if fwd_price == price {
                         break;
                     }
                     if self.should_insert(price, fwd_price) {
@@ -365,20 +370,20 @@ impl SkipList {
 
             // 检查第0层的目标节点
             let next = (*current).forward[0];
-            if !next.is_null() && ((*next).price - price).abs() < 1e-10 {
+            if !next.is_null() && (*next).price_ticks == price {
                 // 遍历链表找到order_id对应的节点
                 let mut node_idx_opt = (*next).orders.front();
                 while let Some(node_idx) = node_idx_opt {
                     // 先保存next指针，避免后续借用冲突
                     let next_idx = if let Some(list_node) = self.list_pool.get(node_idx) {
                         if list_node.order_id == order_id {
-                            // 找到了，获取数量用于更新total_quantity
-                            let quantity = list_node.quantity;
+                            // 找到了，获取数量用于更新total_quantity_lots
+                            let quantity = list_node.quantity_lots;
                             // 从链表和池中移除
                             (*next).orders.remove(node_idx, &mut self.list_pool);
                             self.list_pool.release(node_idx);
-                            // 更新total_quantity
-                            (*next).total_quantity -= quantity;
+                            // 更新total_quantity_lots
+                            (*next).total_quantity_lots -= quantity;
                             return Ok(());
                         }
                         list_node.next
@@ -401,9 +406,9 @@ impl SkipList {
     /// filled but remains in the price level queue.
     pub fn reduce_order_quantity_at_level(
         &mut self,
-        price: f64,
+        price: PriceTicks,
         order_id: u64,
-        quantity: f64,
+        quantity: QuantityLots,
     ) -> Result<(), String> {
         unsafe {
             let mut current = self.head;
@@ -413,8 +418,8 @@ impl SkipList {
                     if fwd.is_null() {
                         break;
                     }
-                    let fwd_price = (*fwd).price;
-                    if (fwd_price - price).abs() < 1e-10 {
+                    let fwd_price = (*fwd).price_ticks;
+                    if fwd_price == price {
                         break;
                     }
                     if self.should_insert(price, fwd_price) {
@@ -425,13 +430,14 @@ impl SkipList {
             }
 
             let next = (*current).forward[0];
-            if !next.is_null() && ((*next).price - price).abs() < 1e-10 {
+            if !next.is_null() && (*next).price_ticks == price {
                 let mut node_idx_opt = (*next).orders.front();
                 while let Some(node_idx) = node_idx_opt {
                     if let Some(list_node) = self.list_pool.get_mut(node_idx) {
                         if list_node.order_id == order_id {
-                            list_node.quantity = (list_node.quantity - quantity).max(0.0);
-                            (*next).total_quantity = ((*next).total_quantity - quantity).max(0.0);
+                            list_node.quantity_lots = (list_node.quantity_lots - quantity).max(0);
+                            (*next).total_quantity_lots =
+                                ((*next).total_quantity_lots - quantity).max(0);
                             return Ok(());
                         }
                         node_idx_opt = list_node.next;
@@ -450,14 +456,14 @@ impl SkipList {
     }
 
     /// 移除整个价格档位（从所有级别移除）
-    pub fn remove_level(&mut self, price: f64) -> Result<(), String> {
+    pub fn remove_level(&mut self, price: PriceTicks) -> Result<(), String> {
         unsafe {
             // 查找所有级别的前驱节点
             let (update, _) = self.find_update(price);
             let target = (*update[0]).forward[0];
 
             // 检查目标节点是否存在
-            if target.is_null() || ((*target).price - price).abs() >= 1e-10 {
+            if target.is_null() || (*target).price_ticks != price {
                 return Err("Price not found".into());
             }
 
@@ -477,7 +483,7 @@ impl SkipList {
 
             self.count -= 1;
             (*target).orders.clear();
-            (*target).total_quantity = 0.0;
+            (*target).total_quantity_lots = 0;
             (*target).forward = [std::ptr::null_mut(); MAX_LEVEL];
             self.free_nodes.push(target);
         }
@@ -502,12 +508,7 @@ impl SkipList {
     }
 
     /// 获取缓存的最优价格（如果有效）或重新计算
-    pub fn get_best_price_cached(&mut self) -> Option<f64> {
-        // Check if cached price is still valid.
-        // Use orders.is_empty() rather than total_quantity > 0 because float
-        // accumulation (e.g. 0.1+0.2-0.1-0.2 ≈ 3e-17) can leave total_quantity
-        // slightly positive even after all orders are removed, creating a ghost
-        // level that would spin match_order forever.
+    pub fn get_best_price_cached(&mut self) -> Option<PriceTicks> {
         if let Some(price) = self.best_price {
             if let Some(node) = self.get_node_at_price(price) {
                 if !node.orders.is_empty() {
@@ -519,7 +520,7 @@ impl SkipList {
         }
 
         // Find best price with orders
-        let best = self.best_with_orders().map(|node| node.price);
+        let best = self.best_with_orders().map(|node| node.price_ticks);
         self.best_price = best;
         best
     }
@@ -530,7 +531,7 @@ impl SkipList {
     }
 
     /// 获取前N个价格档位（用于生成快照）
-    pub fn get_top_levels(&self, limit: usize) -> Vec<(f64, f64)> {
+    pub fn get_top_levels(&self, limit: usize) -> Vec<(PriceTicks, QuantityLots)> {
         let mut result = Vec::new();
         unsafe {
             let mut current = self.head;
@@ -540,7 +541,7 @@ impl SkipList {
                 if next.is_null() {
                     break;
                 }
-                result.push(((*next).price, (*next).total_quantity));
+                result.push(((*next).price_ticks, (*next).total_quantity_lots));
                 current = next;
             }
         }
@@ -550,7 +551,7 @@ impl SkipList {
 
     /// Fill a caller-provided buffer with top levels and return the number of
     /// entries written. This avoids heap allocation in hot snapshot paths.
-    pub fn fill_top_levels(&self, out: &mut [(f64, f64)]) -> usize {
+    pub fn fill_top_levels(&self, out: &mut [(PriceTicks, QuantityLots)]) -> usize {
         let mut written = 0;
         unsafe {
             let mut current = self.head;
@@ -559,7 +560,7 @@ impl SkipList {
                 if next.is_null() {
                     break;
                 }
-                out[written] = ((*next).price, (*next).total_quantity);
+                out[written] = ((*next).price_ticks, (*next).total_quantity_lots);
                 written += 1;
                 current = next;
             }
@@ -572,12 +573,12 @@ impl SkipList {
     /// need to allocate or stop at an arbitrary depth.
     pub fn has_cumulative_quantity_until(
         &self,
-        target_qty: f64,
-        limit_price: f64,
+        target_qty: QuantityLots,
+        limit_price: PriceTicks,
         is_market: bool,
         buy_taker: bool,
     ) -> bool {
-        let mut available = 0.0;
+        let mut available: QuantityLots = 0;
         unsafe {
             let mut current = self.head;
             loop {
@@ -586,7 +587,7 @@ impl SkipList {
                     return false;
                 }
 
-                let price = (*next).price;
+                let price = (*next).price_ticks;
                 let acceptable = is_market
                     || if buy_taker {
                         limit_price >= price
@@ -597,7 +598,7 @@ impl SkipList {
                     return false;
                 }
 
-                available += (*next).total_quantity;
+                available += (*next).total_quantity_lots;
                 if available >= target_qty {
                     return true;
                 }
@@ -615,21 +616,21 @@ impl Drop for SkipList {
 }
 
 impl OrderBook for SkipList {
-    fn insert_level(&mut self, price: f64) -> Result<(), String> {
+    fn insert_level(&mut self, price: PriceTicks) -> Result<(), String> {
         SkipList::insert_level(self, price)
     }
 
-    fn find_node(&self, price: f64) -> Result<(), String> {
+    fn find_node(&self, price: PriceTicks) -> Result<(), String> {
         SkipList::find_node(self, price)
     }
 
-    fn get_node_at_price(&self, price: f64) -> Option<&OrderBookPriceLevel> {
+    fn get_node_at_price(&self, price: PriceTicks) -> Option<&OrderBookPriceLevel> {
         // 安全的转换：SkipListNode 用 #[repr(C)]，前三个字段与 PriceLevel 完全相同
         SkipList::get_node_at_price(self, price)
             .map(|node| unsafe { &*(node as *const SkipListNode as *const OrderBookPriceLevel) })
     }
 
-    fn get_node_mut(&mut self, price: f64) -> Option<&mut OrderBookPriceLevel> {
+    fn get_node_mut(&mut self, price: PriceTicks) -> Option<&mut OrderBookPriceLevel> {
         SkipList::get_node_mut(self, price)
             .map(|node| unsafe { &mut *(node as *mut SkipListNode as *mut OrderBookPriceLevel) })
     }
@@ -646,18 +647,18 @@ impl OrderBook for SkipList {
 
     fn add_order_at_level(
         &mut self,
-        price: f64,
+        price: PriceTicks,
         order_id: u64,
-        quantity: f64,
+        quantity: QuantityLots,
     ) -> Result<(), String> {
         SkipList::add_order_at_level(self, price, order_id, quantity)
     }
 
-    fn remove_order_at_level(&mut self, price: f64, order_id: u64) -> Result<(), String> {
+    fn remove_order_at_level(&mut self, price: PriceTicks, order_id: u64) -> Result<(), String> {
         SkipList::remove_order_at_level(self, price, order_id)
     }
 
-    fn remove_level(&mut self, price: f64) -> Result<(), String> {
+    fn remove_level(&mut self, price: PriceTicks) -> Result<(), String> {
         SkipList::remove_level(self, price)
     }
 
@@ -665,7 +666,7 @@ impl OrderBook for SkipList {
         SkipList::clear(self)
     }
 
-    fn get_top_levels(&self, limit: usize) -> Vec<(f64, f64)> {
+    fn get_top_levels(&self, limit: usize) -> Vec<(PriceTicks, QuantityLots)> {
         SkipList::get_top_levels(self, limit)
     }
 
@@ -677,7 +678,7 @@ impl OrderBook for SkipList {
         &mut self.list_pool
     }
 
-    fn get_best_price(&mut self) -> Option<f64> {
+    fn get_best_price(&mut self) -> Option<PriceTicks> {
         self.get_best_price_cached()
     }
 
@@ -696,20 +697,20 @@ mod tests {
 
         // 插入10个价格
         for i in 0..10 {
-            let price = 100.0 + i as f64;
+            let price = 100 + i;
             assert!(sl.insert_level(price).is_ok());
         }
 
         // 验证所有价格都能找到
         for i in 0..10 {
-            let price = 100.0 + i as f64;
+            let price = 100 + i;
             assert!(sl.find_node(price).is_ok(), "Should find price {}", price);
             assert!(sl.get_node_at_price(price).is_some());
         }
 
         // 验证不存在的价格找不到
-        assert!(sl.find_node(99.0).is_err());
-        assert!(sl.get_node_at_price(99.0).is_none());
+        assert!(sl.find_node(99).is_err());
+        assert!(sl.get_node_at_price(99).is_none());
 
         // 验证计数
         assert_eq!(sl.count(), 10);
@@ -719,9 +720,9 @@ mod tests {
     fn test_insert_duplicate_rejected() {
         let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 100);
 
-        assert!(sl.insert_level(100.0).is_ok());
+        assert!(sl.insert_level(100).is_ok());
         // 尝试插入相同价格应该失败
-        assert!(sl.insert_level(100.0).is_err());
+        assert!(sl.insert_level(100).is_err());
         assert_eq!(sl.count(), 1);
     }
 
@@ -731,7 +732,7 @@ mod tests {
 
         // 插入100个节点
         for i in 0..100 {
-            let price = 1000.0 + i as f64;
+            let price = 1000 + i;
             sl.insert_level(price).ok();
         }
 
@@ -763,30 +764,30 @@ mod tests {
         let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 100);
 
         // 插入价格
-        assert!(sl.insert_level(100.0).is_ok());
+        assert!(sl.insert_level(100).is_ok());
 
         // 添加订单
-        assert!(sl.add_order_at_level(100.0, 1, 10.0).is_ok());
-        assert!(sl.add_order_at_level(100.0, 2, 20.0).is_ok());
+        assert!(sl.add_order_at_level(100, 1, 10).is_ok());
+        assert!(sl.add_order_at_level(100, 2, 20).is_ok());
 
         // 验证总数量
-        let node = sl.get_node_at_price(100.0).unwrap();
-        assert!((node.total_quantity - 30.0).abs() < 1e-10);
+        let node = sl.get_node_at_price(100).unwrap();
+        assert_eq!(node.total_quantity_lots, 30);
         assert!(!node.orders.is_empty());
 
         // 移除订单
-        assert!(sl.remove_order_at_level(100.0, 1).is_ok());
-        let node = sl.get_node_at_price(100.0).unwrap();
-        assert!((node.total_quantity - 20.0).abs() < 1e-10);
+        assert!(sl.remove_order_at_level(100, 1).is_ok());
+        let node = sl.get_node_at_price(100).unwrap();
+        assert_eq!(node.total_quantity_lots, 20);
 
         // 再移除一个
-        assert!(sl.remove_order_at_level(100.0, 2).is_ok());
-        let node = sl.get_node_at_price(100.0).unwrap();
-        assert!((node.total_quantity - 0.0).abs() < 1e-10);
+        assert!(sl.remove_order_at_level(100, 2).is_ok());
+        let node = sl.get_node_at_price(100).unwrap();
+        assert_eq!(node.total_quantity_lots, 0);
         assert!(node.orders.is_empty());
 
         // 尝试移除不存在的订单
-        assert!(sl.remove_order_at_level(100.0, 999).is_err());
+        assert!(sl.remove_order_at_level(100, 999).is_err());
     }
 
     #[test]
@@ -794,18 +795,18 @@ mod tests {
         let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 100);
 
         // 插入多个价格
-        sl.insert_level(100.0).ok();
-        sl.insert_level(101.0).ok();
-        sl.insert_level(102.0).ok();
+        sl.insert_level(100).ok();
+        sl.insert_level(101).ok();
+        sl.insert_level(102).ok();
 
         // 仅在第二个价格添加订单
-        sl.add_order_at_level(101.0, 1, 10.0).ok();
+        sl.add_order_at_level(101, 1, 10).ok();
 
-        // best()应该返回最低价格（100.0）
-        assert_eq!(sl.best().unwrap().price, 100.0);
+        // best()应该返回最低价格（100）
+        assert_eq!(sl.best().unwrap().price_ticks, 100);
 
-        // best_with_orders()应该跳过100.0和102.0，返回101.0
-        assert_eq!(sl.best_with_orders().unwrap().price, 101.0);
+        // best_with_orders()应该跳过100和102，返回101
+        assert_eq!(sl.best_with_orders().unwrap().price_ticks, 101);
     }
 
     #[test]
@@ -814,7 +815,7 @@ mod tests {
 
         // 插入数据
         for i in 0..10 {
-            sl.insert_level(100.0 + i as f64).ok();
+            sl.insert_level(100 + i).ok();
         }
         assert_eq!(sl.count(), 10);
 
@@ -824,9 +825,9 @@ mod tests {
         assert!(sl.best().is_none());
 
         // 应该能再次插入数据
-        sl.insert_level(200.0).ok();
+        sl.insert_level(200).ok();
         assert_eq!(sl.count(), 1);
-        assert_eq!(sl.best().unwrap().price, 200.0);
+        assert_eq!(sl.best().unwrap().price_ticks, 200);
     }
 
     #[test]
@@ -834,35 +835,35 @@ mod tests {
         let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 100);
 
         // 插入多个价格
-        sl.insert_level(100.0).ok();
-        sl.insert_level(101.0).ok();
-        sl.insert_level(102.0).ok();
+        sl.insert_level(100).ok();
+        sl.insert_level(101).ok();
+        sl.insert_level(102).ok();
         assert_eq!(sl.count(), 3);
 
         // 移除中间的价格
-        assert!(sl.remove_level(101.0).is_ok());
+        assert!(sl.remove_level(101).is_ok());
         assert_eq!(sl.count(), 2);
-        assert!(sl.find_node(101.0).is_err());
-        assert!(sl.find_node(100.0).is_ok());
-        assert!(sl.find_node(102.0).is_ok());
+        assert!(sl.find_node(101).is_err());
+        assert!(sl.find_node(100).is_ok());
+        assert!(sl.find_node(102).is_ok());
 
         // 尝试移除已删除的价格
-        assert!(sl.remove_level(101.0).is_err());
+        assert!(sl.remove_level(101).is_err());
     }
 
     #[test]
     fn test_removed_level_node_is_reused() {
         let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 100);
 
-        sl.insert_level(100.0).unwrap();
+        sl.insert_level(100).unwrap();
         let arena_len_after_insert = sl.arena.len();
-        sl.remove_level(100.0).unwrap();
+        sl.remove_level(100).unwrap();
         assert_eq!(sl.free_nodes.len(), 1);
 
-        sl.insert_level(101.0).unwrap();
+        sl.insert_level(101).unwrap();
         assert_eq!(sl.arena.len(), arena_len_after_insert);
         assert_eq!(sl.free_nodes.len(), 0);
-        assert!(sl.get_node_at_price(101.0).is_some());
+        assert!(sl.get_node_at_price(101).is_some());
     }
 
     #[test]
@@ -870,13 +871,13 @@ mod tests {
         let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 100);
 
         // 以随机顺序插入价格
-        let prices = vec![105.5, 100.2, 103.7, 102.1, 104.9, 101.3];
+        let prices = vec![105, 100, 103, 102, 104, 101];
         for &price in &prices {
             sl.insert_level(price).ok();
         }
 
         // 验证level 0是升序的
-        let mut prev = f64::NEG_INFINITY;
+        let mut prev = i64::MIN;
         unsafe {
             let mut current = sl.head;
             for _ in 0..prices.len() {
@@ -884,7 +885,7 @@ mod tests {
                 if next.is_null() {
                     break;
                 }
-                let price = (*next).price;
+                let price = (*next).price_ticks;
                 assert!(price > prev, "Level 0 should be sorted ascending");
                 prev = price;
                 current = next;
@@ -897,13 +898,13 @@ mod tests {
         let mut sl = SkipList::new_with_pool(SortOrder::Descending, 100);
 
         // 以随机顺序插入价格
-        let prices = vec![105.5, 100.2, 103.7, 102.1, 104.9, 101.3];
+        let prices = vec![105, 100, 103, 102, 104, 101];
         for &price in &prices {
             sl.insert_level(price).ok();
         }
 
         // 验证level 0是降序的
-        let mut prev = f64::INFINITY;
+        let mut prev = i64::MAX;
         unsafe {
             let mut current = sl.head;
             for _ in 0..prices.len() {
@@ -911,7 +912,7 @@ mod tests {
                 if next.is_null() {
                     break;
                 }
-                let price = (*next).price;
+                let price = (*next).price_ticks;
                 assert!(price < prev, "Level 0 should be sorted descending");
                 prev = price;
                 current = next;
@@ -925,24 +926,24 @@ mod tests {
 
         // 插入5个价格，各有不同数量
         for i in 0..5 {
-            let price = 100.0 + i as f64;
+            let price = 100 + i;
             sl.insert_level(price).ok();
             for j in 0..=i {
-                sl.add_order_at_level(price, j as u64, 1.0).ok();
+                sl.add_order_at_level(price, j as u64, 1).ok();
             }
         }
 
         // 获取top 3
         let top = sl.get_top_levels(3);
         assert_eq!(top.len(), 3);
-        assert_eq!(top[0].0, 100.0);
-        assert_eq!(top[1].0, 101.0);
-        assert_eq!(top[2].0, 102.0);
+        assert_eq!(top[0].0, 100);
+        assert_eq!(top[1].0, 101);
+        assert_eq!(top[2].0, 102);
 
         // 验证数量
-        assert_eq!(top[0].1, 1.0);
-        assert_eq!(top[1].1, 2.0);
-        assert_eq!(top[2].1, 3.0);
+        assert_eq!(top[0].1, 1);
+        assert_eq!(top[1].1, 2);
+        assert_eq!(top[2].1, 3);
     }
 
     #[test]
@@ -952,8 +953,8 @@ mod tests {
         assert!(sl.best().is_none());
         assert!(sl.best_with_orders().is_none());
         assert_eq!(sl.count(), 0);
-        assert!(sl.find_node(100.0).is_err());
-        assert!(sl.get_node_at_price(100.0).is_none());
+        assert!(sl.find_node(100).is_err());
+        assert!(sl.get_node_at_price(100).is_none());
         assert_eq!(sl.get_top_levels(10).len(), 0);
     }
 }

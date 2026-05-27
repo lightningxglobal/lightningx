@@ -1,11 +1,12 @@
 /// 链表节点对象池实现
 /// 用于存储同价位的订单队列，相比VecDeque支持O(1)的真正删除
+use crate::order::QuantityLots;
 
 /// 链表节点
 #[derive(Debug, Clone, Copy)]
 pub struct ListNode {
     pub order_id: u64,
-    pub quantity: f64,
+    pub quantity_lots: QuantityLots,
     pub next: Option<usize>,
     pub prev: Option<usize>,
 }
@@ -14,7 +15,7 @@ impl Default for ListNode {
     fn default() -> Self {
         Self {
             order_id: 0,
-            quantity: 0.0,
+            quantity_lots: 0,
             next: None,
             prev: None,
         }
@@ -49,11 +50,11 @@ impl ListNodePool {
 
     /// 从池中获取一个节点
     #[inline]
-    pub fn acquire(&mut self, order_id: u64, quantity: f64) -> Option<usize> {
+    pub fn acquire(&mut self, order_id: u64, quantity_lots: QuantityLots) -> Option<usize> {
         self.free_indices.pop().map(|idx| {
             self.nodes[idx] = ListNode {
                 order_id,
-                quantity,
+                quantity_lots,
                 next: None,
                 prev: None,
             };

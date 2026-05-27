@@ -315,6 +315,64 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("Restored {} active orders ({} non-restable skipped)", restored, skipped);
 
+    // Detect crossed books after restoration: can happen if the engine crashed between
+    // desk-server writing an order to DB and the engine receiving it via Aeron.
+    // If bid >= ask for any symbol, cancel all orders for that symbol and rebuild fresh.
+    {
+        let repo = AccountRepository::new(&pool);
+        let mut crossed_fixed = 0usize;
+        for (sym, eng) in engines.iter_mut() {
+            let bids = eng.get_top_levels(1, true);
+            let asks = eng.get_top_levels(1, false);
+            let crossed = matches!((bids.first(), asks.first()),
+                (Some(&(bid, _)), Some(&(ask, _))) if bid >= ask);
+            if !crossed { continue; }
+
+            let best_bid = bids.first().map(|&(p, _)| p).unwrap_or(0.0);
+            let best_ask = asks.first().map(|&(p, _)| p).unwrap_or(f64::MAX);
+            tracing::warn!(
+                "Crossed book for {} (bid={} >= ask={}) — cancelling all open orders and rebuilding",
+                sym, best_bid, best_ask
+            );
+
+            #[allow(clippy::type_complexity)]
+            let open_orders: Vec<(i64, i64, String, f64, f64, Option<f64>, f64)> =
+                sqlx::query_as(
+                    "SELECT id, user_id, side, quantity, filled, price, freeze_price
+                     FROM orders WHERE symbol=$1 AND status IN ('PENDING','TRADING')",
+                )
+                .bind(sym.as_str())
+                .fetch_all(&pool).await.unwrap_or_default();
+
+            let sym_parts: Vec<&str> = sym.splitn(2, '_').collect();
+            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+
+            for (id, user_id, side, quantity, filled, price, freeze_price) in &open_orders {
+                let remaining = quantity - filled;
+                if remaining > 0.0 {
+                    if side == "sell" {
+                        let _ = repo.release_frozen(*user_id, base_asset, remaining).await;
+                    } else {
+                        let fp = if *freeze_price > 0.0 { Some(*freeze_price) } else { price.filter(|&p| p > 0.0) };
+                        if let Some(p) = fp {
+                            let _ = repo.release_frozen(*user_id, quote_asset, p * remaining).await;
+                        }
+                    }
+                }
+                let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
+                    .bind(id).execute(&pool).await;
+            }
+
+            *eng = MatchingEngine::new(PoolConfig::default()).expect("engine");
+            uid_maps.remove(sym.as_str());
+            crossed_fixed += open_orders.len();
+        }
+        if crossed_fixed > 0 {
+            tracing::warn!("Fixed crossed book(s): cancelled {} orders total", crossed_fixed);
+        }
+    }
+
     // Cancel stale market orders from crash.
     {
         let repo = AccountRepository::new(&pool);

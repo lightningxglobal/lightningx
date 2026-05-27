@@ -91,20 +91,20 @@ fn main() {
     println!("║        bench_baseline — ~5% fill rate, new performance baseline  ║");
     println!("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    // Warm-up: 50K orders (same scale as measured runs) to bring CPU to full turbo
-    let _ = bench_single(PoolConfig::default(), 50_000, 500);
-
     println!("【Single order — 2M pool, ~5% fill】");
+    let _ = bench_single(PoolConfig::default(), 50_000, 500);  // warm-up
     let (tps, ns, ev) = bench_single(PoolConfig::default(), 50_000, 500);
     println!("  50 000 orders, TradeEvents={ev} ({:.1}%)", ev as f64 / 50_000.0 * 100.0);
     println!("  TPS: {:.2}M  ({ns} ns/order)", tps / 1e6);
 
     println!("\n【Batch-20 — 2M pool, ~5% fill】");
+    let _ = bench_batch(PoolConfig::default(), 50_000, 20, 500);  // warm-up
     let (tps, ns, tr) = bench_batch(PoolConfig::default(), 50_000, 20, 500);
     println!("  50 000 orders, Trades={tr} ({:.1}%)", tr as f64 / 50_000.0 * 100.0);
     println!("  TPS: {:.2}M  ({ns} ns/order)", tps / 1e6);
 
     println!("\n【Deep OB Batch-20 — 100K pool, 400 levels, ~5% fill】");
+    let _ = bench_batch(PoolConfig { order_capacity: 100_000, queue_capacity: 100_000 }, 5_000, 20, 400);  // warm-up
     let (tps, ns, tr) = bench_batch(
         PoolConfig { order_capacity: 100_000, queue_capacity: 100_000 },
         5_000, 20, 400,

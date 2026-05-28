@@ -19,6 +19,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+fn try_freeze_cache(cache: &crate::api::AccountCache, user_id: i64, asset: &str, amount: f64) -> bool {
+    if amount <= 0.0 { return true; }
+    let Some(mut entry) = cache.get_mut(&user_id) else { return false };
+    let Some(kv) = entry.get_mut(asset) else { return false };
+    if kv.0 - kv.1 >= amount { kv.1 += amount; true } else { false }
+}
+
+fn release_cache_frozen(cache: &crate::api::AccountCache, user_id: i64, asset: &str, amount: f64) {
+    if amount <= 0.0 { return; }
+    if let Some(mut entry) = cache.get_mut(&user_id) {
+        if let Some(kv) = entry.get_mut(asset) {
+            kv.1 = (kv.1 - amount).max(0.0);
+        }
+    }
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -507,10 +523,9 @@ async fn handle_client_message(
                     );
                 }
 
-                let repo = AccountRepository::new(state.db.as_ref());
-                let reservation = if side == "buy" {
-                    let freeze_amount = freeze_price_val * qty;
-                    if freeze_amount <= 0.0 {
+                let (freeze_asset, freeze_amount): (&str, f64) = if side == "buy" {
+                    let amount = freeze_price_val * qty;
+                    if amount <= 0.0 {
                         return Some(
                             json!({
                                 "type": "order_rejected",
@@ -520,45 +535,35 @@ async fn handle_client_message(
                             .to_string(),
                         );
                     }
-                    repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
-                        .await
-                        .map(|row| (quote_asset, row, freeze_amount))
+                    (quote_asset, amount)
                 } else {
-                    repo.freeze_for_sell(user_id, base_asset, qty)
-                        .await
-                        .map(|row| (base_asset, row, qty))
+                    (base_asset, qty)
                 };
-
-                let (reserved_asset, (reserved_bal, reserved_frz), reserved_amount) =
-                    match reservation {
-                        Ok(v) => v,
-                        Err(e) => {
-                            return Some(
-                                json!({
-                                    "type": "order_rejected",
-                                    "client_order_id": client_order_id,
-                                    "reason": e.to_string()
-                                })
-                                .to_string(),
-                            )
-                        }
-                    };
-                state
-                    .account_cache
-                    .entry(user_id)
-                    .or_insert_with(std::collections::HashMap::new)
-                    .insert(reserved_asset.to_string(), (reserved_bal, reserved_frz));
-                if let Some(tx) = state.user_tx.get(&user_id) {
-                    let _ = tx.try_send(
+                if !try_freeze_cache(&state.account_cache, user_id, freeze_asset, freeze_amount) {
+                    return Some(
                         json!({
-                            "type": "balance_update",
-                            "asset": reserved_asset,
-                            "balance": reserved_bal,
-                            "available": reserved_bal - reserved_frz,
-                            "frozen": reserved_frz,
+                            "type": "order_rejected",
+                            "client_order_id": client_order_id,
+                            "reason": "Insufficient balance"
                         })
                         .to_string(),
                     );
+                }
+                if let Some(user_assets) = state.account_cache.get(&user_id) {
+                    if let Some(&(bal, frz)) = user_assets.get(freeze_asset) {
+                        if let Some(tx) = state.user_tx.get(&user_id) {
+                            let _ = tx.try_send(
+                                json!({
+                                    "type": "balance_update",
+                                    "asset": freeze_asset,
+                                    "balance": bal,
+                                    "available": bal - frz,
+                                    "frozen": frz,
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
                 }
 
                 let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
@@ -604,9 +609,7 @@ async fn handle_client_message(
 
                 if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
                     state.pending_meta.remove(&order_id);
-                    let _ = repo
-                        .release_frozen(user_id, reserved_asset, reserved_amount)
-                        .await;
+                    release_cache_frozen(&state.account_cache, user_id, freeze_asset, freeze_amount);
                     return Some(
                         json!({
                             "type": "order_rejected",
@@ -1353,10 +1356,8 @@ async fn handle_client_message(
                     idx: usize,
                     coid: String,
                     order_id: u64,
-                    is_buy: bool,
                     freeze_asset: String,
                     freeze_amount: f64,
-                    freeze_price_val: f64,
                     sbe_req: SbeNewOrder,
                     meta: OrderMeta,
                 }
@@ -1411,8 +1412,7 @@ async fn handle_client_message(
                     let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
                     let freeze_price_val: f64 = if side == "buy" { price.or(best_opposing_price).unwrap_or(0.0) } else { 0.0 };
 
-                    let is_buy = side == "buy";
-                    let (freeze_asset, freeze_amount) = if is_buy {
+                    let (freeze_asset, freeze_amount) = if side == "buy" {
                         let amount = freeze_price_val * qty;
                         if amount <= 0.0 { rej!("Unable to determine buy reservation price"); }
                         (quote_asset.to_owned(), amount)
@@ -1438,43 +1438,28 @@ async fn handle_client_message(
                         side: side_byte, time_in_force: tif_byte,
                         _pad: [0; 14], symbol: sym_bytes,
                     };
-                    validated.push(V { idx, coid, order_id, is_buy, freeze_asset, freeze_amount, freeze_price_val, sbe_req, meta });
+                    validated.push(V { idx, coid, order_id, freeze_asset, freeze_amount, sbe_req, meta });
                 }
 
-                // Phase 2: all freezes run in parallel — different assets don't contend.
-                let pool = state.db.as_ref();
-                let freeze_results = futures::future::join_all(validated.iter().map(|v| {
-                    let repo = AccountRepository::new(pool);
-                    let uid = user_id;
-                    let asset = v.freeze_asset.clone();
-                    let amount = v.freeze_amount;
-                    let is_buy = v.is_buy;
-                    async move {
-                        if is_buy { repo.freeze_for_buy(uid, &asset, amount).await }
-                        else       { repo.freeze_for_sell(uid, &asset, amount).await }
-                    }
-                })).await;
-
-                // Phase 3: build aeron_batch from successes.
+                // Phase 2 + 3: in-memory freeze check + build aeron_batch (no DB on hot path).
                 let mut aeron_batch: smallvec::SmallVec<[SbeNewOrder; 32]> = smallvec::SmallVec::new();
-                for (v, freeze_result) in validated.into_iter().zip(freeze_results) {
-                    match freeze_result {
-                        Ok((bal, frz)) => {
-                            state.account_cache.entry(user_id).or_insert_with(std::collections::HashMap::new)
-                                .insert(v.freeze_asset.clone(), (bal, frz));
-                            if let Some(tx) = state.user_tx.get(&user_id) {
-                                let _ = tx.try_send(json!({
-                                    "type": "balance_update", "asset": &v.freeze_asset,
-                                    "balance": bal, "available": bal - frz, "frozen": frz,
-                                }).to_string());
+                for v in validated {
+                    if try_freeze_cache(&state.account_cache, user_id, &v.freeze_asset, v.freeze_amount) {
+                        if let Some(user_assets) = state.account_cache.get(&user_id) {
+                            if let Some(&(bal, frz)) = user_assets.get(v.freeze_asset.as_str()) {
+                                if let Some(tx) = state.user_tx.get(&user_id) {
+                                    let _ = tx.try_send(json!({
+                                        "type": "balance_update", "asset": &v.freeze_asset,
+                                        "balance": bal, "available": bal - frz, "frozen": frz,
+                                    }).to_string());
+                                }
                             }
-                            state.pending_meta.insert(v.order_id, Box::new(v.meta));
-                            aeron_batch.push(v.sbe_req);
-                            par_results[v.idx] = json!({"client_order_id": v.coid, "order_id": v.order_id, "accepted": true});
                         }
-                        Err(e) => {
-                            par_results[v.idx] = json!({"client_order_id": v.coid, "accepted": false, "reason": e.to_string()});
-                        }
+                        state.pending_meta.insert(v.order_id, Box::new(v.meta));
+                        aeron_batch.push(v.sbe_req);
+                        par_results[v.idx] = json!({"client_order_id": v.coid, "order_id": v.order_id, "accepted": true});
+                    } else {
+                        par_results[v.idx] = json!({"client_order_id": v.coid, "accepted": false, "reason": "Insufficient balance"});
                     }
                 }
 

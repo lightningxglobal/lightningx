@@ -817,6 +817,7 @@ async fn main() -> anyhow::Result<()> {
         let pending_orders = state.pending_orders.clone();
         let pending_meta = state.pending_meta.clone();
         let user_tx = state.user_tx.clone();
+        let account_cache = account_cache.clone();
         let last_depth = state.last_depth.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
@@ -988,7 +989,8 @@ async fn main() -> anyhow::Result<()> {
 
                         if let Some(meta) = ws_meta {
                             if kind == order_update_kind::ACCEPTED {
-                                // Upsert: covers the race where REST path also ran.
+                                // Upsert + freeze: DB worker freezes funds atomically.
+                                // Hot path only updated the in-memory cache; this persists it.
                                 push_db_cmd(&mut db_tx, DbCmd::UpsertOrder {
                                     id:              order_id as i64,
                                     user_id:         meta.user_id,
@@ -1000,7 +1002,7 @@ async fn main() -> anyhow::Result<()> {
                                     filled:          0.0,
                                     status:          DbOrderStatus::Pending.as_u8(),
                                     freeze_price:    meta.freeze_price,
-                                    do_freeze:       false,
+                                    do_freeze:       true,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
                                 }, "upsert accepted order");
                             } else if kind == order_update_kind::FILLED || kind == order_update_kind::PARTIAL_FILL {
@@ -1026,16 +1028,38 @@ async fn main() -> anyhow::Result<()> {
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
                                 }, "upsert filled order");
                             }
-                            if kind == order_update_kind::REJECTED
-                                || kind == order_update_kind::CANCELLED
-                            {
+                            if kind == order_update_kind::REJECTED {
+                                // Freeze was in-memory only (hot path never hit DB).
+                                // Revert the cache and notify; no DB write needed.
+                                let sym_parts: Vec<&str> = meta.symbol.splitn(2, '_').collect();
+                                let base = sym_parts.first().copied().unwrap_or("BTC");
+                                let quote = sym_parts.last().copied().unwrap_or("USDT");
+                                let (asset, rel_amount) = if meta.side == "buy" {
+                                    (quote.to_string(), meta.freeze_price * meta.qty)
+                                } else {
+                                    (base.to_string(), meta.qty)
+                                };
+                                let new_vals = account_cache.get_mut(&meta.user_id).and_then(|mut e| {
+                                    let kv = e.get_mut(asset.as_str())?;
+                                    kv.1 = (kv.1 - rel_amount).max(0.0);
+                                    Some((kv.0, kv.1))
+                                });
+                                if let Some((bal, frz)) = new_vals {
+                                    if let Some(tx) = user_tx.get(&meta.user_id) {
+                                        let _ = tx.try_send(serde_json::json!({
+                                            "type": "balance_update", "asset": &asset,
+                                            "balance": bal, "available": bal - frz, "frozen": frz,
+                                        }).to_string());
+                                    }
+                                }
+                            } else if kind == order_update_kind::CANCELLED {
                                 push_db_cmd(&mut db_tx, DbCmd::ReleaseReservation {
                                     user_id: meta.user_id,
                                     symbol: db_cmd::str_bytes(&meta.symbol),
                                     side: if meta.side == "buy" { 0 } else { 1 },
                                     qty: meta.qty,
                                     freeze_price: meta.freeze_price,
-                                }, "release rejected reservation");
+                                }, "release cancelled reservation");
                             }
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).

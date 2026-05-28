@@ -14,7 +14,7 @@ fn exchange_url() -> String {
 
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
-const TRADE_INTERVAL_MS: u64 = 200;
+const TRADE_INTERVAL_MS: u64 = 3000;
 
 struct SymbolConfig {
     symbol: &'static str,

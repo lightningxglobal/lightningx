@@ -2380,4 +2380,183 @@ mod tests {
         let bids = engine.get_top_levels(5, true);
         assert_eq!(bids.len(), 2);
     }
+
+    // ── Orderbook depth correctness after all operation types ─────────────────
+    //
+    // These tests verify get_top_levels() stays accurate through the full
+    // lifecycle: add → trade (partial/full) → cancel → add again.
+
+    #[test]
+    fn test_depth_single_ask_placed() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 7, TimeInForce::GTC, 0)).unwrap();
+        assert_eq!(engine.get_top_levels(5, false), vec![(100, 7)]);
+        assert!(engine.get_top_levels(5, true).is_empty());
+    }
+
+    #[test]
+    fn test_depth_two_orders_same_price_aggregated() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 3, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Sell, 100, 4, TimeInForce::GTC, 0)).unwrap();
+        // Same price: quantities aggregate to 7
+        assert_eq!(engine.get_top_levels(5, false), vec![(100, 7)]);
+    }
+
+    #[test]
+    fn test_depth_three_ask_levels_ascending_order() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 103, 1, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Sell, 101, 2, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(3, Side::Sell, 102, 3, TimeInForce::GTC, 0)).unwrap();
+        assert_eq!(
+            engine.get_top_levels(3, false),
+            vec![(101, 2), (102, 3), (103, 1)],
+            "asks must be ascending price"
+        );
+    }
+
+    #[test]
+    fn test_depth_three_bid_levels_descending_order() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Buy, 97, 1, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Buy, 99, 2, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(3, Side::Buy, 98, 3, TimeInForce::GTC, 0)).unwrap();
+        assert_eq!(
+            engine.get_top_levels(3, true),
+            vec![(99, 2), (98, 3), (97, 1)],
+            "bids must be descending price"
+        );
+    }
+
+    #[test]
+    fn test_depth_after_cancel_decreases_quantity() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 5, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Sell, 100, 3, TimeInForce::GTC, 0)).unwrap();
+        engine.cancel_order(2).unwrap();
+        assert_eq!(engine.get_top_levels(5, false), vec![(100, 5)]);
+    }
+
+    #[test]
+    fn test_depth_level_disappears_when_all_orders_cancelled() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 5, TimeInForce::GTC, 0)).unwrap();
+        engine.cancel_order(1).unwrap();
+        assert!(engine.get_top_levels(5, false).is_empty());
+    }
+
+    #[test]
+    fn test_depth_after_ioc_partial_fill_reduces_top_level() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 10, TimeInForce::GTC, 0)).unwrap();
+        // IOC buy of 4: consumes 4 from the ask level
+        engine.place_order(Order::new(2, Side::Buy, 100, 4, TimeInForce::IOC, 0)).unwrap();
+        assert_eq!(engine.get_top_levels(5, false), vec![(100, 6)]);
+    }
+
+    #[test]
+    fn test_depth_after_ioc_full_fill_removes_level() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 5, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Buy, 100, 5, TimeInForce::IOC, 0)).unwrap();
+        assert!(engine.get_top_levels(5, false).is_empty());
+    }
+
+    #[test]
+    fn test_depth_after_market_sweep_shows_partially_consumed_level() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 3, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Sell, 101, 5, TimeInForce::GTC, 0)).unwrap();
+        // Market buy for 5: consumes all of level 100 (3) + 2 from level 101 (5)
+        engine.place_order(Order::new_market(10, Side::Buy, 5, 0)).unwrap();
+        assert_eq!(engine.get_top_levels(5, false), vec![(101, 3)]);
+    }
+
+    #[test]
+    fn test_depth_gtc_partial_taker_rests_remainder_correctly() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        // 3 lots available as ask
+        engine.place_order(Order::new(1, Side::Sell, 100, 3, TimeInForce::GTC, 0)).unwrap();
+        // GTC buy for 8: fills 3, rests 5 as a bid at price 100
+        engine.place_order(Order::new(2, Side::Buy, 100, 8, TimeInForce::GTC, 0)).unwrap();
+
+        // Ask side fully consumed
+        assert!(engine.get_top_levels(5, false).is_empty(), "ask must be empty");
+        // Bid side: 5 remaining (not 8)
+        assert_eq!(engine.get_top_levels(5, true), vec![(100, 5)], "bid must show remaining 5");
+    }
+
+    #[test]
+    fn test_depth_limit_caps_returned_levels() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        for i in 1..=5 {
+            engine.place_order(Order::new(i, Side::Sell, i as i64 * 10, 1, TimeInForce::GTC, 0)).unwrap();
+        }
+        // Only top 3
+        let asks = engine.get_top_levels(3, false);
+        assert_eq!(asks.len(), 3);
+        assert_eq!(asks[0].0, 10);
+        assert_eq!(asks[2].0, 30);
+    }
+
+    #[test]
+    fn test_depth_limit_zero_returns_empty() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 5, TimeInForce::GTC, 0)).unwrap();
+        assert_eq!(engine.get_top_levels(0, false), vec![]);
+    }
+
+    #[test]
+    fn test_depth_ask_side_unaffected_by_bid_operations() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 200, 5, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Buy, 100, 3, TimeInForce::GTC, 0)).unwrap();
+        engine.cancel_order(2).unwrap();
+
+        // Ask side must be untouched
+        assert_eq!(engine.get_top_levels(5, false), vec![(200, 5)]);
+    }
+
+    #[test]
+    fn test_depth_no_phantom_level_after_ioc_consumes_multiple_orders_at_level() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 3, TimeInForce::GTC, 0)).unwrap();
+        engine.place_order(Order::new(2, Side::Sell, 100, 2, TimeInForce::GTC, 0)).unwrap();
+        // IOC buys all 5 — both orders at price 100 consumed, level must vanish
+        engine.place_order(Order::new_market(10, Side::Buy, 5, 0)).unwrap();
+        assert!(engine.get_top_levels(5, false).is_empty(), "no phantom level after full consumption");
+    }
+
+    #[test]
+    fn test_depth_post_only_rejection_leaves_book_unchanged() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 5, TimeInForce::GTC, 0)).unwrap();
+        // PostOnly buy at 100 → rejected, book must not change
+        engine.place_order(Order::new(2, Side::Buy, 100, 3, TimeInForce::PostOnly, 0)).unwrap();
+        assert_eq!(engine.get_top_levels(5, false), vec![(100, 5)]);
+        assert!(engine.get_top_levels(5, true).is_empty());
+    }
+
+    #[test]
+    fn test_depth_fok_rejection_leaves_book_unchanged() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 3, TimeInForce::GTC, 0)).unwrap();
+        // FOK wants 5 but only 3 available → rejected, ask untouched
+        engine.place_order(Order::new(2, Side::Buy, 100, 5, TimeInForce::FOK, 0)).unwrap();
+        assert_eq!(engine.get_top_levels(5, false), vec![(100, 3)]);
+        assert!(engine.get_top_levels(5, true).is_empty());
+    }
+
+    #[test]
+    fn test_depth_add_after_full_clear_starts_fresh() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine.place_order(Order::new(1, Side::Sell, 100, 5, TimeInForce::GTC, 0)).unwrap();
+        engine.cancel_order(1).unwrap();
+        assert!(engine.get_top_levels(5, false).is_empty());
+
+        // Now add a fresh order at a different price
+        engine.place_order(Order::new(2, Side::Sell, 110, 8, TimeInForce::GTC, 0)).unwrap();
+        assert_eq!(engine.get_top_levels(5, false), vec![(110, 8)]);
+    }
 }

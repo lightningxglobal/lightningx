@@ -78,7 +78,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/accounts", get(handle_accounts))
         .route("/api/balances", get(handle_accounts))
         // Orders
-        .route("/api/orders", get(handle_orders).post(handle_place_order))
+        .route(
+            "/api/orders",
+            get(handle_orders).post(handle_place_order).delete(handle_cancel_all_orders),
+        )
         .route(
             "/api/orders/:order_id",
             get(handle_order).delete(handle_cancel_order),
@@ -1143,6 +1146,146 @@ async fn handle_cancel_order(
     }
 
     (StatusCode::OK, Json(json!({"cancelled": order_id}))).into_response()
+}
+
+/// DELETE /api/orders — cancel ALL open orders for the authenticated user.
+///
+/// Aeron mode: submits a batch-cancel to the engine asynchronously; fund release
+/// arrives via the CancelConfirmed path when each CANCELLED event comes back.
+/// Standalone mode: cancels each order synchronously and releases frozen funds.
+async fn handle_cancel_all_orders(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // Optional ?symbol= filter.
+    let symbol_filter: Option<String> = params.get("symbol").cloned();
+
+    #[derive(sqlx::FromRow)]
+    struct OpenOrder {
+        id: i64,
+        symbol: String,
+        side: String,
+        price: Option<f64>,
+        quantity: f64,
+        filled: f64,
+    }
+
+    let rows: Vec<OpenOrder> = {
+        let query_str = if symbol_filter.is_some() {
+            "SELECT id, symbol, side, price, quantity, filled FROM orders
+             WHERE user_id = $1 AND symbol = $2 AND status IN ('PENDING','TRADING')"
+        } else {
+            "SELECT id, symbol, side, price, quantity, filled FROM orders
+             WHERE user_id = $1 AND status IN ('PENDING','TRADING')"
+        };
+        let mut q = sqlx::query_as::<_, OpenOrder>(query_str).bind(user_id);
+        if let Some(ref sym) = symbol_filter {
+            q = q.bind(sym);
+        }
+        match q.fetch_all(s.db.as_ref()).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    if rows.is_empty() {
+        return (StatusCode::OK, Json(json!({"cancelled": 0}))).into_response();
+    }
+
+    let order_ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+
+    // ── Aeron mode: batch-cancel in the engine; fund release via CancelConfirmed ─
+    if s.engines.is_none() {
+        if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
+            let reqs: smallvec::SmallVec<[crate::sbe::CancelOrderRequest; 64]> = order_ids
+                .iter()
+                .map(|&id| crate::sbe::CancelOrderRequest { order_id: id as u64 })
+                .collect();
+            let count = reqs.len();
+            if aeron_cmd_tx.send(AeronCmd::BatchCancel(reqs)).is_ok() {
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"cancel_submitted": count})),
+                )
+                    .into_response();
+            }
+            return (StatusCode::BAD_GATEWAY, Json(json!({"error": "Aeron channel closed"}))).into_response();
+        }
+    }
+
+    // ── Standalone mode: cancel in engine + DB + release frozen funds ─────────
+    let mut cancelled = 0usize;
+    let repo = AccountRepository::new(&s.db);
+
+    for row in &rows {
+        // Cancel in matching engine.
+        if let Some(engines) = &s.engines {
+            if let Some(engine) = engines.get(&row.symbol) {
+                let _ = engine.lock().unwrap().cancel_order(row.id as u64);
+            }
+        }
+
+        // Mark as CANCELLED in DB.
+        let upd = sqlx::query(
+            "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
+             WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
+        )
+        .bind(row.id)
+        .bind(user_id)
+        .execute(s.db.as_ref())
+        .await;
+
+        if upd.map(|r| r.rows_affected() > 0).unwrap_or(false) {
+            cancelled += 1;
+        }
+
+        // Release frozen funds for the unfilled remainder.
+        let remaining = row.quantity - row.filled;
+        if remaining > 0.0 {
+            let sym_parts: Vec<&str> = row.symbol.splitn(2, '_').collect();
+            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+            if row.side == "buy" {
+                if let Some(fp) = row.price.filter(|&p| p > 0.0) {
+                    if let Ok((bal, frz)) = repo.release_frozen(user_id, quote_asset, fp * remaining).await {
+                        cache_set(&s.account_cache, user_id, quote_asset, bal, frz);
+                    }
+                }
+            } else if let Ok((bal, frz)) = repo.release_frozen(user_id, base_asset, remaining).await {
+                cache_set(&s.account_cache, user_id, base_asset, bal, frz);
+            }
+        }
+
+        // Notify open WS connections for this user.
+        if let Some(tx) = s.user_tx.get(&user_id) {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0);
+            let msg = serde_json::json!({
+                "type": "order_update",
+                "order_id": row.id,
+                "status": "CANCELED",
+                "ts": ts,
+            })
+            .to_string();
+            let _ = tx.send(msg).await;
+        }
+    }
+
+    (StatusCode::OK, Json(json!({"cancelled": cancelled}))).into_response()
 }
 
 // ─── Tickers ──────────────────────────────────────────────────────────────────

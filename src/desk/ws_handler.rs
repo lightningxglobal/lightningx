@@ -1343,6 +1343,33 @@ async fn batch_cancel_by_ids(
     state: &AppState,
     personal_tx: &tokio::sync::mpsc::Sender<String>,
 ) -> usize {
+    if order_ids.is_empty() {
+        return 0;
+    }
+
+    // Aeron mode: send cancels directly to the engine without a DB round-trip.
+    // The DB query was the dominant latency source (>500ms under load), causing
+    // the market-maker's cancel confirmation timeout to fire before the cancel
+    // even reached the engine.  Fund release / DB update happen via CancelConfirmed
+    // when the engine's CANCELLED event arrives back through the Aeron spin thread.
+    if state.engines.is_none() {
+        if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+            let reqs: smallvec::SmallVec<[crate::sbe::CancelOrderRequest; 64]> = order_ids
+                .iter()
+                .map(|&id| crate::sbe::CancelOrderRequest { order_id: id as u64 })
+                .collect();
+            return if aeron_cmd_tx
+                .send(crate::transport::AeronCmd::BatchCancel(reqs))
+                .is_ok()
+            {
+                order_ids.len()
+            } else {
+                0
+            };
+        }
+    }
+
+    // Standalone mode: query DB to get order details for synchronous fund release.
     #[derive(sqlx::FromRow)]
     struct OpenOrder {
         id: i64,
@@ -1367,25 +1394,6 @@ async fn batch_cancel_by_ids(
 
     if rows.is_empty() {
         return 0;
-    }
-
-    if state.engines.is_none() {
-        if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
-            let mut reqs = smallvec::SmallVec::<[crate::sbe::CancelOrderRequest; 64]>::new();
-            for order in &rows {
-                reqs.push(crate::sbe::CancelOrderRequest {
-                    order_id: order.id as u64,
-                });
-            }
-            return if aeron_cmd_tx
-                .send(crate::transport::AeronCmd::BatchCancel(reqs))
-                .is_ok()
-            {
-                rows.len()
-            } else {
-                0
-            };
-        }
     }
 
     if let Some(engines) = &state.engines {

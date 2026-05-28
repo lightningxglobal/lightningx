@@ -832,11 +832,6 @@ async fn main() -> anyhow::Result<()> {
             .name("aeron-event-loop".to_string())
             .spawn(move || {
                 let mut idle_us: u64 = 0;
-                // Per-symbol timestamp of the last non-empty depth snapshot.
-                // Used to suppress empty snapshots during the cancel-all phase of
-                // market-maker refresh cycles (which momentarily empties the book).
-                let mut last_nonempty_depth: std::collections::HashMap<String, std::time::Instant> =
-                    std::collections::HashMap::new();
                 loop {
                     let mut did_work = false;
                     // Drain outbound commands (WS/REST → engine) without blocking.
@@ -1139,17 +1134,18 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or("BTC_USDT").to_string();
                                 let symbol = if symbol.is_empty() { "BTC_USDT".to_string() } else { symbol };
 
-                                // Suppress one-sided or empty snapshots within 2s of the last
-                                // full (both-sided) snapshot — they are cancel-cycle artifacts.
+                                // Only broadcast complete (both-sided) snapshots.
+                                // When the book is momentarily empty or one-sided during a
+                                // market-maker cancel-replace cycle, re-broadcast the last
+                                // complete snapshot so the frontend never sees an empty book.
                                 let is_incomplete = nb == 0 || na == 0;
                                 if is_incomplete {
-                                    if let Some(&t) = last_nonempty_depth.get(&symbol) {
-                                        if t.elapsed() < std::time::Duration::from_secs(2) {
-                                            continue; // skip transient one-sided / empty snapshot
-                                        }
+                                    if let Some(last) = last_depth.get(&symbol) {
+                                        let j = last.to_string();
+                                        let market_tx2 = market_tx.clone();
+                                        rt.spawn(async move { let _ = market_tx2.send(j); });
                                     }
-                                } else {
-                                    last_nonempty_depth.insert(symbol.clone(), std::time::Instant::now());
+                                    continue;
                                 }
 
                                 let market_tx2 = market_tx.clone();

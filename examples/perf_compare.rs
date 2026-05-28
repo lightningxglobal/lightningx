@@ -57,7 +57,7 @@ fn bench_real_business_batch() -> (f64, u64, u64) {
     let mut trades: u64 = 0;
     let mut total: u64 = 0;
     for round in 0..5000u64 {
-        let mut batch: SmallVec<[Order; 20]> = SmallVec::new();
+        let mut batch: SmallVec<[Order; 40]> = SmallVec::new();
         for i in 0..5i64 {
             let p = 5_000_000 + round as i64 % 50 + i;
             batch.push(make_order(id, Side::Buy, p, 1));
@@ -108,7 +108,7 @@ fn bench_deep_ob_batch() -> (f64, u64, u64) {
     let mut total: u64 = 0;
     let mut trades: u64 = 0;
     for batch_idx in 0..(5000u64 / 20) {
-        let mut batch: SmallVec<[Order; 20]> = SmallVec::new();
+        let mut batch: SmallVec<[Order; 40]> = SmallVec::new();
         for i in 0..10u64 {
             let oid = batch_idx * 20 + i * 2;
             // buy just below best ask (base+1) — does not cross

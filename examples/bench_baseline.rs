@@ -72,7 +72,7 @@ fn bench_batch(pool: PoolConfig, total: u64, batch_size: usize, pre_levels: i64)
     let start = Instant::now();
     let mut trades = 0u64;
     for b in 0..(total / batch_size as u64) {
-        let mut batch: SmallVec<[Order; 20]> = SmallVec::new();
+        let mut batch: SmallVec<[Order; 40]> = SmallVec::new();
         for i in 0..batch_size as u64 {
             batch.push(order_for_seq(id, b * batch_size as u64 + i));
             id += 1;

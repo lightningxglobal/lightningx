@@ -351,12 +351,12 @@ impl MatchingEngine {
         Ok(result)
     }
 
-    /// 批量下单（支持最多20笔订单，避免堆分配）
+    /// 批量下单（支持最多40笔订单，避免堆分配）
     #[inline]
     pub fn place_orders(
         &mut self,
-        orders: SmallVec<[Order; 20]>,
-    ) -> OrderResult<SmallVec<[PlaceOrderResult; 20]>> {
+        orders: SmallVec<[Order; 40]>,
+    ) -> OrderResult<SmallVec<[PlaceOrderResult; 40]>> {
         let mut results = SmallVec::new();
 
         // 预分配订单ID并验证
@@ -893,14 +893,14 @@ impl MatchingEngine {
         Ok(filled)
     }
 
-    /// 批量撮合多个订单（最多20个），共享TradeEvent批处理以提升性能
+    /// 批量撮合多个订单（最多40个），共享TradeEvent批处理以提升性能
     /// 所有订单的TradeEvent被收集到一个batch中，最后一次性发送
     #[inline]
     pub fn match_orders_batch(
         &mut self,
-        orders: SmallVec<[Order; 20]>,
-    ) -> OrderResult<SmallVec<[(QuantityLots, Vec<Trade>); 20]>> {
-        let mut results: SmallVec<[(QuantityLots, Vec<Trade>); 20]> = SmallVec::new();
+        orders: SmallVec<[Order; 40]>,
+    ) -> OrderResult<SmallVec<[(QuantityLots, Vec<Trade>); 40]>> {
+        let mut results: SmallVec<[(QuantityLots, Vec<Trade>); 40]> = SmallVec::new();
         let has_trade_sender = self.trade_event_sender.is_some();
         let mut all_trade_events: SmallVec<[TradeEvent; 256]> = SmallVec::new();
 
@@ -925,7 +925,7 @@ impl MatchingEngine {
                     match opposite_book.get_best_price() {
                         Some(price) => {
                             if opposite_book.get_node_at_price(price).is_some() {
-                                let price_matches = match order.side {
+                                let price_matches = order.is_market || match order.side {
                                     Side::Buy => order.price_ticks >= price,
                                     Side::Sell => order.price_ticks <= price,
                                 };
@@ -2558,5 +2558,85 @@ mod tests {
         // Now add a fresh order at a different price
         engine.place_order(Order::new(2, Side::Sell, 110, 8, TimeInForce::GTC, 0)).unwrap();
         assert_eq!(engine.get_top_levels(5, false), vec![(110, 8)]);
+    }
+
+    // ── match_orders_batch market order regression ────────────────────────────
+
+    #[test]
+    fn test_match_orders_batch_market_buy_fills() {
+        // Regression: match_orders_batch was missing `order.is_market ||` in the
+        // price check, causing market orders to never fill (price_ticks=0 < any ask).
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+
+        // Seed a resting ask at price 50_000
+        engine.place_order(Order::new(1, Side::Sell, 50_000, 10, TimeInForce::GTC, 0)).unwrap();
+
+        let market_buy = Order::new_market(2, Side::Buy, 5, 1);
+        let mut batch: SmallVec<[Order; 40]> = SmallVec::new();
+        batch.push(market_buy);
+
+        let results = engine.match_orders_batch(batch).unwrap();
+        assert_eq!(results.len(), 1);
+        let (filled, _trades) = &results[0];
+        assert_eq!(*filled, 5, "market buy should fill 5 lots from the ask");
+
+        // Remaining 5 lots still in book
+        assert_eq!(engine.get_top_levels(5, false), vec![(50_000, 5)]);
+    }
+
+    #[test]
+    fn test_match_orders_batch_market_sell_fills() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+
+        // Seed a resting bid at 50_000
+        engine.place_order(Order::new(1, Side::Buy, 50_000, 10, TimeInForce::GTC, 0)).unwrap();
+
+        let market_sell = Order::new_market(2, Side::Sell, 7, 1);
+        let mut batch: SmallVec<[Order; 40]> = SmallVec::new();
+        batch.push(market_sell);
+
+        let results = engine.match_orders_batch(batch).unwrap();
+        let (filled, _trades) = &results[0];
+        assert_eq!(*filled, 7, "market sell should fill 7 lots from the bid");
+
+        // Remaining 3 lots still in book
+        assert_eq!(engine.get_top_levels(5, true), vec![(50_000, 3)]);
+    }
+
+    #[test]
+    fn test_match_orders_batch_market_empty_book_fills_zero() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+
+        let market_buy = Order::new_market(1, Side::Buy, 10, 0);
+        let mut batch: SmallVec<[Order; 40]> = SmallVec::new();
+        batch.push(market_buy);
+
+        let results = engine.match_orders_batch(batch).unwrap();
+        let (filled, _trades) = &results[0];
+        assert_eq!(*filled, 0, "market order on empty book should fill 0 lots");
+    }
+
+    #[test]
+    fn test_match_orders_batch_mixed_limit_and_market() {
+        // Validate that limit and market orders in the same batch interact correctly.
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+
+        // Seed ask liquidity
+        engine.place_order(Order::new(1, Side::Sell, 100, 20, TimeInForce::GTC, 0)).unwrap();
+
+        // Batch: limit buy at 100 (takes 5) then market buy (takes another 5)
+        let limit_buy = Order::new(2, Side::Buy, 100, 5, TimeInForce::IOC, 1);
+        let market_buy = Order::new_market(3, Side::Buy, 5, 2);
+        let mut batch: SmallVec<[Order; 40]> = SmallVec::new();
+        batch.push(limit_buy);
+        batch.push(market_buy);
+
+        let results = engine.match_orders_batch(batch).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 5, "limit buy fills 5");
+        assert_eq!(results[1].0, 5, "market buy fills 5");
+
+        // 10 remaining in ask
+        assert_eq!(engine.get_top_levels(5, false), vec![(100, 10)]);
     }
 }

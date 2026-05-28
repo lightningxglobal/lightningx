@@ -957,4 +957,211 @@ mod tests {
         assert!(sl.get_node_at_price(100).is_none());
         assert_eq!(sl.get_top_levels(10).len(), 0);
     }
+
+    // ── has_cumulative_quantity_until ──────────────────────────────────────────
+
+    fn make_ask_book(levels: &[(i64, i64)]) -> SkipList {
+        let capacity = levels.len() * 4 + 10;
+        let mut sl = SkipList::new_with_pool(SortOrder::Ascending, capacity);
+        for (i, &(price, qty)) in levels.iter().enumerate() {
+            sl.insert_level(price).unwrap();
+            sl.add_order_at_level(price, (i + 1) as u64, qty).unwrap();
+        }
+        sl
+    }
+
+    fn make_bid_book(levels: &[(i64, i64)]) -> SkipList {
+        let capacity = levels.len() * 4 + 10;
+        let mut sl = SkipList::new_with_pool(SortOrder::Descending, capacity);
+        for (i, &(price, qty)) in levels.iter().enumerate() {
+            sl.insert_level(price).unwrap();
+            sl.add_order_at_level(price, (i + 1) as u64, qty).unwrap();
+        }
+        sl
+    }
+
+    #[test]
+    fn test_hcqu_empty_book_returns_false() {
+        let sl = SkipList::new_with_pool(SortOrder::Ascending, 10);
+        assert!(!sl.has_cumulative_quantity_until(1, 100, false, true));
+    }
+
+    #[test]
+    fn test_hcqu_exact_quantity_returns_true() {
+        // Ask book: 5 lots at price 100. Buyer wants exactly 5.
+        let sl = make_ask_book(&[(100, 5)]);
+        assert!(sl.has_cumulative_quantity_until(5, 100, false, true));
+    }
+
+    #[test]
+    fn test_hcqu_more_than_available_returns_false() {
+        let sl = make_ask_book(&[(100, 5)]);
+        assert!(!sl.has_cumulative_quantity_until(6, 100, false, true));
+    }
+
+    #[test]
+    fn test_hcqu_less_than_available_returns_true() {
+        let sl = make_ask_book(&[(100, 10)]);
+        assert!(sl.has_cumulative_quantity_until(3, 100, false, true));
+    }
+
+    #[test]
+    fn test_hcqu_price_limit_excludes_expensive_levels() {
+        // Asks at 100(5) and 110(5). Buyer limit=105: only 100 is acceptable.
+        let sl = make_ask_book(&[(100, 5), (110, 5)]);
+        // Want 8, but only 5 acceptable (100<=105, 110>105)
+        assert!(!sl.has_cumulative_quantity_until(8, 105, false, true));
+        // Want 5 — exactly available within price limit
+        assert!(sl.has_cumulative_quantity_until(5, 105, false, true));
+    }
+
+    #[test]
+    fn test_hcqu_spans_multiple_levels() {
+        // Asks at 100(3), 101(3), 102(3). Buyer limit=102, wants 9.
+        let sl = make_ask_book(&[(100, 3), (101, 3), (102, 3)]);
+        assert!(sl.has_cumulative_quantity_until(9, 102, false, true));
+        assert!(!sl.has_cumulative_quantity_until(10, 102, false, true));
+    }
+
+    #[test]
+    fn test_hcqu_market_order_ignores_price_limit() {
+        // Asks at 100(3), 200(3). Market buy ignores price limit.
+        let sl = make_ask_book(&[(100, 3), (200, 3)]);
+        // Limit of 150 would exclude 200, but is_market=true bypasses check.
+        assert!(sl.has_cumulative_quantity_until(6, 150, true, true));
+    }
+
+    #[test]
+    fn test_hcqu_bid_book_sell_taker() {
+        // Bid book: bids at 100(5), 90(5). Sell taker, limit=95: only 100 is acceptable.
+        let sl = make_bid_book(&[(100, 5), (90, 5)]);
+        // Descending: head→100→90→null
+        // Sell taker (buy_taker=false): acceptable when price >= limit_price=95
+        // Only 100 passes (90 < 95)
+        assert!(sl.has_cumulative_quantity_until(5, 95, false, false));
+        assert!(!sl.has_cumulative_quantity_until(6, 95, false, false));
+    }
+
+    #[test]
+    fn test_hcqu_bid_book_sell_taker_spans_levels() {
+        let sl = make_bid_book(&[(100, 4), (90, 4), (80, 4)]);
+        // limit=80: all three levels acceptable for a sell taker
+        assert!(sl.has_cumulative_quantity_until(12, 80, false, false));
+        assert!(!sl.has_cumulative_quantity_until(13, 80, false, false));
+    }
+
+    // ── reduce_order_quantity_at_level ─────────────────────────────────────────
+
+    #[test]
+    fn test_reduce_order_quantity_updates_level_total() {
+        let mut sl = make_ask_book(&[(100, 10)]);
+        sl.reduce_order_quantity_at_level(100, 1, 4).unwrap();
+
+        let node = sl.get_node_at_price(100).unwrap();
+        assert_eq!(node.total_quantity_lots, 6);
+    }
+
+    #[test]
+    fn test_reduce_order_quantity_to_zero() {
+        let mut sl = make_ask_book(&[(100, 5)]);
+        sl.reduce_order_quantity_at_level(100, 1, 5).unwrap();
+
+        let node = sl.get_node_at_price(100).unwrap();
+        assert_eq!(node.total_quantity_lots, 0);
+    }
+
+    #[test]
+    fn test_reduce_order_quantity_wrong_order_id_returns_err() {
+        let mut sl = make_ask_book(&[(100, 5)]);
+        let result = sl.reduce_order_quantity_at_level(100, 999, 3);
+        assert!(result.is_err(), "unknown order id must return Err");
+    }
+
+    #[test]
+    fn test_reduce_order_quantity_wrong_price_returns_err() {
+        let mut sl = make_ask_book(&[(100, 5)]);
+        let result = sl.reduce_order_quantity_at_level(200, 1, 3);
+        assert!(result.is_err(), "wrong price level must return Err");
+    }
+
+    #[test]
+    fn test_reduce_order_only_affects_target_order() {
+        // Two orders at same price level: order 1 (qty=6), order 2 (qty=4)
+        let capacity = 20;
+        let mut sl = SkipList::new_with_pool(SortOrder::Ascending, capacity);
+        sl.insert_level(100).unwrap();
+        sl.add_order_at_level(100, 1, 6).unwrap();
+        sl.add_order_at_level(100, 2, 4).unwrap();
+
+        sl.reduce_order_quantity_at_level(100, 1, 3).unwrap();
+
+        let node = sl.get_node_at_price(100).unwrap();
+        // Total: (6-3) + 4 = 7
+        assert_eq!(node.total_quantity_lots, 7);
+    }
+
+    // ── add_order_at_level: price not found ────────────────────────────────────
+
+    #[test]
+    fn test_add_order_at_nonexistent_level_returns_err() {
+        let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 20);
+        let result = sl.add_order_at_level(100, 1, 5);
+        assert!(result.is_err(), "adding to non-existent level must fail");
+    }
+
+    // ── best_price cache invalidation ─────────────────────────────────────────
+
+    #[test]
+    fn test_best_price_cache_returns_none_after_clear() {
+        let mut sl = make_ask_book(&[(100, 5), (110, 5)]);
+        assert_eq!(sl.get_best_price_cached(), Some(100));
+        sl.clear();
+        assert_eq!(sl.get_best_price_cached(), None);
+    }
+
+    #[test]
+    fn test_best_price_cache_updated_after_remove_level() {
+        let mut sl = make_ask_book(&[(100, 5), (110, 5)]);
+        // Warm cache to 100
+        assert_eq!(sl.get_best_price_cached(), Some(100));
+
+        // Remove level 100; cache should invalidate and next call must return 110
+        sl.remove_level(100).unwrap();
+        assert_eq!(sl.get_best_price_cached(), Some(110));
+    }
+
+    #[test]
+    fn test_invalidate_best_price_forces_rescan() {
+        let mut sl = make_ask_book(&[(100, 5), (90, 5)]);
+        // Force cache to 100 (the ascending-first might give 90 first actually)
+        // In ascending order: 90 < 100, so best is 90
+        let _ = sl.get_best_price_cached();
+        sl.invalidate_best_price_cache();
+        // After invalidation, next call rescans and finds real best
+        let best = sl.get_best_price_cached();
+        assert_eq!(best, Some(90), "ascending book best is the lowest price");
+    }
+
+    // ── remove_order_at_level: quantities ─────────────────────────────────────
+
+    #[test]
+    fn test_remove_order_updates_total_quantity() {
+        let mut sl = make_ask_book(&[(100, 7)]);
+        sl.remove_order_at_level(100, 1).unwrap();
+        let node = sl.get_node_at_price(100).unwrap();
+        assert_eq!(node.total_quantity_lots, 0);
+    }
+
+    #[test]
+    fn test_remove_one_of_two_orders_updates_total() {
+        let capacity = 20;
+        let mut sl = SkipList::new_with_pool(SortOrder::Ascending, capacity);
+        sl.insert_level(100).unwrap();
+        sl.add_order_at_level(100, 1, 7).unwrap();
+        sl.add_order_at_level(100, 2, 3).unwrap();
+
+        sl.remove_order_at_level(100, 1).unwrap();
+        let node = sl.get_node_at_price(100).unwrap();
+        assert_eq!(node.total_quantity_lots, 3);
+    }
 }

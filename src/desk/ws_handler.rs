@@ -57,6 +57,9 @@ enum ClientMsg {
     Auth {
         token: String,
     },
+    ApiKeyAuth {
+        api_key: String,
+    },
     Subscribe {
         channels: Vec<String>,
     },
@@ -96,6 +99,9 @@ impl ClientMsg {
         match t {
             "auth" => Some(ClientMsg::Auth {
                 token: v.get("token")?.as_str()?.to_owned(),
+            }),
+            "auth_key" => Some(ClientMsg::ApiKeyAuth {
+                api_key: v.get("api_key")?.as_str()?.to_owned(),
             }),
             "subscribe" => {
                 let channels = v
@@ -323,6 +329,17 @@ async fn handle_client_message(
             }
             Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
         },
+
+        ClientMsg::ApiKeyAuth { api_key } => {
+            match user_service::verify_api_key(&state.db, &api_key).await {
+                Ok(user_id) => {
+                    session.user_id = Some(user_id);
+                    state.user_tx.insert(user_id, personal_tx);
+                    Some(json!({"type": "auth_ok", "user_id": user_id}).to_string())
+                }
+                Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
+            }
+        }
 
         ClientMsg::Subscribe { channels } => {
             // Collect depth symbols before moving `channels` into the subscribed set,

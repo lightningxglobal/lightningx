@@ -103,3 +103,46 @@ fn make_token(user_id: i64, email: &str) -> Result<String> {
     )
     .map_err(|e| anyhow!("Token encode error: {}", e))
 }
+
+/// Look up user_id by static API key.
+pub async fn verify_api_key(pool: &PgPool, api_key: &str) -> Result<i64> {
+    sqlx::query_scalar::<_, i64>("SELECT user_id FROM api_keys WHERE api_key = $1")
+        .bind(api_key)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow!("Invalid API key"))
+}
+
+/// Ensure the robot account exists and has the given API key registered.
+/// Called once at desk_server startup.
+pub async fn ensure_robot_api_key(
+    pool: &PgPool,
+    email: &str,
+    password: &str,
+    api_key: &str,
+    description: &str,
+) -> Result<i64> {
+    // Find or create the robot user.
+    let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(email)
+        .fetch_optional(pool)
+        .await?;
+    let user_id = if let Some(id) = existing {
+        id
+    } else {
+        let req = RegisterRequest { email: email.to_owned(), password: password.to_owned(), full_name: None };
+        register(pool, req, None).await?.user.id
+    };
+    // Upsert API key.
+    sqlx::query(
+        "INSERT INTO api_keys (api_key, user_id, description)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (api_key) DO NOTHING",
+    )
+    .bind(api_key)
+    .bind(user_id)
+    .bind(description)
+    .execute(pool)
+    .await?;
+    Ok(user_id)
+}

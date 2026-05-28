@@ -675,6 +675,20 @@ async fn main() -> anyhow::Result<()> {
     db::run_migrations(&pool).await?;
     tracing::info!("Migrations applied");
 
+    // Ensure the market-maker robot account and its API key exist.
+    let robot_api_key = std::env::var("ROBOT_API_KEY")
+        .unwrap_or_else(|_| "robot_ak_2026_lightningx".to_string());
+    match lightning_exchange::desk::user_service::ensure_robot_api_key(
+        &pool,
+        "robot@lightningx.exchange",
+        "robot_secret_2026",
+        &robot_api_key,
+        "Market Maker Robot",
+    ).await {
+        Ok(uid) => tracing::info!("Robot account ready (user_id={uid}, api_key={robot_api_key})"),
+        Err(e) => tracing::warn!("Robot account setup failed: {e}"),
+    }
+
     // Pre-load all account balances into memory so GET /api/balances never touches DB.
     let account_cache: AccountCache = AccountCache::default();
     {

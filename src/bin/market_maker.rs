@@ -1,11 +1,12 @@
 /// market-maker: professional two-sided market maker for LightningX.
 ///
-/// Fair value: Binance real-time bookTicker (best bid/ask mid-price).
+/// Fair value: Binance real-time depth snapshot (best bid/ask mid-price).
 /// Quoting:    N bid + N ask levels, computed from mid with configurable spread.
 /// Risk:       inventory skew shifts quotes to reduce position; hard limit stops quoting.
 /// Lifecycle:  cancel-ALL → wait confirm → place-ALL on each re-quote cycle.
 ///             Fills (full and partial) tracked; P&L reported on each cycle.
-use std::collections::HashMap;
+/// Auth:       static API key sent over WebSocket — no REST login required.
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
@@ -16,8 +17,7 @@ use hyper::{
     Request,
 };
 use hyper_util::rt::TokioIo;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -111,10 +111,13 @@ fn exchange_ws_url() -> String {
     }
 }
 
-const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
-const ROBOT_PASSWORD: &str = "robot_secret_2026";
 const BINANCE_WS_BASE: &str = "wss://fstream.binance.com/ws";
-/// How long to wait for cancel confirmations before giving up on this cycle.
+/// API key sent to the exchange WS on every connect. Configure via ROBOT_API_KEY env var.
+fn robot_api_key() -> String {
+    std::env::var("ROBOT_API_KEY").unwrap_or_else(|_| "robot_ak_2026_lightningx".to_string())
+}
+/// How long to wait for cancel confirmations before forcing placement (engine-restart safety).
+const CANCEL_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Per-symbol quoting parameters — all tunable without code changes.
 struct SymbolConfig {
@@ -159,98 +162,30 @@ const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     requote_threshold_bps: 0.05,
 }];
 
-// ── REST helpers ──────────────────────────────────────────────────────────────
+// ── Exchange message types ────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct LoginResponse {
-    token: String,
-}
-#[derive(Serialize)]
-struct LoginRequest<'a> {
-    email: &'a str,
-    password: &'a str,
-}
-#[derive(Serialize)]
-struct RegisterRequest<'a> {
-    email: &'a str,
-    password: &'a str,
-    full_name: &'a str,
-}
-#[derive(Deserialize)]
-struct RestOrder {
-    id: i64,
-}
-
-async fn rest_login(http: &Client, base: &str) -> anyhow::Result<String> {
-    let resp = http
-        .post(format!("{base}/api/auth/login"))
-        .json(&LoginRequest { email: ROBOT_EMAIL, password: ROBOT_PASSWORD })
-        .send()
-        .await?;
-    if resp.status().is_success() {
-        return Ok(resp.json::<LoginResponse>().await?.token);
-    }
-    if resp.status() == 401 {
-        let reg = http
-            .post(format!("{base}/api/auth/register"))
-            .json(&RegisterRequest {
-                email: ROBOT_EMAIL,
-                password: ROBOT_PASSWORD,
-                full_name: "Market Maker Robot",
-            })
-            .send()
-            .await?;
-        if !reg.status().is_success() && reg.status().as_u16() != 409 {
-            anyhow::bail!("register failed: {}", reg.status());
-        }
-        let resp2 = http
-            .post(format!("{base}/api/auth/login"))
-            .json(&LoginRequest { email: ROBOT_EMAIL, password: ROBOT_PASSWORD })
-            .send()
-            .await?;
-        return Ok(resp2.json::<LoginResponse>().await?.token);
-    }
-    anyhow::bail!("login failed: {}", resp.status())
-}
-
-async fn rest_ensure_funds(http: &Client, base: &str, token: &str) {
-    match http
-        .post(format!("{base}/api/robot-funds"))
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => info!("Robot inventory topped up"),
-        Ok(r) => warn!("robot-funds: {}", r.status()),
-        Err(e) => warn!("robot-funds error: {e}"),
-    }
-}
-
-async fn rest_open_order_ids(http: &Client, base: &str, token: &str, symbol: &str) -> Vec<i64> {
-    match http
-        .get(format!("{base}/api/orders"))
-        .query(&[("symbol", symbol), ("status", "open"), ("limit", "500")])
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .and_then(|r| Ok(r.error_for_status()?))
-    {
-        Ok(r) => r.json::<Vec<RestOrder>>().await.map(|v| v.into_iter().map(|o| o.id).collect()).unwrap_or_default(),
-        Err(e) => { warn!("open-order query failed: {e}"); vec![] }
-    }
+struct DepthUpdate {
+    #[serde(rename = "b")]
+    bids: Vec<[String; 2]>,
+    #[serde(rename = "a")]
+    asks: Vec<[String; 2]>,
 }
 
 // ── Quote state machine ───────────────────────────────────────────────────────
 
 enum QuoteState {
     Idle,
-    /// New orders placed; waiting for orders_placed confirmation.
-    /// Old order IDs are cancelled AFTER the new batch is confirmed so the
-    /// engine book is never empty — eliminating one-sided / empty snapshots.
+    /// Cancel requests sent; waiting for all CANCELED acks before placing.
+    Cancelling {
+        to_confirm: HashSet<i64>,
+        next_targets: Vec<TargetLevel>,
+        started_at: std::time::Instant,
+    },
+    /// All old orders confirmed cancelled; new batch sent to engine.
     Placing {
         batch_id: u64,
         targets: Vec<TargetLevel>,
-        old_ids: Vec<i64>,
     },
 }
 
@@ -292,6 +227,7 @@ fn make_place_msg(
 
 // ── Exchange WS message handler ───────────────────────────────────────────────
 
+/// Returns false if the connection should be dropped (auth failure).
 fn on_exch_msg(
     text: &str,
     book: &mut QuoteBook,
@@ -303,17 +239,17 @@ fn on_exch_msg(
     cfg: &'static SymbolConfig,
     batch_counter: &mut u64,
     order_counter: &mut u64,
-) {
+) -> bool {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        _ => return,
+        _ => return true,
     };
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "order_update" => {
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
             let order_id = match v.get("order_id").and_then(|i| i.as_i64()) {
                 Some(id) => id,
-                None => return,
+                None => return true,
             };
             let side_str = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
             let price = v.get("price").and_then(|p| p.as_f64()).unwrap_or(0.0);
@@ -330,10 +266,26 @@ fn on_exch_msg(
                 }
                 "CANCELED" => {
                     book.remove(order_id);
+                    // If we're in cancel-wait phase, tick down and place when done.
+                    let all_confirmed = if let QuoteState::Cancelling { to_confirm, .. } = state {
+                        to_confirm.remove(&order_id);
+                        to_confirm.is_empty()
+                    } else { false };
+                    if all_confirmed {
+                        let targets = match std::mem::replace(state, QuoteState::Idle) {
+                            QuoteState::Cancelling { next_targets, .. } => next_targets,
+                            _ => vec![],
+                        };
+                        let bid = *batch_counter;
+                        *batch_counter += 1;
+                        let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
+                        *state = QuoteState::Placing { batch_id: bid, targets };
+                    }
                 }
                 "REJECTED" => {
                     book.remove(order_id);
                     warn!("[{}] order {} REJECTED by engine", cfg.symbol, order_id);
+                    // Note: cancel-REJECTED (order_id=0) cannot be matched; CANCEL_TIMEOUT handles it.
                 }
                 _ => {}
             }
@@ -341,13 +293,14 @@ fn on_exch_msg(
         "orders_placed" => {
             let batch_id: u64 = match v.get("batch_id").and_then(|b| b.as_str()).and_then(|s| s.parse().ok()) {
                 Some(n) => n,
-                None => return,
+                None => return true,
             };
             let expecting = matches!(state, QuoteState::Placing { batch_id: bid, .. } if *bid == batch_id);
-            if !expecting { return; }
-            let (targets, old_ids) = if let QuoteState::Placing { targets, old_ids, .. } =
-                std::mem::replace(state, QuoteState::Idle)
-            { (targets, old_ids) } else { (vec![], vec![]) };
+            if !expecting { return true; }
+            let targets = match std::mem::replace(state, QuoteState::Idle) {
+                QuoteState::Placing { targets, .. } => targets,
+                _ => vec![],
+            };
             let results: Vec<(Option<i64>, bool)> = v.get("results").and_then(|r| r.as_array())
                 .map(|arr| arr.iter().map(|item| (
                     item.get("order_id").and_then(|i| i.as_i64()),
@@ -368,10 +321,6 @@ fn on_exch_msg(
             }
             book.bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
             book.asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-            // Now cancel old orders — new quotes are already live so the book never empties.
-            if !old_ids.is_empty() {
-                let _ = exch_tx.try_send(make_cancel_msg(&old_ids));
-            }
             info!(
                 "[{}] quotes active: {}b {}a  (inner bid={:.1} ask={:.1})",
                 cfg.symbol, book.bids.len(), book.asks.len(),
@@ -387,8 +336,14 @@ fn on_exch_msg(
             let available = v.get("available").and_then(|a| a.as_f64()).unwrap_or(0.0);
             if !asset.is_empty() { balance.insert(asset, available); }
         }
+        "auth_error" => {
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+            warn!("[{}] WS auth failed: {msg} — reconnecting", cfg.symbol);
+            return false;
+        }
         _ => {}
     }
+    true
 }
 
 // ── Binance depth handler ─────────────────────────────────────────────────────
@@ -438,6 +393,30 @@ fn on_binance_depth(
             }
             trigger_requote(new_targets, book, state, exch_tx, cfg, batch_counter, order_counter);
         }
+        QuoteState::Cancelling { .. } => {
+            // Update to freshest prices while waiting for cancel acks.
+            let timed_out = {
+                if let QuoteState::Cancelling { next_targets, started_at, to_confirm } = &mut *state {
+                    *next_targets = new_targets.clone();
+                    if started_at.elapsed() >= CANCEL_TIMEOUT {
+                        warn!("[{}] cancel timeout ({} pending), forcing place", cfg.symbol, to_confirm.len());
+                        true
+                    } else {
+                        false
+                    }
+                } else { false }
+            };
+            if timed_out {
+                let targets = match std::mem::replace(state, QuoteState::Idle) {
+                    QuoteState::Cancelling { next_targets, .. } => next_targets,
+                    _ => vec![],
+                };
+                let bid = *batch_counter;
+                *batch_counter += 1;
+                let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
+                *state = QuoteState::Placing { batch_id: bid, targets };
+            }
+        }
         QuoteState::Placing { .. } => { *pending_targets = Some(new_targets); }
     }
 }
@@ -451,13 +430,22 @@ fn trigger_requote(
     batch_counter: &mut u64,
     order_counter: &mut u64,
 ) {
-    // Place new orders first — the book is never empty.
-    // Old orders are cancelled after the new batch is confirmed (in orders_placed handler).
-    let old_ids = book.all_ids();
-    let bid = *batch_counter;
-    *batch_counter += 1;
-    let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
-    *state = QuoteState::Placing { batch_id: bid, targets, old_ids };
+    let ids = book.all_ids();
+    if ids.is_empty() {
+        // First quote — no existing orders, place immediately.
+        let bid = *batch_counter;
+        *batch_counter += 1;
+        let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
+        *state = QuoteState::Placing { batch_id: bid, targets };
+    } else {
+        // Cancel first, place after all acks arrive.
+        let _ = exch_tx.try_send(make_cancel_msg(&ids));
+        *state = QuoteState::Cancelling {
+            to_confirm: ids.into_iter().collect(),
+            next_targets: targets,
+            started_at: std::time::Instant::now(),
+        };
+    }
 }
 
 
@@ -614,15 +602,7 @@ fn within_threshold(book: &QuoteBook, targets: &[TargetLevel], threshold_bps: f6
 
 // ── Binance depth snapshot parser ────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct DepthUpdate {
-    #[serde(rename = "b")]
-    bids: Vec<[String; 2]>,
-    #[serde(rename = "a")]
-    asks: Vec<[String; 2]>,
-}
-
-/// Parse Binance `@depth5@100ms` snapshot into TargetLevels.
+/// Parse Binance `@depth10@100ms` snapshot into TargetLevels.
 /// Bids are sorted descending, asks ascending — pair by index directly.
 fn parse_depth_snapshot(text: &str) -> Option<Vec<TargetLevel>> {
     let d: DepthUpdate = serde_json::from_str(text).ok()?;
@@ -646,7 +626,7 @@ fn parse_depth_snapshot(text: &str) -> Option<Vec<TargetLevel>> {
 
 // ── Per-symbol quoting loop (dual-WS: Binance depth + Exchange) ───────────────
 
-async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String, token: String) {
+async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String) {
     let mut inv = Inventory::default();
     let mut book = QuoteBook::default();
     let mut balance: HashMap<String, f64> = HashMap::new();
@@ -673,7 +653,8 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String, token: 
         exch_ws.set_writev(false);
         exch_ws.set_auto_close(true);
         exch_ws.set_auto_pong(true);
-        let auth = json!({"type":"auth","token":&token}).to_string();
+        // Authenticate with API key — no REST login needed.
+        let auth = json!({"type":"auth_key","api_key": robot_api_key()}).to_string();
         if exch_ws.write_frame(Frame::text(Payload::Owned(auth.into_bytes()))).await.is_err() {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -725,7 +706,9 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String, token: 
                         Err(e) => { warn!("[{}] Exchange WS error: {e}", cfg.symbol); break 'conn; }
                         Ok(f) if f.opcode == OpCode::Text => {
                             if let Ok(text) = std::str::from_utf8(&f.payload) {
-                                on_exch_msg(text, &mut book, &mut inv, &mut balance, &mut state, &mut pending_targets, &exch_tx, cfg, &mut batch_counter, &mut order_counter);
+                                if !on_exch_msg(text, &mut book, &mut inv, &mut balance, &mut state, &mut pending_targets, &exch_tx, cfg, &mut batch_counter, &mut order_counter) {
+                                    break 'conn;
+                                }
                             }
                         }
                         _ => {}
@@ -763,40 +746,14 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String, token: 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    info!("LightningX Market Maker starting…");
-
-    let base = exchange_url();
-    let http = Client::builder().timeout(Duration::from_secs(5)).build()?;
-
-    let mut token = String::new();
-    for attempt in 1..=5u32 {
-        match rest_login(&http, &base).await {
-            Ok(t) => { token = t; break; }
-            Err(e) => {
-                if attempt == 5 { anyhow::bail!("cannot authenticate after 5 attempts: {e}"); }
-                warn!("auth failed ({e}), retry in 3s…");
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        }
-    }
-    info!("Authenticated");
-    rest_ensure_funds(&http, &base, &token).await;
-
-    info!("Clearing leftover orders from previous session…");
-    for cfg in SYMBOLS {
-        let leftovers = rest_open_order_ids(&http, &base, &token, cfg.symbol).await;
-        if !leftovers.is_empty() {
-            warn!("[{}] {} leftover orders found, will cancel on WS connect", cfg.symbol, leftovers.len());
-        }
-    }
+    info!("LightningX Market Maker starting… api_key={}", robot_api_key());
 
     let ws_url = exchange_ws_url();
     let handles: Vec<_> = SYMBOLS
         .iter()
         .map(|cfg| {
             let url = ws_url.clone();
-            let tok = token.clone();
-            tokio::spawn(async move { run_symbol(cfg, url, tok).await })
+            tokio::spawn(async move { run_symbol(cfg, url).await })
         })
         .collect();
 

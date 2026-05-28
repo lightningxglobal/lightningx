@@ -5,7 +5,7 @@
 /// Risk:       inventory skew shifts quotes to reduce position; hard limit stops quoting.
 /// Lifecycle:  cancel-ALL → wait confirm → place-ALL on each re-quote cycle.
 ///             Fills (full and partial) tracked; P&L reported on each cycle.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
@@ -149,8 +149,8 @@ const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     symbol: "BTC_USDT",
     binance_stream: "btcusdt@depth10@100ms",
     num_levels: 10,
-    qty_per_level: 0.1,
-    min_qty: 0.001,
+    qty_per_level: 0.001,
+    min_qty: 0.0001,
     price_tick: 0.1,
     inner_half_spread_bps: 0.1,
     level_spacing_bps: 0.5,
@@ -244,18 +244,13 @@ async fn rest_open_order_ids(http: &Client, base: &str, token: &str, symbol: &st
 
 enum QuoteState {
     Idle,
-    /// Waiting for existing orders to be confirmed cancelled before placing new.
-    Cancelling {
-        to_confirm: HashSet<i64>,
-        next_targets: Vec<TargetLevel>,
-        /// When we entered this state — used to detect stuck cancels (engine sends
-        /// REJECTED with order_id=0 for unknown orders, so to_confirm may never empty).
-        started_at: std::time::Instant,
-    },
-    /// Waiting for orders_placed confirmation for the given batch.
+    /// New orders placed; waiting for orders_placed confirmation.
+    /// Old order IDs are cancelled AFTER the new batch is confirmed so the
+    /// engine book is never empty — eliminating one-sided / empty snapshots.
     Placing {
         batch_id: u64,
         targets: Vec<TargetLevel>,
+        old_ids: Vec<i64>,
     },
 }
 
@@ -332,62 +327,12 @@ fn on_exch_msg(
                 "FILLED" => {
                     inv.apply_fill(order_id, &side_str, price, quantity, true);
                     book.remove(order_id);
-                    // Also unblock Cancelling state — a filled order will never send CANCELED.
-                    let advance = if let QuoteState::Cancelling { to_confirm, .. } = state {
-                        to_confirm.remove(&order_id);
-                        to_confirm.is_empty()
-                    } else { false };
-                    if advance {
-                        let next_targets = if let QuoteState::Cancelling { next_targets, .. } =
-                            std::mem::replace(state, QuoteState::Idle)
-                        { next_targets } else { vec![] };
-                        if !next_targets.is_empty() {
-                            let bid = *batch_counter;
-                            *batch_counter += 1;
-                            let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &next_targets, bid, order_counter));
-                            *state = QuoteState::Placing { batch_id: bid, targets: next_targets };
-                        }
-                    }
                 }
                 "CANCELED" => {
                     book.remove(order_id);
-                    let advance = if let QuoteState::Cancelling { to_confirm, started_at, .. } = state {
-                        to_confirm.remove(&order_id);
-                        if to_confirm.is_empty() {
-                            info!("[{}] all cancel acks received in {:.3}ms",
-                                cfg.symbol, started_at.elapsed().as_secs_f64() * 1000.0);
-                            true
-                        } else { false }
-                    } else { false };
-                    if advance {
-                        let next_targets = if let QuoteState::Cancelling { next_targets, .. } =
-                            std::mem::replace(state, QuoteState::Idle)
-                        { next_targets } else { vec![] };
-                        if !next_targets.is_empty() {
-                            let bid = *batch_counter;
-                            *batch_counter += 1;
-                            let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &next_targets, bid, order_counter));
-                            *state = QuoteState::Placing { batch_id: bid, targets: next_targets };
-                        }
-                    }
                 }
                 "REJECTED" => {
                     book.remove(order_id);
-                    let advance = if let QuoteState::Cancelling { to_confirm, .. } = state {
-                        to_confirm.remove(&order_id);
-                        to_confirm.is_empty()
-                    } else { false };
-                    if advance {
-                        let next_targets = if let QuoteState::Cancelling { next_targets, .. } =
-                            std::mem::replace(state, QuoteState::Idle)
-                        { next_targets } else { vec![] };
-                        if !next_targets.is_empty() {
-                            let bid = *batch_counter;
-                            *batch_counter += 1;
-                            let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &next_targets, bid, order_counter));
-                            *state = QuoteState::Placing { batch_id: bid, targets: next_targets };
-                        }
-                    }
                     warn!("[{}] order {} REJECTED by engine", cfg.symbol, order_id);
                 }
                 _ => {}
@@ -400,9 +345,9 @@ fn on_exch_msg(
             };
             let expecting = matches!(state, QuoteState::Placing { batch_id: bid, .. } if *bid == batch_id);
             if !expecting { return; }
-            let targets = if let QuoteState::Placing { targets, .. } =
+            let (targets, old_ids) = if let QuoteState::Placing { targets, old_ids, .. } =
                 std::mem::replace(state, QuoteState::Idle)
-            { targets } else { vec![] };
+            { (targets, old_ids) } else { (vec![], vec![]) };
             let results: Vec<(Option<i64>, bool)> = v.get("results").and_then(|r| r.as_array())
                 .map(|arr| arr.iter().map(|item| (
                     item.get("order_id").and_then(|i| i.as_i64()),
@@ -423,6 +368,10 @@ fn on_exch_msg(
             }
             book.bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
             book.asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+            // Now cancel old orders — new quotes are already live so the book never empties.
+            if !old_ids.is_empty() {
+                let _ = exch_tx.try_send(make_cancel_msg(&old_ids));
+            }
             info!(
                 "[{}] quotes active: {}b {}a  (inner bid={:.1} ask={:.1})",
                 cfg.symbol, book.bids.len(), book.asks.len(),
@@ -456,43 +405,10 @@ fn on_binance_depth(
     batch_counter: &mut u64,
     order_counter: &mut u64,
 ) {
-    let mut new_targets = match parse_depth_snapshot(text) {
+    let new_targets = match parse_depth_snapshot(text) {
         Some(t) => t,
         None => return,
     };
-    // Cap quantities to configured level; Binance real-world sizes (0.5-20 BTC/level) exhaust demo account.
-    for level in &mut new_targets {
-        level.bid_qty = level.bid_qty.min(cfg.qty_per_level);
-        level.ask_qty = level.ask_qty.min(cfg.qty_per_level);
-    }
-    // If stuck in Cancelling for > 2 s, the engine sent REJECTED(order_id=0) for ghost
-    // orders — to_confirm will never empty via normal acks. Force-advance and clear ghosts.
-    let cancelling_timed_out = if let QuoteState::Cancelling { started_at, to_confirm, .. } = state {
-        if started_at.elapsed() > Duration::from_secs(2) {
-            warn!("[{}] cancel timeout: {} IDs unconfirmed, force-advancing", cfg.symbol, to_confirm.len());
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if cancelling_timed_out {
-        book.bids.clear();
-        book.asks.clear();
-        let next_targets = if let QuoteState::Cancelling { next_targets, .. } =
-            std::mem::replace(state, QuoteState::Idle)
-        { next_targets } else { unreachable!() };
-        // Use freshest Binance depth as the placement targets
-        let targets = if next_targets.is_empty() { new_targets } else { next_targets };
-        if !targets.is_empty() {
-            let bid = *batch_counter;
-            *batch_counter += 1;
-            let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
-            *state = QuoteState::Placing { batch_id: bid, targets };
-        }
-        return;
-    }
 
     match state {
         QuoteState::Idle => {
@@ -517,13 +433,11 @@ fn on_binance_depth(
                 let ids = book.all_ids();
                 if !ids.is_empty() {
                     let _ = exch_tx.try_send(make_cancel_msg(&ids));
-                    *state = QuoteState::Cancelling { to_confirm: ids.into_iter().collect(), next_targets: vec![], started_at: std::time::Instant::now() };
                 }
                 return;
             }
             trigger_requote(new_targets, book, state, exch_tx, cfg, batch_counter, order_counter);
         }
-        QuoteState::Cancelling { next_targets, .. } => { *next_targets = new_targets; }
         QuoteState::Placing { .. } => { *pending_targets = Some(new_targets); }
     }
 }
@@ -537,20 +451,13 @@ fn trigger_requote(
     batch_counter: &mut u64,
     order_counter: &mut u64,
 ) {
-    let existing_ids = book.all_ids();
-    if existing_ids.is_empty() {
-        let bid = *batch_counter;
-        *batch_counter += 1;
-        let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
-        *state = QuoteState::Placing { batch_id: bid, targets };
-    } else {
-        let _ = exch_tx.try_send(make_cancel_msg(&existing_ids));
-        *state = QuoteState::Cancelling {
-            to_confirm: existing_ids.into_iter().collect(),
-            next_targets: targets,
-            started_at: std::time::Instant::now(),
-        };
-    }
+    // Place new orders first — the book is never empty.
+    // Old orders are cancelled after the new batch is confirmed (in orders_placed handler).
+    let old_ids = book.all_ids();
+    let bid = *batch_counter;
+    *batch_counter += 1;
+    let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
+    *state = QuoteState::Placing { batch_id: bid, targets, old_ids };
 }
 
 

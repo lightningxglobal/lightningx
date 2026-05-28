@@ -5,12 +5,9 @@
 /// Risk:       inventory skew shifts quotes to reduce position; hard limit stops quoting.
 /// Lifecycle:  cancel-ALL → wait confirm → place-ALL on each re-quote cycle.
 ///             Fills (full and partial) tracked; P&L reported on each cycle.
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use dashmap::DashMap;
 use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
 use http_body_util::Empty;
 use hyper::{
@@ -23,7 +20,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 // ── WS connection helpers ─────────────────────────────────────────────────────
@@ -118,7 +115,6 @@ const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
 const BINANCE_WS_BASE: &str = "wss://fstream.binance.com/ws";
 /// How long to wait for cancel confirmations before giving up on this cycle.
-const CANCEL_TIMEOUT: Duration = Duration::from_millis(3000);
 
 /// Per-symbol quoting parameters — all tunable without code changes.
 struct SymbolConfig {
@@ -244,370 +240,238 @@ async fn rest_open_order_ids(http: &Client, base: &str, token: &str, symbol: &st
     }
 }
 
-// ── Exchange events ───────────────────────────────────────────────────────────
+// ── Quote state machine ───────────────────────────────────────────────────────
 
-/// Events flowing from the desk-server WS to the symbol task.
-#[derive(Debug)]
-enum ExchangeEvent {
-    /// Engine confirmed order open; coid used to correlate with place_order().
-    Accepted { coid: u64, order_id: i64 },
-    /// Order rejected by engine.
-    Rejected { coid: u64 },
-    /// Partial fill: some quantity executed, order still resting.
-    PartialFill {
-        order_id: i64,
-        side: String,
-        fill_price: f64,
-        /// Total cumulative filled qty for this order.
-        cumulative_filled: f64,
+enum QuoteState {
+    Idle,
+    /// Waiting for existing orders to be confirmed cancelled before placing new.
+    Cancelling {
+        to_confirm: HashSet<i64>,
+        next_targets: Vec<TargetLevel>,
     },
-    /// Full fill: order completely executed.
-    FullFill {
-        order_id: i64,
-        side: String,
-        fill_price: f64,
-        qty: f64,
+    /// Waiting for orders_placed confirmation for the given batch.
+    Placing {
+        batch_id: u64,
+        targets: Vec<TargetLevel>,
     },
-    /// Order cancelled (by us or engine).
-    Cancelled { order_id: i64 },
-    /// Balance update from the exchange (after freeze/release).
-    BalanceUpdate { asset: String, balance: f64, available: f64, frozen: f64 },
 }
 
-// ── Batch order result ────────────────────────────────────────────────────────
-
-struct BatchOrderResult {
-    client_order_id: String,
-    order_id: Option<i64>,
-    accepted: bool,
+fn make_cancel_msg(ids: &[i64]) -> String {
+    json!({"type": "batch_cancel", "order_ids": ids}).to_string()
 }
 
-// ── WS Exchange Client ─────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct WsClient {
-    /// Outbound messages to the desk-server WS.
-    ws_tx: mpsc::Sender<String>,
-    /// Pending place_order calls, keyed by client_order_id.
-    pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
-    /// Order IDs confirmed dead (FILLED or CANCELLED), used by wait_dead().
-    dead: Arc<DashMap<i64, ()>>,
-    counter: Arc<AtomicU64>,
-    /// Counter for batch_id generation.
-    batch_counter: Arc<AtomicU64>,
-    /// Pending place_orders_batch calls, keyed by batch_id (numeric).
-    pending_batch: Arc<DashMap<u64, oneshot::Sender<Vec<BatchOrderResult>>>>,
-}
-
-impl WsClient {
-    /// Place a limit order; returns exchange order_id or None on rejection/timeout.
-    async fn place_order(&self, symbol: &str, side: &str, price: f64, qty: f64) -> Option<i64> {
-        let coid = self.counter.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending.insert(coid, tx);
-        let msg = json!({
-            "type": "place_order",
-            "client_order_id": coid.to_string(),
+fn make_place_msg(
+    symbol: &str,
+    targets: &[TargetLevel],
+    batch_id: u64,
+    order_counter: &mut u64,
+) -> String {
+    let mut orders = Vec::with_capacity(targets.len() * 2);
+    for t in targets {
+        let bid_coid = order_counter.to_string();
+        *order_counter += 1;
+        let ask_coid = order_counter.to_string();
+        *order_counter += 1;
+        orders.push(json!({
+            "client_order_id": bid_coid,
             "symbol": symbol,
-            "side": side,
+            "side": "buy",
             "order_type": "limit",
-            "price": price,
-            "qty": qty,
-        })
-        .to_string();
-        if self.ws_tx.send(msg).await.is_err() {
-            self.pending.remove(&coid);
-            return None;
-        }
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(id)) => id,
-            _ => {
-                self.pending.remove(&coid);
-                None
-            }
-        }
+            "price": t.bid_price,
+            "qty": t.bid_qty,
+        }));
+        orders.push(json!({
+            "client_order_id": ask_coid,
+            "symbol": symbol,
+            "side": "sell",
+            "order_type": "limit",
+            "price": t.ask_price,
+            "qty": t.ask_qty,
+        }));
     }
-
-    /// Place multiple orders in a single WS message; returns results for all orders.
-    async fn place_orders_batch(
-        &self,
-        symbol: &str,
-        orders: &[(String, &str, f64, f64)],
-    ) -> Vec<BatchOrderResult> {
-        let batch_num = self.batch_counter.fetch_add(1, Ordering::Relaxed);
-        let batch_id = batch_num.to_string();
-        let (tx, rx) = oneshot::channel();
-        self.pending_batch.insert(batch_num, tx);
-
-        let order_vals: Vec<Value> = orders
-            .iter()
-            .map(|(coid, side, price, qty)| {
-                json!({
-                    "client_order_id": coid,
-                    "symbol": symbol,
-                    "side": side,
-                    "order_type": "limit",
-                    "price": price,
-                    "qty": qty,
-                })
-            })
-            .collect();
-
-        let msg = json!({
-            "type": "place_orders",
-            "batch_id": batch_id,
-            "orders": order_vals,
-        })
-        .to_string();
-
-        if self.ws_tx.send(msg).await.is_err() {
-            self.pending_batch.remove(&batch_num);
-            return orders
-                .iter()
-                .map(|(coid, _, _, _)| BatchOrderResult {
-                    client_order_id: coid.clone(),
-                    order_id: None,
-                    accepted: false,
-                })
-                .collect();
-        }
-
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(results)) => results,
-            _ => {
-                self.pending_batch.remove(&batch_num);
-                orders
-                    .iter()
-                    .map(|(coid, _, _, _)| BatchOrderResult {
-                        client_order_id: coid.clone(),
-                        order_id: None,
-                        accepted: false,
-                    })
-                    .collect()
-            }
-        }
-    }
-
-    /// Batch cancel; fire-and-forget — confirmations arrive as ExchangeEvent::Cancelled.
-    async fn batch_cancel(&self, ids: &[i64]) {
-        if ids.is_empty() {
-            return;
-        }
-        let msg = json!({"type": "batch_cancel", "order_ids": ids}).to_string();
-        let _ = self.ws_tx.send(msg).await;
-    }
-
-    /// Cancel all orders for a symbol (engine-side); fire-and-forget.
-    async fn cancel_symbol(&self, symbol: &str) {
-        let msg = json!({"type": "cancel_symbol", "symbol": symbol}).to_string();
-        let _ = self.ws_tx.send(msg).await;
-    }
-
-    /// Block until all ids appear in dead set, or timeout elapses.
-    async fn wait_dead(&self, ids: &[i64], timeout: Duration) -> bool {
-        if ids.is_empty() {
-            return true;
-        }
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if ids.iter().all(|id| self.dead.contains_key(id)) {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
+    json!({"type": "place_orders", "batch_id": batch_id.to_string(), "orders": orders}).to_string()
 }
 
-// ── WS manager ───────────────────────────────────────────────────────────────
+// ── Exchange WS message handler ───────────────────────────────────────────────
 
-async fn ws_manager(
-    ws_url: String,
-    token: String,
-    mut outbox: mpsc::Receiver<String>,
-    pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
-    pending_batch: Arc<DashMap<u64, oneshot::Sender<Vec<BatchOrderResult>>>>,
-    dead: Arc<DashMap<i64, ()>>,
-    event_tx: mpsc::Sender<ExchangeEvent>,
-) {
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        let mut ws = match ws_connect_plain(&ws_url).await {
-            Ok(ws) => {
-                backoff = Duration::from_secs(1);
-                ws
-            }
-            Err(e) => {
-                warn!("Desk WS connect failed: {e}, retry in {backoff:?}");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-                continue;
-            }
-        };
-        ws.set_writev(false);
-        ws.set_auto_close(true);
-        ws.set_auto_pong(true);
-
-        let auth = json!({"type":"auth","token":&token}).to_string();
-        if ws.write_frame(Frame::text(Payload::Owned(auth.into_bytes()))).await.is_err() {
-            continue;
-        }
-        info!("Desk WS connected");
-
-        'conn: loop {
-            tokio::select! {
-                biased;
-                frame = ws.read_frame() => {
-                    match frame {
-                        Ok(f) if f.opcode == OpCode::Text => {
-                            if let Ok(text) = std::str::from_utf8(&f.payload) {
-                                route_msg(text, &pending, &pending_batch, &dead, &event_tx);
-                            }
-                        }
-                        Ok(f) if f.opcode == OpCode::Close => break 'conn,
-                        Err(e) => { warn!("Desk WS error: {e}"); break 'conn; }
-                        _ => {}
-                    }
-                }
-                msg = outbox.recv() => {
-                    match msg {
-                        Some(text) => {
-                            if ws.write_frame(Frame::text(Payload::Owned(text.into_bytes()))).await.is_err() {
-                                break 'conn;
-                            }
-                        }
-                        None => return,
-                    }
-                }
-            }
-        }
-
-        warn!("Desk WS reconnecting in {backoff:?}");
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
-    }
-}
-
-fn route_msg(
+fn on_exch_msg(
     text: &str,
-    pending: &DashMap<u64, oneshot::Sender<Option<i64>>>,
-    pending_batch: &DashMap<u64, oneshot::Sender<Vec<BatchOrderResult>>>,
-    dead: &DashMap<i64, ()>,
-    event_tx: &mpsc::Sender<ExchangeEvent>,
+    book: &mut QuoteBook,
+    inv: &mut Inventory,
+    balance: &mut HashMap<String, f64>,
+    state: &mut QuoteState,
+    pending_targets: &mut Option<Vec<TargetLevel>>,
+    exch_tx: &mpsc::Sender<String>,
+    cfg: &'static SymbolConfig,
+    batch_counter: &mut u64,
+    order_counter: &mut u64,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         _ => return,
     };
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-        "order_submitted" | "order_accepted" => {
-            let coid: u64 = v
-                .get("client_order_id")
-                .and_then(|c| c.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(u64::MAX);
-            let order_id = v.get("order_id").and_then(|i| i.as_i64());
-            if let Some((_, tx)) = pending.remove(&coid) {
-                let _ = tx.send(order_id);
-            }
-            if let (Some(coid_val), Some(oid)) = (
-                v.get("client_order_id").and_then(|c| c.as_str()).and_then(|s| s.parse::<u64>().ok()),
-                order_id,
-            ) {
-                let _ = event_tx.try_send(ExchangeEvent::Accepted { coid: coid_val, order_id: oid });
-            }
-        }
-        "order_rejected" => {
-            let coid: u64 = v
-                .get("client_order_id")
-                .and_then(|c| c.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(u64::MAX);
-            if let Some((_, tx)) = pending.remove(&coid) {
-                let _ = tx.send(None);
-            }
-            let _ = event_tx.try_send(ExchangeEvent::Rejected { coid });
-        }
         "order_update" => {
             let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
             let order_id = match v.get("order_id").and_then(|i| i.as_i64()) {
                 Some(id) => id,
                 None => return,
             };
-            let side = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let side_str = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
             let price = v.get("price").and_then(|p| p.as_f64()).unwrap_or(0.0);
             let filled = v.get("filled").and_then(|f| f.as_f64()).unwrap_or(0.0);
             let quantity = v.get("quantity").and_then(|q| q.as_f64()).unwrap_or(0.0);
-
             match status {
                 "PARTIALLY_FILLED" => {
-                    let _ = event_tx.try_send(ExchangeEvent::PartialFill {
-                        order_id,
-                        side,
-                        fill_price: price,
-                        cumulative_filled: filled,
-                    });
+                    inv.apply_fill(order_id, &side_str, price, filled, false);
+                    if let Some(q) = book.find_mut(order_id) { q.filled = filled; }
                 }
                 "FILLED" => {
-                    dead.insert(order_id, ());
-                    let _ = event_tx.try_send(ExchangeEvent::FullFill {
-                        order_id,
-                        side,
-                        fill_price: price,
-                        qty: quantity,
-                    });
+                    inv.apply_fill(order_id, &side_str, price, quantity, true);
+                    book.remove(order_id);
                 }
                 "CANCELED" => {
-                    dead.insert(order_id, ());
-                    let _ = event_tx.try_send(ExchangeEvent::Cancelled { order_id });
+                    book.remove(order_id);
+                    let advance = if let QuoteState::Cancelling { to_confirm, .. } = state {
+                        to_confirm.remove(&order_id);
+                        to_confirm.is_empty()
+                    } else { false };
+                    if advance {
+                        let next_targets = if let QuoteState::Cancelling { next_targets, .. } =
+                            std::mem::replace(state, QuoteState::Idle)
+                        { next_targets } else { vec![] };
+                        if !next_targets.is_empty() {
+                            let bid = *batch_counter;
+                            *batch_counter += 1;
+                            let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &next_targets, bid, order_counter));
+                            *state = QuoteState::Placing { batch_id: bid, targets: next_targets };
+                        }
+                    }
                 }
                 _ => {}
             }
         }
         "orders_placed" => {
-            let batch_id_str = v.get("batch_id").and_then(|b| b.as_str()).unwrap_or("");
-            let batch_num: u64 = match batch_id_str.parse() {
-                Ok(n) => n,
-                Err(_) => return,
+            let batch_id: u64 = match v.get("batch_id").and_then(|b| b.as_str()).and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => return,
             };
-            let results: Vec<BatchOrderResult> = v
-                .get("results")
-                .and_then(|r| r.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .map(|item| BatchOrderResult {
-                            client_order_id: item
-                                .get("client_order_id")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("")
-                                .to_owned(),
-                            order_id: item.get("order_id").and_then(|i| i.as_i64()),
-                            accepted: item
-                                .get("accepted")
-                                .and_then(|a| a.as_bool())
-                                .unwrap_or(false),
-                        })
-                        .collect()
-                })
+            let expecting = matches!(state, QuoteState::Placing { batch_id: bid, .. } if *bid == batch_id);
+            if !expecting { return; }
+            let targets = if let QuoteState::Placing { targets, .. } =
+                std::mem::replace(state, QuoteState::Idle)
+            { targets } else { vec![] };
+            let results: Vec<(Option<i64>, bool)> = v.get("results").and_then(|r| r.as_array())
+                .map(|arr| arr.iter().map(|item| (
+                    item.get("order_id").and_then(|i| i.as_i64()),
+                    item.get("accepted").and_then(|a| a.as_bool()).unwrap_or(false),
+                )).collect())
                 .unwrap_or_default();
-            if let Some((_, tx)) = pending_batch.remove(&batch_num) {
-                let _ = tx.send(results);
+            for (i, t) in targets.iter().enumerate() {
+                if let Some(&(Some(id), true)) = results.get(i * 2) {
+                    book.bids.push(Quote { order_id: id, side: "buy", price: t.bid_price, qty: t.bid_qty, filled: 0.0 });
+                }
+                if let Some(&(Some(id), true)) = results.get(i * 2 + 1) {
+                    book.asks.push(Quote { order_id: id, side: "sell", price: t.ask_price, qty: t.ask_qty, filled: 0.0 });
+                }
+            }
+            book.bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+            book.asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+            info!(
+                "[{}] quotes active: {}b {}a  (inner bid={:.1} ask={:.1})",
+                cfg.symbol, book.bids.len(), book.asks.len(),
+                book.bids.first().map(|q| q.price).unwrap_or(0.0),
+                book.asks.first().map(|q| q.price).unwrap_or(0.0),
+            );
+            if let Some(next) = pending_targets.take() {
+                trigger_requote(next, book, state, exch_tx, cfg, batch_counter, order_counter);
             }
         }
         "balance_update" => {
             let asset = v.get("asset").and_then(|a| a.as_str()).unwrap_or("").to_owned();
-            let balance = v.get("balance").and_then(|b| b.as_f64()).unwrap_or(0.0);
             let available = v.get("available").and_then(|a| a.as_f64()).unwrap_or(0.0);
-            let frozen = v.get("frozen").and_then(|f| f.as_f64()).unwrap_or(0.0);
-            if !asset.is_empty() {
-                let _ = event_tx.try_send(ExchangeEvent::BalanceUpdate { asset, balance, available, frozen });
-            }
+            if !asset.is_empty() { balance.insert(asset, available); }
         }
         _ => {}
     }
 }
+
+// ── Binance depth handler ─────────────────────────────────────────────────────
+
+fn on_binance_depth(
+    text: &str,
+    book: &mut QuoteBook,
+    inv: &mut Inventory,
+    balance: &mut HashMap<String, f64>,
+    state: &mut QuoteState,
+    pending_targets: &mut Option<Vec<TargetLevel>>,
+    exch_tx: &mpsc::Sender<String>,
+    cfg: &'static SymbolConfig,
+    batch_counter: &mut u64,
+    order_counter: &mut u64,
+) {
+    let new_targets = match parse_depth_snapshot(text) {
+        Some(t) => t,
+        None => return,
+    };
+    match state {
+        QuoteState::Idle => {
+            if within_threshold(book, &new_targets, cfg.requote_threshold_bps) { return; }
+            let sym_parts: Vec<&str> = cfg.symbol.splitn(2, '_').collect();
+            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+            let avail_base = balance.get(base_asset).copied().unwrap_or(f64::NAN);
+            let avail_quote = balance.get(quote_asset).copied().unwrap_or(f64::NAN);
+            let best_bid = new_targets.first().map(|t| t.bid_price).unwrap_or(0.0);
+            let best_ask = new_targets.first().map(|t| t.ask_price).unwrap_or(0.0);
+            let mid = (best_bid + best_ask) / 2.0;
+            info!(
+                "[{}] bid={:.1} ask={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  avail={:.4}{}/{:.2}{}  → re-quote",
+                cfg.symbol, best_bid, best_ask,
+                inv.position, inv.realized_pnl, inv.unrealized_pnl(mid),
+                book.bids.len(), book.asks.len(),
+                avail_base, base_asset, avail_quote, quote_asset,
+            );
+            if inv.position >= cfg.max_position || inv.position <= -cfg.max_position {
+                warn!("[{}] position limit ({:+.4}), cancelling all", cfg.symbol, inv.position);
+                let ids = book.all_ids();
+                if !ids.is_empty() {
+                    let _ = exch_tx.try_send(make_cancel_msg(&ids));
+                    *state = QuoteState::Cancelling { to_confirm: ids.into_iter().collect(), next_targets: vec![] };
+                }
+                return;
+            }
+            trigger_requote(new_targets, book, state, exch_tx, cfg, batch_counter, order_counter);
+        }
+        QuoteState::Cancelling { next_targets, .. } => { *next_targets = new_targets; }
+        QuoteState::Placing { .. } => { *pending_targets = Some(new_targets); }
+    }
+}
+
+fn trigger_requote(
+    targets: Vec<TargetLevel>,
+    book: &mut QuoteBook,
+    state: &mut QuoteState,
+    exch_tx: &mpsc::Sender<String>,
+    cfg: &'static SymbolConfig,
+    batch_counter: &mut u64,
+    order_counter: &mut u64,
+) {
+    let existing_ids = book.all_ids();
+    if existing_ids.is_empty() {
+        let bid = *batch_counter;
+        *batch_counter += 1;
+        let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
+        *state = QuoteState::Placing { batch_id: bid, targets };
+    } else {
+        let _ = exch_tx.try_send(make_cancel_msg(&existing_ids));
+        *state = QuoteState::Cancelling {
+            to_confirm: existing_ids.into_iter().collect(),
+            next_targets: targets,
+        };
+    }
+}
+
 
 // ── Inventory ─────────────────────────────────────────────────────────────────
 
@@ -713,6 +577,7 @@ impl QuoteBook {
 
 // ── Quote computation ─────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct TargetLevel {
     bid_price: f64,
     bid_qty: f64,
@@ -791,235 +656,117 @@ fn parse_depth_snapshot(text: &str) -> Option<Vec<TargetLevel>> {
     if levels.is_empty() { None } else { Some(levels) }
 }
 
-// ── Apply exchange event ──────────────────────────────────────────────────────
+// ── Per-symbol quoting loop (dual-WS: Binance depth + Exchange) ───────────────
 
-fn apply_event(event: ExchangeEvent, inv: &mut Inventory, book: &mut QuoteBook) {
-    match event {
-        ExchangeEvent::PartialFill { order_id, side, fill_price, cumulative_filled } => {
-            inv.apply_fill(order_id, &side, fill_price, cumulative_filled, false);
-            if let Some(q) = book.find_mut(order_id) {
-                q.filled = cumulative_filled;
-            }
-        }
-        ExchangeEvent::FullFill { order_id, side, fill_price, qty } => {
-            inv.apply_fill(order_id, &side, fill_price, qty, true);
-            book.remove(order_id);
-        }
-        ExchangeEvent::Cancelled { order_id } => {
-            book.remove(order_id);
-        }
-        // Accepted is handled by place_order() oneshot; Rejected likewise.
-        ExchangeEvent::Accepted { .. } | ExchangeEvent::Rejected { .. } => {}
-        // BalanceUpdate is handled by run_symbol's event loop.
-        ExchangeEvent::BalanceUpdate { .. } => {}
-    }
-}
-
-// ── Per-symbol quoting loop ───────────────────────────────────────────────────
-
-async fn run_symbol(
-    cfg: &'static SymbolConfig,
-    client: WsClient,
-    mut event_rx: mpsc::Receiver<ExchangeEvent>,
-) {
+async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String, token: String) {
     let mut inv = Inventory::default();
     let mut book = QuoteBook::default();
-    let mut reconnect_delay = Duration::from_secs(1);
-    // Available balance per asset (updated from BalanceUpdate events).
     let mut balance: HashMap<String, f64> = HashMap::new();
+    let mut state = QuoteState::Idle;
+    let mut pending_targets: Option<Vec<TargetLevel>> = None;
+    let mut batch_counter: u64 = 0;
+    let mut order_counter: u64 = 0;
 
     info!("[{}] market-maker started", cfg.symbol);
 
+    let mut backoff = Duration::from_secs(1);
     loop {
-        let url = format!("{BINANCE_WS_BASE}/{}", cfg.binance_stream);
-        let mut ws = match ws_connect_tls(&url).await {
-            Ok(ws) => {
-                reconnect_delay = Duration::from_secs(1);
-                ws
-            }
-            Err(e) => {
-                warn!("[{}] Binance connect failed: {e}", cfg.symbol);
-                tokio::time::sleep(reconnect_delay).await;
-                reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
-                continue;
+        // ── Connect Exchange WS ──────────────────────────────────────────────
+        let mut exch_ws = loop {
+            match ws_connect_plain(&exchange_ws_url).await {
+                Ok(ws) => { backoff = Duration::from_secs(1); break ws; }
+                Err(e) => {
+                    warn!("[{}] Exchange WS failed: {e}", cfg.symbol);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
             }
         };
-        ws.set_auto_close(true);
-        ws.set_auto_pong(true);
-        info!("[{}] Binance connected", cfg.symbol);
+        exch_ws.set_writev(false);
+        exch_ws.set_auto_close(true);
+        exch_ws.set_auto_pong(true);
+        let auth = json!({"type":"auth","token":&token}).to_string();
+        if exch_ws.write_frame(Frame::text(Payload::Owned(auth.into_bytes()))).await.is_err() {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+            continue;
+        }
+        // Reset local book; cancel stale engine orders from last session.
+        book.bids.clear();
+        book.asks.clear();
+        state = QuoteState::Idle;
+        pending_targets = None;
+        let cancel_sym = json!({"type":"cancel_symbol","symbol":cfg.symbol}).to_string();
+        let _ = exch_ws.write_frame(Frame::text(Payload::Owned(cancel_sym.into_bytes()))).await;
 
-        'feed: loop {
-            // ── drain all pending exchange events (non-blocking) ──────────
-            loop {
-                match event_rx.try_recv() {
-                    Ok(ExchangeEvent::BalanceUpdate { asset, available, .. }) => {
-                        balance.insert(asset, available);
-                    }
-                    Ok(ev) => apply_event(ev, &mut inv, &mut book),
-                    Err(_) => break,
-                }
-            }
-
-            // ── wait for next Binance price ───────────────────────────────
-            let frame = match ws.read_frame().await {
-                Ok(f) => f,
+        // ── Connect Binance depth WS ─────────────────────────────────────────
+        let binance_url = format!("{BINANCE_WS_BASE}/{}", cfg.binance_stream);
+        let mut binance_ws = loop {
+            match ws_connect_tls(&binance_url).await {
+                Ok(ws) => break ws,
                 Err(e) => {
-                    warn!("[{}] Binance read error: {e}", cfg.symbol);
-                    break 'feed;
+                    warn!("[{}] Binance WS failed: {e}", cfg.symbol);
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-            };
-            let text = match frame.opcode {
-                OpCode::Text => match std::str::from_utf8(&frame.payload) {
-                    Ok(t) => t.to_string(),
-                    Err(_) => continue,
-                },
-                OpCode::Close => break 'feed,
-                _ => continue,
-            };
-            let targets = match parse_depth_snapshot(&text) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            // Skip if all quotes are already within threshold.
-            if within_threshold(&book, &targets, cfg.requote_threshold_bps) {
-                continue;
             }
+        };
+        binance_ws.set_auto_close(true);
+        binance_ws.set_auto_pong(true);
+        info!("[{}] Binance connected — dual-WS loop active", cfg.symbol);
 
-            let sym_parts: Vec<&str> = cfg.symbol.splitn(2, '_').collect();
-            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
-            let avail_base = balance.get(base_asset).copied().unwrap_or(f64::NAN);
-            let avail_quote = balance.get(quote_asset).copied().unwrap_or(f64::NAN);
-            let best_bid = targets.first().map(|t| t.bid_price).unwrap_or(0.0);
-            let best_ask = targets.first().map(|t| t.ask_price).unwrap_or(0.0);
-            let mid = (best_bid + best_ask) / 2.0;
-            info!(
-                "[{}] bid={:.1} ask={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  avail={:.4}{}/{:.2}{}  → re-quote",
-                cfg.symbol,
-                best_bid,
-                best_ask,
-                inv.position,
-                inv.realized_pnl,
-                inv.unrealized_pnl(mid),
-                book.bids.len(),
-                book.asks.len(),
-                avail_base,
-                base_asset,
-                avail_quote,
-                quote_asset,
-            );
+        // Internal outbox: handler functions queue messages here;
+        // the write arm drains them without borrow-conflict on exch_ws.
+        let (exch_tx, mut exch_rx) = mpsc::channel::<String>(256);
 
-            // ── risk check: pause quoting at position limit ───────────────
-            let at_max_long = inv.position >= cfg.max_position;
-            let at_max_short = inv.position <= -cfg.max_position;
-            if at_max_long || at_max_short {
-                warn!(
-                    "[{}] position limit hit ({:+.4}), cancelling all quotes",
-                    cfg.symbol, inv.position
-                );
-                let ids = book.all_ids();
-                if !ids.is_empty() {
-                    client.batch_cancel(&ids).await;
-                    if client.wait_dead(&ids, CANCEL_TIMEOUT).await {
-                        book.bids.clear();
-                        book.asks.clear();
+        'conn: loop {
+            tokio::select! {
+                biased;
+
+                // ── Exchange WS: write pump ──────────────────────────────────
+                Some(msg) = exch_rx.recv() => {
+                    if exch_ws.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
+                        warn!("[{}] Exchange WS write error", cfg.symbol);
+                        break 'conn;
                     }
                 }
-                continue;
-            }
 
-            // ── cancel ALL existing quotes, wait for confirmation ─────────
-            let existing_ids = book.all_ids();
-            if !existing_ids.is_empty() {
-                client.batch_cancel(&existing_ids).await;
-                let confirmed = client.wait_dead(&existing_ids, CANCEL_TIMEOUT).await;
-                book.bids.clear();
-                book.asks.clear();
-                if !confirmed {
-                    warn!("[{}] cancel timeout — skipping this cycle", cfg.symbol);
-                    continue;
-                }
-            }
-
-            if targets.is_empty() {
-                continue;
-            }
-
-            // ── place all bids and asks in a single batch message ────────
-            // Build a list of (coid, side, price, qty) for each level.
-            let batch_counter_base = client.counter.fetch_add(targets.len() as u64 * 2, Ordering::Relaxed);
-            let mut batch_orders: Vec<(String, &str, f64, f64)> = Vec::with_capacity(targets.len() * 2);
-            for (i, t) in targets.iter().enumerate() {
-                let bid_coid = format!("{}_{}", cfg.symbol, batch_counter_base + i as u64);
-                let ask_coid = format!("{}_{}_a", cfg.symbol, batch_counter_base + i as u64);
-                batch_orders.push((bid_coid, "buy", t.bid_price, t.bid_qty));
-                batch_orders.push((ask_coid, "sell", t.ask_price, t.ask_qty));
-            }
-
-            let batch_results = client.place_orders_batch(cfg.symbol, &batch_orders).await;
-
-            // Match results back to target levels (bids first, then asks, interleaved).
-            for (i, t) in targets.iter().enumerate() {
-                // bid result is at position i*2, ask result at i*2+1.
-                if let Some(res) = batch_results.get(i * 2) {
-                    if res.accepted {
-                        if let Some(id) = res.order_id {
-                            book.bids.push(Quote {
-                                order_id: id,
-                                side: "buy",
-                                price: t.bid_price,
-                                qty: t.bid_qty,
-                                filled: 0.0,
-                            });
+                // ── Exchange WS: inbound ─────────────────────────────────────
+                frame = exch_ws.read_frame() => {
+                    match frame {
+                        Ok(f) if f.opcode == OpCode::Close => { warn!("[{}] Exchange WS closed", cfg.symbol); break 'conn; }
+                        Err(e) => { warn!("[{}] Exchange WS error: {e}", cfg.symbol); break 'conn; }
+                        Ok(f) if f.opcode == OpCode::Text => {
+                            if let Ok(text) = std::str::from_utf8(&f.payload) {
+                                on_exch_msg(text, &mut book, &mut inv, &mut balance, &mut state, &mut pending_targets, &exch_tx, cfg, &mut batch_counter, &mut order_counter);
+                            }
                         }
+                        _ => {}
                     }
                 }
-                if let Some(res) = batch_results.get(i * 2 + 1) {
-                    if res.accepted {
-                        if let Some(id) = res.order_id {
-                            book.asks.push(Quote {
-                                order_id: id,
-                                side: "sell",
-                                price: t.ask_price,
-                                qty: t.ask_qty,
-                                filled: 0.0,
-                            });
+
+                // ── Binance: depth inbound ───────────────────────────────────
+                frame = binance_ws.read_frame() => {
+                    match frame {
+                        Ok(f) if f.opcode == OpCode::Close => { warn!("[{}] Binance WS closed", cfg.symbol); break 'conn; }
+                        Err(e) => { warn!("[{}] Binance error: {e}", cfg.symbol); break 'conn; }
+                        Ok(f) if f.opcode == OpCode::Text => {
+                            if let Ok(text) = std::str::from_utf8(&f.payload) {
+                                on_binance_depth(text, &mut book, &mut inv, &mut balance, &mut state, &mut pending_targets, &exch_tx, cfg, &mut batch_counter, &mut order_counter);
+                            }
                         }
+                        _ => {}
                     }
                 }
             }
-
-            // Keep sorted: bids descending, asks ascending (innermost first).
-            book.bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-            book.asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-
-            info!(
-                "[{}] quotes active: {}b {}a  (inner bid={:.1} ask={:.1})",
-                cfg.symbol,
-                book.bids.len(),
-                book.asks.len(),
-                book.bids.first().map(|q| q.price).unwrap_or(0.0),
-                book.asks.first().map(|q| q.price).unwrap_or(0.0),
-            );
         }
 
-        // ── Binance disconnected: cancel all to avoid stale quotes ────────
         if !book.is_empty() {
-            warn!("[{}] Binance disconnected — cancelling {} quotes", cfg.symbol, book.all_ids().len());
-            let ids = book.all_ids();
-            client.batch_cancel(&ids).await;
-            if client.wait_dead(&ids, CANCEL_TIMEOUT).await {
-                book.bids.clear();
-                book.asks.clear();
-            } else {
-                warn!("[{}] cancel timeout on disconnect; quotes may remain in engine", cfg.symbol);
-            }
+            warn!("[{}] WS dropped with {} live quotes; will cancel on reconnect", cfg.symbol, book.all_ids().len());
+            book.bids.clear();
+            book.asks.clear();
         }
-
-        warn!("[{}] reconnecting in {reconnect_delay:?}", cfg.symbol);
-        tokio::time::sleep(reconnect_delay).await;
-        reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -1036,14 +783,9 @@ async fn main() -> anyhow::Result<()> {
     let mut token = String::new();
     for attempt in 1..=5u32 {
         match rest_login(&http, &base).await {
-            Ok(t) => {
-                token = t;
-                break;
-            }
+            Ok(t) => { token = t; break; }
             Err(e) => {
-                if attempt == 5 {
-                    anyhow::bail!("cannot authenticate after 5 attempts: {e}");
-                }
+                if attempt == 5 { anyhow::bail!("cannot authenticate after 5 attempts: {e}"); }
                 warn!("auth failed ({e}), retry in 3s…");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
@@ -1052,72 +794,28 @@ async fn main() -> anyhow::Result<()> {
     info!("Authenticated");
     rest_ensure_funds(&http, &base, &token).await;
 
-    // Shared WS client.
-    let (ws_tx, ws_rx) = mpsc::channel::<String>(8192);
-    let pending = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
-    let pending_batch = Arc::new(DashMap::<u64, oneshot::Sender<Vec<BatchOrderResult>>>::new());
-    let dead = Arc::new(DashMap::<i64, ()>::new());
-
-    let client = WsClient {
-        ws_tx,
-        pending: pending.clone(),
-        dead: dead.clone(),
-        counter: Arc::new(AtomicU64::new(0)),
-        batch_counter: Arc::new(AtomicU64::new(0)),
-        pending_batch: pending_batch.clone(),
-    };
-
-    // Per-symbol event channels (one per symbol task).
-    let mut event_txs: Vec<mpsc::Sender<ExchangeEvent>> = Vec::new();
-    let mut event_rxs: Vec<mpsc::Receiver<ExchangeEvent>> = Vec::new();
-    for _ in SYMBOLS {
-        let (tx, rx) = mpsc::channel(4096);
-        event_txs.push(tx);
-        event_rxs.push(rx);
-    }
-
-    // WS manager: connection lifecycle + message routing.
-    // For now single symbol → single event_tx.  Multi-symbol would filter by symbol field.
-    let event_tx = event_txs.into_iter().next().expect("at least one symbol");
-    let ws_url = exchange_ws_url();
-    tokio::spawn(ws_manager(ws_url, token.clone(), ws_rx, pending, pending_batch, dead, event_tx));
-
-    // Brief pause for the WS manager to connect and authenticate.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Cancel any leftover orders from a previous session.
     info!("Clearing leftover orders from previous session…");
-    for cfg in SYMBOLS {
-        client.cancel_symbol(cfg.symbol).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
     for cfg in SYMBOLS {
         let leftovers = rest_open_order_ids(&http, &base, &token, cfg.symbol).await;
         if !leftovers.is_empty() {
-            warn!("[{}] {} leftover orders remain after cancel_symbol", cfg.symbol, leftovers.len());
+            warn!("[{}] {} leftover orders found, will cancel on WS connect", cfg.symbol, leftovers.len());
         }
     }
 
-    // Spawn one quoting task per symbol.
+    let ws_url = exchange_ws_url();
     let handles: Vec<_> = SYMBOLS
         .iter()
-        .zip(event_rxs)
-        .map(|(cfg, rx)| {
-            let c = client.clone();
-            tokio::spawn(async move { run_symbol(cfg, c, rx).await })
+        .map(|cfg| {
+            let url = ws_url.clone();
+            let tok = token.clone();
+            tokio::spawn(async move { run_symbol(cfg, url, tok).await })
         })
         .collect();
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down…");
-    for h in &handles {
-        h.abort();
-    }
-    // Give cancellations a moment to reach the engine.
-    for cfg in SYMBOLS {
-        client.cancel_symbol(cfg.symbol).await;
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    for h in &handles { h.abort(); }
+    tokio::time::sleep(Duration::from_secs(1)).await;
     info!("Done.");
     Ok(())
 }
@@ -1218,31 +916,30 @@ mod tests {
         let _ = round_tick(100.0, 0.0);
     }
 
-    // ── parse_mid tests ───────────────────────────────────────────────────────
+    // ── parse_depth_snapshot tests ────────────────────────────────────────────
 
     #[test]
-    fn test_parse_mid_valid() {
-        let json = r#"{"b":"50000.5","a":"50001.5"}"#;
-        let mid = parse_mid(json).expect("should parse");
-        assert!((mid - 50001.0).abs() < 1e-9);
+    fn test_parse_depth_snapshot_valid() {
+        let json = r#"{"b":[["50000.5","0.1"],["50000.0","0.2"]],"a":[["50001.5","0.1"],["50002.0","0.3"]]}"#;
+        let levels = parse_depth_snapshot(json).expect("should parse");
+        assert_eq!(levels.len(), 2);
+        assert!((levels[0].bid_price - 50000.5).abs() < 1e-9);
+        assert!((levels[0].ask_price - 50001.5).abs() < 1e-9);
+        assert!((levels[0].bid_qty - 0.1).abs() < 1e-9);
     }
 
     #[test]
-    fn test_parse_mid_invalid_json() {
-        assert!(parse_mid("not json").is_none());
-        assert!(parse_mid("{}").is_none());
+    fn test_parse_depth_snapshot_invalid_json() {
+        assert!(parse_depth_snapshot("not json").is_none());
+        assert!(parse_depth_snapshot("{}").is_none());
     }
 
     #[test]
-    fn test_parse_mid_bid_above_ask_returns_none() {
-        let json = r#"{"b":"50002.0","a":"50001.0"}"#;
-        assert!(parse_mid(json).is_none());
-    }
-
-    #[test]
-    fn test_parse_mid_zero_bid_returns_none() {
-        let json = r#"{"b":"0.0","a":"50001.0"}"#;
-        assert!(parse_mid(json).is_none());
+    fn test_parse_depth_snapshot_crossed_rejected() {
+        // bid >= ask should be filtered out
+        let json = r#"{"b":[["50002.0","0.1"]],"a":[["50001.0","0.1"]]}"#;
+        let result = parse_depth_snapshot(json);
+        assert!(result.is_none());
     }
 
     // ── Inventory tests ───────────────────────────────────────────────────────

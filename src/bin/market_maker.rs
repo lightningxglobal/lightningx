@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
-use futures_util::future;
 use http_body_util::Empty;
 use hyper::{
     body::Bytes,
@@ -271,6 +270,16 @@ enum ExchangeEvent {
     },
     /// Order cancelled (by us or engine).
     Cancelled { order_id: i64 },
+    /// Balance update from the exchange (after freeze/release).
+    BalanceUpdate { asset: String, balance: f64, available: f64, frozen: f64 },
+}
+
+// ── Batch order result ────────────────────────────────────────────────────────
+
+struct BatchOrderResult {
+    client_order_id: String,
+    order_id: Option<i64>,
+    accepted: bool,
 }
 
 // ── WS Exchange Client ─────────────────────────────────────────────────────────
@@ -284,6 +293,10 @@ struct WsClient {
     /// Order IDs confirmed dead (FILLED or CANCELLED), used by wait_dead().
     dead: Arc<DashMap<i64, ()>>,
     counter: Arc<AtomicU64>,
+    /// Counter for batch_id generation.
+    batch_counter: Arc<AtomicU64>,
+    /// Pending place_orders_batch calls, keyed by batch_id (numeric).
+    pending_batch: Arc<DashMap<u64, oneshot::Sender<Vec<BatchOrderResult>>>>,
 }
 
 impl WsClient {
@@ -311,6 +324,66 @@ impl WsClient {
             _ => {
                 self.pending.remove(&coid);
                 None
+            }
+        }
+    }
+
+    /// Place multiple orders in a single WS message; returns results for all orders.
+    async fn place_orders_batch(
+        &self,
+        symbol: &str,
+        orders: &[(String, &str, f64, f64)],
+    ) -> Vec<BatchOrderResult> {
+        let batch_num = self.batch_counter.fetch_add(1, Ordering::Relaxed);
+        let batch_id = batch_num.to_string();
+        let (tx, rx) = oneshot::channel();
+        self.pending_batch.insert(batch_num, tx);
+
+        let order_vals: Vec<Value> = orders
+            .iter()
+            .map(|(coid, side, price, qty)| {
+                json!({
+                    "client_order_id": coid,
+                    "symbol": symbol,
+                    "side": side,
+                    "order_type": "limit",
+                    "price": price,
+                    "qty": qty,
+                })
+            })
+            .collect();
+
+        let msg = json!({
+            "type": "place_orders",
+            "batch_id": batch_id,
+            "orders": order_vals,
+        })
+        .to_string();
+
+        if self.ws_tx.send(msg).await.is_err() {
+            self.pending_batch.remove(&batch_num);
+            return orders
+                .iter()
+                .map(|(coid, _, _, _)| BatchOrderResult {
+                    client_order_id: coid.clone(),
+                    order_id: None,
+                    accepted: false,
+                })
+                .collect();
+        }
+
+        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(results)) => results,
+            _ => {
+                self.pending_batch.remove(&batch_num);
+                orders
+                    .iter()
+                    .map(|(coid, _, _, _)| BatchOrderResult {
+                        client_order_id: coid.clone(),
+                        order_id: None,
+                        accepted: false,
+                    })
+                    .collect()
             }
         }
     }
@@ -355,6 +428,7 @@ async fn ws_manager(
     token: String,
     mut outbox: mpsc::Receiver<String>,
     pending: Arc<DashMap<u64, oneshot::Sender<Option<i64>>>>,
+    pending_batch: Arc<DashMap<u64, oneshot::Sender<Vec<BatchOrderResult>>>>,
     dead: Arc<DashMap<i64, ()>>,
     event_tx: mpsc::Sender<ExchangeEvent>,
 ) {
@@ -389,7 +463,7 @@ async fn ws_manager(
                     match frame {
                         Ok(f) if f.opcode == OpCode::Text => {
                             if let Ok(text) = std::str::from_utf8(&f.payload) {
-                                route_msg(text, &pending, &dead, &event_tx);
+                                route_msg(text, &pending, &pending_batch, &dead, &event_tx);
                             }
                         }
                         Ok(f) if f.opcode == OpCode::Close => break 'conn,
@@ -419,6 +493,7 @@ async fn ws_manager(
 fn route_msg(
     text: &str,
     pending: &DashMap<u64, oneshot::Sender<Option<i64>>>,
+    pending_batch: &DashMap<u64, oneshot::Sender<Vec<BatchOrderResult>>>,
     dead: &DashMap<i64, ()>,
     event_tx: &mpsc::Sender<ExchangeEvent>,
 ) {
@@ -489,6 +564,45 @@ fn route_msg(
                     let _ = event_tx.try_send(ExchangeEvent::Cancelled { order_id });
                 }
                 _ => {}
+            }
+        }
+        "orders_placed" => {
+            let batch_id_str = v.get("batch_id").and_then(|b| b.as_str()).unwrap_or("");
+            let batch_num: u64 = match batch_id_str.parse() {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            let results: Vec<BatchOrderResult> = v
+                .get("results")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|item| BatchOrderResult {
+                            client_order_id: item
+                                .get("client_order_id")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("")
+                                .to_owned(),
+                            order_id: item.get("order_id").and_then(|i| i.as_i64()),
+                            accepted: item
+                                .get("accepted")
+                                .and_then(|a| a.as_bool())
+                                .unwrap_or(false),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some((_, tx)) = pending_batch.remove(&batch_num) {
+                let _ = tx.send(results);
+            }
+        }
+        "balance_update" => {
+            let asset = v.get("asset").and_then(|a| a.as_str()).unwrap_or("").to_owned();
+            let balance = v.get("balance").and_then(|b| b.as_f64()).unwrap_or(0.0);
+            let available = v.get("available").and_then(|a| a.as_f64()).unwrap_or(0.0);
+            let frozen = v.get("frozen").and_then(|f| f.as_f64()).unwrap_or(0.0);
+            if !asset.is_empty() {
+                let _ = event_tx.try_send(ExchangeEvent::BalanceUpdate { asset, balance, available, frozen });
             }
         }
         _ => {}
@@ -685,6 +799,8 @@ fn apply_event(event: ExchangeEvent, inv: &mut Inventory, book: &mut QuoteBook) 
         }
         // Accepted is handled by place_order() oneshot; Rejected likewise.
         ExchangeEvent::Accepted { .. } | ExchangeEvent::Rejected { .. } => {}
+        // BalanceUpdate is handled by run_symbol's event loop.
+        ExchangeEvent::BalanceUpdate { .. } => {}
     }
 }
 
@@ -698,6 +814,8 @@ async fn run_symbol(
     let mut inv = Inventory::default();
     let mut book = QuoteBook::default();
     let mut reconnect_delay = Duration::from_secs(1);
+    // Available balance per asset (updated from BalanceUpdate events).
+    let mut balance: HashMap<String, f64> = HashMap::new();
 
     info!("[{}] market-maker started", cfg.symbol);
 
@@ -723,6 +841,9 @@ async fn run_symbol(
             // ── drain all pending exchange events (non-blocking) ──────────
             loop {
                 match event_rx.try_recv() {
+                    Ok(ExchangeEvent::BalanceUpdate { asset, available, .. }) => {
+                        balance.insert(asset, available);
+                    }
                     Ok(ev) => apply_event(ev, &mut inv, &mut book),
                     Err(_) => break,
                 }
@@ -757,8 +878,13 @@ async fn run_symbol(
                 continue;
             }
 
+            let sym_parts: Vec<&str> = cfg.symbol.splitn(2, '_').collect();
+            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+            let avail_base = balance.get(base_asset).copied().unwrap_or(f64::NAN);
+            let avail_quote = balance.get(quote_asset).copied().unwrap_or(f64::NAN);
             info!(
-                "[{}] mid={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  → re-quote",
+                "[{}] mid={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  avail={:.4}{}/{:.2}{}  → re-quote",
                 cfg.symbol,
                 mid,
                 inv.position,
@@ -766,6 +892,10 @@ async fn run_symbol(
                 inv.unrealized_pnl(mid),
                 book.bids.len(),
                 book.asks.len(),
+                avail_base,
+                base_asset,
+                avail_quote,
+                quote_asset,
             );
 
             // ── risk check: pause quoting at position limit ───────────────
@@ -804,41 +934,47 @@ async fn run_symbol(
                 continue;
             }
 
-            // ── place bids and asks concurrently ─────────────────────────
-            // bid_i and ask_i at the same level are submitted simultaneously
-            // so neither side is exposed without the other.
-            let bid_futs: Vec<_> = targets
-                .iter()
-                .map(|t| client.place_order(cfg.symbol, "buy", t.bid_price, t.qty))
-                .collect();
-            let ask_futs: Vec<_> = targets
-                .iter()
-                .map(|t| client.place_order(cfg.symbol, "sell", t.ask_price, t.qty))
-                .collect();
-
-            let (bid_results, ask_results) =
-                tokio::join!(future::join_all(bid_futs), future::join_all(ask_futs));
-
-            for (t, result) in targets.iter().zip(bid_results) {
-                if let Some(id) = result {
-                    book.bids.push(Quote {
-                        order_id: id,
-                        side: "buy",
-                        price: t.bid_price,
-                        qty: t.qty,
-                        filled: 0.0,
-                    });
-                }
+            // ── place all bids and asks in a single batch message ────────
+            // Build a list of (coid, side, price, qty) for each level.
+            let batch_counter_base = client.counter.fetch_add(targets.len() as u64 * 2, Ordering::Relaxed);
+            let mut batch_orders: Vec<(String, &str, f64, f64)> = Vec::with_capacity(targets.len() * 2);
+            for (i, t) in targets.iter().enumerate() {
+                let bid_coid = format!("{}_{}", cfg.symbol, batch_counter_base + i as u64);
+                let ask_coid = format!("{}_{}_a", cfg.symbol, batch_counter_base + i as u64);
+                batch_orders.push((bid_coid, "buy", t.bid_price, t.qty));
+                batch_orders.push((ask_coid, "sell", t.ask_price, t.qty));
             }
-            for (t, result) in targets.iter().zip(ask_results) {
-                if let Some(id) = result {
-                    book.asks.push(Quote {
-                        order_id: id,
-                        side: "sell",
-                        price: t.ask_price,
-                        qty: t.qty,
-                        filled: 0.0,
-                    });
+
+            let batch_results = client.place_orders_batch(cfg.symbol, &batch_orders).await;
+
+            // Match results back to target levels (bids first, then asks, interleaved).
+            for (i, t) in targets.iter().enumerate() {
+                // bid result is at position i*2, ask result at i*2+1.
+                if let Some(res) = batch_results.get(i * 2) {
+                    if res.accepted {
+                        if let Some(id) = res.order_id {
+                            book.bids.push(Quote {
+                                order_id: id,
+                                side: "buy",
+                                price: t.bid_price,
+                                qty: t.qty,
+                                filled: 0.0,
+                            });
+                        }
+                    }
+                }
+                if let Some(res) = batch_results.get(i * 2 + 1) {
+                    if res.accepted {
+                        if let Some(id) = res.order_id {
+                            book.asks.push(Quote {
+                                order_id: id,
+                                side: "sell",
+                                price: t.ask_price,
+                                qty: t.qty,
+                                filled: 0.0,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -907,6 +1043,7 @@ async fn main() -> anyhow::Result<()> {
     // Shared WS client.
     let (ws_tx, ws_rx) = mpsc::channel::<String>(8192);
     let pending = Arc::new(DashMap::<u64, oneshot::Sender<Option<i64>>>::new());
+    let pending_batch = Arc::new(DashMap::<u64, oneshot::Sender<Vec<BatchOrderResult>>>::new());
     let dead = Arc::new(DashMap::<i64, ()>::new());
 
     let client = WsClient {
@@ -914,6 +1051,8 @@ async fn main() -> anyhow::Result<()> {
         pending: pending.clone(),
         dead: dead.clone(),
         counter: Arc::new(AtomicU64::new(0)),
+        batch_counter: Arc::new(AtomicU64::new(0)),
+        pending_batch: pending_batch.clone(),
     };
 
     // Per-symbol event channels (one per symbol task).
@@ -929,7 +1068,7 @@ async fn main() -> anyhow::Result<()> {
     // For now single symbol → single event_tx.  Multi-symbol would filter by symbol field.
     let event_tx = event_txs.into_iter().next().expect("at least one symbol");
     let ws_url = exchange_ws_url();
-    tokio::spawn(ws_manager(ws_url, token.clone(), ws_rx, pending, dead, event_tx));
+    tokio::spawn(ws_manager(ws_url, token.clone(), ws_rx, pending, pending_batch, dead, event_tx));
 
     // Brief pause for the WS manager to connect and authenticate.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -969,4 +1108,263 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     info!("Done.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── compute_target tests ──────────────────────────────────────────────────
+
+    fn default_cfg() -> &'static SymbolConfig {
+        &SYMBOLS[0]
+    }
+
+    fn zero_inv() -> Inventory {
+        Inventory::default()
+    }
+
+    #[test]
+    fn test_compute_target_bid_below_ask() {
+        let cfg = default_cfg();
+        let inv = zero_inv();
+        let levels = compute_target(50000.0, &inv, cfg);
+        for t in &levels {
+            assert!(t.bid_price < t.ask_price, "bid must be below ask");
+        }
+    }
+
+    #[test]
+    fn test_compute_target_num_levels() {
+        let cfg = default_cfg();
+        let inv = zero_inv();
+        let levels = compute_target(50000.0, &inv, cfg);
+        // All levels should be present (mid is high enough that none are dropped).
+        assert_eq!(levels.len(), cfg.num_levels);
+    }
+
+    #[test]
+    fn test_compute_target_skew_shifts_down_when_long() {
+        let cfg = default_cfg();
+        let mut inv_long = Inventory::default();
+        inv_long.position = 0.1; // long position
+        let inv_flat = zero_inv();
+        let mid = 50000.0;
+        let levels_long = compute_target(mid, &inv_long, cfg);
+        let levels_flat = compute_target(mid, &inv_flat, cfg);
+        // Long inventory shifts bids downward.
+        assert!(
+            levels_long[0].bid_price < levels_flat[0].bid_price,
+            "long position should shift bid down"
+        );
+    }
+
+    #[test]
+    fn test_compute_target_skew_shifts_up_when_short() {
+        let cfg = default_cfg();
+        let mut inv_short = Inventory::default();
+        inv_short.position = -0.1; // short position
+        let inv_flat = zero_inv();
+        let mid = 50000.0;
+        let levels_short = compute_target(mid, &inv_short, cfg);
+        let levels_flat = compute_target(mid, &inv_flat, cfg);
+        // Short inventory shifts asks upward (skew is negative, so -skew pushes ask up).
+        assert!(
+            levels_short[0].ask_price > levels_flat[0].ask_price,
+            "short position should shift ask up"
+        );
+    }
+
+    #[test]
+    fn test_compute_target_level_spacing() {
+        let cfg = default_cfg();
+        let inv = zero_inv();
+        let levels = compute_target(50000.0, &inv, cfg);
+        // Each successive level should have a wider spread than the previous.
+        for i in 1..levels.len() {
+            let spread_inner = levels[i - 1].ask_price - levels[i - 1].bid_price;
+            let spread_outer = levels[i].ask_price - levels[i].bid_price;
+            assert!(
+                spread_outer >= spread_inner,
+                "outer levels must be wider than inner"
+            );
+        }
+    }
+
+    // ── round_tick tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_round_tick_rounds_to_nearest() {
+        assert!((round_tick(100.15, 0.1) - 100.2).abs() < 1e-9);
+        assert!((round_tick(100.14, 0.1) - 100.1).abs() < 1e-9);
+        assert!((round_tick(50001.3, 0.5) - 50001.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_round_tick_zero_tick() {
+        // tick=0 should not panic; result is NaN or inf but no panic.
+        let _ = round_tick(100.0, 0.0);
+    }
+
+    // ── parse_mid tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_mid_valid() {
+        let json = r#"{"b":"50000.5","a":"50001.5"}"#;
+        let mid = parse_mid(json).expect("should parse");
+        assert!((mid - 50001.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_mid_invalid_json() {
+        assert!(parse_mid("not json").is_none());
+        assert!(parse_mid("{}").is_none());
+    }
+
+    #[test]
+    fn test_parse_mid_bid_above_ask_returns_none() {
+        let json = r#"{"b":"50002.0","a":"50001.0"}"#;
+        assert!(parse_mid(json).is_none());
+    }
+
+    #[test]
+    fn test_parse_mid_zero_bid_returns_none() {
+        let json = r#"{"b":"0.0","a":"50001.0"}"#;
+        assert!(parse_mid(json).is_none());
+    }
+
+    // ── Inventory tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_inventory_buy_fill_increases_position() {
+        let mut inv = Inventory::default();
+        inv.apply_fill(1, "buy", 50000.0, 0.01, true);
+        assert!((inv.position - 0.01).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_inventory_sell_fill_decreases_position() {
+        let mut inv = Inventory::default();
+        // First establish a position.
+        inv.apply_fill(1, "buy", 50000.0, 0.01, true);
+        inv.apply_fill(2, "sell", 51000.0, 0.01, true);
+        assert!(inv.position.abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_inventory_partial_fill_tracked_incrementally() {
+        let mut inv = Inventory::default();
+        // First partial fill of 0.005.
+        inv.apply_fill(1, "buy", 50000.0, 0.005, false);
+        assert!((inv.position - 0.005).abs() < 1e-10);
+        // Second cumulative fill brings total to 0.01.
+        inv.apply_fill(1, "buy", 50000.0, 0.01, true);
+        assert!((inv.position - 0.01).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_inventory_realized_pnl_on_sell() {
+        let mut inv = Inventory::default();
+        inv.apply_fill(1, "buy", 50000.0, 0.01, true);
+        // Sell at 51000 → realized PnL = 0.01 * (51000 - 50000) = 10.
+        inv.apply_fill(2, "sell", 51000.0, 0.01, true);
+        assert!((inv.realized_pnl - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_inventory_avg_cost_running_weighted_average() {
+        let mut inv = Inventory::default();
+        // Buy 0.01 at 50000 and 0.01 at 52000 → avg = 51000.
+        inv.apply_fill(1, "buy", 50000.0, 0.01, true);
+        inv.apply_fill(2, "buy", 52000.0, 0.01, true);
+        assert!((inv.avg_cost - 51000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_inventory_final_fill_removes_tracker() {
+        let mut inv = Inventory::default();
+        inv.apply_fill(1, "buy", 50000.0, 0.005, false);
+        assert!(inv.order_fill_tracker.contains_key(&1));
+        inv.apply_fill(1, "buy", 50000.0, 0.01, true);
+        // Final fill removes the tracker entry.
+        assert!(!inv.order_fill_tracker.contains_key(&1));
+    }
+
+    // ── QuoteBook tests ───────────────────────────────────────────────────────
+
+    fn make_quote(id: i64, side: &'static str, price: f64) -> Quote {
+        Quote { order_id: id, side, price, qty: 0.001, filled: 0.0 }
+    }
+
+    #[test]
+    fn test_quotebook_all_ids() {
+        let mut book = QuoteBook::default();
+        book.bids.push(make_quote(1, "buy", 100.0));
+        book.asks.push(make_quote(2, "sell", 101.0));
+        let ids = book.all_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+    }
+
+    #[test]
+    fn test_quotebook_remove() {
+        let mut book = QuoteBook::default();
+        book.bids.push(make_quote(1, "buy", 100.0));
+        book.asks.push(make_quote(2, "sell", 101.0));
+        book.remove(1);
+        assert_eq!(book.bids.len(), 0);
+        assert_eq!(book.asks.len(), 1);
+    }
+
+    #[test]
+    fn test_quotebook_is_empty() {
+        let mut book = QuoteBook::default();
+        assert!(book.is_empty());
+        book.bids.push(make_quote(1, "buy", 100.0));
+        assert!(!book.is_empty());
+    }
+
+    #[test]
+    fn test_quotebook_find_mut() {
+        let mut book = QuoteBook::default();
+        book.bids.push(make_quote(1, "buy", 100.0));
+        let q = book.find_mut(1).expect("should find");
+        q.filled = 0.001;
+        assert!((book.bids[0].filled - 0.001).abs() < 1e-10);
+        assert!(book.find_mut(99).is_none());
+    }
+
+    // ── within_threshold tests ────────────────────────────────────────────────
+
+    fn make_targets(bid: f64, ask: f64) -> Vec<TargetLevel> {
+        vec![TargetLevel { bid_price: bid, ask_price: ask, qty: 0.001 }]
+    }
+
+    #[test]
+    fn test_within_threshold_true_when_close() {
+        let mut book = QuoteBook::default();
+        book.bids.push(make_quote(1, "buy", 100.0));
+        book.asks.push(make_quote(2, "sell", 101.0));
+        let targets = make_targets(100.0, 101.0);
+        assert!(within_threshold(&book, &targets, 1.0));
+    }
+
+    #[test]
+    fn test_within_threshold_false_when_far() {
+        let mut book = QuoteBook::default();
+        book.bids.push(make_quote(1, "buy", 99.0));
+        book.asks.push(make_quote(2, "sell", 102.0));
+        let targets = make_targets(100.0, 101.0);
+        // 1 bps threshold, price moved by 100 bps → should be outside.
+        assert!(!within_threshold(&book, &targets, 1.0));
+    }
+
+    #[test]
+    fn test_within_threshold_false_when_wrong_count() {
+        let book = QuoteBook::default();
+        let targets = make_targets(100.0, 101.0);
+        // Book has 0 orders but targets has 1 level → mismatch.
+        assert!(!within_threshold(&book, &targets, 100.0));
+    }
 }

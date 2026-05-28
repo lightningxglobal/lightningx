@@ -56,6 +56,10 @@ enum ClientMsg {
         price: Option<f64>,
         qty: f64,
     },
+    PlaceOrders {
+        batch_id: String,
+        orders: Vec<serde_json::Value>,
+    },
     CancelOrder {
         order_id: i64,
     },
@@ -113,6 +117,11 @@ impl ClientMsg {
                 price: v.get("price").and_then(|p| p.as_f64()),
                 qty: v.get("qty").or_else(|| v.get("quantity"))?.as_f64()?,
             }),
+            "place_orders" => {
+                let batch_id = v.get("batch_id").and_then(|b| b.as_str()).unwrap_or("").to_owned();
+                let orders = v.get("orders").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+                Some(ClientMsg::PlaceOrders { batch_id, orders })
+            }
             "cancel_order" => Some(ClientMsg::CancelOrder {
                 order_id: v.get("order_id")?.as_i64()?,
             }),
@@ -1315,6 +1324,411 @@ async fn handle_client_message(
             }
 
             Some(json!({"type": "order_update", "order_id": order_id, "status": "CANCELED", "ts": unix_now()}).to_string())
+        }
+
+        ClientMsg::PlaceOrders { batch_id, orders } => {
+            let user_id = match session.user_id {
+                Some(id) => id,
+                None => {
+                    return Some(
+                        json!({"type": "error", "message": "Not authenticated"}).to_string(),
+                    )
+                }
+            };
+
+            // Cap batch at 40 orders.
+            let orders = if orders.len() > 40 { &orders[..40] } else { &orders[..] };
+            let mut results: Vec<serde_json::Value> = Vec::with_capacity(orders.len());
+
+            for order_val in orders {
+                let coid = order_val
+                    .get("client_order_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let symbol = match order_val.get("symbol").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_owned(),
+                    None => {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Missing symbol"}));
+                        continue;
+                    }
+                };
+                let side = match order_val.get("side").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_owned(),
+                    None => {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Missing side"}));
+                        continue;
+                    }
+                };
+                let order_type = order_val
+                    .get("order_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("limit")
+                    .to_owned();
+                let time_in_force: Option<String> = order_val
+                    .get("time_in_force")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_ascii_lowercase());
+                let price: Option<f64> = order_val.get("price").and_then(|v| v.as_f64());
+                let qty = match order_val
+                    .get("qty")
+                    .or_else(|| order_val.get("quantity"))
+                    .and_then(|v| v.as_f64())
+                {
+                    Some(q) => q,
+                    None => {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Missing qty"}));
+                        continue;
+                    }
+                };
+
+                let engine_side = match side.as_str() {
+                    "buy" => Side::Buy,
+                    "sell" => Side::Sell,
+                    _ => {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Invalid side"}));
+                        continue;
+                    }
+                };
+
+                let tif = match order_type.as_str() {
+                    "ioc" => TimeInForce::IOC,
+                    "fok" => TimeInForce::FOK,
+                    "post_only" => TimeInForce::PostOnly,
+                    "market" => TimeInForce::IOC,
+                    "limit" | "gtc" => match time_in_force.as_deref() {
+                        Some("ioc") => TimeInForce::IOC,
+                        Some("fok") => TimeInForce::FOK,
+                        Some("post_only") => TimeInForce::PostOnly,
+                        _ => TimeInForce::GTC,
+                    },
+                    _ => {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Unknown order type"}));
+                        continue;
+                    }
+                };
+
+                // ── Aeron fast path ──────────────────────────────────────────
+                if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+                    use crate::sbe::NewOrderRequest as SbeNewOrder;
+                    use crate::transport::{AeronCmd, OrderMeta};
+
+                    // Reject unknown symbols.
+                    if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": format!("No engine for symbol: {}", symbol)}));
+                        continue;
+                    }
+
+                    let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+                    let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+                    let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+                    let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
+
+                    let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
+                    let freeze_price_val: f64 = if side == "buy" {
+                        price.or(best_opposing_price).unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    let _ = rules; // suppress unused warning
+
+                    let repo = AccountRepository::new(state.db.as_ref());
+                    let reservation = if side == "buy" {
+                        let freeze_amount = freeze_price_val * qty;
+                        if freeze_amount <= 0.0 {
+                            results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Unable to determine buy reservation price"}));
+                            continue;
+                        }
+                        repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
+                            .await
+                            .map(|row| (quote_asset, row, freeze_amount))
+                    } else {
+                        repo.freeze_for_sell(user_id, base_asset, qty)
+                            .await
+                            .map(|row| (base_asset, row, qty))
+                    };
+
+                    let (reserved_asset, (reserved_bal, reserved_frz), reserved_amount) =
+                        match reservation {
+                            Ok(v) => v,
+                            Err(e) => {
+                                results.push(json!({"client_order_id": coid, "accepted": false, "reason": e.to_string()}));
+                                continue;
+                            }
+                        };
+
+                    state
+                        .account_cache
+                        .entry(user_id)
+                        .or_insert_with(std::collections::HashMap::new)
+                        .insert(reserved_asset.to_string(), (reserved_bal, reserved_frz));
+                    if let Some(tx) = state.user_tx.get(&user_id) {
+                        let _ = tx.try_send(
+                            json!({
+                                "type": "balance_update",
+                                "asset": reserved_asset,
+                                "balance": reserved_bal,
+                                "available": reserved_bal - reserved_frz,
+                                "frozen": reserved_frz,
+                            })
+                            .to_string(),
+                        );
+                    }
+
+                    let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
+                    let mut sym_bytes = [0u8; 16];
+                    let sb = symbol.as_bytes();
+                    sym_bytes[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
+
+                    let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
+                    let tif_byte: u8 = match tif {
+                        TimeInForce::GTC => 0,
+                        TimeInForce::IOC => 1,
+                        TimeInForce::FOK => 2,
+                        TimeInForce::PostOnly => 3,
+                    };
+
+                    let sbe_req = SbeNewOrder {
+                        client_order_id: order_id,
+                        participant_id: user_id as u64,
+                        price: price.unwrap_or(0.0),
+                        quantity: qty,
+                        side: side_byte,
+                        time_in_force: tif_byte,
+                        _pad: [0; 14],
+                        symbol: sym_bytes,
+                    };
+
+                    state.pending_meta.insert(
+                        order_id,
+                        Box::new(OrderMeta {
+                            user_id,
+                            symbol: symbol.clone(),
+                            side: side.clone(),
+                            order_type: order_type.clone(),
+                            price,
+                            qty,
+                            client_order_id: coid.clone(),
+                            freeze_price: freeze_price_val,
+                        }),
+                    );
+
+                    if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
+                        state.pending_meta.remove(&order_id);
+                        let _ = repo
+                            .release_frozen(user_id, reserved_asset, reserved_amount)
+                            .await;
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Aeron channel closed"}));
+                        continue;
+                    }
+
+                    results.push(json!({"client_order_id": coid, "order_id": order_id, "accepted": true}));
+                    continue;
+                }
+
+                // ── Standalone engine path ───────────────────────────────────
+                let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = state
+                    .engines
+                    .as_ref()
+                    .and_then(|m| m.get(&symbol).map(|e| e.value().clone()));
+                if state.engines.is_some() && engine_opt.is_none() {
+                    results.push(json!({"client_order_id": coid, "accepted": false, "reason": format!("Unknown symbol: {}", symbol)}));
+                    continue;
+                }
+                let engine = match engine_opt {
+                    Some(e) => e,
+                    None => {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "No matching engine configured"}));
+                        continue;
+                    }
+                };
+
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+
+                let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+                let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+                let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+                let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
+
+                let best_opposing_price: Option<f64> = {
+                    let eng = engine.lock().unwrap();
+                    let levels = eng.get_top_levels(1, engine_side == Side::Sell);
+                    levels.first().map(|(p, _)| rules.ticks_to_price(*p))
+                };
+
+                let freeze_price_val: f64 = if side == "buy" {
+                    price.or(best_opposing_price).unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+
+                let db_order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed) as i64;
+                let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
+                    "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8) RETURNING *",
+                )
+                .bind(db_order_id)
+                .bind(user_id)
+                .bind(&symbol)
+                .bind(&side)
+                .bind(&order_type)
+                .bind(price)
+                .bind(qty)
+                .bind(freeze_price_val)
+                .fetch_one(state.db.as_ref())
+                .await;
+
+                if let Err(e) = db_result {
+                    results.push(json!({"client_order_id": coid, "accepted": false, "reason": format!("DB error: {}", e)}));
+                    continue;
+                }
+
+                let fixed_order = match crate::symbol_rules::FixedOrderInput::from_order_fields(
+                    db_order_id as u64,
+                    &symbol,
+                    engine_side,
+                    &order_type,
+                    price,
+                    qty,
+                    tif,
+                    now_ns,
+                ) {
+                    Ok(o) => o,
+                    Err(reason) => {
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": reason}));
+                        continue;
+                    }
+                };
+
+                let engine_order = if fixed_order.is_market {
+                    Order::new_market(
+                        fixed_order.id,
+                        fixed_order.side,
+                        fixed_order.quantity_lots,
+                        fixed_order.timestamp,
+                    )
+                } else {
+                    Order::new(
+                        fixed_order.id,
+                        fixed_order.side,
+                        fixed_order.price_ticks,
+                        fixed_order.quantity_lots,
+                        fixed_order.time_in_force,
+                        fixed_order.timestamp,
+                    )
+                };
+
+                // Freeze funds.
+                let repo = AccountRepository::new(state.db.as_ref());
+                let freeze_result = if side == "buy" {
+                    let freeze_amount = freeze_price_val * qty;
+                    if freeze_amount > 0.0 {
+                        repo.freeze_for_buy(user_id, quote_asset, freeze_amount).await
+                    } else {
+                        Ok((0.0, 0.0))
+                    }
+                } else {
+                    repo.freeze_for_sell(user_id, base_asset, qty).await
+                };
+
+                let frozen_asset = if side == "buy" { quote_asset } else { base_asset };
+                match freeze_result {
+                    Err(e) => {
+                        let _ = sqlx::query(
+                            "UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1",
+                        )
+                        .bind(db_order_id)
+                        .execute(state.db.as_ref())
+                        .await;
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": e.to_string()}));
+                        continue;
+                    }
+                    Ok((bal, frz)) if bal > 0.0 || frz >= 0.0 => {
+                        state
+                            .account_cache
+                            .entry(user_id)
+                            .or_insert_with(std::collections::HashMap::new)
+                            .insert(frozen_asset.to_string(), (bal, frz));
+                        if let Some(tx) = state.user_tx.get(&user_id) {
+                            let _ = tx.try_send(
+                                json!({
+                                    "type": "balance_update",
+                                    "asset": frozen_asset,
+                                    "balance": bal,
+                                    "available": bal - frz,
+                                    "frozen": frz,
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                }
+
+                let engine_result = {
+                    let mut eng = engine.lock().unwrap();
+                    eng.place_order(engine_order)
+                };
+                let result = match engine_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = sqlx::query(
+                            "UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1",
+                        )
+                        .bind(db_order_id)
+                        .execute(state.db.as_ref())
+                        .await;
+                        if side == "buy" {
+                            let p = price.or(best_opposing_price).unwrap_or(0.0);
+                            if p > 0.0 {
+                                let _ = repo.release_frozen(user_id, quote_asset, p * qty).await;
+                            }
+                        } else {
+                            let _ = repo.release_frozen(user_id, base_asset, qty).await;
+                        }
+                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": e.to_string()}));
+                        continue;
+                    }
+                };
+
+                let db_status = db_status_from_engine(result.status).as_str();
+                let filled_qty = rules.lots_to_quantity(result.filled_lots);
+                let _ = sqlx::query(
+                    "UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3",
+                )
+                .bind(db_status)
+                .bind(filled_qty)
+                .bind(db_order_id)
+                .execute(state.db.as_ref())
+                .await;
+
+                if result.status == OrderStatus::Rejected {
+                    if side == "buy" {
+                        let p = price.or(best_opposing_price).unwrap_or(0.0);
+                        if p > 0.0 {
+                            let _ = repo.release_frozen(user_id, quote_asset, p * qty).await;
+                        }
+                    } else {
+                        let _ = repo.release_frozen(user_id, base_asset, qty).await;
+                    }
+                    results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Rejected by matching engine"}));
+                    continue;
+                }
+
+                results.push(json!({"client_order_id": coid, "order_id": db_order_id, "accepted": true}));
+            }
+
+            Some(
+                json!({
+                    "type": "orders_placed",
+                    "batch_id": batch_id,
+                    "results": results,
+                })
+                .to_string(),
+            )
         }
 
         ClientMsg::BatchCancel { order_ids } => {

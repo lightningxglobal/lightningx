@@ -1340,12 +1340,156 @@ async fn handle_client_message(
 
             // Cap batch at 40 orders.
             let orders = if orders.len() > 40 { &orders[..40] } else { &orders[..] };
+
+            // ── Aeron fast path: parse all → parallel DB freeze → batch-publish ──────────
+            // All DB freezes run concurrently (bids freeze USDT, asks freeze BTC — different
+            // rows so they don't contend). Then all N SBE requests are published in one Aeron
+            // write so the engine sees the full batch before the next 10ms depth snapshot.
+            if state.aeron_cmd_tx.is_some() {
+                use crate::sbe::NewOrderRequest as SbeNewOrder;
+                use crate::transport::OrderMeta;
+
+                struct V {
+                    idx: usize,
+                    coid: String,
+                    order_id: u64,
+                    is_buy: bool,
+                    freeze_asset: String,
+                    freeze_amount: f64,
+                    freeze_price_val: f64,
+                    sbe_req: SbeNewOrder,
+                    meta: OrderMeta,
+                }
+
+                let mut par_results = vec![serde_json::Value::Null; orders.len()];
+                let mut validated: Vec<V> = Vec::with_capacity(orders.len());
+
+                for (idx, order_val) in orders.iter().enumerate() {
+                    let coid = order_val.get("client_order_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+
+                    macro_rules! rej {
+                        ($r:expr) => {{ par_results[idx] = json!({"client_order_id": &coid, "accepted": false, "reason": $r}); continue; }};
+                    }
+
+                    let symbol = match order_val.get("symbol").and_then(|v| v.as_str()) {
+                        Some(s) => s.to_owned(), None => rej!("Missing symbol"),
+                    };
+                    let side = match order_val.get("side").and_then(|v| v.as_str()) {
+                        Some(s) => s.to_owned(), None => rej!("Missing side"),
+                    };
+                    let order_type = order_val.get("order_type").and_then(|v| v.as_str()).unwrap_or("limit").to_owned();
+                    let time_in_force: Option<String> = order_val.get("time_in_force").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase());
+                    let price: Option<f64> = order_val.get("price").and_then(|v| v.as_f64());
+                    let qty = match order_val.get("qty").or_else(|| order_val.get("quantity")).and_then(|v| v.as_f64()) {
+                        Some(q) => q, None => rej!("Missing qty"),
+                    };
+                    let engine_side = match side.as_str() {
+                        "buy" => Side::Buy, "sell" => Side::Sell, _ => rej!("Invalid side"),
+                    };
+                    let tif = match order_type.as_str() {
+                        "ioc" => TimeInForce::IOC,
+                        "fok" => TimeInForce::FOK,
+                        "post_only" => TimeInForce::PostOnly,
+                        "market" => TimeInForce::IOC,
+                        "limit" | "gtc" => match time_in_force.as_deref() {
+                            Some("ioc") => TimeInForce::IOC,
+                            Some("fok") => TimeInForce::FOK,
+                            Some("post_only") => TimeInForce::PostOnly,
+                            _ => TimeInForce::GTC,
+                        },
+                        _ => rej!("Unknown order type"),
+                    };
+
+                    if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
+                        rej!(format!("No engine for symbol: {}", symbol));
+                    }
+
+                    let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
+                    let base_asset = sym_parts.first().copied().unwrap_or("BTC");
+                    let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+
+                    let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
+                    let freeze_price_val: f64 = if side == "buy" { price.or(best_opposing_price).unwrap_or(0.0) } else { 0.0 };
+
+                    let is_buy = side == "buy";
+                    let (freeze_asset, freeze_amount) = if is_buy {
+                        let amount = freeze_price_val * qty;
+                        if amount <= 0.0 { rej!("Unable to determine buy reservation price"); }
+                        (quote_asset.to_owned(), amount)
+                    } else {
+                        (base_asset.to_owned(), qty)
+                    };
+
+                    let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
+                    let mut sym_bytes = [0u8; 16];
+                    let sb = symbol.as_bytes();
+                    sym_bytes[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
+                    let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
+                    let tif_byte: u8 = match tif { TimeInForce::GTC => 0, TimeInForce::IOC => 1, TimeInForce::FOK => 2, TimeInForce::PostOnly => 3 };
+
+                    let meta = OrderMeta {
+                        user_id, symbol: symbol.clone(), side: side.clone(),
+                        order_type: order_type.clone(), price, qty,
+                        client_order_id: coid.clone(), freeze_price: freeze_price_val,
+                    };
+                    let sbe_req = SbeNewOrder {
+                        client_order_id: order_id, participant_id: user_id as u64,
+                        price: price.unwrap_or(0.0), quantity: qty,
+                        side: side_byte, time_in_force: tif_byte,
+                        _pad: [0; 14], symbol: sym_bytes,
+                    };
+                    validated.push(V { idx, coid, order_id, is_buy, freeze_asset, freeze_amount, freeze_price_val, sbe_req, meta });
+                }
+
+                // Phase 2: all freezes run in parallel — different assets don't contend.
+                let pool = state.db.as_ref();
+                let freeze_results = futures::future::join_all(validated.iter().map(|v| {
+                    let repo = AccountRepository::new(pool);
+                    let uid = user_id;
+                    let asset = v.freeze_asset.clone();
+                    let amount = v.freeze_amount;
+                    let is_buy = v.is_buy;
+                    async move {
+                        if is_buy { repo.freeze_for_buy(uid, &asset, amount).await }
+                        else       { repo.freeze_for_sell(uid, &asset, amount).await }
+                    }
+                })).await;
+
+                // Phase 3: build aeron_batch from successes.
+                let mut aeron_batch: smallvec::SmallVec<[SbeNewOrder; 32]> = smallvec::SmallVec::new();
+                for (v, freeze_result) in validated.into_iter().zip(freeze_results) {
+                    match freeze_result {
+                        Ok((bal, frz)) => {
+                            state.account_cache.entry(user_id).or_insert_with(std::collections::HashMap::new)
+                                .insert(v.freeze_asset.clone(), (bal, frz));
+                            if let Some(tx) = state.user_tx.get(&user_id) {
+                                let _ = tx.try_send(json!({
+                                    "type": "balance_update", "asset": &v.freeze_asset,
+                                    "balance": bal, "available": bal - frz, "frozen": frz,
+                                }).to_string());
+                            }
+                            state.pending_meta.insert(v.order_id, Box::new(v.meta));
+                            aeron_batch.push(v.sbe_req);
+                            par_results[v.idx] = json!({"client_order_id": v.coid, "order_id": v.order_id, "accepted": true});
+                        }
+                        Err(e) => {
+                            par_results[v.idx] = json!({"client_order_id": v.coid, "accepted": false, "reason": e.to_string()});
+                        }
+                    }
+                }
+
+                if !aeron_batch.is_empty() {
+                    if let Some(ref tx) = state.aeron_cmd_tx {
+                        let _ = tx.send(crate::transport::AeronCmd::BatchNewOrder(aeron_batch));
+                    }
+                }
+
+                let results: Vec<_> = par_results.into_iter().filter(|v| !v.is_null()).collect();
+                return Some(json!({"type": "orders_placed", "batch_id": batch_id, "results": results}).to_string());
+            }
+
+            // ── Standalone engine path ─────────────────────────────────────────────────────
             let mut results: Vec<serde_json::Value> = Vec::with_capacity(orders.len());
-            // Collect Aeron requests for the entire batch so all N orders are published
-            // in one tight loop, ensuring the engine sees them together before the next
-            // depth snapshot fires (~10ms).
-            let mut aeron_batch: smallvec::SmallVec<[crate::sbe::NewOrderRequest; 32]> =
-                smallvec::SmallVec::new();
 
             for order_val in orders {
                 let coid = order_val
@@ -1414,117 +1558,6 @@ async fn handle_client_message(
                         continue;
                     }
                 };
-
-                // ── Aeron fast path ──────────────────────────────────────────
-                if state.aeron_cmd_tx.is_some() {
-                    use crate::sbe::NewOrderRequest as SbeNewOrder;
-                    use crate::transport::OrderMeta;
-
-                    // Reject unknown symbols.
-                    if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
-                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": format!("No engine for symbol: {}", symbol)}));
-                        continue;
-                    }
-
-                    let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
-                    let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-                    let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
-                    let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
-
-                    let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
-                    let freeze_price_val: f64 = if side == "buy" {
-                        price.or(best_opposing_price).unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
-                    let _ = rules; // suppress unused warning
-
-                    let repo = AccountRepository::new(state.db.as_ref());
-                    let reservation = if side == "buy" {
-                        let freeze_amount = freeze_price_val * qty;
-                        if freeze_amount <= 0.0 {
-                            results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Unable to determine buy reservation price"}));
-                            continue;
-                        }
-                        repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
-                            .await
-                            .map(|row| (quote_asset, row, freeze_amount))
-                    } else {
-                        repo.freeze_for_sell(user_id, base_asset, qty)
-                            .await
-                            .map(|row| (base_asset, row, qty))
-                    };
-
-                    let (reserved_asset, (reserved_bal, reserved_frz), _reserved_amount) =
-                        match reservation {
-                            Ok(v) => v,
-                            Err(e) => {
-                                results.push(json!({"client_order_id": coid, "accepted": false, "reason": e.to_string()}));
-                                continue;
-                            }
-                        };
-
-                    state
-                        .account_cache
-                        .entry(user_id)
-                        .or_insert_with(std::collections::HashMap::new)
-                        .insert(reserved_asset.to_string(), (reserved_bal, reserved_frz));
-                    if let Some(tx) = state.user_tx.get(&user_id) {
-                        let _ = tx.try_send(
-                            json!({
-                                "type": "balance_update",
-                                "asset": reserved_asset,
-                                "balance": reserved_bal,
-                                "available": reserved_bal - reserved_frz,
-                                "frozen": reserved_frz,
-                            })
-                            .to_string(),
-                        );
-                    }
-
-                    let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
-                    let mut sym_bytes = [0u8; 16];
-                    let sb = symbol.as_bytes();
-                    sym_bytes[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
-
-                    let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
-                    let tif_byte: u8 = match tif {
-                        TimeInForce::GTC => 0,
-                        TimeInForce::IOC => 1,
-                        TimeInForce::FOK => 2,
-                        TimeInForce::PostOnly => 3,
-                    };
-
-                    let sbe_req = SbeNewOrder {
-                        client_order_id: order_id,
-                        participant_id: user_id as u64,
-                        price: price.unwrap_or(0.0),
-                        quantity: qty,
-                        side: side_byte,
-                        time_in_force: tif_byte,
-                        _pad: [0; 14],
-                        symbol: sym_bytes,
-                    };
-
-                    state.pending_meta.insert(
-                        order_id,
-                        Box::new(OrderMeta {
-                            user_id,
-                            symbol: symbol.clone(),
-                            side: side.clone(),
-                            order_type: order_type.clone(),
-                            price,
-                            qty,
-                            client_order_id: coid.clone(),
-                            freeze_price: freeze_price_val,
-                        }),
-                    );
-
-                    aeron_batch.push(sbe_req);
-
-                    results.push(json!({"client_order_id": coid, "order_id": order_id, "accepted": true}));
-                    continue;
-                }
 
                 // ── Standalone engine path ───────────────────────────────────
                 let engine_opt: Option<Arc<Mutex<MatchingEngine>>> = state
@@ -1719,13 +1752,6 @@ async fn handle_client_message(
                 }
 
                 results.push(json!({"client_order_id": coid, "order_id": db_order_id, "accepted": true}));
-            }
-
-            // Publish all Aeron orders in one shot after all DB freezes are done.
-            if !aeron_batch.is_empty() {
-                if let Some(ref aeron_cmd_tx) = state.aeron_cmd_tx {
-                    let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::BatchNewOrder(aeron_batch));
-                }
             }
 
             Some(

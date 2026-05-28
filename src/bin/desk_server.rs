@@ -1115,13 +1115,13 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or("BTC_USDT").to_string();
                                 let symbol = if symbol.is_empty() { "BTC_USDT".to_string() } else { symbol };
 
-                                // Suppress empty snapshots that arrive within 2s of
-                                // a non-empty one — they are artifacts of the market-maker
-                                // cancel-all cycle, not a genuinely empty book.
-                                if nb == 0 && na == 0 {
+                                // Suppress one-sided or empty snapshots within 2s of the last
+                                // full (both-sided) snapshot — they are cancel-cycle artifacts.
+                                let is_incomplete = nb == 0 || na == 0;
+                                if is_incomplete {
                                     if let Some(&t) = last_nonempty_depth.get(&symbol) {
                                         if t.elapsed() < std::time::Duration::from_secs(2) {
-                                            continue; // skip this empty snapshot
+                                            continue; // skip transient one-sided / empty snapshot
                                         }
                                     }
                                 } else {

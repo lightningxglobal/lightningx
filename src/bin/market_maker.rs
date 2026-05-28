@@ -147,8 +147,8 @@ struct SymbolConfig {
 
 const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     symbol: "BTC_USDT",
-    binance_stream: "btcusdt@depth5@100ms",
-    num_levels: 5,
+    binance_stream: "btcusdt@depth10@100ms",
+    num_levels: 10,
     qty_per_level: 0.001,
     min_qty: 0.0001,
     price_tick: 0.1,

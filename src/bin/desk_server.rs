@@ -1134,17 +1134,10 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or("BTC_USDT").to_string();
                                 let symbol = if symbol.is_empty() { "BTC_USDT".to_string() } else { symbol };
 
-                                // Only broadcast complete (both-sided) snapshots.
-                                // When the book is momentarily empty or one-sided during a
-                                // market-maker cancel-replace cycle, re-broadcast the last
-                                // complete snapshot so the frontend never sees an empty book.
-                                let is_incomplete = nb == 0 || na == 0;
-                                if is_incomplete {
-                                    if let Some(last) = last_depth.get(&symbol) {
-                                        let j = last.to_string();
-                                        let market_tx2 = market_tx.clone();
-                                        rt.spawn(async move { let _ = market_tx2.send(j); });
-                                    }
+                                // Empty or one-sided snapshot: silently drop.
+                                // The frontend keeps its last rendered state — no need to
+                                // broadcast anything. Never send empty depth to clients.
+                                if nb == 0 || na == 0 {
                                     continue;
                                 }
 

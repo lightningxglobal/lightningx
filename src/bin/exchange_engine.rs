@@ -234,6 +234,9 @@ fn spawn_symbol_thread(
                                             )
                                         }
                                         OrderStatus::PartiallyFilled => {
+                                            // Order rests in book after partial fill — must track
+                                            // participant so cancel confirmations route correctly.
+                                            uid_map.insert(result.order_id, req.participant_id);
                                             OrderUpdateMsg::partial_fill(
                                                 result.order_id,
                                                 req.client_order_id,

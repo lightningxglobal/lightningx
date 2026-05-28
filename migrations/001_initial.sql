@@ -49,8 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_orders_created   ON orders(created_at DESC);
 CREATE TABLE IF NOT EXISTS trades (
     id              BIGSERIAL PRIMARY KEY,
     symbol          VARCHAR(20) NOT NULL,
-    buy_order_id    BIGINT NOT NULL REFERENCES orders(id),
-    sell_order_id   BIGINT NOT NULL REFERENCES orders(id),
+    buy_order_id    BIGINT NOT NULL,
+    sell_order_id   BIGINT NOT NULL,
     price           DOUBLE PRECISION NOT NULL,
     quantity        DOUBLE PRECISION NOT NULL,
     buy_fee         DOUBLE PRECISION NOT NULL DEFAULT 0,

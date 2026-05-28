@@ -22,7 +22,7 @@ struct SymbolConfig {
 }
 
 const SYMBOLS: &[SymbolConfig] = &[
-    SymbolConfig { symbol: "BTC_USDT", base_qty: 0.001 },
+    SymbolConfig { symbol: "BTC_USDT", base_qty: 0.003 },
 ];
 
 #[derive(Serialize)]
@@ -53,11 +53,11 @@ async fn login(http: &Client, base: &str) -> anyhow::Result<String> {
     Ok(resp.json::<LoginResponse>().await?.token)
 }
 
-/// Return a pseudo-random multiplier in [0.4, 1.6] based on seed.
+/// Return a pseudo-random multiplier in [1.0, 2.0] based on seed.
 /// Uses a simple LCG to avoid pulling in a rand crate.
 fn qty_jitter(seed: u64) -> f64 {
     let x = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-    0.4 + (x >> 58) as f64 / 10.0   // 0.4 + [0..15]/10 = 0.4..1.9, clamp below
+    1.0 + (x >> 60) as f64 / 15.0   // 1.0 + [0..15]/15 = [1.0, 2.0]
 }
 
 async fn place_market(http: &Client, base: &str, token: &str, symbol: &str, side: &str, qty: f64) {
@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
         let futs: Vec<_> = SYMBOLS.iter().enumerate().map(|(i, cfg)| {
             let jitter = qty_jitter(cycle.wrapping_add(i as u64 * 31337));
             let qty = (cfg.base_qty * jitter * 1e4).round() / 1e4;
-            let qty = qty.max(cfg.base_qty * 0.4);  // floor at 40% of base
+            let qty = qty.max(cfg.base_qty);  // floor at base_qty
             place_market(&http, &base, &token, cfg.symbol, side, qty)
         }).collect();
 

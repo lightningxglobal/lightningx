@@ -90,8 +90,8 @@ impl PollCallback for OrderInboundCallback {
                 }
             }
             2 => {
-                // CancelOrderRequest: header(8) + body(8) = 16字节
-                if data.len() >= 16 {
+                // CancelOrderRequest: header(8) + body(16) = 24字节
+                if data.len() >= 24 {
                     unsafe {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const CancelOrderRequest,
@@ -391,7 +391,7 @@ impl DeskOrderPublisher {
         &mut self,
         req: &crate::sbe::CancelOrderRequest,
     ) -> Result<(), crate::transport::TransportError> {
-        let mut data = [0u8; 16]; // 8 header + 8 body
+        let mut data = [0u8; 24]; // 8 header + 16 body
         crate::sbe::encode_cancel_order(req, &mut data)
             .map_err(|_| crate::transport::TransportError::BackPressured)?;
 
@@ -800,8 +800,8 @@ mod tests {
             dropped: dropped.clone(),
         };
 
-        let req = CancelOrderRequest { order_id: 9 };
-        let mut data = [0u8; 16];
+        let req = CancelOrderRequest { order_id: 9, participant_id: 42 };
+        let mut data = [0u8; 24];
         sbe::encode_cancel_order(&req, &mut data).unwrap();
 
         callback.on_data(&data);

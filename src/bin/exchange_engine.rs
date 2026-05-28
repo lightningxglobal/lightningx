@@ -299,18 +299,37 @@ fn spawn_symbol_thread(
                         InboundMsg::CancelOrder(req) => {
                             let ts = now_ns();
                             let cancel_oid: u64 = req.order_id;
-                            if let Ok(res) = engine.cancel_order(cancel_oid) {
-                                let participant_id = uid_map.remove(&cancel_oid).unwrap_or(0);
-                                let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
-                                    req.order_id,
-                                    0,
-                                    participant_id,
-                                    rules.lots_to_quantity(res.cancelled_quantity),
-                                    ts,
-                                ));
+                            match engine.cancel_order(cancel_oid) {
+                                Ok(res) => {
+                                    // Prefer uid_map; fall back to participant_id in the request
+                                    // (covers ghost orders never inserted into uid_map).
+                                    let participant_id = uid_map
+                                        .remove(&cancel_oid)
+                                        .unwrap_or(req.participant_id);
+                                    let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
+                                        req.order_id,
+                                        0,
+                                        participant_id,
+                                        rules.lots_to_quantity(res.cancelled_quantity),
+                                        ts,
+                                    ));
+                                }
+                                Err(_) => {
+                                    // Order not in this engine (wrong symbol or already gone).
+                                    // Send CANCELED with qty=0 so the caller can unblock.
+                                    // Use participant_id from the request — uid_map won't have it.
+                                    let participant_id = req.participant_id;
+                                    if participant_id != 0 {
+                                        let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
+                                            req.order_id,
+                                            0,
+                                            participant_id,
+                                            0.0,
+                                            ts,
+                                        ));
+                                    }
+                                }
                             }
-                            // If this engine doesn't own the order, cancel_order() returns Err
-                            // and we publish nothing — the correct symbol thread will handle it.
                         }
                     }
                 }

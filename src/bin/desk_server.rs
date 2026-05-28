@@ -296,6 +296,7 @@ async fn process_db_cmd(
                         let _ = tx.send(AeronCmd::Cancel(
                             lightning_exchange::sbe::CancelOrderRequest {
                                 order_id: id as u64,
+                                participant_id: user_id as u64,
                             },
                         ));
                     }

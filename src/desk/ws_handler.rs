@@ -1231,6 +1231,7 @@ async fn handle_client_message(
                 if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                     let cancel_req = crate::sbe::CancelOrderRequest {
                         order_id: order_id as u64,
+                        participant_id: user_id as u64,
                     };
                     if aeron_cmd_tx
                         .send(crate::transport::AeronCmd::Cancel(cancel_req))
@@ -1274,6 +1275,7 @@ async fn handle_client_message(
             } else if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 let cancel_req = crate::sbe::CancelOrderRequest {
                     order_id: order_id as u64,
+                    participant_id: user_id as u64,
                 };
                 let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(cancel_req));
             }
@@ -1770,7 +1772,10 @@ async fn batch_cancel_by_ids(
         if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
             let reqs: smallvec::SmallVec<[crate::sbe::CancelOrderRequest; 64]> = order_ids
                 .iter()
-                .map(|&id| crate::sbe::CancelOrderRequest { order_id: id as u64 })
+                .map(|&id| crate::sbe::CancelOrderRequest {
+                    order_id: id as u64,
+                    participant_id: user_id as u64,
+                })
                 .collect();
             return if aeron_cmd_tx
                 .send(crate::transport::AeronCmd::BatchCancel(reqs))
@@ -1917,6 +1922,7 @@ async fn bulk_cancel(
             for order in &rows {
                 reqs.push(crate::sbe::CancelOrderRequest {
                     order_id: order.id as u64,
+                    participant_id: user_id as u64,
                 });
             }
             return if aeron_cmd_tx

@@ -1044,6 +1044,7 @@ async fn handle_cancel_order(
         if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
             let cancel_req = crate::sbe::CancelOrderRequest {
                 order_id: order_id as u64,
+                participant_id: user_id as u64,
             };
             if aeron_cmd_tx.send(AeronCmd::Cancel(cancel_req)).is_err() {
                 return (
@@ -1104,6 +1105,7 @@ async fn handle_cancel_order(
         // Aeron mode: send cancel to exchange_engine via lock-free channel.
         let cancel_req = crate::sbe::CancelOrderRequest {
             order_id: order_id as u64,
+            participant_id: user_id as u64,
         };
         let _ = aeron_cmd_tx.send(AeronCmd::Cancel(cancel_req));
     }
@@ -1216,7 +1218,10 @@ async fn handle_cancel_all_orders(
         if let Some(aeron_cmd_tx) = &s.aeron_cmd_tx {
             let reqs: smallvec::SmallVec<[crate::sbe::CancelOrderRequest; 64]> = order_ids
                 .iter()
-                .map(|&id| crate::sbe::CancelOrderRequest { order_id: id as u64 })
+                .map(|&id| crate::sbe::CancelOrderRequest {
+                    order_id: id as u64,
+                    participant_id: user_id as u64,
+                })
                 .collect();
             let count = reqs.len();
             if aeron_cmd_tx.send(AeronCmd::BatchCancel(reqs)).is_ok() {

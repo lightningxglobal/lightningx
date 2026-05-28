@@ -63,9 +63,12 @@ static_assertions::const_assert_eq!(std::mem::size_of::<NewOrderRequest>(), 64);
 #[derive(Debug, Clone, Copy)]
 pub struct CancelOrderRequest {
     pub order_id: u64,
+    /// Who requested the cancel — needed to route the CANCELED/REJECTED ack back
+    /// even when the order is a ghost (never accepted, not in uid_map).
+    pub participant_id: u64,
 }
 
-static_assertions::const_assert_eq!(std::mem::size_of::<CancelOrderRequest>(), 8);
+static_assertions::const_assert_eq!(std::mem::size_of::<CancelOrderRequest>(), 16);
 
 // Outbound: 委托已接受
 #[repr(C, packed)]
@@ -176,12 +179,12 @@ pub fn encode_cancel_order(msg: &CancelOrderRequest, buf: &mut [u8]) -> Result<u
         return Err(());
     }
 
-    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_CANCEL_ORDER, 8));
+    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_CANCEL_ORDER, 16));
     let msg_bytes =
-        unsafe { std::slice::from_raw_parts(msg as *const CancelOrderRequest as *const u8, 8) };
-    buf[8..16].copy_from_slice(msg_bytes);
+        unsafe { std::slice::from_raw_parts(msg as *const CancelOrderRequest as *const u8, 16) };
+    buf[8..24].copy_from_slice(msg_bytes);
 
-    Ok(16)
+    Ok(24)
 }
 
 pub fn encode_accepted(msg: &OrderAccepted, buf: &mut [u8]) -> Result<usize, ()> {

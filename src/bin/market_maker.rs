@@ -351,9 +351,13 @@ fn on_exch_msg(
                 }
                 "CANCELED" => {
                     book.remove(order_id);
-                    let advance = if let QuoteState::Cancelling { to_confirm, .. } = state {
+                    let advance = if let QuoteState::Cancelling { to_confirm, started_at, .. } = state {
                         to_confirm.remove(&order_id);
-                        to_confirm.is_empty()
+                        if to_confirm.is_empty() {
+                            info!("[{}] all cancel acks received in {:.3}ms",
+                                cfg.symbol, started_at.elapsed().as_secs_f64() * 1000.0);
+                            true
+                        } else { false }
                     } else { false };
                     if advance {
                         let next_targets = if let QuoteState::Cancelling { next_targets, .. } =

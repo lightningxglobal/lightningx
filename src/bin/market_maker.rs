@@ -151,16 +151,16 @@ struct SymbolConfig {
 
 const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     symbol: "BTC_USDT",
-    binance_stream: "btcusdt@bookTicker",
+    binance_stream: "btcusdt@depth5@100ms",
     num_levels: 5,
     qty_per_level: 0.001,
     min_qty: 0.0001,
     price_tick: 0.1,
-    inner_half_spread_bps: 3.0,
-    level_spacing_bps: 2.0,
+    inner_half_spread_bps: 0.1,
+    level_spacing_bps: 0.5,
     max_position: 0.05,
-    skew_bps_per_unit: 5.0,
-    requote_threshold_bps: 1.0,
+    skew_bps_per_unit: 1.0,
+    requote_threshold_bps: 0.05,
 }];
 
 // ── REST helpers ──────────────────────────────────────────────────────────────
@@ -715,14 +715,13 @@ impl QuoteBook {
 
 struct TargetLevel {
     bid_price: f64,
+    bid_qty: f64,
     ask_price: f64,
-    qty: f64,
+    ask_qty: f64,
 }
 
 fn compute_target(mid: f64, inv: &Inventory, cfg: &SymbolConfig) -> Vec<TargetLevel> {
-    // Inventory skew: when long, shift spread downward to encourage selling.
     let skew = inv.position * cfg.skew_bps_per_unit / 10_000.0 * mid;
-
     let mut levels = Vec::with_capacity(cfg.num_levels);
     for i in 0..cfg.num_levels {
         let half_spread = (cfg.inner_half_spread_bps + i as f64 * cfg.level_spacing_bps) / 10_000.0;
@@ -731,7 +730,8 @@ fn compute_target(mid: f64, inv: &Inventory, cfg: &SymbolConfig) -> Vec<TargetLe
         if bid >= ask || bid <= 0.0 {
             continue;
         }
-        levels.push(TargetLevel { bid_price: bid, ask_price: ask, qty: cfg.qty_per_level.max(cfg.min_qty) });
+        let q = cfg.qty_per_level.max(cfg.min_qty);
+        levels.push(TargetLevel { bid_price: bid, bid_qty: q, ask_price: ask, ask_qty: q });
     }
     levels
 }
@@ -759,25 +759,36 @@ fn within_threshold(book: &QuoteBook, targets: &[TargetLevel], threshold_bps: f6
     true
 }
 
-// ── Binance bookTicker parser ─────────────────────────────────────────────────
+// ── Binance depth snapshot parser ────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct BookTicker {
+struct DepthUpdate {
     #[serde(rename = "b")]
-    bid: String,
+    bids: Vec<[String; 2]>,
     #[serde(rename = "a")]
-    ask: String,
+    asks: Vec<[String; 2]>,
 }
 
-fn parse_mid(text: &str) -> Option<f64> {
-    let t: BookTicker = serde_json::from_str(text).ok()?;
-    let bid: f64 = t.bid.parse().ok()?;
-    let ask: f64 = t.ask.parse().ok()?;
-    if bid > 0.0 && ask > bid {
-        Some((bid + ask) / 2.0)
-    } else {
-        None
+/// Parse Binance `@depth5@100ms` snapshot into TargetLevels.
+/// Bids are sorted descending, asks ascending — pair by index directly.
+fn parse_depth_snapshot(text: &str) -> Option<Vec<TargetLevel>> {
+    let d: DepthUpdate = serde_json::from_str(text).ok()?;
+    if d.bids.is_empty() || d.asks.is_empty() {
+        return None;
     }
+    let n = d.bids.len().min(d.asks.len());
+    let mut levels = Vec::with_capacity(n);
+    for i in 0..n {
+        let bid_price: f64 = d.bids[i][0].parse().ok()?;
+        let bid_qty: f64 = d.bids[i][1].parse().ok()?;
+        let ask_price: f64 = d.asks[i][0].parse().ok()?;
+        let ask_qty: f64 = d.asks[i][1].parse().ok()?;
+        if bid_price <= 0.0 || ask_price <= bid_price || bid_qty <= 0.0 || ask_qty <= 0.0 {
+            continue;
+        }
+        levels.push(TargetLevel { bid_price, bid_qty, ask_price, ask_qty });
+    }
+    if levels.is_empty() { None } else { Some(levels) }
 }
 
 // ── Apply exchange event ──────────────────────────────────────────────────────
@@ -865,13 +876,10 @@ async fn run_symbol(
                 OpCode::Close => break 'feed,
                 _ => continue,
             };
-            let mid = match parse_mid(&text) {
-                Some(m) => m,
+            let targets = match parse_depth_snapshot(&text) {
+                Some(t) => t,
                 None => continue,
             };
-
-            // ── compute target quotes ─────────────────────────────────────
-            let targets = compute_target(mid, &inv, cfg);
 
             // Skip if all quotes are already within threshold.
             if within_threshold(&book, &targets, cfg.requote_threshold_bps) {
@@ -883,10 +891,14 @@ async fn run_symbol(
             let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
             let avail_base = balance.get(base_asset).copied().unwrap_or(f64::NAN);
             let avail_quote = balance.get(quote_asset).copied().unwrap_or(f64::NAN);
+            let best_bid = targets.first().map(|t| t.bid_price).unwrap_or(0.0);
+            let best_ask = targets.first().map(|t| t.ask_price).unwrap_or(0.0);
+            let mid = (best_bid + best_ask) / 2.0;
             info!(
-                "[{}] mid={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  avail={:.4}{}/{:.2}{}  → re-quote",
+                "[{}] bid={:.1} ask={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  avail={:.4}{}/{:.2}{}  → re-quote",
                 cfg.symbol,
-                mid,
+                best_bid,
+                best_ask,
                 inv.position,
                 inv.realized_pnl,
                 inv.unrealized_pnl(mid),
@@ -941,8 +953,8 @@ async fn run_symbol(
             for (i, t) in targets.iter().enumerate() {
                 let bid_coid = format!("{}_{}", cfg.symbol, batch_counter_base + i as u64);
                 let ask_coid = format!("{}_{}_a", cfg.symbol, batch_counter_base + i as u64);
-                batch_orders.push((bid_coid, "buy", t.bid_price, t.qty));
-                batch_orders.push((ask_coid, "sell", t.ask_price, t.qty));
+                batch_orders.push((bid_coid, "buy", t.bid_price, t.bid_qty));
+                batch_orders.push((ask_coid, "sell", t.ask_price, t.ask_qty));
             }
 
             let batch_results = client.place_orders_batch(cfg.symbol, &batch_orders).await;
@@ -957,7 +969,7 @@ async fn run_symbol(
                                 order_id: id,
                                 side: "buy",
                                 price: t.bid_price,
-                                qty: t.qty,
+                                qty: t.bid_qty,
                                 filled: 0.0,
                             });
                         }
@@ -970,7 +982,7 @@ async fn run_symbol(
                                 order_id: id,
                                 side: "sell",
                                 price: t.ask_price,
-                                qty: t.qty,
+                                qty: t.ask_qty,
                                 filled: 0.0,
                             });
                         }
@@ -1338,7 +1350,7 @@ mod tests {
     // ── within_threshold tests ────────────────────────────────────────────────
 
     fn make_targets(bid: f64, ask: f64) -> Vec<TargetLevel> {
-        vec![TargetLevel { bid_price: bid, ask_price: ask, qty: 0.001 }]
+        vec![TargetLevel { bid_price: bid, bid_qty: 0.001, ask_price: ask, ask_qty: 0.001 }]
     }
 
     #[test]

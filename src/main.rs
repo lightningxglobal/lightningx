@@ -183,6 +183,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Recover active orders from DB back into engines so book state survives restarts.
     let max_order_id: u64 = {
+        // Fetch global max ID across all orders (not just active ones) so the
+        // next_order_id counter never reuses an ID from a previous session.
+        let global_max: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+
         let rows = sqlx::query_as::<_, DbOrder>(
             "SELECT * FROM orders WHERE status IN ('PENDING', 'TRADING') ORDER BY id ASC",
         )
@@ -190,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .unwrap_or_default();
 
-        let mut max_id: u64 = 0;
+        let mut max_id: u64 = global_max as u64;
         let mut restored = 0usize;
         let mut skipped = 0usize;
         for db_order in &rows {

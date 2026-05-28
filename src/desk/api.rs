@@ -113,10 +113,15 @@ async fn handle_register(
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
     match user_service::register(&s.db, req, ip).await {
         Ok(resp) => (StatusCode::CREATED, Json(json!(resp))),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        ),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("duplicate key") || msg.contains("unique constraint") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(json!({"error": msg})))
+        }
     }
 }
 

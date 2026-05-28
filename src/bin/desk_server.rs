@@ -889,6 +889,25 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                            AeronCmd::BatchNewOrder(reqs) => {
+                                // Publish all new orders in one tight inner loop so the engine
+                                // sees the entire batch before the next depth snapshot (10ms).
+                                for req in &reqs {
+                                    let sym = std::str::from_utf8(&req.symbol)
+                                        .unwrap_or("").trim_end_matches('\0');
+                                    remember_runtime_order(
+                                        &mut order_meta_cache,
+                                        req.client_order_id,
+                                        req.participant_id as i64,
+                                    );
+                                    if let Some(pub_) = order_pubs.get_mut(sym) {
+                                        let _ = pub_.publish_new_order(req);
+                                    }
+                                    if let Some(ref t) = spin_tracer {
+                                        t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
+                                    }
+                                }
+                            }
                         }
                     }
 

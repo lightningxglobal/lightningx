@@ -22,6 +22,9 @@ pub enum AeronCmd {
     Cancel(CancelOrderRequest),
     /// Batch-cancel: all requests published in one tight loop inside the spin thread.
     BatchCancel(smallvec::SmallVec<[CancelOrderRequest; 64]>),
+    /// Batch-new-order: all requests published in one tight loop so the engine
+    /// processes the entire batch before the next depth snapshot fires (10ms).
+    BatchNewOrder(smallvec::SmallVec<[NewOrderRequest; 32]>),
 }
 
 /// Order metadata stored by the WS handler so the Aeron event loop can

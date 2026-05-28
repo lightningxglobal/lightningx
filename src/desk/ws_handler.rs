@@ -1341,6 +1341,11 @@ async fn handle_client_message(
             // Cap batch at 40 orders.
             let orders = if orders.len() > 40 { &orders[..40] } else { &orders[..] };
             let mut results: Vec<serde_json::Value> = Vec::with_capacity(orders.len());
+            // Collect Aeron requests for the entire batch so all N orders are published
+            // in one tight loop, ensuring the engine sees them together before the next
+            // depth snapshot fires (~10ms).
+            let mut aeron_batch: smallvec::SmallVec<[crate::sbe::NewOrderRequest; 32]> =
+                smallvec::SmallVec::new();
 
             for order_val in orders {
                 let coid = order_val
@@ -1411,9 +1416,9 @@ async fn handle_client_message(
                 };
 
                 // ── Aeron fast path ──────────────────────────────────────────
-                if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+                if state.aeron_cmd_tx.is_some() {
                     use crate::sbe::NewOrderRequest as SbeNewOrder;
-                    use crate::transport::{AeronCmd, OrderMeta};
+                    use crate::transport::OrderMeta;
 
                     // Reject unknown symbols.
                     if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
@@ -1450,7 +1455,7 @@ async fn handle_client_message(
                             .map(|row| (base_asset, row, qty))
                     };
 
-                    let (reserved_asset, (reserved_bal, reserved_frz), reserved_amount) =
+                    let (reserved_asset, (reserved_bal, reserved_frz), _reserved_amount) =
                         match reservation {
                             Ok(v) => v,
                             Err(e) => {
@@ -1515,14 +1520,7 @@ async fn handle_client_message(
                         }),
                     );
 
-                    if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
-                        state.pending_meta.remove(&order_id);
-                        let _ = repo
-                            .release_frozen(user_id, reserved_asset, reserved_amount)
-                            .await;
-                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": "Aeron channel closed"}));
-                        continue;
-                    }
+                    aeron_batch.push(sbe_req);
 
                     results.push(json!({"client_order_id": coid, "order_id": order_id, "accepted": true}));
                     continue;
@@ -1721,6 +1719,13 @@ async fn handle_client_message(
                 }
 
                 results.push(json!({"client_order_id": coid, "order_id": db_order_id, "accepted": true}));
+            }
+
+            // Publish all Aeron orders in one shot after all DB freezes are done.
+            if !aeron_batch.is_empty() {
+                if let Some(ref aeron_cmd_tx) = state.aeron_cmd_tx {
+                    let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::BatchNewOrder(aeron_batch));
+                }
             }
 
             Some(

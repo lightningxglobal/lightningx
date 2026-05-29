@@ -20,7 +20,6 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 // ── WS connection helpers ─────────────────────────────────────────────────────
@@ -182,10 +181,12 @@ enum QuoteState {
         next_targets: Vec<TargetLevel>,
         started_at: std::time::Instant,
     },
-    /// All old orders confirmed cancelled; new batch sent to engine.
+    /// New batch sent; tracking individual OPEN (ACCEPTED) events per client_order_id.
+    /// Binance depth events that arrive while placing are ignored — the next depth
+    /// after transitioning back to Idle will re-evaluate via within_threshold.
     Placing {
-        batch_id: u64,
-        targets: Vec<TargetLevel>,
+        /// client_order_id → (side, price, qty) for each unconfirmed order.
+        awaiting: HashMap<String, (&'static str, f64, f64)>,
     },
 }
 
@@ -193,17 +194,38 @@ fn make_cancel_msg(ids: &[i64]) -> String {
     json!({"type": "batch_cancel", "order_ids": ids}).to_string()
 }
 
+/// Process-start nanoseconds used as a session prefix on every client_order_id
+/// so coids stay globally unique across MM restarts. The DB has a UNIQUE
+/// constraint on (user_id, client_order_id); without this prefix, a fresh MM
+/// session reusing "0", "1", "2"... silently fails to INSERT the order row,
+/// which later breaks the trades FK.
+static SESSION_PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn session_prefix() -> &'static str {
+    SESSION_PREFIX.get_or_init(|| {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("mm{}", ns)
+    })
+}
+
+/// Returns the WS message string and a map of client_order_id → (side, price, qty)
+/// used to correlate individual ACCEPTED ("OPEN") events back to our quotes.
 fn make_place_msg(
     symbol: &str,
     targets: &[TargetLevel],
-    batch_id: u64,
     order_counter: &mut u64,
-) -> String {
+) -> (String, HashMap<String, (&'static str, f64, f64)>) {
+    let prefix = session_prefix();
     let mut orders = Vec::with_capacity(targets.len() * 2);
+    let mut awaiting: HashMap<String, (&'static str, f64, f64)> =
+        HashMap::with_capacity(targets.len() * 2);
     for t in targets {
-        let bid_coid = order_counter.to_string();
+        let bid_coid = format!("{prefix}-{}", *order_counter);
         *order_counter += 1;
-        let ask_coid = order_counter.to_string();
+        let ask_coid = format!("{prefix}-{}", *order_counter);
         *order_counter += 1;
         orders.push(json!({
             "client_order_id": bid_coid,
@@ -213,6 +235,7 @@ fn make_place_msg(
             "price": t.bid_price,
             "qty": t.bid_qty,
         }));
+        awaiting.insert(bid_coid, ("buy", t.bid_price, t.bid_qty));
         orders.push(json!({
             "client_order_id": ask_coid,
             "symbol": symbol,
@@ -221,129 +244,235 @@ fn make_place_msg(
             "price": t.ask_price,
             "qty": t.ask_qty,
         }));
+        awaiting.insert(ask_coid, ("sell", t.ask_price, t.ask_qty));
     }
-    json!({"type": "place_orders", "batch_id": batch_id.to_string(), "orders": orders}).to_string()
+    (json!({"type": "place_orders", "orders": orders}).to_string(), awaiting)
 }
 
 // ── Exchange WS message handler ───────────────────────────────────────────────
 
-/// Returns false if the connection should be dropped (auth failure).
+/// Called when an order is definitively gone (CANCELED/FILLED/REJECTED).
+/// Removes it from the Cancelling to_confirm set; when the set empties, places next batch.
+fn confirm_cancel(
+    order_id: i64,
+    state: &mut QuoteState,
+    book: &mut QuoteBook,
+    cfg: &'static SymbolConfig,
+    order_counter: &mut u64,
+) -> Option<String> {
+    let done = if let QuoteState::Cancelling { to_confirm, .. } = state {
+        to_confirm.remove(&order_id);
+        to_confirm.is_empty()
+    } else {
+        false
+    };
+    if !done {
+        return None;
+    }
+    let targets = match std::mem::replace(state, QuoteState::Idle) {
+        QuoteState::Cancelling { next_targets, .. } => next_targets,
+        _ => return None,
+    };
+    if targets.is_empty() {
+        return None;
+    }
+    trigger_requote(targets, book, state, cfg, order_counter)
+}
+
+/// Returns `(continue, message_to_send)`.  `continue=false` drops the connection.
 fn on_exch_msg(
     text: &str,
     book: &mut QuoteBook,
     inv: &mut Inventory,
     balance: &mut HashMap<String, f64>,
     state: &mut QuoteState,
-    pending_targets: &mut Option<Vec<TargetLevel>>,
-    exch_tx: &mpsc::Sender<String>,
     cfg: &'static SymbolConfig,
-    batch_counter: &mut u64,
     order_counter: &mut u64,
-) -> bool {
+) -> (bool, Option<String>) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        _ => return true,
+        Err(_) => return (true, None),
     };
-    match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+    let msg_type = match v.get("type").and_then(|t| t.as_str()) {
+        Some(t) => t,
+        None => return (true, None),
+    };
+    match msg_type {
         "order_update" => {
-            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let status = match v.get("status").and_then(|s| s.as_str()) {
+                Some(s) => s,
+                None => { warn!("[{}] order_update missing status", cfg.symbol); return (true, None); }
+            };
             let order_id = match v.get("order_id").and_then(|i| i.as_i64()) {
                 Some(id) => id,
-                None => return true,
+                None => { warn!("[{}] order_update missing order_id", cfg.symbol); return (true, None); }
             };
-            let side_str = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            let price = v.get("price").and_then(|p| p.as_f64()).unwrap_or(0.0);
-            let filled = v.get("filled").and_then(|f| f.as_f64()).unwrap_or(0.0);
-            let quantity = v.get("quantity").and_then(|q| q.as_f64()).unwrap_or(0.0);
+            let client_order_id = v.get("client_order_id").and_then(|c| c.as_str()).map(|s| s.to_owned());
             match status {
+                "OPEN" => {
+                    // ACCEPTED: move from awaiting → active book.
+                    let coid = match client_order_id {
+                        Some(c) => c,
+                        None => { warn!("[{}] OPEN missing client_order_id for order {}", cfg.symbol, order_id); return (true, None); }
+                    };
+                    if let QuoteState::Placing { awaiting } = state {
+                        if let Some((side, price, qty)) = awaiting.remove(&coid) {
+                            if side == "buy" {
+                                book.bids.push(Quote { order_id, side: "buy", price, qty, filled: 0.0 });
+                                book.bids.sort_by(|a, b| b.price.total_cmp(&a.price));
+                            } else {
+                                book.asks.push(Quote { order_id, side: "sell", price, qty, filled: 0.0 });
+                                book.asks.sort_by(|a, b| a.price.total_cmp(&b.price));
+                            }
+                        }
+                        if awaiting.is_empty() {
+                            *state = QuoteState::Idle;
+                            info!("[{}] all quotes active: {}b {}a", cfg.symbol, book.bids.len(), book.asks.len());
+                        }
+                    }
+                    (true, None)
+                }
                 "PARTIALLY_FILLED" => {
-                    inv.apply_fill(order_id, &side_str, price, filled, false);
-                    if let Some(q) = book.find_mut(order_id) { q.filled = filled; }
+                    // Server does not send `side` — look it up from the book (order must be there).
+                    let side_str = match book.bids.iter().find(|q| q.order_id == order_id).map(|q| q.side)
+                        .or_else(|| book.asks.iter().find(|q| q.order_id == order_id).map(|q| q.side))
+                    {
+                        Some(s) => s,
+                        None => { warn!("[{}] PARTIALLY_FILLED order {} not in book", cfg.symbol, order_id); return (true, None); }
+                    };
+                    let filled_qty = match v.get("filled_qty").and_then(|f| f.as_f64()) {
+                        Some(f) => f,
+                        None => { warn!("[{}] PARTIALLY_FILLED missing filled_qty for order {}", cfg.symbol, order_id); return (true, None); }
+                    };
+                    let avg_price = match v.get("avg_price").and_then(|p| p.as_f64()) {
+                        Some(p) => p,
+                        None => { warn!("[{}] PARTIALLY_FILLED missing avg_price for order {}", cfg.symbol, order_id); return (true, None); }
+                    };
+                    inv.apply_fill(order_id, side_str, avg_price, filled_qty, false);
+                    if let Some(q) = book.find_mut(order_id) { q.filled = filled_qty; }
+                    (true, None)
                 }
                 "FILLED" => {
-                    inv.apply_fill(order_id, &side_str, price, quantity, true);
+                    // Server does not send `side` — look up from book, then awaiting (immediate fill).
+                    let side_str = book.bids.iter().find(|q| q.order_id == order_id).map(|q| q.side)
+                        .or_else(|| book.asks.iter().find(|q| q.order_id == order_id).map(|q| q.side))
+                        .or_else(|| {
+                            if let QuoteState::Placing { awaiting } = state {
+                                client_order_id.as_deref()
+                                    .and_then(|coid| awaiting.get(coid))
+                                    .map(|(side, _, _)| *side)
+                            } else { None }
+                        });
+                    let side_str = match side_str {
+                        Some(s) => s,
+                        None => { warn!("[{}] FILLED order {} unknown (not in book or awaiting)", cfg.symbol, order_id); return (true, None); }
+                    };
+                    let filled_qty = match v.get("filled_qty").and_then(|f| f.as_f64()) {
+                        Some(f) => f,
+                        None => { warn!("[{}] FILLED missing filled_qty for order {}", cfg.symbol, order_id); return (true, None); }
+                    };
+                    let avg_price = match v.get("avg_price").and_then(|p| p.as_f64()) {
+                        Some(p) => p,
+                        None => { warn!("[{}] FILLED missing avg_price for order {}", cfg.symbol, order_id); return (true, None); }
+                    };
+                    inv.apply_fill(order_id, side_str, avg_price, filled_qty, true);
+                    // Remove from awaiting if this order filled before we saw its OPEN ack.
+                    let placing_done = if let QuoteState::Placing { awaiting } = state {
+                        if let Some(coid) = &client_order_id {
+                            awaiting.remove(coid);
+                        }
+                        awaiting.is_empty()
+                    } else { false };
                     book.remove(order_id);
+                    if placing_done {
+                        // All pending acks resolved — go Idle; next depth will re-evaluate.
+                        *state = QuoteState::Idle;
+                        return (true, None);
+                    }
+                    // Filled while cancel was in flight — counts as a cancel confirmation.
+                    (true, confirm_cancel(order_id, state, book, cfg, order_counter))
                 }
                 "CANCELED" => {
                     book.remove(order_id);
-                    // If we're in cancel-wait phase, tick down and place when done.
-                    let all_confirmed = if let QuoteState::Cancelling { to_confirm, .. } = state {
-                        to_confirm.remove(&order_id);
-                        to_confirm.is_empty()
-                    } else { false };
-                    if all_confirmed {
-                        let targets = match std::mem::replace(state, QuoteState::Idle) {
-                            QuoteState::Cancelling { next_targets, .. } => next_targets,
-                            _ => vec![],
-                        };
-                        let bid = *batch_counter;
-                        *batch_counter += 1;
-                        let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
-                        *state = QuoteState::Placing { batch_id: bid, targets };
-                    }
+                    inv.order_fill_tracker.remove(&order_id);
+                    (true, confirm_cancel(order_id, state, book, cfg, order_counter))
                 }
                 "REJECTED" => {
+                    warn!("[{}] order {} REJECTED", cfg.symbol, order_id);
                     book.remove(order_id);
-                    warn!("[{}] order {} REJECTED by engine", cfg.symbol, order_id);
-                    // Note: cancel-REJECTED (order_id=0) cannot be matched; CANCEL_TIMEOUT handles it.
+                    inv.order_fill_tracker.remove(&order_id);
+                    // New-order rejected: remove from awaiting, check if entire batch is resolved.
+                    let placing_done = if let QuoteState::Placing { awaiting } = state {
+                        if let Some(coid) = &client_order_id {
+                            awaiting.remove(coid);
+                        }
+                        awaiting.is_empty()
+                    } else { false };
+                    if placing_done {
+                        *state = QuoteState::Idle;
+                        return (true, None);
+                    }
+                    // Cancel-REJECTED (order_id may be 0 on engine restart) — try confirm anyway.
+                    (true, confirm_cancel(order_id, state, book, cfg, order_counter))
                 }
-                _ => {}
+                _ => (true, None),
             }
         }
         "orders_placed" => {
-            let batch_id: u64 = match v.get("batch_id").and_then(|b| b.as_str()).and_then(|s| s.parse().ok()) {
-                Some(n) => n,
-                None => return true,
+            // Drain per-order rejections from the Placing awaiting map.
+            // Accepted orders will later arrive as individual OPEN (order_update) events.
+            let results = match v.get("results").and_then(|r| r.as_array()) {
+                Some(r) => r,
+                None => return (true, None),
             };
-            let expecting = matches!(state, QuoteState::Placing { batch_id: bid, .. } if *bid == batch_id);
-            if !expecting { return true; }
-            let targets = match std::mem::replace(state, QuoteState::Idle) {
-                QuoteState::Placing { targets, .. } => targets,
-                _ => vec![],
-            };
-            let results: Vec<(Option<i64>, bool)> = v.get("results").and_then(|r| r.as_array())
-                .map(|arr| arr.iter().map(|item| (
-                    item.get("order_id").and_then(|i| i.as_i64()),
-                    item.get("accepted").and_then(|a| a.as_bool()).unwrap_or(false),
-                )).collect())
-                .unwrap_or_default();
-            for (i, t) in targets.iter().enumerate() {
-                match results.get(i * 2) {
-                    Some(&(Some(id), true)) => book.bids.push(Quote { order_id: id, side: "buy", price: t.bid_price, qty: t.bid_qty, filled: 0.0 }),
-                    Some(&(_, false)) => warn!("[{}] bid rejected: price={:.1} qty={:.4}", cfg.symbol, t.bid_price, t.bid_qty),
-                    _ => {}
+            let placing_done = if let QuoteState::Placing { awaiting } = state {
+                for result in results {
+                    let accepted = match result.get("accepted").and_then(|a| a.as_bool()) {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                    if !accepted {
+                        if let Some(coid) = result.get("client_order_id").and_then(|c| c.as_str()) {
+                            if awaiting.remove(coid).is_some() {
+                                let reason = match result.get("reason").and_then(|r| r.as_str()) {
+                                    Some(r) => r,
+                                    None => "unknown",
+                                };
+                                warn!("[{}] order coid={} rejected at placement: {}", cfg.symbol, coid, reason);
+                            }
+                        }
+                    }
                 }
-                match results.get(i * 2 + 1) {
-                    Some(&(Some(id), true)) => book.asks.push(Quote { order_id: id, side: "sell", price: t.ask_price, qty: t.ask_qty, filled: 0.0 }),
-                    Some(&(_, false)) => warn!("[{}] ask rejected: price={:.1} qty={:.4}", cfg.symbol, t.ask_price, t.ask_qty),
-                    _ => {}
-                }
+                awaiting.is_empty()
+            } else { false };
+            if placing_done {
+                // Every order in the batch was rejected — go Idle; next depth event re-evaluates.
+                *state = QuoteState::Idle;
+                warn!("[{}] entire placement batch rejected, going idle", cfg.symbol);
             }
-            book.bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-            book.asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-            info!(
-                "[{}] quotes active: {}b {}a  (inner bid={:.1} ask={:.1})",
-                cfg.symbol, book.bids.len(), book.asks.len(),
-                book.bids.first().map(|q| q.price).unwrap_or(0.0),
-                book.asks.first().map(|q| q.price).unwrap_or(0.0),
-            );
-            if let Some(next) = pending_targets.take() {
-                trigger_requote(next, book, state, exch_tx, cfg, batch_counter, order_counter);
-            }
+            (true, None)
         }
         "balance_update" => {
-            let asset = v.get("asset").and_then(|a| a.as_str()).unwrap_or("").to_owned();
-            let available = v.get("available").and_then(|a| a.as_f64()).unwrap_or(0.0);
-            if !asset.is_empty() { balance.insert(asset, available); }
+            let asset = match v.get("asset").and_then(|a| a.as_str()) {
+                Some(a) => a.to_owned(),
+                None => { warn!("[{}] balance_update missing asset", cfg.symbol); return (true, None); }
+            };
+            let available = match v.get("available").and_then(|a| a.as_f64()) {
+                Some(a) => a,
+                None => { warn!("[{}] balance_update missing available", cfg.symbol); return (true, None); }
+            };
+            balance.insert(asset, available);
+            (true, None)
         }
         "auth_error" => {
-            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
-            warn!("[{}] WS auth failed: {msg} — reconnecting", cfg.symbol);
-            return false;
+            match v.get("message").and_then(|m| m.as_str()) {
+                Some(msg) => warn!("[{}] WS auth failed: {msg} — reconnecting", cfg.symbol),
+                None => warn!("[{}] WS auth failed — reconnecting", cfg.symbol),
+            }
+            (false, None)
         }
-        _ => {}
+        _ => (true, None),
     }
-    true
 }
 
 // ── Binance depth handler ─────────────────────────────────────────────────────
@@ -352,99 +481,121 @@ fn on_binance_depth(
     text: &str,
     book: &mut QuoteBook,
     inv: &mut Inventory,
-    balance: &mut HashMap<String, f64>,
+    balance: &HashMap<String, f64>,
     state: &mut QuoteState,
-    pending_targets: &mut Option<Vec<TargetLevel>>,
-    exch_tx: &mpsc::Sender<String>,
     cfg: &'static SymbolConfig,
-    batch_counter: &mut u64,
     order_counter: &mut u64,
-) {
+) -> Option<String> {
     let new_targets = match parse_depth_snapshot(text) {
         Some(t) => t,
-        None => return,
+        None => return None,
     };
-
     match state {
         QuoteState::Idle => {
-            if within_threshold(book, &new_targets, cfg.requote_threshold_bps) { return; }
-            let sym_parts: Vec<&str> = cfg.symbol.splitn(2, '_').collect();
-            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
-            let avail_base = balance.get(base_asset).copied().unwrap_or(f64::NAN);
-            let avail_quote = balance.get(quote_asset).copied().unwrap_or(f64::NAN);
-            let best_bid = new_targets.first().map(|t| t.bid_price).unwrap_or(0.0);
-            let best_ask = new_targets.first().map(|t| t.ask_price).unwrap_or(0.0);
-            let mid = (best_bid + best_ask) / 2.0;
+            let (base_asset, quote_asset) = match cfg.symbol.split_once('_') {
+                Some(parts) => parts,
+                None => { warn!("[{}] invalid symbol format", cfg.symbol); return None; }
+            };
+            let first = match new_targets.first() {
+                Some(t) => t,
+                None => return None,
+            };
+            let mid = (first.bid_price + first.ask_price) / 2.0;
+            if inv.position >= cfg.max_position || inv.position <= -cfg.max_position {
+                let our_targets = compute_target(mid, inv, cfg);
+                if within_threshold(book, &our_targets, cfg.requote_threshold_bps) {
+                    return None;
+                }
+                warn!("[{}] pos={:+.4} hit limit, cancelling all", cfg.symbol, inv.position);
+                return trigger_requote(vec![], book, state, cfg, order_counter);
+            }
+            let our_targets = compute_target(mid, inv, cfg);
+            if within_threshold(book, &our_targets, cfg.requote_threshold_bps) {
+                return None;
+            }
+            let avail_base = match balance.get(base_asset) {
+                Some(v) => format!("{v:.4}"),
+                None => "?".to_string(),
+            };
+            let avail_quote = match balance.get(quote_asset) {
+                Some(v) => format!("{v:.2}"),
+                None => "?".to_string(),
+            };
             info!(
-                "[{}] bid={:.1} ask={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  avail={:.4}{}/{:.2}{}  → re-quote",
-                cfg.symbol, best_bid, best_ask,
+                "[{}] bid={:.1} ask={:.1}  pos={:+.4}  rpnl={:+.2}  upnl={:+.2}  book={}b/{}a  avail={}{}/{}{} → re-quote",
+                cfg.symbol, first.bid_price, first.ask_price,
                 inv.position, inv.realized_pnl, inv.unrealized_pnl(mid),
                 book.bids.len(), book.asks.len(),
                 avail_base, base_asset, avail_quote, quote_asset,
             );
-            if inv.position >= cfg.max_position || inv.position <= -cfg.max_position {
-                warn!("[{}] position limit ({:+.4}), cancelling all", cfg.symbol, inv.position);
-                let ids = book.all_ids();
-                if !ids.is_empty() {
-                    let _ = exch_tx.try_send(make_cancel_msg(&ids));
-                }
-                return;
-            }
-            trigger_requote(new_targets, book, state, exch_tx, cfg, batch_counter, order_counter);
+            trigger_requote(our_targets, book, state, cfg, order_counter)
         }
         QuoteState::Cancelling { .. } => {
-            // Update to freshest prices while waiting for cancel acks.
-            let timed_out = {
-                if let QuoteState::Cancelling { next_targets, started_at, to_confirm } = &mut *state {
-                    *next_targets = new_targets.clone();
-                    if started_at.elapsed() >= CANCEL_TIMEOUT {
-                        warn!("[{}] cancel timeout ({} pending), forcing place", cfg.symbol, to_confirm.len());
-                        true
-                    } else {
-                        false
-                    }
-                } else { false }
+            // Refresh next_targets with the latest computed quote while waiting for cancel acks.
+            // Respect position limit: if over limit, keep next_targets empty (cancel without re-quote).
+            let mid = match new_targets.first() {
+                Some(t) => (t.bid_price + t.ask_price) / 2.0,
+                None => return None,
             };
+            let fresh = if inv.position >= cfg.max_position || inv.position <= -cfg.max_position {
+                vec![]
+            } else {
+                compute_target(mid, inv, cfg)
+            };
+            let timed_out = if let QuoteState::Cancelling { next_targets, started_at, to_confirm } = state {
+                *next_targets = fresh;
+                if started_at.elapsed() >= CANCEL_TIMEOUT {
+                    warn!("[{}] cancel timeout ({} pending), forcing place", cfg.symbol, to_confirm.len());
+                    true
+                } else {
+                    false
+                }
+            } else { false };
             if timed_out {
                 let targets = match std::mem::replace(state, QuoteState::Idle) {
                     QuoteState::Cancelling { next_targets, .. } => next_targets,
-                    _ => vec![],
+                    _ => return None,
                 };
-                let bid = *batch_counter;
-                *batch_counter += 1;
-                let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
-                *state = QuoteState::Placing { batch_id: bid, targets };
+                if targets.is_empty() {
+                    return None;
+                }
+                trigger_requote(targets, book, state, cfg, order_counter)
+            } else {
+                None
             }
         }
-        QuoteState::Placing { .. } => { *pending_targets = Some(new_targets); }
+        QuoteState::Placing { .. } => {
+            // Batch in flight — ignore; next depth after transitioning to Idle will re-evaluate.
+            None
+        }
     }
 }
 
+/// Returns the WS message to send (cancel batch or place batch), or None if nothing to do.
+/// Empty `targets` means cancel-all without subsequent re-quote (position limit hit).
 fn trigger_requote(
     targets: Vec<TargetLevel>,
     book: &mut QuoteBook,
     state: &mut QuoteState,
-    exch_tx: &mpsc::Sender<String>,
     cfg: &'static SymbolConfig,
-    batch_counter: &mut u64,
     order_counter: &mut u64,
-) {
+) -> Option<String> {
     let ids = book.all_ids();
     if ids.is_empty() {
-        // First quote — no existing orders, place immediately.
-        let bid = *batch_counter;
-        *batch_counter += 1;
-        let _ = exch_tx.try_send(make_place_msg(cfg.symbol, &targets, bid, order_counter));
-        *state = QuoteState::Placing { batch_id: bid, targets };
+        if targets.is_empty() {
+            *state = QuoteState::Idle;
+            return None;
+        }
+        let (msg, awaiting) = make_place_msg(cfg.symbol, &targets, order_counter);
+        *state = QuoteState::Placing { awaiting };
+        Some(msg)
     } else {
-        // Cancel first, place after all acks arrive.
-        let _ = exch_tx.try_send(make_cancel_msg(&ids));
         *state = QuoteState::Cancelling {
-            to_confirm: ids.into_iter().collect(),
+            to_confirm: ids.iter().cloned().collect(),
             next_targets: targets,
             started_at: std::time::Instant::now(),
         };
+        Some(make_cancel_msg(&ids))
     }
 }
 
@@ -518,6 +669,7 @@ struct Quote {
     order_id: i64,
     side: &'static str,
     price: f64,
+    #[allow(dead_code)]
     qty: f64,
     /// Filled quantity so far (updated from PartialFill events).
     filled: f64,
@@ -630,9 +782,6 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String) {
     let mut inv = Inventory::default();
     let mut book = QuoteBook::default();
     let mut balance: HashMap<String, f64> = HashMap::new();
-    let mut state = QuoteState::Idle;
-    let mut pending_targets: Option<Vec<TargetLevel>> = None;
-    let mut batch_counter: u64 = 0;
     let mut order_counter: u64 = 0;
 
     info!("[{}] market-maker started", cfg.symbol);
@@ -660,11 +809,10 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String) {
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
         }
-        // Reset local book; cancel stale engine orders from last session.
+        // Reset local book and state; cancel stale engine orders from last session.
         book.bids.clear();
         book.asks.clear();
-        state = QuoteState::Idle;
-        pending_targets = None;
+        let mut state = QuoteState::Idle;
         let cancel_sym = json!({"type":"cancel_symbol","symbol":cfg.symbol}).to_string();
         let _ = exch_ws.write_frame(Frame::text(Payload::Owned(cancel_sym.into_bytes()))).await;
 
@@ -683,21 +831,9 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String) {
         binance_ws.set_auto_pong(true);
         info!("[{}] Binance connected — dual-WS loop active", cfg.symbol);
 
-        // Internal outbox: handler functions queue messages here;
-        // the write arm drains them without borrow-conflict on exch_ws.
-        let (exch_tx, mut exch_rx) = mpsc::channel::<String>(256);
-
         'conn: loop {
             tokio::select! {
                 biased;
-
-                // ── Exchange WS: write pump ──────────────────────────────────
-                Some(msg) = exch_rx.recv() => {
-                    if exch_ws.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
-                        warn!("[{}] Exchange WS write error", cfg.symbol);
-                        break 'conn;
-                    }
-                }
 
                 // ── Exchange WS: inbound ─────────────────────────────────────
                 frame = exch_ws.read_frame() => {
@@ -706,8 +842,13 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String) {
                         Err(e) => { warn!("[{}] Exchange WS error: {e}", cfg.symbol); break 'conn; }
                         Ok(f) if f.opcode == OpCode::Text => {
                             if let Ok(text) = std::str::from_utf8(&f.payload) {
-                                if !on_exch_msg(text, &mut book, &mut inv, &mut balance, &mut state, &mut pending_targets, &exch_tx, cfg, &mut batch_counter, &mut order_counter) {
-                                    break 'conn;
+                                let (cont, msg) = on_exch_msg(text, &mut book, &mut inv, &mut balance, &mut state, cfg, &mut order_counter);
+                                if !cont { break 'conn; }
+                                if let Some(m) = msg {
+                                    if exch_ws.write_frame(Frame::text(Payload::Owned(m.into_bytes()))).await.is_err() {
+                                        warn!("[{}] Exchange WS write error", cfg.symbol);
+                                        break 'conn;
+                                    }
                                 }
                             }
                         }
@@ -722,7 +863,13 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String) {
                         Err(e) => { warn!("[{}] Binance error: {e}", cfg.symbol); break 'conn; }
                         Ok(f) if f.opcode == OpCode::Text => {
                             if let Ok(text) = std::str::from_utf8(&f.payload) {
-                                on_binance_depth(text, &mut book, &mut inv, &mut balance, &mut state, &mut pending_targets, &exch_tx, cfg, &mut batch_counter, &mut order_counter);
+                                let msg = on_binance_depth(text, &mut book, &mut inv, &balance, &mut state, cfg, &mut order_counter);
+                                if let Some(m) = msg {
+                                    if exch_ws.write_frame(Frame::text(Payload::Owned(m.into_bytes()))).await.is_err() {
+                                        warn!("[{}] Exchange WS write error", cfg.symbol);
+                                        break 'conn;
+                                    }
+                                }
                             }
                         }
                         _ => {}

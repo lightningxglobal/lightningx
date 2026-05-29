@@ -133,7 +133,10 @@ struct SymbolConfig {
 
 const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     symbol: "BTC_USDT",
-    binance_stream: "btcusdt@depth10@100ms",
+    // 20 levels × 2 sides = 40 orders per batch — matches the desk WS hard
+    // cap of 40 in ws_handler.rs PlaceOrders, so the full mirror lands in
+    // a single batch and a single Aeron publish.
+    binance_stream: "btcusdt@depth20@100ms",
     max_position: 5.0,
 }];
 

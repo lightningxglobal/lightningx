@@ -624,7 +624,7 @@ async fn handle_place_order(
             Ok(r) => r,
             Err(e) => {
                 let _ = sqlx::query(
-                    "UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1",
+                    "DELETE FROM orders WHERE id=$1",
                 )
                 .bind(db_order_id)
                 .execute(s.db.as_ref())
@@ -914,7 +914,7 @@ async fn handle_place_order(
         if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
             s.pending_orders.remove(&(db_order_id as u64));
             let _ =
-                sqlx::query("UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1")
+                sqlx::query("DELETE FROM orders WHERE id=$1")
                     .bind(db_order_id)
                     .execute(s.db.as_ref())
                     .await;
@@ -1072,8 +1072,7 @@ async fn handle_cancel_order(
     }
 
     let upd = sqlx::query(
-        "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
-         WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
+        "DELETE FROM orders WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
     )
     .bind(order_id)
     .bind(user_id)
@@ -1257,8 +1256,7 @@ async fn handle_cancel_all_orders(
 
         // Mark as CANCELLED in DB.
         let upd = sqlx::query(
-            "UPDATE orders SET status = 'CANCELED', updated_at = NOW()
-             WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
+            "DELETE FROM orders WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
         )
         .bind(row.id)
         .bind(user_id)

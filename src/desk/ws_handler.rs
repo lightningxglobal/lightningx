@@ -768,7 +768,7 @@ async fn handle_client_message(
                 match freeze_result {
                     Err(e) => {
                         let _ = sqlx::query(
-                            "UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1",
+                            "DELETE FROM orders WHERE id=$1",
                         )
                         .bind(db_order_id)
                         .execute(state.db.as_ref())
@@ -815,7 +815,7 @@ async fn handle_client_message(
                     Ok(r) => r,
                     Err(e) => {
                         let _ = sqlx::query(
-                            "UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1",
+                            "DELETE FROM orders WHERE id = $1",
                         )
                         .bind(db_order_id)
                         .execute(state.db.as_ref())
@@ -1283,7 +1283,7 @@ async fn handle_client_message(
 
             // Update DB status.
             let db_result = sqlx::query(
-                "UPDATE orders SET status = 'CANCELED', updated_at = NOW() WHERE id = $1",
+                "DELETE FROM orders WHERE id = $1",
             )
             .bind(order_id)
             .execute(state.db.as_ref())
@@ -1682,7 +1682,7 @@ async fn handle_client_message(
                 match freeze_result {
                     Err(e) => {
                         let _ = sqlx::query(
-                            "UPDATE orders SET status='REJECTED', updated_at=NOW() WHERE id=$1",
+                            "DELETE FROM orders WHERE id=$1",
                         )
                         .bind(db_order_id)
                         .execute(state.db.as_ref())
@@ -1720,7 +1720,7 @@ async fn handle_client_message(
                     Ok(r) => r,
                     Err(e) => {
                         let _ = sqlx::query(
-                            "UPDATE orders SET status = 'REJECTED', updated_at = NOW() WHERE id = $1",
+                            "DELETE FROM orders WHERE id = $1",
                         )
                         .bind(db_order_id)
                         .execute(state.db.as_ref())
@@ -1871,8 +1871,7 @@ async fn batch_cancel_by_ids(
     // Batch UPDATE all matching orders in one query.
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let _ = sqlx::query(
-        "UPDATE orders SET status='CANCELED', updated_at=NOW()
-         WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
+        "DELETE FROM orders WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
     )
     .bind(&ids[..])
     .execute(state.db.as_ref())
@@ -1992,8 +1991,7 @@ async fn bulk_cancel(
     // Batch UPDATE all matching orders in one query.
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let _ = sqlx::query(
-        "UPDATE orders SET status='CANCELED', updated_at=NOW()
-         WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
+        "DELETE FROM orders WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
     )
     .bind(&ids[..])
     .execute(state.db.as_ref())

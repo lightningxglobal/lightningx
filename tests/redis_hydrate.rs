@@ -13,8 +13,6 @@ use lightning_exchange::desk::redis_store::{
 };
 use redis::AsyncCommands;
 
-const TEST_USER_EMAIL: &str = "redis_hydrate_test@lightning.test";
-
 async fn try_connect() -> Option<(sqlx::PgPool, redis::aio::MultiplexedConnection)> {
     let pg_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@127.0.0.1:5432/mydb".to_string());
@@ -35,13 +33,13 @@ async fn try_connect() -> Option<(sqlx::PgPool, redis::aio::MultiplexedConnectio
     Some((pg, conn))
 }
 
-async fn ensure_test_user(pg: &sqlx::PgPool) -> sqlx::Result<i64> {
+async fn ensure_test_user(pg: &sqlx::PgPool, email: &str) -> sqlx::Result<i64> {
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO users (email, password_hash, full_name)
          VALUES ($1, 'x', 'Redis Hydrate Test')
          ON CONFLICT (email) DO UPDATE SET id = users.id RETURNING id",
     )
-    .bind(TEST_USER_EMAIL)
+    .bind(email)
     .fetch_one(pg)
     .await?;
     sqlx::query(
@@ -108,6 +106,7 @@ async fn seed_orders(
     Ok(active_ids)
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn hydrate_loads_active_orders_and_accounts() {
     let Some((pg, mut conn)) = try_connect().await else {
@@ -117,7 +116,7 @@ async fn hydrate_loads_active_orders_and_accounts() {
 
     // Clean slate.
     purge_all(&mut conn).await.unwrap();
-    let user_id = ensure_test_user(&pg).await.expect("ensure test user");
+    let user_id = ensure_test_user(&pg, &format!("rht_{}@lightning.test", uuid::Uuid::new_v4())).await.expect("ensure test user");
     let active_ids = seed_orders(&pg, user_id, 5, 4)
         .await
         .expect("seed orders");
@@ -192,6 +191,7 @@ async fn hydrate_loads_active_orders_and_accounts() {
         .ok();
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn purge_clears_everything_we_wrote() {
     let Some((pg, mut conn)) = try_connect().await else {
@@ -199,7 +199,7 @@ async fn purge_clears_everything_we_wrote() {
         return;
     };
 
-    let user_id = ensure_test_user(&pg).await.expect("ensure test user");
+    let user_id = ensure_test_user(&pg, &format!("rht_{}@lightning.test", uuid::Uuid::new_v4())).await.expect("ensure test user");
     seed_orders(&pg, user_id, 3, 0).await.expect("seed");
     hydrate_from_pg(&pg, &mut conn).await.expect("hydrate");
     assert!(is_hydrated(&mut conn).await.unwrap());

@@ -66,6 +66,7 @@ pub async fn hydrate_from_pg(
 ) -> anyhow::Result<HydrateStats> {
     let mut stats = HydrateStats::default();
 
+    let t_pg_orders = std::time::Instant::now();
     // 1) Active orders.
     let rows: Vec<(
         i64,
@@ -88,10 +89,11 @@ pub async fn hydrate_from_pg(
     )
     .fetch_all(pg)
     .await?;
+    let dt_pg_orders = t_pg_orders.elapsed();
 
+    let t_redis_orders = std::time::Instant::now();
     if !rows.is_empty() {
         let mut pipe = redis::pipe();
-        pipe.atomic();
         for (
             id,
             user_id,
@@ -136,17 +138,20 @@ pub async fn hydrate_from_pg(
         pipe.query_async::<()>(conn).await?;
         stats.orders = rows.len() as u64;
     }
+    let dt_redis_orders = t_redis_orders.elapsed();
 
+    let t_pg_acct = std::time::Instant::now();
     // 2) Accounts.
     let acct_rows: Vec<(i64, String, f64, f64)> = sqlx::query_as(
         "SELECT user_id, asset, balance, frozen FROM accounts",
     )
     .fetch_all(pg)
     .await?;
+    let dt_pg_acct = t_pg_acct.elapsed();
 
+    let t_redis_acct = std::time::Instant::now();
     if !acct_rows.is_empty() {
         let mut pipe = redis::pipe();
-        pipe.atomic();
         for (user_id, asset, balance, frozen) in &acct_rows {
             pipe.hset_multiple(
                 key_account(*user_id, asset),
@@ -161,36 +166,36 @@ pub async fn hydrate_from_pg(
         pipe.query_async::<()>(conn).await?;
         stats.accounts = acct_rows.len() as u64;
     }
+    let dt_redis_acct = t_redis_acct.elapsed();
+
+    tracing::info!(
+        "hydrate timings: PG orders={:?} ({} rows), Redis orders write={:?}, PG accounts={:?} ({} rows), Redis accounts write={:?}",
+        dt_pg_orders, rows.len(), dt_redis_orders,
+        dt_pg_acct, acct_rows.len(), dt_redis_acct,
+    );
 
     Ok(stats)
 }
 
 /// Wipe every key managed by this module — used by tests and by an explicit
-/// re-hydrate command (`redis-writer --rehydrate`). Walks `active_orders`
-/// and `user_assets` to find dependent keys; does NOT call FLUSHALL.
+/// re-hydrate (`FORCE_REHYDRATE`). Walks `active_orders` and `user_assets`
+/// to find dependent keys, then issues all DELs in a single pipeline.
+/// Does NOT call FLUSHALL.
 pub async fn purge_all(
     conn: &mut redis::aio::MultiplexedConnection,
 ) -> anyhow::Result<()> {
+    // Phase 1 — read all the index keys (one pipelined batch). After this
+    // we know every key to delete; no more SCAN/SMEMBERS needed.
     let order_ids: Vec<i64> = conn.smembers(KEY_ACTIVE_ORDERS).await.unwrap_or_default();
-    let mut user_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for id in &order_ids {
-        let user_id: Option<i64> = conn.hget(key_order(*id), "user_id").await.unwrap_or(None);
-        if let Some(uid) = user_id {
-            user_ids.insert(uid);
-        }
-        let _: i64 = conn.del(key_order(*id)).await.unwrap_or(0);
-    }
-    let _: i64 = conn.del(KEY_ACTIVE_ORDERS).await.unwrap_or(0);
-    // Find every (user_id, asset) by scanning user_assets and READING the
-    // set members BEFORE deleting any keys — earlier we deleted user_assets:*
-    // before SMEMBERS could read them, leaving acct:{uid}:{asset} hashes orphaned.
-    let mut scan_cursor: redis::AsyncIter<String> =
-        conn.scan_match("user_assets:*").await?;
+
+    let mut scan_cursor: redis::AsyncIter<String> = conn.scan_match("user_assets:*").await?;
     let mut user_asset_keys: Vec<String> = Vec::new();
     while let Some(k) = scan_cursor.next_item().await {
         user_asset_keys.push(k);
     }
     drop(scan_cursor);
+
+    let mut user_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     for k in &user_asset_keys {
         if let Some(rest) = k.strip_prefix("user_assets:") {
             if let Ok(uid) = rest.parse::<i64>() {
@@ -198,22 +203,56 @@ pub async fn purge_all(
             }
         }
     }
-    // First pass: collect assets per user, then delete the per-asset hashes.
-    for uid in &user_ids {
-        let assets: Vec<String> = conn
-            .smembers(key_user_assets(*uid))
-            .await
-            .unwrap_or_default();
+
+    // Read user_id for every active order + the asset list per user — pipelined.
+    let (order_user_ids, assets_per_user): (Vec<Option<i64>>, Vec<Vec<String>>) = {
+        let mut pipe = redis::pipe();
+        for id in &order_ids {
+            pipe.hget(key_order(*id), "user_id");
+        }
+        let oids: Vec<Option<i64>> = if order_ids.is_empty() {
+            Vec::new()
+        } else {
+            pipe.query_async(conn).await.unwrap_or_default()
+        };
+
+        let mut pipe = redis::pipe();
+        let user_id_list: Vec<i64> = user_ids.iter().copied().collect();
+        for uid in &user_id_list {
+            pipe.smembers(key_user_assets(*uid));
+        }
+        let assets: Vec<Vec<String>> = if user_id_list.is_empty() {
+            Vec::new()
+        } else {
+            pipe.query_async(conn).await.unwrap_or_default()
+        };
+        // Persist user_id order so the asset list maps back correctly.
+        // We'll iterate via zip below.
+        (oids, assets)
+    };
+
+    for uid in order_user_ids.into_iter().flatten() {
+        user_ids.insert(uid);
+    }
+    let user_id_list: Vec<i64> = user_ids.iter().copied().collect();
+
+    // Phase 2 — fire every DEL in one pipeline.
+    let mut pipe = redis::pipe();
+    for id in &order_ids {
+        pipe.del(key_order(*id)).ignore();
+    }
+    pipe.del(KEY_ACTIVE_ORDERS).ignore();
+    for (uid, assets) in user_id_list.iter().zip(assets_per_user.iter()) {
         for asset in assets {
-            let _: i64 = conn.del(key_account(*uid, &asset)).await.unwrap_or(0);
+            pipe.del(key_account(*uid, asset)).ignore();
         }
     }
-    // Second pass: tear down the index keys themselves.
-    for uid in &user_ids {
-        let _: i64 = conn.del(key_user_orders(*uid)).await.unwrap_or(0);
-        let _: i64 = conn.del(key_user_coid(*uid)).await.unwrap_or(0);
-        let _: i64 = conn.del(key_user_assets(*uid)).await.unwrap_or(0);
+    for uid in &user_id_list {
+        pipe.del(key_user_orders(*uid)).ignore();
+        pipe.del(key_user_coid(*uid)).ignore();
+        pipe.del(key_user_assets(*uid)).ignore();
     }
+    pipe.query_async::<()>(conn).await?;
     Ok(())
 }
 

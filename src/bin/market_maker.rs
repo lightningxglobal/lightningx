@@ -151,6 +151,36 @@ struct DepthUpdate {
 }
 
 // ── Quote state machine ───────────────────────────────────────────────────────
+//
+// Current design: full cancel-all → full place-all per cycle. Only one batch
+// is in flight at any moment (Cancelling or Placing). Binance updates that
+// arrive mid-cycle just overwrite `next_targets` and are merged on the next
+// cycle, so the effective follow rate is capped at 1 / cycle_time ≈ 7-10 Hz —
+// good enough to mirror Binance's 10 Hz @depth20@100ms but not better.
+//
+// TODO: incremental order updates. Diff the current book against the new
+// Binance snapshot per level (price + qty), then send only:
+//   * cancel for levels whose price disappeared / shifted
+//   * new place for levels whose price is now in-band but wasn't before
+//   * (engine doesn't support edit-in-place, so a qty-only change is still
+//     cancel+place at the same price)
+// Expected wins:
+//   * Burst < 40 cancels + < 40 places per cycle; typical steady-state is
+//     only 1-3 levels move per Binance tick, so ~5-10x less Aeron traffic.
+//   * Cycle time shrinks from "wait for all 40 cancels" down to "wait for
+//     just the levels we touched", which lifts the follow-rate ceiling
+//     toward the full 10 Hz Binance cadence even on a slow link.
+// Cost:
+//   * Need a per-cycle diff routine over (price, qty) tuples on both sides.
+//   * State machine becomes (price → in-flight-cancel-id) and
+//     (price → in-flight-place-coid) maps instead of two HashSets, plus
+//     careful handling of fills during a partial-cycle (an OPEN may arrive
+//     after we already decided to cancel that level on the next tick).
+//   * Risk of the local book drifting from the engine's book if any single
+//     incremental cancel or place is silently dropped — current full-cycle
+//     design self-heals every cycle.
+// Worth doing only if we ever raise the follow-rate target above ~10 Hz or
+// reduce wire/CPU traffic becomes a goal.
 
 enum QuoteState {
     Idle,

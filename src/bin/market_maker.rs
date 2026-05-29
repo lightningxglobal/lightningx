@@ -118,30 +118,17 @@ fn robot_api_key() -> String {
 /// How long to wait for cancel confirmations before forcing placement (engine-restart safety).
 const CANCEL_TIMEOUT: Duration = Duration::from_millis(800);
 
-/// Per-symbol quoting parameters — all tunable without code changes.
+/// Per-symbol quoting parameters. This MM mirrors Binance depth verbatim
+/// (price + qty per level) — there is no spread, skew, or qty munging.
+/// The only knobs are the upstream Binance stream, a hard position limit
+/// for safety, and how much price drift triggers a re-quote.
 struct SymbolConfig {
     /// Our exchange symbol (e.g. "BTC_USDT").
     symbol: &'static str,
     /// Binance futures stream.  bookTicker gives real-time best bid/ask.
     binance_stream: &'static str,
-    /// Number of bid + ask levels to maintain simultaneously.
-    num_levels: usize,
-    /// Base quantity per level (in base currency).
-    qty_per_level: f64,
-    /// Minimum allowed order quantity.
-    min_qty: f64,
-    /// Price rounding tick (e.g. 0.1 for BTC/USDT).
-    price_tick: f64,
-    /// Half-spread for the innermost (tightest) level, in basis points.
-    /// Inner bid = mid * (1 - inner_half_spread), inner ask = mid * (1 + inner_half_spread).
-    inner_half_spread_bps: f64,
-    /// Additional bps widening per level further from mid.
-    level_spacing_bps: f64,
     /// Hard position limit (base currency, both long and short).
     max_position: f64,
-    /// Inventory skew: shifts the entire spread by this many bps per unit of
-    /// net long inventory.  Long → shift down (buy less, sell more).
-    skew_bps_per_unit: f64,
     /// Re-quote threshold: only trigger cancel-replace when any quote price
     /// has drifted by more than this many bps from its target.
     requote_threshold_bps: f64,
@@ -150,14 +137,7 @@ struct SymbolConfig {
 const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     symbol: "BTC_USDT",
     binance_stream: "btcusdt@depth10@100ms",
-    num_levels: 10,
-    qty_per_level: 0.001,
-    min_qty: 0.0001,
-    price_tick: 0.1,
-    inner_half_spread_bps: 0.1,
-    level_spacing_bps: 0.5,
     max_position: 5.0,
-    skew_bps_per_unit: 1.0,
     requote_threshold_bps: 0.05,
 }];
 
@@ -492,6 +472,10 @@ fn on_binance_depth(
     };
     match state {
         QuoteState::Idle => {
+            // Mirror Binance depth verbatim: every level's price AND qty is
+            // forwarded as-is. This MM exists to exercise the matching system
+            // with realistic flow, not to make money — so no spread, no skew,
+            // no qty munging. Position limit is the only safety wired here.
             let (base_asset, quote_asset) = match cfg.symbol.split_once('_') {
                 Some(parts) => parts,
                 None => { warn!("[{}] invalid symbol format", cfg.symbol); return None; }
@@ -501,17 +485,12 @@ fn on_binance_depth(
                 None => return None,
             };
             let mid = (first.bid_price + first.ask_price) / 2.0;
+            if within_threshold(book, &new_targets, cfg.requote_threshold_bps) {
+                return None;
+            }
             if inv.position >= cfg.max_position || inv.position <= -cfg.max_position {
-                let our_targets = compute_target(mid, inv, cfg);
-                if within_threshold(book, &our_targets, cfg.requote_threshold_bps) {
-                    return None;
-                }
                 warn!("[{}] pos={:+.4} hit limit, cancelling all", cfg.symbol, inv.position);
                 return trigger_requote(vec![], book, state, cfg, order_counter);
-            }
-            let our_targets = compute_target(mid, inv, cfg);
-            if within_threshold(book, &our_targets, cfg.requote_threshold_bps) {
-                return None;
             }
             let avail_base = match balance.get(base_asset) {
                 Some(v) => format!("{v:.4}"),
@@ -528,19 +507,16 @@ fn on_binance_depth(
                 book.bids.len(), book.asks.len(),
                 avail_base, base_asset, avail_quote, quote_asset,
             );
-            trigger_requote(our_targets, book, state, cfg, order_counter)
+            trigger_requote(new_targets, book, state, cfg, order_counter)
         }
         QuoteState::Cancelling { .. } => {
-            // Refresh next_targets with the latest computed quote while waiting for cancel acks.
-            // Respect position limit: if over limit, keep next_targets empty (cancel without re-quote).
-            let mid = match new_targets.first() {
-                Some(t) => (t.bid_price + t.ask_price) / 2.0,
-                None => return None,
-            };
+            // Refresh next_targets with the latest Binance snapshot while waiting
+            // for cancel acks. Respect position limit by clearing targets so
+            // confirm_cancel falls through to Idle without re-quoting.
             let fresh = if inv.position >= cfg.max_position || inv.position <= -cfg.max_position {
                 vec![]
             } else {
-                compute_target(mid, inv, cfg)
+                new_targets.clone()
             };
             let timed_out = if let QuoteState::Cancelling { next_targets, started_at, to_confirm } = state {
                 *next_targets = fresh;
@@ -711,26 +687,6 @@ struct TargetLevel {
     bid_qty: f64,
     ask_price: f64,
     ask_qty: f64,
-}
-
-fn compute_target(mid: f64, inv: &Inventory, cfg: &SymbolConfig) -> Vec<TargetLevel> {
-    let skew = inv.position * cfg.skew_bps_per_unit / 10_000.0 * mid;
-    let mut levels = Vec::with_capacity(cfg.num_levels);
-    for i in 0..cfg.num_levels {
-        let half_spread = (cfg.inner_half_spread_bps + i as f64 * cfg.level_spacing_bps) / 10_000.0;
-        let bid = round_tick(mid * (1.0 - half_spread) - skew, cfg.price_tick);
-        let ask = round_tick(mid * (1.0 + half_spread) - skew, cfg.price_tick);
-        if bid >= ask || bid <= 0.0 {
-            continue;
-        }
-        let q = cfg.qty_per_level.max(cfg.min_qty);
-        levels.push(TargetLevel { bid_price: bid, bid_qty: q, ask_price: ask, ask_qty: q });
-    }
-    levels
-}
-
-fn round_tick(price: f64, tick: f64) -> f64 {
-    (price / tick).round() * tick
 }
 
 /// True if all current quotes are within threshold of their targets.
@@ -915,98 +871,6 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── compute_target tests ──────────────────────────────────────────────────
-
-    fn default_cfg() -> &'static SymbolConfig {
-        &SYMBOLS[0]
-    }
-
-    fn zero_inv() -> Inventory {
-        Inventory::default()
-    }
-
-    #[test]
-    fn test_compute_target_bid_below_ask() {
-        let cfg = default_cfg();
-        let inv = zero_inv();
-        let levels = compute_target(50000.0, &inv, cfg);
-        for t in &levels {
-            assert!(t.bid_price < t.ask_price, "bid must be below ask");
-        }
-    }
-
-    #[test]
-    fn test_compute_target_num_levels() {
-        let cfg = default_cfg();
-        let inv = zero_inv();
-        let levels = compute_target(50000.0, &inv, cfg);
-        // All levels should be present (mid is high enough that none are dropped).
-        assert_eq!(levels.len(), cfg.num_levels);
-    }
-
-    #[test]
-    fn test_compute_target_skew_shifts_down_when_long() {
-        let cfg = default_cfg();
-        let mut inv_long = Inventory::default();
-        inv_long.position = 0.1; // long position
-        let inv_flat = zero_inv();
-        let mid = 50000.0;
-        let levels_long = compute_target(mid, &inv_long, cfg);
-        let levels_flat = compute_target(mid, &inv_flat, cfg);
-        // Long inventory shifts bids downward.
-        assert!(
-            levels_long[0].bid_price < levels_flat[0].bid_price,
-            "long position should shift bid down"
-        );
-    }
-
-    #[test]
-    fn test_compute_target_skew_shifts_up_when_short() {
-        let cfg = default_cfg();
-        let mut inv_short = Inventory::default();
-        inv_short.position = -0.1; // short position
-        let inv_flat = zero_inv();
-        let mid = 50000.0;
-        let levels_short = compute_target(mid, &inv_short, cfg);
-        let levels_flat = compute_target(mid, &inv_flat, cfg);
-        // Short inventory shifts asks upward (skew is negative, so -skew pushes ask up).
-        assert!(
-            levels_short[0].ask_price > levels_flat[0].ask_price,
-            "short position should shift ask up"
-        );
-    }
-
-    #[test]
-    fn test_compute_target_level_spacing() {
-        let cfg = default_cfg();
-        let inv = zero_inv();
-        let levels = compute_target(50000.0, &inv, cfg);
-        // Each successive level should have a wider spread than the previous.
-        for i in 1..levels.len() {
-            let spread_inner = levels[i - 1].ask_price - levels[i - 1].bid_price;
-            let spread_outer = levels[i].ask_price - levels[i].bid_price;
-            assert!(
-                spread_outer >= spread_inner,
-                "outer levels must be wider than inner"
-            );
-        }
-    }
-
-    // ── round_tick tests ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_round_tick_rounds_to_nearest() {
-        assert!((round_tick(100.15, 0.1) - 100.2).abs() < 1e-9);
-        assert!((round_tick(100.14, 0.1) - 100.1).abs() < 1e-9);
-        assert!((round_tick(50001.3, 0.5) - 50001.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_round_tick_zero_tick() {
-        // tick=0 should not panic; result is NaN or inf but no panic.
-        let _ = round_tick(100.0, 0.0);
-    }
 
     // ── parse_depth_snapshot tests ────────────────────────────────────────────
 

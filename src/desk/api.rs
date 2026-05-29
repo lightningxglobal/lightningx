@@ -50,6 +50,14 @@ pub struct AppState {
     pub pending_orders: Arc<DashMap<u64, oneshot::Sender<OrderUpdateMsg>>>,
     /// Last known depth per symbol from Aeron push (desk_server mode only).
     pub last_depth: Arc<DashMap<String, serde_json::Value>>,
+    /// Last broadcast ticker payload per symbol (JSON string ready to send).
+    /// Pushed to new subscribers of `ticker.{symbol}` so they don't wait
+    /// for the next periodic tick to see 24h stats.
+    pub last_ticker: Arc<DashMap<String, String>>,
+    /// Last trade price per symbol — updated on every `SettleTrade`. Drives the
+    /// `last` field of broadcast tickers (which used to use best bid, causing
+    /// the order-book center price to lag the recent-trades feed).
+    pub last_trade_price: Arc<DashMap<String, f64>>,
     /// Latency tracer checkpoints (desk-server side). None in standalone mode.
     pub tracer: Option<Arc<ExchangeTracer>>,
     /// In-memory account balances: read path never touches DB after initial load.

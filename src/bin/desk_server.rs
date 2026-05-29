@@ -187,6 +187,7 @@ async fn process_db_cmd(
     account_cache: lightning_exchange::api::AccountCache,
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
     market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
 ) {
     use lightning_exchange::account_repository::AccountRepository;
@@ -217,7 +218,12 @@ async fn process_db_cmd(
             let side_str = if side == 0 { "buy" } else { "sell" };
             let status_str = db_cmd::status_str(status);
 
-            let _ = sqlx::query(
+            // INSERT (or UPDATE on id conflict). If the caller-supplied
+            // client_order_id collides with another row of the same user
+            // (UNIQUE (user_id, client_order_id) WHERE client_order_id IS NOT NULL),
+            // retry once with client_order_id=NULL — losing the coid annotation
+            // is acceptable; silently dropping the entire order row is not.
+            if let Err(e) = sqlx::query(
                 "INSERT INTO orders \
                  (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
@@ -226,8 +232,31 @@ async fn process_db_cmd(
             .bind(id).bind(user_id).bind(sym_str)
             .bind(side_str).bind(ot_str)
             .bind(price).bind(qty).bind(filled).bind(status_str).bind(freeze_price)
-            .bind(coid_str)
-            .execute(db.as_ref()).await;
+            .bind(coid_str.clone())
+            .execute(db.as_ref()).await
+            {
+                let is_coid_conflict = e.as_database_error()
+                    .and_then(|de| de.constraint())
+                    .map(|c| c.contains("client_order_id"))
+                    .unwrap_or(false);
+                if is_coid_conflict {
+                    if let Err(e2) = sqlx::query(
+                        "INSERT INTO orders \
+                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL) \
+                         ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()",
+                    )
+                    .bind(id).bind(user_id).bind(sym_str)
+                    .bind(side_str).bind(ot_str)
+                    .bind(price).bind(qty).bind(filled).bind(status_str).bind(freeze_price)
+                    .execute(db.as_ref()).await
+                    {
+                        tracing::error!("orders insert failed (retry without coid) id={id} user={user_id}: {e2}");
+                    }
+                } else {
+                    tracing::error!("orders insert failed id={id} user={user_id}: {e}");
+                }
+            }
 
             if do_freeze {
                 let repo = AccountRepository::new(&db);
@@ -440,6 +469,9 @@ async fn process_db_cmd(
                 r#"{{"type":"trade","symbol":"{symbol}","price":{price},"qty":{qty},"side":"{side_str}","ts":{ts}}}"#
             );
             let _ = market_tx.send(trade_msg);
+            // Record last trade price so the ticker `last` field reflects the
+            // most recent execution (not best bid).
+            last_trade_price.insert(symbol.clone(), price);
 
             // Resolve UIDs if cache missed.
             if taker_uid == 0 {
@@ -635,6 +667,7 @@ fn spawn_db_worker(
     account_cache: lightning_exchange::api::AccountCache,
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
     market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
 ) {
     std::thread::Builder::new()
@@ -650,8 +683,9 @@ fn spawn_db_worker(
                     let ac2 = account_cache.clone();
                     let ut2 = user_tx.clone();
                     let mt2 = market_tx.clone();
+                    let ltp2 = last_trade_price.clone();
                     let at2 = aeron_cancel_tx.clone();
-                    rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, at2));
+                    rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, ltp2, at2));
                 }
                 if !did_work {
                     idle_us = (idle_us * 2 + 10).min(200);
@@ -807,6 +841,8 @@ async fn main() -> anyhow::Result<()> {
         pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
+        last_ticker: Arc::new(DashMap::new()),
+        last_trade_price: Arc::new(DashMap::new()),
         tracer: tracer.clone(),
         account_cache: account_cache.clone(),
         valid_symbols: Arc::new(valid_symbols),
@@ -821,6 +857,7 @@ async fn main() -> anyhow::Result<()> {
         account_cache.clone(),
         state.user_tx.clone(),
         state.market_tx.clone(),
+        state.last_trade_price.clone(),
         Some(db_worker_aeron_tx),
     );
 

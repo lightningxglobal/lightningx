@@ -330,6 +330,8 @@ async fn main() -> anyhow::Result<()> {
         pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
+        last_ticker: Arc::new(DashMap::new()),
+        last_trade_price: Arc::new(DashMap::new()),
         tracer: None,
         account_cache: AccountCache::default(),
         valid_symbols: Arc::new(std::collections::HashSet::new()),

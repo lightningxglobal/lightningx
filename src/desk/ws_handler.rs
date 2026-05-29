@@ -342,11 +342,15 @@ async fn handle_client_message(
         }
 
         ClientMsg::Subscribe { channels } => {
-            // Collect depth symbols before moving `channels` into the subscribed set,
-            // so we can push an immediate snapshot for each new depth.* channel.
+            // Collect depth + ticker symbols before moving `channels` into the
+            // subscribed set, so we can push an immediate snapshot for each.
             let depth_symbols: Vec<String> = channels
                 .iter()
                 .filter_map(|c| c.strip_prefix("depth.").map(str::to_string))
+                .collect();
+            let ticker_symbols: Vec<String> = channels
+                .iter()
+                .filter_map(|c| c.strip_prefix("ticker.").map(str::to_string))
                 .collect();
             for ch in channels {
                 session.subscribed.insert(ch);
@@ -359,6 +363,11 @@ async fn handle_client_message(
                     }
                 } else if let Some(depth_json) = state.last_depth.get(&sym) {
                     let _ = personal_tx.try_send(depth_json.to_string());
+                }
+            }
+            for sym in ticker_symbols {
+                if let Some(payload) = state.last_ticker.get(&sym) {
+                    let _ = personal_tx.try_send(payload.clone());
                 }
             }
             None
@@ -2143,7 +2152,7 @@ pub async fn market_data_broadcaster(state: AppState) {
     depth_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     kline_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut ticker_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut ticker_interval = tokio::time::interval(std::time::Duration::from_millis(100));
     ticker_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut agg_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     agg_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2194,10 +2203,17 @@ pub async fn market_data_broadcaster(state: AppState) {
                 // Periodic ticker per symbol that has a known last price.
                 // DB is queried at most once every 60s per symbol (cached in ticker_cache).
                 // Between DB refreshes we broadcast cached 24h stats with live last price.
+                //
+                // `last` = most recent trade price (from state.last_trade_price, written
+                // by SettleTrade). Fallback to best bid (last_prices) only for symbols
+                // that haven't traded yet this session.
                 let now_secs = unix_secs();
                 let symbols: Vec<(String, f64)> = last_prices.iter()
                     .filter(|(_, &p)| p > 0.0)
-                    .map(|(s, &p)| (s.clone(), p))
+                    .map(|(s, &bid)| {
+                        let last = state.last_trade_price.get(s).map(|v| *v).unwrap_or(bid);
+                        (s.clone(), last)
+                    })
                     .collect();
                 for (symbol, last_price) in symbols {
                     let cached = ticker_cache.lock().ok()
@@ -2211,6 +2227,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                         }
                         let db = state.db.clone();
                         let mtx = state.market_tx.clone();
+                        let last_ticker = state.last_ticker.clone();
                         let tc2 = ticker_cache.clone();
                         let sym2 = symbol.clone();
                         tokio::spawn(async move {
@@ -2242,7 +2259,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                                 c.insert(sym2.clone(), (open, h, l, v, ts));
                             }
                             let change = if open != 0.0 { (last_price - open) / open * 100.0 } else { 0.0 };
-                            let _ = mtx.send(serde_json::json!({
+                            let payload = serde_json::json!({
                                 "type": "ticker",
                                 "symbol": sym2,
                                 "last": last_price,
@@ -2250,12 +2267,14 @@ pub async fn market_data_broadcaster(state: AppState) {
                                 "high": h,
                                 "low": l,
                                 "volume": v,
-                            }).to_string());
+                            }).to_string();
+                            last_ticker.insert(sym2.clone(), payload.clone());
+                            let _ = mtx.send(payload);
                         });
                     } else if let Some((open, high, low, volume, _)) = cached {
                         // Broadcast cached stats with current last price — no DB hit.
                         let change = if open != 0.0 { (last_price - open) / open * 100.0 } else { 0.0 };
-                        let _ = state.market_tx.send(serde_json::json!({
+                        let payload = serde_json::json!({
                             "type": "ticker",
                             "symbol": symbol,
                             "last": last_price,
@@ -2263,7 +2282,9 @@ pub async fn market_data_broadcaster(state: AppState) {
                             "high": high,
                             "low": low,
                             "volume": volume,
-                        }).to_string());
+                        }).to_string();
+                        state.last_ticker.insert(symbol.clone(), payload.clone());
+                        let _ = state.market_tx.send(payload);
                     }
                 }
             }

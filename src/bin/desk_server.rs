@@ -54,6 +54,24 @@ mod db_cmd {
 
 // ── DbCmd: fixed-size Copy type for rtrb spin thread → DB worker ─────────────
 /// No heap allocation; zero Arc clones on the hot path.
+
+/// One row in a batched `INSERT INTO orders` cmd. Kept POD/Copy for rtrb.
+#[derive(Clone, Copy)]
+struct OrderInsertEntry {
+    id: i64,
+    user_id: i64,
+    symbol: [u8; 16],
+    side: u8, // 0=buy 1=sell
+    order_type: [u8; 16],
+    price: f64,
+    qty: f64,
+    filled: f64,
+    status: u8, // DbOrderStatus as u8
+    freeze_price: f64,
+    do_freeze: bool,
+    client_order_id: [u8; 32], // null-padded, max 31 chars
+}
+
 #[derive(Clone, Copy)]
 enum DbCmd {
     /// INSERT INTO orders … ON CONFLICT DO UPDATE.
@@ -72,6 +90,10 @@ enum DbCmd {
         do_freeze: bool,
         client_order_id: [u8; 32], // null-padded, max 31 chars
     },
+    /// Engine-confirmed ACCEPTEDs (batched). Single multi-row INSERT +
+    /// grouped UPDATE accounts per (user_id, asset). ~11× faster locally
+    /// than per-id sequential INSERT + freeze (examples/bench_upsert_order).
+    BatchUpsertOrder { entries: [OrderInsertEntry; 64], count: u8 },
     /// UPDATE orders SET status, filled WHERE id  (REST / subsequent update path).
     UpdateStatus { id: i64, status: u8, filled: f64 },
     /// Engine-confirmed cancels (batched). Single SQL DELETE ... RETURNING +
@@ -335,6 +357,175 @@ async fn process_db_cmd(
                                 participant_id: user_id as u64,
                             },
                         ));
+                    }
+                }
+            }
+        }
+
+        DbCmd::BatchUpsertOrder { entries, count } => {
+            // Multi-row INSERT + grouped UPDATE accounts. ~11× local /
+            // expected ~15-17× on EC2 vs per-id UpsertOrder (see
+            // examples/bench_upsert_order). All entries assumed do_freeze=true
+            // (the only caller is the MM-batch ACCEPTED path).
+            let count = count as usize;
+            if count == 0 {
+                return;
+            }
+            let entries = &entries[..count];
+
+            // 1) Multi-row INSERT.
+            let mut sql = String::with_capacity(256 + count * 80);
+            sql.push_str(
+                "INSERT INTO orders \
+                 (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
+                 VALUES ",
+            );
+            for i in 0..count {
+                let b = i * 11;
+                if i > 0 {
+                    sql.push(',');
+                }
+                use std::fmt::Write;
+                let _ = write!(
+                    sql,
+                    "(${},${},${},${},${},${},${},${},${},${},${})",
+                    b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8, b + 9, b + 10, b + 11,
+                );
+            }
+            sql.push_str(
+                " ON CONFLICT (id) DO UPDATE \
+                 SET status=EXCLUDED.status, filled=EXCLUDED.filled, updated_at=NOW()",
+            );
+
+            let mut q = sqlx::query(&sql);
+            // Hold owned strings alive until the query is executed.
+            let mut owned_syms: smallvec::SmallVec<[String; 64]> =
+                smallvec::SmallVec::with_capacity(count);
+            let mut owned_ots: smallvec::SmallVec<[String; 64]> =
+                smallvec::SmallVec::with_capacity(count);
+            let mut owned_coids: smallvec::SmallVec<[Option<String>; 64]> =
+                smallvec::SmallVec::with_capacity(count);
+            for e in entries {
+                let sym_end = e.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                let ot_end = e.order_type.iter().position(|&b| b == 0).unwrap_or(16);
+                let coid_end = e.client_order_id.iter().position(|&b| b == 0).unwrap_or(32);
+                owned_syms.push(
+                    std::str::from_utf8(&e.symbol[..sym_end])
+                        .unwrap_or("BTC_USDT")
+                        .to_owned(),
+                );
+                owned_ots.push(
+                    std::str::from_utf8(&e.order_type[..ot_end])
+                        .unwrap_or("limit")
+                        .to_owned(),
+                );
+                let coid = std::str::from_utf8(&e.client_order_id[..coid_end])
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_owned());
+                owned_coids.push(coid);
+            }
+            for (i, e) in entries.iter().enumerate() {
+                q = q
+                    .bind(e.id)
+                    .bind(e.user_id)
+                    .bind(&owned_syms[i])
+                    .bind(if e.side == 0 { "buy" } else { "sell" })
+                    .bind(&owned_ots[i])
+                    .bind(e.price)
+                    .bind(e.qty)
+                    .bind(e.filled)
+                    .bind(db_cmd::status_str(e.status))
+                    .bind(e.freeze_price)
+                    .bind(owned_coids[i].clone());
+            }
+            if let Err(err) = q.execute(db.as_ref()).await {
+                tracing::error!("batch orders INSERT failed (count={count}): {err}");
+                // Fallback: try per-id INSERTs so a single bad row doesn't
+                // sink the whole batch (e.g. coid UNIQUE conflict from a
+                // legacy reused client_order_id).
+                for e in entries {
+                    let _ = sqlx::query(
+                        "INSERT INTO orders \
+                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL) \
+                         ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()",
+                    )
+                    .bind(e.id)
+                    .bind(e.user_id)
+                    .bind(
+                        std::str::from_utf8(
+                            &e.symbol[..e.symbol.iter().position(|&b| b == 0).unwrap_or(16)],
+                        )
+                        .unwrap_or("BTC_USDT"),
+                    )
+                    .bind(if e.side == 0 { "buy" } else { "sell" })
+                    .bind(
+                        std::str::from_utf8(
+                            &e.order_type[..e.order_type.iter().position(|&b| b == 0).unwrap_or(16)],
+                        )
+                        .unwrap_or("limit"),
+                    )
+                    .bind(e.price)
+                    .bind(e.qty)
+                    .bind(e.filled)
+                    .bind(db_cmd::status_str(e.status))
+                    .bind(e.freeze_price)
+                    .execute(db.as_ref())
+                    .await;
+                }
+            }
+
+            // 2) Group freezes by (user_id, asset) and UPDATE accounts per group.
+            // All entries from MM ACCEPTED carry do_freeze=true.
+            let mut freezes: HashMap<(i64, String), f64> = HashMap::new();
+            for e in entries {
+                if !e.do_freeze {
+                    continue;
+                }
+                let sym_end = e.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                let sym = std::str::from_utf8(&e.symbol[..sym_end]).unwrap_or("BTC_USDT");
+                let parts: Vec<&str> = sym.splitn(2, '_').collect();
+                let base = parts.first().copied().unwrap_or("BTC");
+                let quote = parts.last().copied().unwrap_or("USDT");
+                let (asset, amount) = if e.side == 0 {
+                    (quote.to_string(), e.freeze_price * e.qty)
+                } else {
+                    (base.to_string(), e.qty)
+                };
+                if amount > 0.0 {
+                    *freezes.entry((e.user_id, asset)).or_insert(0.0) += amount;
+                }
+            }
+            for ((uid, asset), amount) in freezes {
+                let updated: Option<(f64, f64)> = sqlx::query_as(
+                    "UPDATE accounts \
+                     SET frozen = frozen + $1, updated_at = NOW() \
+                     WHERE user_id=$2 AND asset=$3 \
+                     RETURNING balance, frozen",
+                )
+                .bind(amount)
+                .bind(uid)
+                .bind(&asset)
+                .fetch_optional(db.as_ref())
+                .await
+                .unwrap_or(None);
+                if let Some((bal, frz)) = updated {
+                    account_cache
+                        .entry(uid)
+                        .or_insert_with(HashMap::new)
+                        .insert(asset.clone(), (bal, frz));
+                    if let Some(tx) = user_tx.get(&uid) {
+                        let _ = tx.try_send(
+                            serde_json::json!({
+                                "type": "balance_update",
+                                "asset": asset,
+                                "balance": bal,
+                                "available": bal - frz,
+                                "frozen": frz,
+                            })
+                            .to_string(),
+                        );
                     }
                 }
             }
@@ -918,6 +1109,17 @@ async fn main() -> anyhow::Result<()> {
                 // count to keep DbCmd `Copy` (rtrb requirement).
                 let mut cancel_batch: [i64; 64] = [0; 64];
                 let mut cancel_count: usize = 0;
+
+                // Same pattern for ACCEPTED — flushed as one
+                // DbCmd::BatchUpsertOrder (~11× faster than per-id INSERT;
+                // see examples/bench_upsert_order).
+                let mut accepted_batch: [OrderInsertEntry; 64] = [OrderInsertEntry {
+                    id: 0, user_id: 0, symbol: [0; 16], side: 0,
+                    order_type: [0; 16], price: 0.0, qty: 0.0, filled: 0.0,
+                    status: 0, freeze_price: 0.0, do_freeze: false,
+                    client_order_id: [0; 32],
+                }; 64];
+                let mut accepted_count: usize = 0;
                 loop {
                     let mut did_work = false;
                     // Drain outbound commands (WS/REST → engine) without blocking.
@@ -1070,9 +1272,22 @@ async fn main() -> anyhow::Result<()> {
 
                         if let Some(meta) = ws_meta {
                             if kind == order_update_kind::ACCEPTED {
-                                // Upsert + freeze: DB worker freezes funds atomically.
-                                // Hot path only updated the in-memory cache; this persists it.
-                                push_db_cmd(&mut db_tx, DbCmd::UpsertOrder {
+                                // Accumulate into the batched-INSERT buffer.
+                                // Flushed below as a single DbCmd::BatchUpsertOrder
+                                // after the poll burst ends (~11× faster than
+                                // per-id UpsertOrder; see bench_upsert_order).
+                                if accepted_count >= 64 {
+                                    push_db_cmd(
+                                        &mut db_tx,
+                                        DbCmd::BatchUpsertOrder {
+                                            entries: accepted_batch,
+                                            count: accepted_count as u8,
+                                        },
+                                        "batch upsert order (overflow)",
+                                    );
+                                    accepted_count = 0;
+                                }
+                                accepted_batch[accepted_count] = OrderInsertEntry {
                                     id:              order_id as i64,
                                     user_id:         meta.user_id,
                                     symbol:          db_cmd::str_bytes(&meta.symbol),
@@ -1085,7 +1300,8 @@ async fn main() -> anyhow::Result<()> {
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       true,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
-                                }, "upsert accepted order");
+                                };
+                                accepted_count += 1;
                             } else if kind == order_update_kind::PARTIAL_FILL {
                                 // Order is still resting — UpsertOrder writes the live row.
                                 push_db_cmd(&mut db_tx, DbCmd::UpsertOrder {
@@ -1217,6 +1433,22 @@ async fn main() -> anyhow::Result<()> {
                         {
                             remove_runtime_order(&mut order_meta_cache, order_id, client_order_id);
                         }
+                    }
+
+                    // Flush per-burst ACCEPTED accumulator as one batched
+                    // multi-row INSERT + grouped freeze UPDATE. Cuts work for
+                    // an MM 20-id place cycle from 40 round-trips (2 per id)
+                    // to ~3 total.
+                    if accepted_count > 0 {
+                        push_db_cmd(
+                            &mut db_tx,
+                            DbCmd::BatchUpsertOrder {
+                                entries: accepted_batch,
+                                count: accepted_count as u8,
+                            },
+                            "batch upsert order",
+                        );
+                        accepted_count = 0;
                     }
 
                     // Flush the per-burst CANCELLED accumulator as one batched

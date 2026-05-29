@@ -72,6 +72,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         include_str!("../../migrations/009_client_order_id_unique.sql"),
     )
     .await?;
+    apply_migration(
+        pool,
+        "010_api_keys",
+        include_str!("../../migrations/010_api_keys.sql"),
+    )
+    .await?;
     Ok(())
 }
 

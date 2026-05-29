@@ -115,28 +115,30 @@ const BINANCE_WS_BASE: &str = "wss://fstream.binance.com/ws";
 fn robot_api_key() -> String {
     std::env::var("ROBOT_API_KEY").unwrap_or_else(|_| "robot_ak_2026_lightningx".to_string())
 }
+/// Binance depth stream to mirror. Default is `depth20@100ms` for the dev box
+/// (full 20-level mirror at 10 Hz). On EC2 t3.small the resulting ~1200 DB
+/// ops/s blows the desk-server connection pool, so prod overrides to a slower
+/// cadence (e.g. `btcusdt@depth5@500ms` → ~50 ops/s).
+fn binance_stream() -> String {
+    std::env::var("BINANCE_STREAM").unwrap_or_else(|_| "btcusdt@depth20@100ms".to_string())
+}
 /// How long to wait for cancel confirmations before forcing placement (engine-restart safety).
 const CANCEL_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Per-symbol quoting parameters. This MM mirrors Binance depth verbatim
 /// (price + qty per level) — there is no spread, skew, or qty munging.
-/// The only knobs are the upstream Binance stream, a hard position limit
-/// for safety, and how much price drift triggers a re-quote.
+/// The Binance stream is configured via the `BINANCE_STREAM` env var
+/// (see `binance_stream()`); the symbol field is our internal exchange
+/// symbol and `max_position` is the hard inventory safety stop.
 struct SymbolConfig {
     /// Our exchange symbol (e.g. "BTC_USDT").
     symbol: &'static str,
-    /// Binance futures stream.  bookTicker gives real-time best bid/ask.
-    binance_stream: &'static str,
     /// Hard position limit (base currency, both long and short).
     max_position: f64,
 }
 
 const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     symbol: "BTC_USDT",
-    // 20 levels × 2 sides = 40 orders per batch — matches the desk WS hard
-    // cap of 40 in ws_handler.rs PlaceOrders, so the full mirror lands in
-    // a single batch and a single Aeron publish.
-    binance_stream: "btcusdt@depth20@100ms",
     max_position: 5.0,
 }];
 
@@ -785,7 +787,8 @@ async fn run_symbol(cfg: &'static SymbolConfig, exchange_ws_url: String) {
         let _ = exch_ws.write_frame(Frame::text(Payload::Owned(cancel_sym.into_bytes()))).await;
 
         // ── Connect Binance depth WS ─────────────────────────────────────────
-        let binance_url = format!("{BINANCE_WS_BASE}/{}", cfg.binance_stream);
+        let stream = binance_stream();
+        let binance_url = format!("{BINANCE_WS_BASE}/{stream}");
         let mut binance_ws = loop {
             match ws_connect_tls(&binance_url).await {
                 Ok(ws) => break ws,

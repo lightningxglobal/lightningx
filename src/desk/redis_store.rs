@@ -48,6 +48,197 @@ pub async fn is_hydrated(conn: &mut redis::aio::MultiplexedConnection) -> anyhow
     Ok(n > 0)
 }
 
+// ── Frame application (used by redis-writer subscriber loop) ────────────────
+
+use crate::transport::persist_event::{
+    unpack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
+    PersistFrame, PersistKind, TradeInsertPayload,
+};
+
+/// Apply one PersistFrame to Redis L1. Idempotent and safe to replay
+/// (subscriber may see duplicates after Aeron lag recovery).
+pub async fn apply_frame(
+    conn: &mut redis::aio::MultiplexedConnection,
+    frame: &PersistFrame,
+) -> anyhow::Result<()> {
+    match frame.kind() {
+        Some(PersistKind::OrderUpsert) => {
+            if let Some(p) = frame.as_order_upsert() {
+                apply_order_upsert(conn, &p).await?;
+            }
+        }
+        Some(PersistKind::OrderDelete) => {
+            if let Some(p) = frame.as_order_delete() {
+                apply_order_delete(conn, &p).await?;
+            }
+        }
+        Some(PersistKind::AccountSet) => {
+            if let Some(p) = frame.as_account_set() {
+                apply_account_set(conn, &p).await?;
+            }
+        }
+        Some(PersistKind::OrderFillUpdate) => {
+            if let Some(p) = frame.as_order_fill_update() {
+                apply_order_fill_update(conn, &p).await?;
+            }
+        }
+        Some(PersistKind::TradeInsert) => {
+            // trades aren't held in Redis (append-only history); skip.
+            // pg-writer is responsible for trades.
+        }
+        None => {
+            tracing::warn!("PersistFrame with unknown kind={}", frame.kind);
+        }
+    }
+    Ok(())
+}
+
+async fn apply_order_upsert(
+    conn: &mut redis::aio::MultiplexedConnection,
+    p: &OrderUpsertPayload,
+) -> anyhow::Result<()> {
+    // Copy packed fields to locals so we can borrow them.
+    let id: i64 = p.id;
+    let user_id: i64 = p.user_id;
+    let side: u8 = p.side;
+    let status: u8 = p.status;
+    let price: f64 = p.price;
+    let qty: f64 = p.qty;
+    let filled: f64 = p.filled;
+    let freeze_price: f64 = p.freeze_price;
+    let created_at_ms: i64 = p.created_at_ms;
+    let symbol = unpack_str(&p.symbol).to_owned();
+    let order_type = unpack_str(&p.order_type).to_owned();
+    let coid_str = unpack_str(&p.client_order_id).to_owned();
+
+    let side_str = if side == 0 { "buy" } else { "sell" };
+    let status_str = match status {
+        1 => "PENDING",
+        2 => "TRADING",
+        3 => "COMPLETED",
+        4 => "CANCELED",
+        5 => "REJECTED",
+        _ => "PENDING",
+    };
+    let mut pipe = redis::pipe();
+    pipe.hset_multiple(
+        key_order(id),
+        &[
+            ("user_id", user_id.to_string()),
+            ("symbol", symbol),
+            ("side", side_str.to_string()),
+            ("order_type", order_type),
+            ("price", price.to_string()),
+            ("qty", qty.to_string()),
+            ("filled", filled.to_string()),
+            ("status", status_str.to_string()),
+            ("freeze_price", freeze_price.to_string()),
+            ("client_order_id", coid_str.clone()),
+            ("created_at_ms", created_at_ms.to_string()),
+        ],
+    )
+    .ignore();
+    pipe.sadd(KEY_ACTIVE_ORDERS, id).ignore();
+    pipe.sadd(key_user_orders(user_id), id).ignore();
+    if !coid_str.is_empty() {
+        pipe.hset(key_user_coid(user_id), coid_str, id).ignore();
+    }
+    pipe.query_async::<()>(conn).await?;
+    Ok(())
+}
+
+async fn apply_order_delete(
+    conn: &mut redis::aio::MultiplexedConnection,
+    p: &OrderDeletePayload,
+) -> anyhow::Result<()> {
+    let id: i64 = p.id;
+    // Read user_id + client_order_id so we can clean per-user indices too.
+    let pre: (Option<String>, Option<String>) = redis::pipe()
+        .hget(key_order(id), "user_id")
+        .hget(key_order(id), "client_order_id")
+        .query_async(conn)
+        .await
+        .unwrap_or((None, None));
+    let user_id: Option<i64> = pre.0.and_then(|s| s.parse().ok());
+    let coid: Option<String> = pre.1.filter(|s| !s.is_empty());
+
+    let mut pipe = redis::pipe();
+    pipe.del(key_order(id)).ignore();
+    pipe.srem(KEY_ACTIVE_ORDERS, id).ignore();
+    if let Some(uid) = user_id {
+        pipe.srem(key_user_orders(uid), id).ignore();
+        if let Some(c) = coid {
+            pipe.hdel(key_user_coid(uid), c).ignore();
+        }
+    }
+    pipe.query_async::<()>(conn).await?;
+    Ok(())
+}
+
+async fn apply_order_fill_update(
+    conn: &mut redis::aio::MultiplexedConnection,
+    p: &OrderFillUpdatePayload,
+) -> anyhow::Result<()> {
+    let id: i64 = p.id;
+    let filled: f64 = p.filled;
+    let status: u8 = p.status;
+    let status_str = match status {
+        1 => "PENDING",
+        2 => "TRADING",
+        3 => "COMPLETED",
+        4 => "CANCELED",
+        5 => "REJECTED",
+        _ => return Ok(()),
+    };
+    // Only update the two changing fields. Skip if the order isn't in
+    // Redis (could happen during cold-start replay; OK to drop).
+    let exists: bool = conn.exists(key_order(id)).await.unwrap_or(false);
+    if !exists {
+        return Ok(());
+    }
+    redis::pipe()
+        .hset_multiple(
+            key_order(id),
+            &[
+                ("filled", filled.to_string()),
+                ("status", status_str.to_string()),
+            ],
+        )
+        .query_async::<()>(conn)
+        .await?;
+    Ok(())
+}
+
+async fn apply_account_set(
+    conn: &mut redis::aio::MultiplexedConnection,
+    p: &AccountSetPayload,
+) -> anyhow::Result<()> {
+    let user_id: i64 = p.user_id;
+    let balance: f64 = p.balance;
+    let frozen: f64 = p.frozen;
+    let asset = unpack_str(&p.asset).to_owned();
+    if asset.is_empty() {
+        return Ok(());
+    }
+    redis::pipe()
+        .hset_multiple(
+            key_account(user_id, &asset),
+            &[
+                ("balance", balance.to_string()),
+                ("frozen", frozen.to_string()),
+            ],
+        )
+        .sadd(key_user_assets(user_id), &asset)
+        .query_async::<()>(conn)
+        .await?;
+    Ok(())
+}
+
+// Trade inserts are a no-op in Redis (trades aren't kept here). Kept as a
+// `_` parameter so the import stays.
+#[allow(dead_code)]
+fn _no_op_trade_insert(_p: &TradeInsertPayload) {}
+
 /// Counts of rows written by `hydrate_from_pg`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HydrateStats {

@@ -751,6 +751,121 @@ impl DeskDepthSubscriber {
     }
 }
 
+// ============================================================================
+// PersistEvent — desk-server → redis-writer / pg-writer
+// ============================================================================
+
+use crate::transport::persist_event::{PersistFrame, FRAME_SIZE as PERSIST_FRAME_SIZE};
+
+const PERSIST_RING: usize = 16 * 1024;
+
+pub struct PersistPublisher {
+    _client: Arc<AeronClient>,
+    publisher: aeron_wrapper::Publisher,
+}
+
+impl PersistPublisher {
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
+        let publisher = client
+            .add_publication(channel, stream_id)
+            .map_err(|e| format!("Failed to add persist publication: {:?}", e))?;
+        tracing::info!(
+            "✓ PersistPublisher created on stream {} ({} bytes/frame)",
+            stream_id,
+            PERSIST_FRAME_SIZE,
+        );
+        Ok(Self {
+            _client: client,
+            publisher,
+        })
+    }
+
+    pub fn publish(&mut self, frame: &PersistFrame) -> Result<(), TransportError> {
+        publish_with_retry(&mut self.publisher, frame.as_bytes())
+    }
+}
+
+struct PersistCallback {
+    tx: Producer<PersistFrame>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl PollCallback for PersistCallback {
+    fn on_data(&mut self, data: &[u8]) {
+        let Some(frame) = PersistFrame::from_bytes(data) else {
+            return;
+        };
+        if let Err(rtrb::PushError::Full(_)) = self.tx.push(frame) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub struct PersistSubscriber {
+    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<PersistCallback>>>>,
+    rx: Consumer<PersistFrame>,
+    dropped: Arc<AtomicU64>,
+    last_reported_dropped: u64,
+    client: Arc<AeronClient>,
+}
+
+impl PersistSubscriber {
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
+        let (tx, rx) = RingBuffer::<PersistFrame>::new(PERSIST_RING);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let subscriber = client
+            .add_subscription(
+                channel,
+                stream_id,
+                10_000,
+                PersistCallback {
+                    tx,
+                    dropped: dropped.clone(),
+                },
+                NoopLifecycle,
+            )
+            .map_err(|e| format!("Failed to add persist subscription: {:?}", e))?;
+        tracing::info!("✓ PersistSubscriber created on stream {}", stream_id);
+        Ok(Self {
+            subscriber: Arc::new(Mutex::new(subscriber)),
+            rx,
+            dropped,
+            last_reported_dropped: 0,
+            client,
+        })
+    }
+
+    pub fn do_work(&self) {
+        self.client.do_work();
+    }
+
+    /// Drive the underlying Aeron subscription and return one parsed frame
+    /// if available. Caller is expected to spin-loop until `None`.
+    pub fn poll(&mut self) -> Option<PersistFrame> {
+        {
+            let mut sub = self.subscriber.lock();
+            let _ = sub.poll();
+        }
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped != self.last_reported_dropped {
+            tracing::warn!(
+                "PersistSubscriber ring full: {} frames dropped (total)",
+                dropped
+            );
+            self.last_reported_dropped = dropped;
+        }
+        self.rx.pop().ok()
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.subscriber.lock().is_connected()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

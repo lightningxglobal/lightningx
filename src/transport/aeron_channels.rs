@@ -119,3 +119,10 @@ pub const LEVEL2_STREAM: i32 = 6;
 /// Always IPC: the beacon runs co-located with the publisher.
 pub const METRICS_CHANNEL: &str = "aeron:ipc";
 pub const METRICS_STREAM: i32 = 1001;
+
+/// Desk → persistence consumers: `PersistEvent` (orders / accounts / trades
+/// state changes). Subscribed by redis-writer and (later) pg-writer so
+/// neither lives on the hot path. Always IPC — both writers co-locate with
+/// desk-server.
+pub const PERSIST_CHANNEL: &str = "aeron:ipc";
+pub const PERSIST_STREAM: i32 = 30;

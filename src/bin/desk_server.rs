@@ -4,10 +4,15 @@ use lightning_exchange::{
     aeron_channels::{
         aeron_dir, depth_channel, order_update_channel, orders_channel, orders_stream_for_symbol,
         trade_channel, DEPTH50_STREAM, DEPTH_STREAM, LEVEL2_STREAM, METRICS_CHANNEL,
-        METRICS_STREAM, ORDER_UPDATE_STREAM, TRADE_STREAM,
+        METRICS_STREAM, ORDER_UPDATE_STREAM, PERSIST_CHANNEL, PERSIST_STREAM, TRADE_STREAM,
     },
     aeron_transport::{
         DeskDepthSubscriber, DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber,
+        PersistPublisher,
+    },
+    transport::persist_event::{
+        pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload,
+        OrderUpsertPayload, PersistFrame, TradeInsertPayload,
     },
     api::{router, AccountCache, AppState},
     db,
@@ -221,6 +226,15 @@ fn push_db_cmd(db_tx: &mut rtrb::Producer<DbCmd>, mut cmd: DbCmd, context: &'sta
 }
 
 // ── process_db_cmd: runs in the tokio runtime, off the spin thread ────────────
+/// Lock-and-publish helper for PersistFrames. Lock is held for the duration
+/// of a single Aeron `publish` (~µs).
+fn publish_frame(
+    pp: &std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
+    frame: &PersistFrame,
+) {
+    let _ = pp.lock().publish(frame);
+}
+
 async fn process_db_cmd(
     cmd: DbCmd,
     db: std::sync::Arc<sqlx::PgPool>,
@@ -228,6 +242,7 @@ async fn process_db_cmd(
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
     market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
     last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
+    persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
 ) {
     use lightning_exchange::account_repository::AccountRepository;
@@ -526,6 +541,16 @@ async fn process_db_cmd(
                         .entry(uid)
                         .or_insert_with(HashMap::new)
                         .insert(asset.clone(), (bal, frz));
+                    // PR2 dual-write: publish AccountSet for redis-writer.
+                    publish_frame(
+                        &persist_pub,
+                        &PersistFrame::account_set(AccountSetPayload {
+                            user_id: uid,
+                            asset: pack_str(&asset),
+                            balance: bal,
+                            frozen: frz,
+                        }),
+                    );
                     if let Some(tx) = user_tx.get(&uid) {
                         let _ = tx.try_send(
                             serde_json::json!({
@@ -539,6 +564,29 @@ async fn process_db_cmd(
                         );
                     }
                 }
+            }
+
+            // PR2 dual-write: publish OrderUpsert per row so redis-writer
+            // sees the same active orders that just landed in PG.
+            for e in entries {
+                publish_frame(
+                    &persist_pub,
+                    &PersistFrame::order_upsert(OrderUpsertPayload {
+                        id: e.id,
+                        user_id: e.user_id,
+                        symbol: e.symbol,
+                        side: e.side,
+                        status: e.status,
+                        _pad: [0; 6],
+                        order_type: e.order_type,
+                        price: e.price,
+                        qty: e.qty,
+                        filled: e.filled,
+                        freeze_price: e.freeze_price,
+                        client_order_id: e.client_order_id,
+                        created_at_ms: chrono::Utc::now().timestamp_millis(),
+                    }),
+                );
             }
         }
 
@@ -610,6 +658,16 @@ async fn process_db_cmd(
                         .entry(uid)
                         .or_insert_with(HashMap::new)
                         .insert(asset.clone(), (bal, frz));
+                    // PR2 dual-write: account changed → tell redis-writer.
+                    publish_frame(
+                        &persist_pub,
+                        &PersistFrame::account_set(AccountSetPayload {
+                            user_id: uid,
+                            asset: pack_str(&asset),
+                            balance: bal,
+                            frozen: frz,
+                        }),
+                    );
                     if let Some(tx) = user_tx.get(&uid) {
                         let _ = tx.try_send(
                             serde_json::json!({
@@ -623,6 +681,13 @@ async fn process_db_cmd(
                         );
                     }
                 }
+            }
+            // PR2 dual-write: orders dropped from PG → drop from Redis too.
+            for (id, _uid, _sym, _side, _q, _f, _fp) in &rows {
+                publish_frame(
+                    &persist_pub,
+                    &PersistFrame::order_delete(OrderDeletePayload { id: *id }),
+                );
             }
         }
 
@@ -679,6 +744,13 @@ async fn process_db_cmd(
                 .bind(&ids_vec)
                 .execute(db.as_ref())
                 .await;
+            // PR2 dual-write: tell redis-writer to drop the same ids.
+            for &id in &ids_vec {
+                publish_frame(
+                    &persist_pub,
+                    &PersistFrame::order_delete(OrderDeletePayload { id }),
+                );
+            }
         }
 
         DbCmd::BatchSettleTrade { entries, count } => {
@@ -955,12 +1027,43 @@ async fn process_db_cmd(
                         .to_string(),
                     );
                 }
+                // PR2 dual-write: maker order changed (filled grew, maybe
+                // completed). Push OrderDelete if completed, else upsert the
+                // updated filled value via a partial OrderUpsert.
+                if new_status == "COMPLETED" {
+                    publish_frame(
+                        &persist_pub,
+                        &PersistFrame::order_delete(OrderDeletePayload { id: *maker_id }),
+                    );
+                } else {
+                    // Partial fill of an already-known order: only filled
+                    // and status change. Use OrderFillUpdate so the writer
+                    // doesn't overwrite price/qty/etc with sentinels.
+                    publish_frame(
+                        &persist_pub,
+                        &PersistFrame::order_fill_update(OrderFillUpdatePayload {
+                            id: *maker_id,
+                            filled: *new_filled,
+                            status: DbOrderStatus::Trading.as_u8(),
+                            _pad: [0; 7],
+                        }),
+                    );
+                }
             }
             for (uid, asset, bal, frz) in updated_accounts {
                 account_cache
                     .entry(uid)
                     .or_insert_with(HashMap::new)
                     .insert(asset.clone(), (bal, frz));
+                publish_frame(
+                    &persist_pub,
+                    &PersistFrame::account_set(AccountSetPayload {
+                        user_id: uid,
+                        asset: pack_str(&asset),
+                        balance: bal,
+                        frozen: frz,
+                    }),
+                );
                 if let Some(tx) = user_tx.get(&uid) {
                     let _ = tx.try_send(
                         serde_json::json!({
@@ -973,6 +1076,21 @@ async fn process_db_cmd(
                         .to_string(),
                     );
                 }
+            }
+            // PR2 dual-write: emit TradeInsert for each fill. Redis ignores;
+            // pg-writer (future PR) will consume to write the trades table.
+            for r in &resolved {
+                publish_frame(
+                    &persist_pub,
+                    &PersistFrame::trade_insert(TradeInsertPayload {
+                        buy_order_id: if r.side == 0 { r.taker_id } else { r.maker_id },
+                        sell_order_id: if r.side == 0 { r.maker_id } else { r.taker_id },
+                        symbol: pack_str(&r.symbol),
+                        price: r.price,
+                        qty: r.qty,
+                        ts_ms: (ts / 1000) as i64,
+                    }),
+                );
             }
         }
     }
@@ -987,6 +1105,7 @@ fn spawn_db_worker(
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
     market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
     last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
+    persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
 ) {
     std::thread::Builder::new()
@@ -1003,8 +1122,9 @@ fn spawn_db_worker(
                     let ut2 = user_tx.clone();
                     let mt2 = market_tx.clone();
                     let ltp2 = last_trade_price.clone();
+                    let pp2 = persist_pub.clone();
                     let at2 = aeron_cancel_tx.clone();
-                    rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, ltp2, at2));
+                    rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, ltp2, pp2, at2));
                 }
                 if !did_work {
                     idle_us = (idle_us * 2 + 10).min(200);
@@ -1080,6 +1200,14 @@ async fn main() -> anyhow::Result<()> {
         AeronClient::new(&aeron_dir())
             .map_err(|e| anyhow::anyhow!("Aeron init failed: {:?}", e))?,
     );
+
+    // PR2 dual-write: every DB-worker mutation also publishes the
+    // corresponding PersistEvent to the persist Aeron stream, so the
+    // (independent) redis-writer consumer keeps Redis L1 in sync.
+    let persist_pub = Arc::new(parking_lot::Mutex::new(
+        PersistPublisher::new(client.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
+            .map_err(|e| anyhow::anyhow!("PersistPublisher: {}", e))?,
+    ));
 
     // Per-symbol order publishers: each symbol routes to its own Aeron stream so the
     // matching threads never share a stream and there is zero HOL blocking between symbols.
@@ -1177,6 +1305,7 @@ async fn main() -> anyhow::Result<()> {
         state.user_tx.clone(),
         state.market_tx.clone(),
         state.last_trade_price.clone(),
+        persist_pub.clone(),
         Some(db_worker_aeron_tx),
     );
 

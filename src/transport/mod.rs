@@ -2,6 +2,7 @@ pub mod sbe;
 pub mod order_update;
 pub mod aeron_transport;
 pub mod aeron_channels;
+pub mod persist_event;
 pub mod tracer;
 
 /// Transport层抽象 - Aeron的trait定义 + Mock实现

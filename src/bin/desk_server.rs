@@ -96,6 +96,10 @@ enum DbCmd {
         side: u8, // 0=buy taker, 1=sell taker
         symbol: [u8; 16],
     },
+    /// Drop a terminal-state order row from the DB. Used for FILLED/REJECTED
+    /// (and CANCELED via the dedicated CancelConfirmed path) so orders stays
+    /// lean — only PENDING/TRADING rows live there.
+    DeleteOrder { id: i64 },
 }
 
 #[derive(Clone, Copy)]
@@ -394,13 +398,13 @@ async fn process_db_cmd(
                 }
             }
 
-            let _ = sqlx::query(
-                "UPDATE orders SET status='CANCELED', updated_at=NOW()
-                 WHERE id=$1 AND status IN ('PENDING','TRADING')",
-            )
-            .bind(id)
-            .execute(db.as_ref())
-            .await;
+            // Terminal state: delete the row outright. Trades table no
+            // longer has an FK to orders (see migration 011), so partial-fill
+            // history stays in trades without needing the orders row.
+            let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
+                .bind(id)
+                .execute(db.as_ref())
+                .await;
         }
 
         DbCmd::ReleaseReservation {
@@ -655,6 +659,13 @@ async fn process_db_cmd(
                     }
                 }
             }
+        }
+
+        DbCmd::DeleteOrder { id } => {
+            let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
+                .bind(id)
+                .execute(db.as_ref())
+                .await;
         }
     }
 }
@@ -1051,14 +1062,8 @@ async fn main() -> anyhow::Result<()> {
                                     do_freeze:       true,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
                                 }, "upsert accepted order");
-                            } else if kind == order_update_kind::FILLED || kind == order_update_kind::PARTIAL_FILL {
-                                // Market / IOC order filled immediately — no ACCEPTED was sent.
-                                // Insert the order row now so the fills JOIN and order history work.
-                                let status = if kind == order_update_kind::FILLED {
-                                    DbOrderStatus::Completed.as_u8()
-                                } else {
-                                    DbOrderStatus::Trading.as_u8()
-                                };
+                            } else if kind == order_update_kind::PARTIAL_FILL {
+                                // Order is still resting — UpsertOrder writes the live row.
                                 push_db_cmd(&mut db_tx, DbCmd::UpsertOrder {
                                     id:              order_id as i64,
                                     user_id:         meta.user_id,
@@ -1068,12 +1073,15 @@ async fn main() -> anyhow::Result<()> {
                                     price:           meta.price.unwrap_or(0.0),
                                     qty:             meta.qty,
                                     filled:          fill_qty,
-                                    status,
+                                    status:          DbOrderStatus::Trading.as_u8(),
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       false,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
-                                }, "upsert filled order");
+                                }, "upsert partially-filled order");
                             }
+                            // kind == FILLED here means "first event was a full fill"
+                            // (market / IOC). Skip INSERT — the order is already terminal,
+                            // and trades has no FK to orders so settle is unaffected.
                             if kind == order_update_kind::REJECTED {
                                 // Freeze was in-memory only (hot path never hit DB).
                                 // Revert the cache and notify; no DB write needed.
@@ -1109,13 +1117,21 @@ async fn main() -> anyhow::Result<()> {
                             }
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).
-                            let status = db_status_from_update_kind(kind).as_u8();
+                            // Terminal states get dropped from the orders table; only
+                            // PARTIAL_FILL (still resting) updates filled/status.
                             if kind == order_update_kind::CANCELLED {
                                 push_db_cmd(&mut db_tx, DbCmd::CancelConfirmed {
                                     id: order_id as i64,
                                     cancelled_qty: fill_qty,
                                 }, "confirm cancelled order");
+                            } else if kind == order_update_kind::FILLED
+                                || kind == order_update_kind::REJECTED
+                            {
+                                push_db_cmd(&mut db_tx, DbCmd::DeleteOrder {
+                                    id: order_id as i64,
+                                }, "delete terminal order");
                             } else {
+                                let status = db_status_from_update_kind(kind).as_u8();
                                 push_db_cmd(&mut db_tx, DbCmd::UpdateStatus {
                                     id:     order_id as i64,
                                     status,

@@ -6,6 +6,7 @@ pub mod models;
 pub mod order_state;
 pub mod positions;
 pub mod rate_limit;
+pub mod redis_store;
 pub mod snowflake;
 pub mod symbol_rules;
 pub mod user_service;

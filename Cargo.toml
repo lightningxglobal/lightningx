@@ -85,3 +85,7 @@ path = "src/bin/kline_service.rs"
 [[bin]]
 name = "exchange-engine"
 path = "src/bin/exchange_engine.rs"
+
+[[bin]]
+name = "redis-writer"
+path = "src/bin/redis_writer.rs"

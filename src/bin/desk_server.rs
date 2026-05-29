@@ -131,10 +131,11 @@ enum DbCmd {
         entries: [SettleTradeEntry; 64],
         count: u8,
     },
-    /// Drop a terminal-state order row from the DB. Used for FILLED/REJECTED
-    /// (and CANCELED via the dedicated CancelConfirmed path) so orders stays
-    /// lean — only PENDING/TRADING rows live there.
-    DeleteOrder { id: i64 },
+    /// Batched DeleteOrder — collapses N FILLED/REJECTED events from one
+    /// engine burst into a single `DELETE … WHERE id = ANY($1)`. ~9×
+    /// faster locally (examples/bench_delete_order). Works equally for
+    /// count=1. Fixed-array + count to keep DbCmd `Copy`.
+    BatchDeleteOrder { ids: [i64; 64], count: u8 },
 }
 
 #[derive(Clone, Copy)]
@@ -668,9 +669,14 @@ async fn process_db_cmd(
         }
 
 
-        DbCmd::DeleteOrder { id } => {
-            let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
-                .bind(id)
+        DbCmd::BatchDeleteOrder { ids, count } => {
+            let count = count as usize;
+            if count == 0 {
+                return;
+            }
+            let ids_vec: Vec<i64> = ids[..count].to_vec();
+            let _ = sqlx::query("DELETE FROM orders WHERE id = ANY($1)")
+                .bind(&ids_vec)
                 .execute(db.as_ref())
                 .await;
         }
@@ -1224,6 +1230,11 @@ async fn main() -> anyhow::Result<()> {
                     price: 0.0, qty: 0.0, side: 0, symbol: [0; 16],
                 }; 64];
                 let mut settle_count: usize = 0;
+
+                // FILLED / REJECTED rows deleted in one DELETE…ANY per burst
+                // (~9× faster locally; see examples/bench_delete_order).
+                let mut delete_batch: [i64; 64] = [0; 64];
+                let mut delete_count: usize = 0;
                 loop {
                     let mut did_work = false;
                     // Drain outbound commands (WS/REST → engine) without blocking.
@@ -1498,9 +1509,20 @@ async fn main() -> anyhow::Result<()> {
                             } else if kind == order_update_kind::FILLED
                                 || kind == order_update_kind::REJECTED
                             {
-                                push_db_cmd(&mut db_tx, DbCmd::DeleteOrder {
-                                    id: order_id as i64,
-                                }, "delete terminal order");
+                                // Batched DELETE — flushed after the burst.
+                                if delete_count >= 64 {
+                                    push_db_cmd(
+                                        &mut db_tx,
+                                        DbCmd::BatchDeleteOrder {
+                                            ids: delete_batch,
+                                            count: delete_count as u8,
+                                        },
+                                        "batch delete order (overflow)",
+                                    );
+                                    delete_count = 0;
+                                }
+                                delete_batch[delete_count] = order_id as i64;
+                                delete_count += 1;
                             } else {
                                 let status = db_status_from_update_kind(kind).as_u8();
                                 push_db_cmd(&mut db_tx, DbCmd::UpdateStatus {
@@ -1584,6 +1606,20 @@ async fn main() -> anyhow::Result<()> {
                             "batch upsert order",
                         );
                         accepted_count = 0;
+                    }
+
+                    // Flush per-burst FILLED/REJECTED DELETE accumulator.
+                    // ~9× faster than per-id DELETE (examples/bench_delete_order).
+                    if delete_count > 0 {
+                        push_db_cmd(
+                            &mut db_tx,
+                            DbCmd::BatchDeleteOrder {
+                                ids: delete_batch,
+                                count: delete_count as u8,
+                            },
+                            "batch delete order",
+                        );
+                        delete_count = 0;
                     }
 
                     // Flush the per-burst CANCELLED accumulator as one batched

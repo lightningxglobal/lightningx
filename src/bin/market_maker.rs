@@ -129,16 +129,12 @@ struct SymbolConfig {
     binance_stream: &'static str,
     /// Hard position limit (base currency, both long and short).
     max_position: f64,
-    /// Re-quote threshold: only trigger cancel-replace when any quote price
-    /// has drifted by more than this many bps from its target.
-    requote_threshold_bps: f64,
 }
 
 const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
     symbol: "BTC_USDT",
     binance_stream: "btcusdt@depth10@100ms",
     max_position: 5.0,
-    requote_threshold_bps: 0.05,
 }];
 
 // ── Exchange message types ────────────────────────────────────────────────────
@@ -163,7 +159,7 @@ enum QuoteState {
     },
     /// New batch sent; tracking individual OPEN (ACCEPTED) events per client_order_id.
     /// Binance depth events that arrive while placing are ignored — the next depth
-    /// after transitioning back to Idle will re-evaluate via within_threshold.
+    /// after transitioning back to Idle will trigger a fresh re-quote unconditionally.
     Placing {
         /// client_order_id → (side, price, qty) for each unconfirmed order.
         awaiting: HashMap<String, (&'static str, f64, f64)>,
@@ -485,9 +481,11 @@ fn on_binance_depth(
                 None => return None,
             };
             let mid = (first.bid_price + first.ask_price) / 2.0;
-            if within_threshold(book, &new_targets, cfg.requote_threshold_bps) {
-                return None;
-            }
+            // No threshold filtering — tracking Binance verbatim means every
+            // depth tick is a meaningful change (price OR qty per level, all
+            // ten levels). The cycle is naturally rate-limited by MM's own
+            // cancel-replace round-trip (subsequent depth ticks land in
+            // Cancelling/Placing arms and become next_targets).
             if inv.position >= cfg.max_position || inv.position <= -cfg.max_position {
                 warn!("[{}] pos={:+.4} hit limit, cancelling all", cfg.symbol, inv.position);
                 return trigger_requote(vec![], book, state, cfg, order_counter);
@@ -687,25 +685,6 @@ struct TargetLevel {
     bid_qty: f64,
     ask_price: f64,
     ask_qty: f64,
-}
-
-/// True if all current quotes are within threshold of their targets.
-fn within_threshold(book: &QuoteBook, targets: &[TargetLevel], threshold_bps: f64) -> bool {
-    if book.bids.len() != targets.len() || book.asks.len() != targets.len() {
-        return false;
-    }
-    let tol = threshold_bps / 10_000.0;
-    for (q, t) in book.bids.iter().zip(targets) {
-        if (q.price - t.bid_price).abs() / t.bid_price > tol {
-            return false;
-        }
-    }
-    for (q, t) in book.asks.iter().zip(targets) {
-        if (q.price - t.ask_price).abs() / t.ask_price > tol {
-            return false;
-        }
-    }
-    true
 }
 
 // ── Binance depth snapshot parser ────────────────────────────────────────────
@@ -1000,36 +979,4 @@ mod tests {
         assert!(book.find_mut(99).is_none());
     }
 
-    // ── within_threshold tests ────────────────────────────────────────────────
-
-    fn make_targets(bid: f64, ask: f64) -> Vec<TargetLevel> {
-        vec![TargetLevel { bid_price: bid, bid_qty: 0.001, ask_price: ask, ask_qty: 0.001 }]
-    }
-
-    #[test]
-    fn test_within_threshold_true_when_close() {
-        let mut book = QuoteBook::default();
-        book.bids.push(make_quote(1, "buy", 100.0));
-        book.asks.push(make_quote(2, "sell", 101.0));
-        let targets = make_targets(100.0, 101.0);
-        assert!(within_threshold(&book, &targets, 1.0));
-    }
-
-    #[test]
-    fn test_within_threshold_false_when_far() {
-        let mut book = QuoteBook::default();
-        book.bids.push(make_quote(1, "buy", 99.0));
-        book.asks.push(make_quote(2, "sell", 102.0));
-        let targets = make_targets(100.0, 101.0);
-        // 1 bps threshold, price moved by 100 bps → should be outside.
-        assert!(!within_threshold(&book, &targets, 1.0));
-    }
-
-    #[test]
-    fn test_within_threshold_false_when_wrong_count() {
-        let book = QuoteBook::default();
-        let targets = make_targets(100.0, 101.0);
-        // Book has 0 orders but targets has 1 level → mismatch.
-        assert!(!within_threshold(&book, &targets, 100.0));
-    }
 }

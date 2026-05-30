@@ -30,6 +30,13 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 /// Updated after every DB write so GET /api/balances never hits the DB.
 pub type AccountCache = Arc<DashMap<i64, HashMap<String, (f64, f64)>>>;
 
+/// Shared Redis L1 connection. MultiplexedConnection is cheap-to-clone and
+/// safe under concurrent use, so each request handler clones its own copy
+/// before issuing commands. `None` means Redis is not available (e.g.
+/// standalone in-process mode, or REDIS_URL unreachable at startup) →
+/// readers fall back to PG.
+pub type RedisConn = redis::aio::MultiplexedConnection;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<PgPool>,
@@ -66,6 +73,8 @@ pub struct AppState {
     /// before sending order_submitted, preventing phantom orders in clients.
     /// Empty set = all symbols allowed (standalone mode with local engines).
     pub valid_symbols: Arc<HashSet<String>>,
+    /// Redis L1 read connection. None ⇒ no Redis at startup, REST falls back to PG.
+    pub redis: Option<RedisConn>,
 }
 
 pub fn router(state: AppState) -> Router {

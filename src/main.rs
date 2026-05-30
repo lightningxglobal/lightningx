@@ -335,6 +335,7 @@ async fn main() -> anyhow::Result<()> {
         tracer: None,
         account_cache: AccountCache::default(),
         valid_symbols: Arc::new(std::collections::HashSet::new()),
+        redis: None,
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

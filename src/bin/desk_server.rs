@@ -1278,6 +1278,38 @@ async fn main() -> anyhow::Result<()> {
 
     let valid_symbols: std::collections::HashSet<String> = order_pubs.keys().cloned().collect();
 
+    // Redis L1: cheap multiplexed conn for REST read fallback. If REDIS_URL is
+    // unreachable at boot, leave it as None — handlers transparently fall
+    // back to the existing PG path. We do NOT block startup on Redis.
+    let redis_conn: Option<redis::aio::MultiplexedConnection> = {
+        let url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+        match redis::Client::open(url.clone()) {
+            Ok(client) => match client.get_multiplexed_async_connection().await {
+                Ok(mut c) => {
+                    match redis::cmd("PING").query_async::<String>(&mut c).await {
+                        Ok(_) => {
+                            tracing::info!("Redis L1 reader attached: {url}");
+                            Some(c)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Redis PING failed at {url}: {e} — REST will fall back to PG");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Redis connect failed at {url}: {e} — REST will fall back to PG");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Invalid REDIS_URL '{url}': {e} — REST will fall back to PG");
+                None
+            }
+        }
+    };
+
     let state = AppState {
         db: Arc::new(pool),
         engines: None,
@@ -1293,6 +1325,7 @@ async fn main() -> anyhow::Result<()> {
         tracer: tracer.clone(),
         account_cache: account_cache.clone(),
         valid_symbols: Arc::new(valid_symbols),
+        redis: redis_conn,
     };
 
     // ── DB worker: rtrb ring buffer spin thread → DB worker thread ───────────

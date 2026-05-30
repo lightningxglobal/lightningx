@@ -247,7 +247,36 @@ async fn handle_orders(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let limit = q.limit.unwrap_or(50).min(500);
+    let limit_raw = match q.limit {
+        Some(v) => v,
+        None => 50,
+    };
+    let limit = limit_raw.min(500);
+
+    // Fast path: status=open + Redis attached → read user_orders:{uid} (SET)
+    // + pipelined HGETALLs, no PG round-trip. Falls back to PG on any error.
+    let wants_open = matches!(q.status.as_deref(), Some("open"));
+    if wants_open {
+        if let Some(conn_template) = s.redis.as_ref() {
+            let mut conn = conn_template.clone();
+            match crate::desk::redis_store::list_user_open_orders(
+                &mut conn,
+                user_id,
+                q.symbol.as_deref(),
+                limit as usize,
+            )
+            .await
+            {
+                Ok(rows) => return (StatusCode::OK, Json(json!(rows))).into_response(),
+                Err(e) => {
+                    tracing::warn!(
+                        "Redis list_user_open_orders failed for user={user_id}: {e} — falling back to PG"
+                    );
+                }
+            }
+        }
+    }
+
     let status_filter: Option<Vec<&str>> = match q.status.as_deref() {
         Some("open") => Some(vec!["PENDING", "TRADING"]),
         Some("history") => Some(vec!["COMPLETED", "CANCELED", "REJECTED"]),
@@ -281,6 +310,23 @@ async fn handle_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+
+    // Fast path: try Redis first when the order is still active. Redis only
+    // holds PENDING/TRADING orders, so missing-in-Redis (Ok(None)) doesn't
+    // imply 404 — we fall through to PG which has terminal-state history too.
+    if let Some(conn_template) = s.redis.as_ref() {
+        let mut conn = conn_template.clone();
+        match crate::desk::redis_store::get_order(&mut conn, order_id, user_id).await {
+            Ok(Some(order)) => return (StatusCode::OK, Json(json!(order))).into_response(),
+            Ok(None) => { /* fall through to PG */ }
+            Err(e) => {
+                tracing::warn!(
+                    "Redis get_order failed for order_id={order_id} user_id={user_id}: {e} — falling back to PG"
+                );
+            }
+        }
+    }
+
     let row = sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id = $1 AND user_id = $2")
         .bind(order_id)
         .bind(user_id)

@@ -4,7 +4,7 @@
 //!
 //! - `HASH order:{id}` — full row of an active (PENDING/TRADING) order.
 //!   fields: user_id, symbol, side, order_type, price, qty, filled, status,
-//!           freeze_price, client_order_id, created_at
+//!           freeze_price, client_order_id, created_at_ms, updated_at_ms
 //! - `SET active_orders` — global index of order ids (for full scans / cold
 //!   hydrate checks).
 //! - `SET user_orders:{user_id}` — per-user index for `/api/orders?status=open`.
@@ -135,6 +135,7 @@ async fn apply_order_upsert(
             ("freeze_price", freeze_price.to_string()),
             ("client_order_id", coid_str.clone()),
             ("created_at_ms", created_at_ms.to_string()),
+            ("updated_at_ms", created_at_ms.to_string()),
         ],
     )
     .ignore();
@@ -190,18 +191,23 @@ async fn apply_order_fill_update(
         5 => "REJECTED",
         _ => return Ok(()),
     };
-    // Only update the two changing fields. Skip if the order isn't in
+    // Only update the changing fields. Skip if the order isn't in
     // Redis (could happen during cold-start replay; OK to drop).
     let exists: bool = conn.exists(key_order(id)).await.unwrap_or(false);
     if !exists {
         return Ok(());
     }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .map_err(|e| anyhow::anyhow!("clock before UNIX_EPOCH: {e}"))?;
     redis::pipe()
         .hset_multiple(
             key_order(id),
             &[
                 ("filled", filled.to_string()),
                 ("status", status_str.to_string()),
+                ("updated_at_ms", now_ms.to_string()),
             ],
         )
         .query_async::<()>(conn)
@@ -272,9 +278,10 @@ pub async fn hydrate_from_pg(
         Option<f64>,
         Option<String>,
         chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
     )> = sqlx::query_as(
         "SELECT id, user_id, symbol, side, order_type, price, quantity, filled,
-                status, freeze_price, client_order_id, created_at
+                status, freeze_price, client_order_id, created_at, updated_at
          FROM orders
          WHERE status IN ('PENDING','TRADING')",
     )
@@ -298,23 +305,39 @@ pub async fn hydrate_from_pg(
             freeze_price,
             client_order_id,
             created_at,
+            updated_at,
         ) in &rows
         {
+            // PG schema allows nullable price / freeze_price / client_order_id; we hydrate them
+            // as the natural empty/zero value Redis readers expect. This is NOT silent fallback
+            // data — it's the documented Redis encoding for "absent" (e.g. market orders have
+            // no price). Done at hydrate site only; runtime writes go through PersistEvent which
+            // carries explicit fields.
+            let price_str = match price {
+                Some(p) => p.to_string(),
+                None => "0".to_string(),
+            };
+            let freeze_str = match freeze_price {
+                Some(f) => f.to_string(),
+                None => "0".to_string(),
+            };
+            let coid_str = match client_order_id {
+                Some(s) => s.clone(),
+                None => String::new(),
+            };
             let fields: Vec<(&str, String)> = vec![
                 ("user_id", user_id.to_string()),
                 ("symbol", symbol.clone()),
                 ("side", side.clone()),
                 ("order_type", order_type.clone()),
-                ("price", price.unwrap_or(0.0).to_string()),
+                ("price", price_str),
                 ("qty", quantity.to_string()),
                 ("filled", filled.to_string()),
                 ("status", status.clone()),
-                ("freeze_price", freeze_price.unwrap_or(0.0).to_string()),
-                (
-                    "client_order_id",
-                    client_order_id.clone().unwrap_or_default(),
-                ),
+                ("freeze_price", freeze_str),
+                ("client_order_id", coid_str),
                 ("created_at_ms", created_at.timestamp_millis().to_string()),
+                ("updated_at_ms", updated_at.timestamp_millis().to_string()),
             ];
             pipe.hset_multiple(key_order(*id), &fields).ignore();
             pipe.sadd(KEY_ACTIVE_ORDERS, *id).ignore();
@@ -447,6 +470,152 @@ pub async fn purge_all(
     Ok(())
 }
 
+// ── Reader path (used by REST handlers to skip PG entirely) ─────────────────
+
+use crate::desk::models::DbOrder;
+use chrono::{DateTime, TimeZone, Utc};
+use std::collections::HashMap;
+
+/// Decode a HGETALL result back into the DbOrder shape the REST layer returns.
+/// Returns None when the HASH is missing or doesn't carry the required fields.
+/// Does NOT invent missing fields — incomplete HASH ⇒ None ⇒ caller falls back
+/// to PG (avoids silently serving truncated rows).
+fn decode_hash(id: i64, fields: &HashMap<String, String>) -> Option<DbOrder> {
+    let user_id: i64 = fields.get("user_id")?.parse().ok()?;
+    let symbol = fields.get("symbol")?.clone();
+    let side = fields.get("side")?.clone();
+    let order_type = fields.get("order_type")?.clone();
+    let status = fields.get("status")?.clone();
+    let quantity: f64 = fields.get("qty")?.parse().ok()?;
+    let filled: f64 = fields.get("filled")?.parse().ok()?;
+    let freeze_price: f64 = fields.get("freeze_price")?.parse().ok()?;
+    // price stored as f64 string; 0 is the documented sentinel for market orders
+    // (writers convert Option::None → 0 deliberately — see apply_order_upsert).
+    let price_raw: f64 = fields.get("price")?.parse().ok()?;
+    let price = if price_raw == 0.0 { None } else { Some(price_raw) };
+    let client_order_id = match fields.get("client_order_id") {
+        Some(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    let created_at_ms: i64 = fields.get("created_at_ms")?.parse().ok()?;
+    let updated_at_ms: i64 = match fields.get("updated_at_ms").and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None => created_at_ms,
+    };
+    let created_at = Utc.timestamp_millis_opt(created_at_ms).single()?;
+    let updated_at = Utc.timestamp_millis_opt(updated_at_ms).single()?;
+    Some(DbOrder {
+        id,
+        user_id,
+        symbol,
+        side,
+        order_type,
+        price,
+        quantity,
+        filled,
+        status,
+        freeze_price,
+        client_order_id,
+        created_at,
+        updated_at,
+    })
+}
+
+/// Read a single order by id from Redis. Returns Ok(None) if missing or
+/// belongs to a different user (caller passes user_id for ownership check).
+pub async fn get_order(
+    conn: &mut redis::aio::MultiplexedConnection,
+    id: i64,
+    user_id: i64,
+) -> anyhow::Result<Option<DbOrder>> {
+    let fields: HashMap<String, String> = conn.hgetall(key_order(id)).await?;
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    let order = match decode_hash(id, &fields) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    if order.user_id != user_id {
+        return Ok(None);
+    }
+    Ok(Some(order))
+}
+
+/// List all open (PENDING/TRADING) orders for a user, newest-first by
+/// `created_at`. `symbol_filter` narrows to a single symbol when Some.
+/// `limit` caps the result count after sorting.
+///
+/// Reads `user_orders:{uid}` (SET) then pipelines HGETALL per id. Skips ids
+/// whose HASH is missing or fails to decode — those fall through to PG via
+/// the caller's normal path.
+pub async fn list_user_open_orders(
+    conn: &mut redis::aio::MultiplexedConnection,
+    user_id: i64,
+    symbol_filter: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<DbOrder>> {
+    let ids: Vec<i64> = conn.smembers(key_user_orders(user_id)).await?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pipe = redis::pipe();
+    for id in &ids {
+        pipe.hgetall(key_order(*id));
+    }
+    let hashes: Vec<HashMap<String, String>> = pipe.query_async(conn).await?;
+    let mut out: Vec<DbOrder> = Vec::with_capacity(ids.len());
+    for (id, h) in ids.into_iter().zip(hashes.into_iter()) {
+        if h.is_empty() {
+            continue;
+        }
+        let Some(o) = decode_hash(id, &h) else { continue };
+        if let Some(sym) = symbol_filter {
+            if o.symbol != sym {
+                continue;
+            }
+        }
+        out.push(o);
+    }
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    if out.len() > limit {
+        out.truncate(limit);
+    }
+    Ok(out)
+}
+
+/// Snapshot of accounts a user holds (for `/api/balances` cold-path fallback).
+/// Returns Vec of (asset, balance, frozen, updated_at). `updated_at` is set
+/// to "now" because Redis HASH stores no timestamp for accounts.
+pub async fn list_user_accounts(
+    conn: &mut redis::aio::MultiplexedConnection,
+    user_id: i64,
+) -> anyhow::Result<Vec<(String, f64, f64, DateTime<Utc>)>> {
+    let assets: Vec<String> = conn.smembers(key_user_assets(user_id)).await?;
+    if assets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pipe = redis::pipe();
+    for a in &assets {
+        pipe.hgetall(key_account(user_id, a));
+    }
+    let rows: Vec<HashMap<String, String>> = pipe.query_async(conn).await?;
+    let now = Utc::now();
+    let mut out: Vec<(String, f64, f64, DateTime<Utc>)> = Vec::with_capacity(assets.len());
+    for (asset, h) in assets.into_iter().zip(rows.into_iter()) {
+        let balance: f64 = match h.get("balance").and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let frozen: f64 = match h.get("frozen").and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        out.push((asset, balance, frozen, now));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +627,59 @@ mod tests {
         assert_eq!(key_account(7, "USDT"), "acct:7:USDT");
         assert_eq!(key_user_assets(7), "user_assets:7");
         assert_eq!(key_user_coid(7), "user_coid:7");
+    }
+
+    #[test]
+    fn decode_hash_roundtrip() {
+        let mut h = HashMap::new();
+        h.insert("user_id".into(), "42".into());
+        h.insert("symbol".into(), "BTC_USDT".into());
+        h.insert("side".into(), "buy".into());
+        h.insert("order_type".into(), "limit".into());
+        h.insert("status".into(), "PENDING".into());
+        h.insert("price".into(), "73000.5".into());
+        h.insert("qty".into(), "0.05".into());
+        h.insert("filled".into(), "0".into());
+        h.insert("freeze_price".into(), "73000.5".into());
+        h.insert("client_order_id".into(), "abc".into());
+        h.insert("created_at_ms".into(), "1700000000000".into());
+        h.insert("updated_at_ms".into(), "1700000001000".into());
+        let o = decode_hash(7, &h).expect("decode");
+        assert_eq!(o.id, 7);
+        assert_eq!(o.user_id, 42);
+        assert_eq!(o.symbol, "BTC_USDT");
+        assert_eq!(o.price, Some(73000.5));
+        assert_eq!(o.client_order_id.as_deref(), Some("abc"));
+        assert_eq!(o.created_at.timestamp_millis(), 1700000000000);
+        assert_eq!(o.updated_at.timestamp_millis(), 1700000001000);
+    }
+
+    #[test]
+    fn decode_hash_missing_field_returns_none() {
+        let mut h = HashMap::new();
+        h.insert("user_id".into(), "42".into());
+        // status missing → must NOT invent data
+        assert!(decode_hash(7, &h).is_none());
+    }
+
+    #[test]
+    fn decode_hash_empty_client_order_id_is_none() {
+        let mut h = HashMap::new();
+        h.insert("user_id".into(), "42".into());
+        h.insert("symbol".into(), "BTC_USDT".into());
+        h.insert("side".into(), "buy".into());
+        h.insert("order_type".into(), "market".into());
+        h.insert("status".into(), "PENDING".into());
+        h.insert("price".into(), "0".into());
+        h.insert("qty".into(), "1".into());
+        h.insert("filled".into(), "0".into());
+        h.insert("freeze_price".into(), "0".into());
+        h.insert("client_order_id".into(), "".into());
+        h.insert("created_at_ms".into(), "1700000000000".into());
+        let o = decode_hash(7, &h).expect("decode");
+        assert!(o.client_order_id.is_none());
+        assert!(o.price.is_none(), "price==0 sentinel decodes back to None");
+        // updated_at_ms missing → tracks created_at_ms.
+        assert_eq!(o.updated_at, o.created_at);
     }
 }

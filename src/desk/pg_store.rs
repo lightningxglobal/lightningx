@@ -25,10 +25,15 @@ use crate::transport::persist_event::{
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
 
-const STATUS_NAMES: [&str; 6] = ["UNKNOWN", "PENDING", "TRADING", "COMPLETED", "CANCELED", "REJECTED"];
+// Status encoding matches `DbOrderStatus` (0-indexed) which is what
+// desk-server actually publishes on the wire — see
+// crate::desk::order_state::DbOrderStatus. Earlier drafts of this module
+// used a 1-indexed mapping which silently coerced everything to PENDING.
+const STATUS_NAMES: [&str; 5] =
+    ["PENDING", "TRADING", "COMPLETED", "CANCELED", "REJECTED"];
 
 fn status_str(code: u8) -> Option<&'static str> {
-    if (1..=5).contains(&code) {
+    if (code as usize) < STATUS_NAMES.len() {
         Some(STATUS_NAMES[code as usize])
     } else {
         None
@@ -85,6 +90,36 @@ struct TradeRow {
     created_at: DateTime<Utc>,
 }
 
+/// Reason a frame was rejected by `push`, for diagnostics. Counters are
+/// printed by the pg-writer stats log so we can see whether the persist
+/// stream is carrying malformed frames or just unknown kinds.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SkipCounts {
+    pub unknown_kind: u64,
+    pub upsert_bad_status: u64,
+    pub upsert_bad_timestamp: u64,
+    pub upsert_empty_string: u64,
+    pub fill_bad_status: u64,
+    pub account_empty_asset: u64,
+    pub trade_empty_symbol: u64,
+    pub trade_bad_timestamp: u64,
+    pub payload_decode_failed: u64,
+}
+
+impl SkipCounts {
+    pub fn total(&self) -> u64 {
+        self.unknown_kind
+            + self.upsert_bad_status
+            + self.upsert_bad_timestamp
+            + self.upsert_empty_string
+            + self.fill_bad_status
+            + self.account_empty_asset
+            + self.trade_empty_symbol
+            + self.trade_bad_timestamp
+            + self.payload_decode_failed
+    }
+}
+
 #[derive(Default)]
 pub struct PgWriteBatch {
     upserts: Vec<UpsertRow>,
@@ -93,6 +128,7 @@ pub struct PgWriteBatch {
     accounts: Vec<AccountRow>,
     trades: Vec<TradeRow>,
     skipped: u64,
+    skip_counts: SkipCounts,
 }
 
 impl PgWriteBatch {
@@ -116,6 +152,10 @@ impl PgWriteBatch {
         self.skipped
     }
 
+    pub fn skip_counts(&self) -> SkipCounts {
+        self.skip_counts
+    }
+
     /// Drop any buffered rows but preserve the `skipped` counter. Used by
     /// the writer loop after a flush error: we discard the in-flight batch
     /// (to avoid an infinite retry loop on a poison frame) without losing
@@ -136,6 +176,7 @@ impl PgWriteBatch {
                 Some(p) => self.push_upsert(&p),
                 None => {
                     self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
                     false
                 }
             },
@@ -146,6 +187,7 @@ impl PgWriteBatch {
                 }
                 None => {
                     self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
                     false
                 }
             },
@@ -153,6 +195,7 @@ impl PgWriteBatch {
                 Some(p) => self.push_fill(&p),
                 None => {
                     self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
                     false
                 }
             },
@@ -160,6 +203,7 @@ impl PgWriteBatch {
                 Some(p) => self.push_account(&p),
                 None => {
                     self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
                     false
                 }
             },
@@ -167,11 +211,13 @@ impl PgWriteBatch {
                 Some(p) => self.push_trade(&p),
                 None => {
                     self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
                     false
                 }
             },
             None => {
                 self.skipped += 1;
+                self.skip_counts.unknown_kind += 1;
                 false
             }
         }
@@ -189,10 +235,12 @@ impl PgWriteBatch {
         let created_at_ms: i64 = p.created_at_ms;
         let Some(status) = status_str(status_code) else {
             self.skipped += 1;
+            self.skip_counts.upsert_bad_status += 1;
             return false;
         };
         let Some(created_at) = from_unix_ms(created_at_ms) else {
             self.skipped += 1;
+            self.skip_counts.upsert_bad_timestamp += 1;
             return false;
         };
         let symbol = unpack_str(&p.symbol).to_owned();
@@ -200,6 +248,7 @@ impl PgWriteBatch {
         let coid = unpack_str(&p.client_order_id).to_owned();
         if symbol.is_empty() || order_type.is_empty() {
             self.skipped += 1;
+            self.skip_counts.upsert_empty_string += 1;
             return false;
         }
         // price=0 is the documented sentinel for "market order" (NULL in PG).
@@ -232,6 +281,7 @@ impl PgWriteBatch {
         let filled: f64 = p.filled;
         let Some(status) = status_str(p.status) else {
             self.skipped += 1;
+            self.skip_counts.fill_bad_status += 1;
             return false;
         };
         self.fills.push(FillRow { id, filled, status });
@@ -245,6 +295,7 @@ impl PgWriteBatch {
         let asset = unpack_str(&p.asset).to_owned();
         if asset.is_empty() {
             self.skipped += 1;
+            self.skip_counts.account_empty_asset += 1;
             return false;
         }
         self.accounts.push(AccountRow {
@@ -265,10 +316,12 @@ impl PgWriteBatch {
         let symbol = unpack_str(&p.symbol).to_owned();
         if symbol.is_empty() {
             self.skipped += 1;
+            self.skip_counts.trade_empty_symbol += 1;
             return false;
         }
         let Some(created_at) = from_unix_ms(ts_ms) else {
             self.skipped += 1;
+            self.skip_counts.trade_bad_timestamp += 1;
             return false;
         };
         self.trades.push(TradeRow {
@@ -307,7 +360,49 @@ impl PgWriteBatch {
     }
 }
 
-async fn flush_upserts(pool: &PgPool, rows: Vec<UpsertRow>) -> anyhow::Result<usize> {
+/// In-place "keep last by key" dedup. Preserves order of the surviving rows
+/// (the position of the LAST occurrence). Used because PG's ON CONFLICT DO
+/// UPDATE refuses batches where the same target row appears twice.
+fn dedup_keep_last_by_id<T, F: Fn(&T) -> i64>(rows: Vec<T>, key: F) -> Vec<T> {
+    use std::collections::HashMap;
+    let mut keep: HashMap<i64, usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        keep.insert(key(r), i);
+    }
+    let mut keep_idx: Vec<usize> = keep.into_values().collect();
+    keep_idx.sort_unstable();
+    let mut out = Vec::with_capacity(keep_idx.len());
+    for (i, r) in rows.into_iter().enumerate() {
+        if keep_idx.binary_search(&i).is_ok() {
+            out.push(r);
+        }
+    }
+    out
+}
+
+fn dedup_accounts_keep_last(rows: Vec<AccountRow>) -> Vec<AccountRow> {
+    use std::collections::HashMap;
+    let mut keep: HashMap<(i64, String), usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        keep.insert((r.user_id, r.asset.clone()), i);
+    }
+    let mut keep_idx: Vec<usize> = keep.into_values().collect();
+    keep_idx.sort_unstable();
+    let mut out = Vec::with_capacity(keep_idx.len());
+    for (i, r) in rows.into_iter().enumerate() {
+        if keep_idx.binary_search(&i).is_ok() {
+            out.push(r);
+        }
+    }
+    out
+}
+
+async fn flush_upserts(pool: &PgPool, mut rows: Vec<UpsertRow>) -> anyhow::Result<usize> {
+    // Dedup by id, keeping the LAST occurrence — PG's ON CONFLICT DO UPDATE
+    // rejects batches that touch the same row twice. "Last wins" is the
+    // semantics we want anyway: the final state per id reflects the
+    // newest event in the batch.
+    rows = dedup_keep_last_by_id(rows, |r| r.id);
     // Pivot to column arrays for UNNEST — single SQL, server-side join.
     let n = rows.len();
     let mut ids = Vec::with_capacity(n);
@@ -382,6 +477,10 @@ async fn flush_upserts(pool: &PgPool, rows: Vec<UpsertRow>) -> anyhow::Result<us
 }
 
 async fn flush_deletes(pool: &PgPool, ids: Vec<i64>) -> anyhow::Result<usize> {
+    // DELETE WHERE ANY tolerates duplicate ids, but trimming saves bytes.
+    let mut ids = ids;
+    ids.sort_unstable();
+    ids.dedup();
     let res = sqlx::query("DELETE FROM orders WHERE id = ANY($1::bigint[])")
         .bind(&ids)
         .execute(pool)
@@ -390,6 +489,10 @@ async fn flush_deletes(pool: &PgPool, ids: Vec<i64>) -> anyhow::Result<usize> {
 }
 
 async fn flush_fills(pool: &PgPool, rows: Vec<FillRow>) -> anyhow::Result<usize> {
+    // UPDATE FROM (UNNEST...) silently joins one VALUES row to the same
+    // target row twice when duplicates exist; result is "one of the values
+    // wins, undefined which." We force last-wins explicitly.
+    let rows = dedup_keep_last_by_id(rows, |r| r.id);
     let mut ids = Vec::with_capacity(rows.len());
     let mut filleds = Vec::with_capacity(rows.len());
     let mut statuses = Vec::with_capacity(rows.len());
@@ -418,6 +521,9 @@ async fn flush_fills(pool: &PgPool, rows: Vec<FillRow>) -> anyhow::Result<usize>
 }
 
 async fn flush_accounts(pool: &PgPool, rows: Vec<AccountRow>) -> anyhow::Result<usize> {
+    // Dedup by (user_id, asset) keeping the last value — same ON CONFLICT
+    // constraint as orders.
+    let rows = dedup_accounts_keep_last(rows);
     let mut user_ids = Vec::with_capacity(rows.len());
     let mut assets = Vec::with_capacity(rows.len());
     let mut balances = Vec::with_capacity(rows.len());
@@ -498,7 +604,7 @@ mod tests {
             user_id: 7,
             symbol: pack_str("BTC_USDT"),
             side: 0,
-            status: 1, // PENDING
+            status: 0, // PENDING (DbOrderStatus::Pending = 0)
             _pad: [0; 6],
             order_type: pack_str("limit"),
             price: 70000.0,
@@ -568,11 +674,73 @@ mod tests {
     }
 
     #[test]
+    fn dedup_keep_last_keeps_last_occurrence() {
+        #[derive(Clone)]
+        struct R {
+            id: i64,
+            tag: u8,
+        }
+        let rows = vec![
+            R { id: 1, tag: 10 },
+            R { id: 2, tag: 20 },
+            R { id: 1, tag: 11 }, // overrides id=1
+            R { id: 3, tag: 30 },
+            R { id: 2, tag: 21 }, // overrides id=2
+        ];
+        let out = dedup_keep_last_by_id(rows, |r| r.id);
+        // Order: positions kept = indices 2,3,4 ⇒ ids [1,3,2] with last tags.
+        let ids: Vec<i64> = out.iter().map(|r| r.id).collect();
+        let tags: Vec<u8> = out.iter().map(|r| r.tag).collect();
+        assert_eq!(ids, vec![1, 3, 2]);
+        assert_eq!(tags, vec![11, 30, 21]);
+    }
+
+    #[test]
+    fn dedup_accounts_keeps_last_per_user_asset() {
+        let rows = vec![
+            AccountRow {
+                user_id: 1,
+                asset: "USDT".into(),
+                balance: 100.0,
+                frozen: 0.0,
+            },
+            AccountRow {
+                user_id: 2,
+                asset: "USDT".into(),
+                balance: 200.0,
+                frozen: 0.0,
+            },
+            AccountRow {
+                user_id: 1,
+                asset: "USDT".into(),
+                balance: 150.0,
+                frozen: 5.0,
+            }, // overrides user=1,USDT
+            AccountRow {
+                user_id: 1,
+                asset: "BTC".into(),
+                balance: 0.1,
+                frozen: 0.0,
+            },
+        ];
+        let out = dedup_accounts_keep_last(rows);
+        assert_eq!(out.len(), 3);
+        // The "last (user=1, USDT)" row must have balance=150 not 100.
+        let usdt_user1 = out
+            .iter()
+            .find(|r| r.user_id == 1 && r.asset == "USDT")
+            .expect("user=1 USDT present");
+        assert!((usdt_user1.balance - 150.0).abs() < 1e-9);
+        assert!((usdt_user1.frozen - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn fill_with_unknown_status_skipped() {
+        // Wire encoding is 0..=4 (DbOrderStatus). 99 is out-of-range.
         let f = PersistFrame::order_fill_update(OrderFillUpdatePayload {
             id: 5,
             filled: 0.1,
-            status: 0, // 0 is reserved
+            status: 99,
             _pad: [0; 7],
         });
         let mut b = PgWriteBatch::new();

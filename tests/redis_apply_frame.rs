@@ -43,7 +43,7 @@ async fn upsert_then_fill_then_delete_via_frames() {
         user_id,
         symbol: pack_str("BTC_USDT"),
         side: 0,
-        status: 1, // PENDING
+        status: 0, // PENDING (DbOrderStatus::Pending = 0)
         _pad: [0; 6],
         order_type: pack_str("limit"),
         price: 73000.5,
@@ -70,7 +70,7 @@ async fn upsert_then_fill_then_delete_via_frames() {
     let f = PersistFrame::order_fill_update(OrderFillUpdatePayload {
         id,
         filled: 0.03,
-        status: 2, // TRADING
+        status: 1, // TRADING (DbOrderStatus::Trading = 1)
         _pad: [0; 7],
     });
     apply_frame(&mut conn, &f).await.expect("fill update");
@@ -164,7 +164,7 @@ async fn fill_update_on_missing_id_is_noop() {
     let f = PersistFrame::order_fill_update(OrderFillUpdatePayload {
         id,
         filled: 0.1,
-        status: 2,
+        status: 1, // TRADING
         _pad: [0; 7],
     });
     apply_frame(&mut conn, &f).await.unwrap();

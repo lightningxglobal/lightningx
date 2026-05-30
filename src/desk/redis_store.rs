@@ -112,13 +112,24 @@ async fn apply_order_upsert(
     let coid_str = unpack_str(&p.client_order_id).to_owned();
 
     let side_str = if side == 0 { "buy" } else { "sell" };
+    // Wire status uses the `DbOrderStatus` 0-indexed encoding
+    // (Pending=0..Rejected=4) — same value the desk-server publishers cast
+    // via `DbOrderStatus::as_u8()`. Out-of-range codes are dropped so we
+    // never silently coerce an unknown value into PENDING.
     let status_str = match status {
-        1 => "PENDING",
-        2 => "TRADING",
-        3 => "COMPLETED",
-        4 => "CANCELED",
-        5 => "REJECTED",
-        _ => "PENDING",
+        0 => "PENDING",
+        1 => "TRADING",
+        2 => "COMPLETED",
+        3 => "CANCELED",
+        4 => "REJECTED",
+        _ => {
+            tracing::warn!(
+                "apply_order_upsert: unknown status code {} for id {} — dropping",
+                status,
+                id
+            );
+            return Ok(());
+        }
     };
     let mut pipe = redis::pipe();
     pipe.hset_multiple(
@@ -183,12 +194,13 @@ async fn apply_order_fill_update(
     let id: i64 = p.id;
     let filled: f64 = p.filled;
     let status: u8 = p.status;
+    // Wire status uses the `DbOrderStatus` 0-indexed encoding.
     let status_str = match status {
-        1 => "PENDING",
-        2 => "TRADING",
-        3 => "COMPLETED",
-        4 => "CANCELED",
-        5 => "REJECTED",
+        0 => "PENDING",
+        1 => "TRADING",
+        2 => "COMPLETED",
+        3 => "CANCELED",
+        4 => "REJECTED",
         _ => return Ok(()),
     };
     // Only update the changing fields. Skip if the order isn't in

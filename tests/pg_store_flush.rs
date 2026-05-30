@@ -91,8 +91,8 @@ async fn upsert_then_fill_then_delete_round_trips_through_pg() {
     let id_b: i64 = 980_000_100_002;
 
     let mut batch = PgWriteBatch::new();
-    assert!(batch.push(&upsert(id_a, user_id, 1))); // PENDING
-    assert!(batch.push(&upsert(id_b, user_id, 1)));
+    assert!(batch.push(&upsert(id_a, user_id, 0))); // PENDING (DbOrderStatus::Pending=0)
+    assert!(batch.push(&upsert(id_b, user_id, 0)));
     let written = batch.flush(&pg).await.expect("flush upserts");
     assert_eq!(written, 2);
 
@@ -113,7 +113,7 @@ async fn upsert_then_fill_then_delete_round_trips_through_pg() {
     let fill = PersistFrame::order_fill_update(OrderFillUpdatePayload {
         id: id_a,
         filled: 0.04,
-        status: 2, // TRADING
+        status: 1, // TRADING (DbOrderStatus::Trading = 1)
         _pad: [0; 7],
     });
     assert!(batch.push(&fill));

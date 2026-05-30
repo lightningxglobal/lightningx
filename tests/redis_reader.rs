@@ -48,7 +48,7 @@ fn upsert_frame(id: i64, user_id: i64, symbol: &str, price: f64, qty: f64) -> Pe
         user_id,
         symbol: pack_str(symbol),
         side: 0,
-        status: 1, // PENDING
+        status: 0, // PENDING (DbOrderStatus::Pending = 0)
         _pad: [0; 6],
         order_type: pack_str("limit"),
         price,
@@ -192,14 +192,14 @@ async fn fill_update_bumps_updated_at_ms() {
         &PersistFrame::order_fill_update(OrderFillUpdatePayload {
             id,
             filled: 0.03,
-            status: 2,
+            status: 1, // TRADING
             _pad: [0; 7],
         }),
     )
     .await
     .unwrap();
     let after = get_order(&mut conn, id, user_id).await.unwrap().unwrap();
-    assert_eq!(after.status, "TRADING");
+    assert_eq!(after.status, "TRADING", "fill update status=1 → TRADING");
     assert_eq!(after.filled, 0.03);
     assert!(
         after.updated_at.timestamp_millis() > created_ms,

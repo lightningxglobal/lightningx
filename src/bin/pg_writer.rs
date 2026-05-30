@@ -106,12 +106,25 @@ async fn main() -> anyhow::Result<()> {
         // never resets it (see PgWriteBatch::flush — only the per-kind Vecs
         // are taken). So reporting it directly is correct.
         if last_log.elapsed() >= Duration::from_secs(30) {
+            let sc = batch.skip_counts();
             info!(
-                "pg-writer: applied={} flushes={} skipped={} sub_dropped={}",
+                "pg-writer: applied={} flushes={} skipped={} sub_dropped={} \
+                 [unknown_kind={} upsert_bad_status={} upsert_bad_ts={} upsert_empty_str={} \
+                 fill_bad_status={} account_empty_asset={} trade_empty_symbol={} \
+                 trade_bad_ts={} decode_failed={}]",
                 total_applied,
                 total_flushes,
                 batch.skipped(),
-                sub.dropped_frames()
+                sub.dropped_frames(),
+                sc.unknown_kind,
+                sc.upsert_bad_status,
+                sc.upsert_bad_timestamp,
+                sc.upsert_empty_string,
+                sc.fill_bad_status,
+                sc.account_empty_asset,
+                sc.trade_empty_symbol,
+                sc.trade_bad_timestamp,
+                sc.payload_decode_failed,
             );
             last_log = Instant::now();
         }

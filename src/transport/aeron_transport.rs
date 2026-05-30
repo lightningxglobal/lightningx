@@ -24,7 +24,11 @@ use std::sync::Arc;
 
 const MAX_BACKPRESSURE_SPINS: u32 = 100_000;
 const ORDER_INBOUND_RING: usize = 16 * 1024;
-const ORDER_UPDATE_RING: usize = 16 * 1024;
+// 16K saturated on MM restart bursts — 5835 OPEN events dropped in ~5s, which
+// permanently corrupted MM's in-memory book (orders engine knew about but MM
+// did not). 128K survives a full cancel-all+place-all burst from a 40-quote MM
+// with room to spare; cost is ~11MB at sizeof(OrderUpdateMsg)≈88B.
+const ORDER_UPDATE_RING: usize = 128 * 1024;
 const TRADE_RING: usize = 16 * 1024;
 const DEPTH_RING: usize = 4 * 1024;
 

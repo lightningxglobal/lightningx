@@ -90,3 +90,7 @@ path = "src/bin/exchange_engine.rs"
 [[bin]]
 name = "redis-writer"
 path = "src/bin/redis_writer.rs"
+
+[[bin]]
+name = "pg-writer"
+path = "src/bin/pg_writer.rs"

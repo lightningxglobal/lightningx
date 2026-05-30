@@ -36,6 +36,9 @@ async fn main() -> anyhow::Result<()> {
     let oneshot = std::env::var("ONESHOT_HYDRATE")
         .map(|s| !s.is_empty())
         .unwrap_or(false);
+    let reconcile = std::env::var("RECONCILE_ON_START")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
 
     info!(
         "redis-writer starting (pg={}, redis={})",
@@ -77,6 +80,22 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         info!("Redis already hydrated; skipping cold load");
+    }
+
+    // Optional one-shot reconcile: drop Redis state for orders that no
+    // longer exist in PG. Idempotent and cheap (one ANY-bigint query per
+    // set). Useful after a publish-path bug left strays behind. Runs
+    // after hydrate so the freshly-hydrated active set is the truth.
+    if reconcile {
+        info!("RECONCILE_ON_START set — sweeping orphans");
+        let stats = redis_store::reconcile_orphans(&pg, &mut conn).await?;
+        info!(
+            "reconcile done: orders_scanned={} orders_removed={} user_sets_scanned={} accounts_scanned={}",
+            stats.redis_orders_scanned,
+            stats.orders_removed,
+            stats.user_sets_scanned,
+            stats.accounts_scanned,
+        );
     }
 
     if oneshot {

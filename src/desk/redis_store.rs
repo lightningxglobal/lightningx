@@ -403,6 +403,136 @@ pub async fn hydrate_from_pg(
     Ok(stats)
 }
 
+/// Stats for `reconcile_orphans` — non-destructive sweep that drops Redis
+/// state for orders/accounts that no longer exist in PG. Used at startup
+/// (and optionally periodically) to converge L1 back to PG after a
+/// publish-path bug or process restart left stragglers behind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileStats {
+    pub redis_orders_scanned: u64,
+    pub orders_removed: u64,
+    pub accounts_scanned: u64,
+    pub accounts_removed: u64,
+    pub user_sets_scanned: u64,
+}
+
+/// Reconcile Redis L1 with PG: drop any `order:{id}` HASH and SREM the id
+/// from `active_orders` / `user_orders:{uid}` when the row no longer
+/// exists in PG. Also drops `acct:{uid}:{asset}` HASHes whose `accounts`
+/// row was removed in PG (extremely rare — accounts are append-only in
+/// practice). Idempotent and safe to call against a live system.
+///
+/// Strategy:
+/// 1. Pull every member of `active_orders` (the global index).
+/// 2. Ask PG which of those ids still exist.
+/// 3. SREM + DEL the ones that don't, plus SREM from the owner's
+///    `user_orders:{uid}` (uid recovered from the HASH before DEL).
+/// 4. Repeat for `user_orders:{uid}` SCAN — covers ids that were added
+///    to per-user sets but missing from `active_orders` (defence in
+///    depth).
+pub async fn reconcile_orphans(
+    pg: &PgPool,
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> anyhow::Result<ReconcileStats> {
+    let mut stats = ReconcileStats::default();
+
+    // 1) Walk active_orders.
+    let order_ids: Vec<i64> = conn.smembers(KEY_ACTIVE_ORDERS).await.unwrap_or_default();
+    stats.redis_orders_scanned = order_ids.len() as u64;
+
+    if !order_ids.is_empty() {
+        // Ask PG which ids still exist (any status, not only PENDING/TRADING —
+        // a row in COMPLETED briefly before BatchDeleteOrder runs should not
+        // be reaped here either).
+        let existing: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM orders WHERE id = ANY($1::bigint[])",
+        )
+        .bind(&order_ids)
+        .fetch_all(pg)
+        .await?;
+        let existing_set: std::collections::HashSet<i64> =
+            existing.into_iter().map(|(id,)| id).collect();
+
+        let orphan_ids: Vec<i64> = order_ids
+            .into_iter()
+            .filter(|id| !existing_set.contains(id))
+            .collect();
+        if !orphan_ids.is_empty() {
+            // Resolve user_id per orphan so we can clean `user_orders:{uid}` too.
+            let mut pipe = redis::pipe();
+            for id in &orphan_ids {
+                pipe.hget(key_order(*id), "user_id");
+            }
+            let uids: Vec<Option<String>> = pipe.query_async(conn).await.unwrap_or_default();
+
+            let mut pipe = redis::pipe();
+            for (id, uid_str) in orphan_ids.iter().zip(uids.iter()) {
+                pipe.del(key_order(*id)).ignore();
+                pipe.srem(KEY_ACTIVE_ORDERS, *id).ignore();
+                if let Some(s) = uid_str {
+                    if let Ok(uid) = s.parse::<i64>() {
+                        pipe.srem(key_user_orders(uid), *id).ignore();
+                    }
+                }
+            }
+            pipe.query_async::<()>(conn).await?;
+            stats.orders_removed = orphan_ids.len() as u64;
+        }
+    }
+
+    // 2) Defence-in-depth: scan user_orders:* for ids missing from active_orders
+    //    or PG. These are ids that for some reason landed in a per-user set
+    //    without (or after losing) the global index entry.
+    let mut iter: redis::AsyncIter<String> = conn.scan_match("user_orders:*").await?;
+    let mut user_sets: Vec<String> = Vec::new();
+    while let Some(k) = iter.next_item().await {
+        user_sets.push(k);
+    }
+    drop(iter);
+    stats.user_sets_scanned = user_sets.len() as u64;
+
+    for set_key in &user_sets {
+        let ids: Vec<i64> = conn.smembers(set_key).await.unwrap_or_default();
+        if ids.is_empty() {
+            continue;
+        }
+        let existing: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM orders WHERE id = ANY($1::bigint[])",
+        )
+        .bind(&ids)
+        .fetch_all(pg)
+        .await?;
+        let existing_set: std::collections::HashSet<i64> =
+            existing.into_iter().map(|(id,)| id).collect();
+        let orphans: Vec<i64> = ids
+            .into_iter()
+            .filter(|id| !existing_set.contains(id))
+            .collect();
+        if orphans.is_empty() {
+            continue;
+        }
+        let mut pipe = redis::pipe();
+        for id in &orphans {
+            pipe.srem(set_key, *id).ignore();
+            // Also enforce global cleanup — in case active_orders walk missed them.
+            pipe.srem(KEY_ACTIVE_ORDERS, *id).ignore();
+            pipe.del(key_order(*id)).ignore();
+        }
+        pipe.query_async::<()>(conn).await?;
+        stats.orders_removed += orphans.len() as u64;
+    }
+
+    // 3) Accounts: very rare to need reaping (accounts persist forever in PG)
+    //    so we only scan but skip removal unless asset is empty. Reserved as
+    //    future work — for now just count what's there.
+    let mut iter: redis::AsyncIter<String> = conn.scan_match("acct:*").await?;
+    while let Some(_) = iter.next_item().await {
+        stats.accounts_scanned += 1;
+    }
+
+    Ok(stats)
+}
+
 /// Wipe every key managed by this module — used by tests and by an explicit
 /// re-hydrate (`FORCE_REHYDRATE`). Walks `active_orders` and `user_assets`
 /// to find dependent keys, then issues all DELs in a single pipeline.

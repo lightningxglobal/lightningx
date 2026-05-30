@@ -598,6 +598,18 @@ async fn process_db_cmd(
                     .bind(id)
                     .execute(db.as_ref())
                     .await;
+            // PR2 dual-write: mirror to Redis so REST reads see the updated
+            // filled/status instead of the stale PENDING the OrderUpsert
+            // first published. OrderFillUpdate preserves price / qty / freeze.
+            publish_frame(
+                &persist_pub,
+                &PersistFrame::order_fill_update(OrderFillUpdatePayload {
+                    id,
+                    filled,
+                    status,
+                    _pad: [0; 7],
+                }),
+            );
         }
 
         DbCmd::BatchCancelConfirmed { ids, count } => {
@@ -683,10 +695,19 @@ async fn process_db_cmd(
                 }
             }
             // PR2 dual-write: orders dropped from PG → drop from Redis too.
-            for (id, _uid, _sym, _side, _q, _f, _fp) in &rows {
+            // Publish for EVERY requested id, not only RETURNING rows. When an
+            // id was already removed by another path (e.g. BatchSettleTrade's
+            // maker UPDATE → COMPLETED → BatchDeleteOrder) the RETURNING set
+            // is empty for that id, but the id may still be in Redis from an
+            // earlier OrderUpsert. OrderDelete is idempotent in apply_frame,
+            // so publishing once per requested id is safe and prevents
+            // user_orders / active_orders orphans from accumulating. Without
+            // this loop we measured 2000+ orphans after a few hours of
+            // continuous MM trading, which inflated REST latency 8×.
+            for &id in &ids_vec {
                 publish_frame(
                     &persist_pub,
-                    &PersistFrame::order_delete(OrderDeletePayload { id: *id }),
+                    &PersistFrame::order_delete(OrderDeletePayload { id }),
                 );
             }
         }

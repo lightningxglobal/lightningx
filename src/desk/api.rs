@@ -37,6 +37,15 @@ pub type AccountCache = Arc<DashMap<i64, HashMap<String, (f64, f64)>>>;
 /// readers fall back to PG.
 pub type RedisConn = redis::aio::MultiplexedConnection;
 
+/// Shared handle to the PersistEvent publisher (Aeron). Wrapped in a
+/// parking_lot Mutex because aeron-wrapper's Publisher is not Send+Sync.
+/// REST POST /api/orders uses this to publish OrderUpsert+AccountSet so
+/// Redis L1 stays in sync without waiting for the DB worker batch path
+/// (which previously caused ~12 orders of REST→Redis drift). `None` in
+/// standalone mode (no Aeron).
+pub type PersistPubHandle =
+    std::sync::Arc<parking_lot::Mutex<crate::transport::aeron_transport::PersistPublisher>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<PgPool>,
@@ -75,6 +84,9 @@ pub struct AppState {
     pub valid_symbols: Arc<HashSet<String>>,
     /// Redis L1 read connection. None ⇒ no Redis at startup, REST falls back to PG.
     pub redis: Option<RedisConn>,
+    /// PersistEvent publisher (Aeron IPC stream consumed by redis-writer).
+    /// None ⇒ standalone mode without Aeron — REST POST will not publish.
+    pub persist_pub: Option<PersistPubHandle>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -226,6 +238,84 @@ async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl 
             Json(json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+// ─── PersistEvent helpers (REST → Aeron → redis-writer) ──────────────────────
+
+/// Publish OrderUpsert + AccountSet frames to the persist stream so Redis
+/// L1 stays in sync with PG. Called by REST POST /api/orders after the
+/// row lands in PG. No-op when persist_pub is None (standalone mode).
+///
+/// We deliberately publish from REST (not the DB worker batch path) so
+/// Redis sees the new order before the engine response round-trip, which
+/// previously left ~12 orders of drift between PG and Redis under load.
+fn publish_rest_order_upsert(
+    state: &AppState,
+    db_order: &DbOrder,
+    user_id: i64,
+    freeze_price: f64,
+    quote_asset: &str,
+    base_asset: &str,
+) {
+    use crate::transport::persist_event::{
+        pack_str, AccountSetPayload, OrderUpsertPayload, PersistFrame,
+    };
+    let Some(pp) = state.persist_pub.as_ref() else {
+        return;
+    };
+
+    // OrderUpsert: encode the row exactly as INSERT…RETURNING gave it back.
+    // For market orders db_order.price is None — Redis encodes that as 0
+    // (documented sentinel in apply_order_upsert); this matches the wire
+    // format apply_frame already understands.
+    let side: u8 = if db_order.side == "buy" { 0 } else { 1 };
+    let price_f: f64 = match db_order.price {
+        Some(p) => p,
+        None => 0.0,
+    };
+    let coid_str: &str = match db_order.client_order_id.as_deref() {
+        Some(s) => s,
+        None => "",
+    };
+    let upsert = OrderUpsertPayload {
+        id: db_order.id,
+        user_id,
+        symbol: pack_str(&db_order.symbol),
+        side,
+        status: 1, // PENDING — matches INSERT default
+        _pad: [0; 6],
+        order_type: pack_str(&db_order.order_type),
+        price: price_f,
+        qty: db_order.quantity,
+        filled: db_order.filled,
+        freeze_price,
+        client_order_id: pack_str(coid_str),
+        created_at_ms: db_order.created_at.timestamp_millis(),
+    };
+    let _ = pp.lock().publish(&PersistFrame::order_upsert(upsert));
+
+    // AccountSet: only the side that was frozen. Read balance/frozen from
+    // the in-memory cache which the freeze step already updated with the
+    // PG-RETURNING value. Skip publishing if the cache entry is somehow
+    // missing — better silent than fabricated.
+    let asset = if db_order.side == "buy" {
+        quote_asset
+    } else {
+        base_asset
+    };
+    let snapshot: Option<(f64, f64)> = state
+        .account_cache
+        .get(&user_id)
+        .and_then(|entry| entry.get(asset).copied());
+    if let Some((balance, frozen)) = snapshot {
+        let acc = AccountSetPayload {
+            user_id,
+            asset: pack_str(asset),
+            balance,
+            frozen,
+        };
+        let _ = pp.lock().publish(&PersistFrame::account_set(acc));
     }
 }
 
@@ -633,6 +723,18 @@ async fn handle_place_order(
         }
     };
     let db_order_id = db_order.id;
+
+    // Mirror the new row to Redis L1 immediately, before the engine round-trip.
+    // Standalone mode (persist_pub=None) skips this; Aeron mode keeps Redis
+    // in sync without waiting for the DB worker's batch path.
+    publish_rest_order_upsert(
+        &s,
+        &db_order,
+        user_id,
+        freeze_price,
+        quote_asset,
+        base_asset,
+    );
 
     // ── Route to engine: local (standalone) vs Aeron (desk) ──────────────────
     if let Some(engine) = engine_opt {

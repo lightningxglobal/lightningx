@@ -1326,6 +1326,7 @@ async fn main() -> anyhow::Result<()> {
         account_cache: account_cache.clone(),
         valid_symbols: Arc::new(valid_symbols),
         redis: redis_conn,
+        persist_pub: Some(persist_pub.clone()),
     };
 
     // ── DB worker: rtrb ring buffer spin thread → DB worker thread ───────────

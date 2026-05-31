@@ -349,7 +349,14 @@ fn on_exch_msg(
                         .or_else(|| book.asks.iter().find(|q| q.order_id == order_id).map(|q| q.side))
                     {
                         Some(s) => s,
-                        None => { warn!("[{}] PARTIALLY_FILLED order {} not in book", cfg.symbol, order_id); return (true, None); }
+                        None => {
+                            // Same shared-user_id situation as FILLED — see comment there.
+                            tracing::debug!(
+                                "[{}] PARTIALLY_FILLED order {} not in book — likely another connection's order",
+                                cfg.symbol, order_id
+                            );
+                            return (true, None);
+                        }
                     };
                     let filled_qty = match v.get("filled_qty").and_then(|f| f.as_f64()) {
                         Some(f) => f,
@@ -376,7 +383,18 @@ fn on_exch_msg(
                         });
                     let side_str = match side_str {
                         Some(s) => s,
-                        None => { warn!("[{}] FILLED order {} unknown (not in book or awaiting)", cfg.symbol, order_id); return (true, None); }
+                        None => {
+                            // Not ours — most commonly trade-bot's REST market
+                            // orders (same user_id=16 as MM, so desk-server
+                            // fans every fill out to this WS channel). Correct
+                            // behaviour: don't touch inv; just drop. Logging
+                            // at debug to keep ops dashboards clean.
+                            tracing::debug!(
+                                "[{}] FILLED order {} unknown (not in book or awaiting) — likely another connection's order on shared user_id",
+                                cfg.symbol, order_id
+                            );
+                            return (true, None);
+                        }
                     };
                     let filled_qty = match v.get("filled_qty").and_then(|f| f.as_f64()) {
                         Some(f) => f,

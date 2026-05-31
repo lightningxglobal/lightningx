@@ -396,7 +396,48 @@ async fn handle_client_message(
                 None => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
             };
 
-            if !client_order_id.is_empty() {
+            // Idempotent check via Redis L1 (replaces the PG SELECT this used
+            // to do — 100× cheaper on the hot path). user_coid:{uid} maps
+            // each known client_order_id → engine id; if it exists we
+            // echo back the prior submission and skip re-placing. Redis miss
+            // is "no prior submission" — if a duplicate slips through, the
+            // (user_id, client_order_id) UNIQUE constraint catches it
+            // downstream in the DB worker's INSERT (logged but client already
+            // got order_submitted). Standalone mode falls back to PG below.
+            if !client_order_id.is_empty() && state.redis.is_some() {
+                let mut conn = match state.redis.as_ref() {
+                    Some(c) => c.clone(),
+                    None => return None,
+                };
+                use redis::AsyncCommands;
+                let existing_id: Option<i64> = conn
+                    .hget(crate::desk::redis_store::key_user_coid(user_id), &client_order_id)
+                    .await
+                    .ok();
+                if let Some(prior_id) = existing_id {
+                    if let Ok(Some(order)) =
+                        crate::desk::redis_store::get_order(&mut conn, prior_id, user_id).await
+                    {
+                        return Some(
+                            json!({
+                                "type": "order_submitted",
+                                "client_order_id": client_order_id,
+                                "order_id": order.id,
+                                "symbol": order.symbol,
+                                "side": order.side,
+                                "order_type": order.order_type,
+                                "price": order.price,
+                                "quantity": order.quantity,
+                                "status": order.status,
+                                "ts": unix_now()
+                            })
+                            .to_string(),
+                        );
+                    }
+                    // Redis HGET hit but HASH missing — treat as not present
+                    // (e.g. eviction or race after delete). Fall through.
+                }
+            } else if !client_order_id.is_empty() {
                 let existing = sqlx::query_as::<_, crate::models::DbOrder>(
                     "SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2",
                 )
@@ -1226,7 +1267,39 @@ async fn handle_client_message(
                 }
             };
 
-            // Fetch order details before cancelling so we know what to unfreeze.
+            // ── Aeron fast path: forward cancel immediately, no DB on the hot
+            // path. Fund release + PG DELETE happen when engine's CANCELED
+            // event lands in the spin thread → BatchCancelConfirmed (already
+            // covered there). The old "SELECT then send" sequence added a
+            // ~1ms PG round-trip per single-order cancel for nothing — the
+            // engine doesn't need the metadata to cancel.
+            if state.engines.is_none() {
+                if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+                    let cancel_req = crate::sbe::CancelOrderRequest {
+                        order_id: order_id as u64,
+                        participant_id: user_id as u64,
+                    };
+                    if aeron_cmd_tx
+                        .send(crate::transport::AeronCmd::Cancel(cancel_req))
+                        .is_err()
+                    {
+                        return Some(
+                            json!({"type": "error", "message": "Aeron channel closed"}).to_string(),
+                        );
+                    }
+                    return Some(
+                        json!({
+                            "type": "cancel_submitted",
+                            "order_id": order_id,
+                            "ts": unix_now()
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+
+            // ── Standalone path: still needs the SELECT + freeze release
+            // because there's no spin thread to do it. Kept inline below.
             let order_row = sqlx::query(
                 "SELECT symbol, side, price, quantity, filled FROM orders
                  WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",
@@ -1255,31 +1328,6 @@ async fn handle_client_message(
             let quantity: f64 = order_row.get("quantity");
             let filled: f64 = order_row.get("filled");
             let remaining = quantity - filled;
-
-            if state.engines.is_none() {
-                if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
-                    let cancel_req = crate::sbe::CancelOrderRequest {
-                        order_id: order_id as u64,
-                        participant_id: user_id as u64,
-                    };
-                    if aeron_cmd_tx
-                        .send(crate::transport::AeronCmd::Cancel(cancel_req))
-                        .is_err()
-                    {
-                        return Some(
-                            json!({"type": "error", "message": "Aeron channel closed"}).to_string(),
-                        );
-                    }
-                    return Some(
-                        json!({
-                            "type": "cancel_submitted",
-                            "order_id": order_id,
-                            "ts": unix_now()
-                        })
-                        .to_string(),
-                    );
-                }
-            }
 
             // Update DB status.
             let db_result = sqlx::query(

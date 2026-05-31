@@ -240,8 +240,11 @@ async fn process_db_cmd(
     db: std::sync::Arc<sqlx::PgPool>,
     account_cache: lightning_exchange::api::AccountCache,
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
-    market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
-    last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
+    // Trade WS broadcast + last_trade_price update moved to the spin thread
+    // for lower latency. DB worker no longer reads either; kept to avoid a
+    // wider signature refactor.
+    _market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    _last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
 ) {
@@ -848,22 +851,15 @@ async fn process_db_cmd(
                 return;
             }
 
-            // Broadcast trade WS events + update last_trade_price for each
-            // fill (these don't need the txn to succeed first — the WS
-            // truth is the trade event publish, not the DB row).
+            // NOTE: trade WS broadcast + last_trade_price update now happen
+            // on the SPIN thread, immediately when each trade pops out of
+            // trade_sub.poll() — see the trade loop in the Aeron spin
+            // thread. Doing it here would duplicate every WS trade event
+            // and add ms-scale cross-thread latency to clients.
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0);
-            for r in &resolved {
-                let side_str = if r.side == 0 { "buy" } else { "sell" };
-                let msg = format!(
-                    r#"{{"type":"trade","symbol":"{}","price":{},"qty":{},"side":"{}","ts":{}}}"#,
-                    r.symbol, r.price, r.qty, side_str, ts,
-                );
-                let _ = market_tx.send(msg);
-                last_trade_price.insert(r.symbol.clone(), r.price);
-            }
 
             // Single txn for the whole batch.
             let mut txn = match db.begin().await {
@@ -1373,6 +1369,7 @@ async fn main() -> anyhow::Result<()> {
         let user_tx = state.user_tx.clone();
         let account_cache = account_cache.clone();
         let last_depth = state.last_depth.clone();
+        let last_trade_price = state.last_trade_price.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
         let mut order_meta_cache = open_order_meta;
@@ -1514,6 +1511,35 @@ async fn main() -> anyhow::Result<()> {
 
                         let mut sym = [0u8; 16];
                         sym.copy_from_slice(&trade.symbol[..16]);
+
+                        // Broadcast trade WS event + bump last_trade_price right
+                        // here on the spin thread, BEFORE handing settlement off
+                        // to the DB worker. Previously this lived inside
+                        // BatchSettleTrade in the DB worker — which meant trade
+                        // WS latency = spin → rtrb → tokio scheduling → DB worker
+                        // dispatch (~ms scale). Direct broadcast::Sender::send
+                        // is lock-free and doesn't need a tokio runtime, so we
+                        // can fan out from the spin thread with a few µs of
+                        // overhead. PG/Redis writes still run async in the
+                        // DB worker via the settle_batch below.
+                        {
+                            let sym_end = sym.iter().position(|&b| b == 0).unwrap_or(16);
+                            let symbol_str = std::str::from_utf8(&sym[..sym_end])
+                                .unwrap_or("BTC_USDT");
+                            let side_str = if side == 0 { "buy" } else { "sell" };
+                            let ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_micros() as u64)
+                                .unwrap_or(0);
+                            // Hand-written JSON; serde_json::json! macro costs
+                            // ~600ns per call vs format!'s ~150ns for this shape.
+                            let msg = format!(
+                                r#"{{"type":"trade","symbol":"{}","price":{},"qty":{},"side":"{}","ts":{}}}"#,
+                                symbol_str, price, qty, side_str, ts,
+                            );
+                            let _ = market_tx.send(msg);
+                            last_trade_price.insert(symbol_str.to_string(), price);
+                        }
 
                         // Accumulate into the batched settlement buffer.
                         // Flushed below as a single DbCmd::BatchSettleTrade

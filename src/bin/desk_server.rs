@@ -73,6 +73,20 @@ struct SettleTradeEntry {
     symbol: [u8; 16],
 }
 
+/// One cancel + release pair. Spin thread resolves the asset + amount
+/// from the in-memory OrderRuntimeMeta at CANCELED-event time so the DB
+/// worker doesn't need a PG SELECT to know what to release. Kept POD/Copy
+/// for rtrb.
+#[derive(Clone, Copy)]
+struct CancelReleaseEntry {
+    id: i64,
+    user_id: i64,
+    /// Resolved release asset ("BTC", "USDT", ...) as null-padded bytes.
+    asset: [u8; 16],
+    /// Amount to release back from `frozen` into `balance` for that asset.
+    release_amount: f64,
+}
+
 /// One row in a batched `INSERT INTO orders` cmd. Kept POD/Copy for rtrb.
 #[derive(Clone, Copy)]
 struct OrderInsertEntry {
@@ -114,12 +128,14 @@ enum DbCmd {
     BatchUpsertOrder { entries: [OrderInsertEntry; 64], count: u8 },
     /// UPDATE orders SET status, filled WHERE id  (REST / subsequent update path).
     UpdateStatus { id: i64, status: u8, filled: f64 },
-    /// Engine-confirmed cancels (batched). Single SQL DELETE ... RETURNING +
-    /// grouped UPDATE accounts per (user_id, asset). ~17× faster on EC2
-    /// than per-id sequential SELECT/UPDATE/DELETE on a 20-id MM cycle
-    /// (examples/bench_cancel_confirm). Works equally for count=1.
-    /// Fixed-array + count to keep DbCmd `Copy` (rtrb requirement).
-    BatchCancelConfirmed { ids: [i64; 64], count: u8 },
+    /// Engine-confirmed cancels (batched). PR5b: spin thread now passes
+    /// pre-computed (user_id, asset, release_amount) per cancel — DB
+    /// worker just mutates account_cache and publishes OrderDelete +
+    /// AccountSet. No more PG SELECT or UPDATE.
+    BatchCancelConfirmed {
+        entries: [CancelReleaseEntry; 64],
+        count: u8,
+    },
     /// Release a pre-engine reservation for an order that never became active.
     ReleaseReservation {
         user_id: i64,
@@ -695,65 +711,45 @@ async fn process_db_cmd(
             );
         }
 
-        DbCmd::BatchCancelConfirmed { ids, count } => {
-            // Single-shot batched cancel-confirm: DELETE ... RETURNING gives
-            // back every row's user_id/symbol/side/qty/filled/freeze_price
-            // in one round trip, then a single grouped UPDATE per
-            // (user_id, asset) releases the frozen funds. ~17× faster on
-            // EC2 vs per-id sequential (examples/bench_cancel_confirm).
-            let ids_vec: Vec<i64> = ids[..count as usize].to_vec();
-            let rows: Vec<(i64, i64, String, String, f64, f64, f64)> = sqlx::query_as(
-                "DELETE FROM orders
-                 WHERE id = ANY($1) AND status IN ('PENDING','TRADING')
-                 RETURNING id, user_id, symbol, side, quantity, filled,
-                           COALESCE(freeze_price, COALESCE(price, 0.0))",
-            )
-            .bind(&ids_vec)
-            .fetch_all(db.as_ref())
-            .await
-            .unwrap_or_default();
+        DbCmd::BatchCancelConfirmed { entries, count } => {
+            // PR5b: spin thread already computed (user_id, asset,
+            // release_amount) per cancel using OrderRuntimeMeta. DB
+            // worker is now pure cache mutate + publish — no PG round
+            // trips. pg-writer (when running) picks up the same
+            // AccountSet + OrderDelete frames from the persist stream
+            // and applies them to PG asynchronously.
+            let count = count as usize;
+            if count == 0 {
+                return;
+            }
+            let entries = &entries[..count];
 
-            // Group by (user_id, asset). Typical MM bid+ask cancel hits two
-            // entries (USDT for bids, base for asks).
+            // Group releases by (user_id, asset) to coalesce the cache
+            // mutate + balance_update WS push. Typical MM cancel cycle
+            // touches two groups (USDT for bids, base for asks).
             let mut releases: HashMap<(i64, String), f64> = HashMap::new();
-            for (_id, uid, symbol, side, qty, filled, freeze_price) in &rows {
-                let release_qty = (qty - filled).max(0.0);
-                if release_qty <= 0.0 {
+            for e in entries {
+                if e.release_amount <= 0.0 || e.user_id == 0 {
                     continue;
                 }
-                let parts: Vec<&str> = symbol.splitn(2, '_').collect();
-                let base = parts.first().copied().unwrap_or("BTC");
-                let quote = parts.last().copied().unwrap_or("USDT");
-                let (asset, amount) = if side == "sell" {
-                    (base.to_string(), release_qty)
-                } else {
-                    (quote.to_string(), freeze_price * release_qty)
+                let asset_end = e.asset.iter().position(|&b| b == 0).unwrap_or(16);
+                let asset = match std::str::from_utf8(&e.asset[..asset_end]) {
+                    Ok(s) if !s.is_empty() => s.to_owned(),
+                    _ => continue,
                 };
-                if amount > 0.0 {
-                    *releases.entry((*uid, asset)).or_insert(0.0) += amount;
-                }
+                *releases.entry((e.user_id, asset)).or_insert(0.0) += e.release_amount;
             }
             for ((uid, asset), amount) in releases {
-                let updated: Option<(f64, f64)> = sqlx::query_as(
-                    "UPDATE accounts
-                     SET balance = balance + $1,
-                         frozen  = GREATEST(frozen - $1, 0),
-                         updated_at = NOW()
-                     WHERE user_id=$2 AND asset=$3
-                     RETURNING balance, frozen",
-                )
-                .bind(amount)
-                .bind(uid)
-                .bind(&asset)
-                .fetch_optional(db.as_ref())
-                .await
-                .unwrap_or(None);
-                if let Some((bal, frz)) = updated {
-                    account_cache
-                        .entry(uid)
-                        .or_insert_with(HashMap::new)
-                        .insert(asset.clone(), (bal, frz));
-                    // PR2 dual-write: account changed → tell redis-writer.
+                // Atomic in-memory release: frozen -= amount (clamped to 0).
+                // Balance unchanged — for a cancel, the funds were never
+                // actually debited, only frozen; releasing just decrements
+                // the frozen counter back into available.
+                let new_vals = account_cache.get_mut(&uid).and_then(|mut entry| {
+                    let kv = entry.get_mut(&asset)?;
+                    kv.1 = (kv.1 - amount).max(0.0);
+                    Some((kv.0, kv.1))
+                });
+                if let Some((bal, frz)) = new_vals {
                     publish_frame(
                         &persist_pub,
                         &PersistFrame::account_set(AccountSetPayload {
@@ -764,33 +760,20 @@ async fn process_db_cmd(
                         }),
                     );
                     if let Some(tx) = user_tx.get(&uid) {
-                        let _ = tx.try_send(
-                            serde_json::json!({
-                                "type": "balance_update",
-                                "asset": asset,
-                                "balance": bal,
-                                "available": bal - frz,
-                                "frozen": frz,
-                            })
-                            .to_string(),
-                        );
+                        let _ = tx.try_send(format!(
+                            r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
+                            asset, bal, bal - frz, frz,
+                        ));
                     }
                 }
             }
-            // PR2 dual-write: orders dropped from PG → drop from Redis too.
-            // Publish for EVERY requested id, not only RETURNING rows. When an
-            // id was already removed by another path (e.g. BatchSettleTrade's
-            // maker UPDATE → COMPLETED → BatchDeleteOrder) the RETURNING set
-            // is empty for that id, but the id may still be in Redis from an
-            // earlier OrderUpsert. OrderDelete is idempotent in apply_frame,
-            // so publishing once per requested id is safe and prevents
-            // user_orders / active_orders orphans from accumulating. Without
-            // this loop we measured 2000+ orphans after a few hours of
-            // continuous MM trading, which inflated REST latency 8×.
-            for &id in &ids_vec {
+            // Publish OrderDelete for every requested id (idempotent — see
+            // commit 556d523 for the audit of why we publish ALL ids, not
+            // only those that existed in PG).
+            for e in entries {
                 publish_frame(
                     &persist_pub,
-                    &PersistFrame::order_delete(OrderDeletePayload { id }),
+                    &PersistFrame::order_delete(OrderDeletePayload { id: e.id }),
                 );
             }
         }
@@ -1494,12 +1477,14 @@ async fn main() -> anyhow::Result<()> {
             .name("aeron-event-loop".to_string())
             .spawn(move || {
                 let mut idle_us: u64 = 0;
-                // Accumulator for CANCELLED ids observed in one poll burst.
-                // Flushed below as one DbCmd::BatchCancelConfirmed — ~17×
-                // faster on EC2 than N individual CancelConfirmed for a 20-id
-                // MM cycle (examples/bench_cancel_confirm). Fixed array +
-                // count to keep DbCmd `Copy` (rtrb requirement).
-                let mut cancel_batch: [i64; 64] = [0; 64];
+                // Accumulator for CANCELLED events observed in one poll burst.
+                // PR5b: each entry carries the fully-resolved (user_id,
+                // asset, release_amount), looked up via OrderRuntimeMeta
+                // when CANCELED arrives. DB worker becomes pure cache-mutate
+                // + publish — no PG SELECT/UPDATE.
+                let mut cancel_batch: [CancelReleaseEntry; 64] = [CancelReleaseEntry {
+                    id: 0, user_id: 0, asset: [0; 16], release_amount: 0.0,
+                }; 64];
                 let mut cancel_count: usize = 0;
 
                 // Same pattern for ACCEPTED — flushed as one
@@ -1844,21 +1829,65 @@ async fn main() -> anyhow::Result<()> {
                             // Terminal states get dropped from the orders table; only
                             // PARTIAL_FILL (still resting) updates filled/status.
                             if kind == order_update_kind::CANCELLED {
-                                // Batched — flushed after this poll burst ends.
-                                // If the burst exceeds 64 (one full MM cycle is
-                                // 20), flush early and start a new batch.
+                                // PR5b: resolve (user_id, asset, release_amount)
+                                // from runtime meta — was a PG SELECT in the DB
+                                // worker before. Skip the entry if we have no
+                                // meta (e.g. order placed before this desk-server
+                                // restart and not yet rehydrated) — falling
+                                // through is safe; the order simply won't have
+                                // funds released by this path, but cache state
+                                // remains correct because no freeze happened on
+                                // our side either.
+                                let entry = runtime_meta(&order_meta_cache, order_id)
+                                    .and_then(|m| {
+                                        let release_qty = (m.quantity - m.filled).max(0.0);
+                                        if release_qty <= 0.0 {
+                                            return Some(CancelReleaseEntry {
+                                                id: order_id as i64,
+                                                user_id: m.user_id,
+                                                asset: [0; 16],
+                                                release_amount: 0.0,
+                                            });
+                                        }
+                                        let sym_end = m.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                                        let symbol = std::str::from_utf8(&m.symbol[..sym_end]).ok()?;
+                                        let (base, quote) = symbol.split_once('_')?;
+                                        let (asset_str, amount) = if m.side == 1 {
+                                            // sell: release base by remaining qty
+                                            (base, release_qty)
+                                        } else {
+                                            // buy: release quote by freeze_price * remaining qty
+                                            (quote, m.freeze_price * release_qty)
+                                        };
+                                        let mut asset_bytes = [0u8; 16];
+                                        let ab = asset_str.as_bytes();
+                                        let n = ab.len().min(16);
+                                        asset_bytes[..n].copy_from_slice(&ab[..n]);
+                                        Some(CancelReleaseEntry {
+                                            id: order_id as i64,
+                                            user_id: m.user_id,
+                                            asset: asset_bytes,
+                                            release_amount: amount,
+                                        })
+                                    })
+                                    .unwrap_or(CancelReleaseEntry {
+                                        id: order_id as i64,
+                                        user_id: 0,
+                                        asset: [0; 16],
+                                        release_amount: 0.0,
+                                    });
                                 if cancel_count >= 64 {
                                     push_db_cmd(
                                         &mut db_tx,
                                         DbCmd::BatchCancelConfirmed {
-                                            ids: cancel_batch,
+                                            entries: cancel_batch,
                                             count: cancel_count as u8,
                                         },
                                         "batch cancel confirmed (overflow)",
                                     );
                                     cancel_count = 0;
                                 }
-                                cancel_batch[cancel_count] = order_id as i64;
+                                cancel_batch[cancel_count] = entry;
                                 cancel_count += 1;
                             } else if kind == order_update_kind::FILLED
                                 || kind == order_update_kind::REJECTED
@@ -1991,7 +2020,7 @@ async fn main() -> anyhow::Result<()> {
                         push_db_cmd(
                             &mut db_tx,
                             DbCmd::BatchCancelConfirmed {
-                                ids: cancel_batch,
+                                entries: cancel_batch,
                                 count: cancel_count as u8,
                             },
                             "batch cancel confirmed",

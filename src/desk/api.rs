@@ -1464,6 +1464,43 @@ async fn handle_cancel_all_orders(
 // ─── Tickers ──────────────────────────────────────────────────────────────────
 
 async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
+    // Fast path: serve from in-memory `last_ticker` DashMap, populated by
+    // the periodic ticker broadcast in market_data_broadcaster (~100ms
+    // cadence). Each entry is the already-stringified WS ticker payload,
+    // so we just collect-and-strip the WS envelope to match the REST
+    // response shape. p50 here used to be 243ms (PG aggregate over the
+    // trades table) — this path is sub-ms.
+    //
+    // Cold-start fallback: if last_ticker is empty (process just booted
+    // and no trade has fired the broadcast yet), run the old PG query so
+    // the first call after startup still returns something useful.
+    if !s.last_ticker.is_empty() {
+        let mut tickers: Vec<Value> = Vec::with_capacity(s.last_ticker.len());
+        for entry in s.last_ticker.iter() {
+            // Each cached value is the WS push payload — `{"type":"ticker", "symbol":..., "last":..., ...}`.
+            // The REST response omits the "type" field; convert when serving.
+            let json: Value = match serde_json::from_str(entry.value()) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(obj) = json.as_object() else { continue };
+            let mut out = serde_json::Map::with_capacity(obj.len());
+            for (k, v) in obj.iter() {
+                if k == "type" {
+                    continue;
+                }
+                out.insert(k.clone(), v.clone());
+            }
+            tickers.push(Value::Object(out));
+        }
+        tickers.sort_by(|a, b| {
+            let ks = a.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+            let kt = b.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+            ks.cmp(kt)
+        });
+        return (StatusCode::OK, Json(json!(tickers))).into_response();
+    }
+
     let rows = sqlx::query(
         "SELECT symbol,
                 MAX(price) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS high_24h,

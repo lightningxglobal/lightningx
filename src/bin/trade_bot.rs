@@ -12,9 +12,25 @@ fn exchange_url() -> String {
     std::env::var("EXCHANGE_URL").unwrap_or_else(|_| "http://localhost:4003".to_string())
 }
 
+// Recommended: trade-bot runs as its OWN account so its order_updates
+// don't fan out to the market-maker's WS channel (desk-server's user_tx
+// is keyed by user_id; two clients sharing a user share one WS event
+// stream — see shared_user_ws_fanout memory). Falls back to the shared
+// robot account when TRADE_BOT_EMAIL is unset so single-user demo
+// setups still work.
+const DEFAULT_TRADE_BOT_EMAIL: &str = "tradebot@lightningx.exchange";
+const DEFAULT_TRADE_BOT_PASSWORD: &str = "tradebot_secret_2026";
 const ROBOT_EMAIL: &str = "robot@lightningx.exchange";
 const ROBOT_PASSWORD: &str = "robot_secret_2026";
 const TRADE_INTERVAL_MS: u64 = 3000;
+
+fn trade_bot_email() -> String {
+    std::env::var("TRADE_BOT_EMAIL").unwrap_or_else(|_| DEFAULT_TRADE_BOT_EMAIL.to_string())
+}
+fn trade_bot_password() -> String {
+    std::env::var("TRADE_BOT_PASSWORD")
+        .unwrap_or_else(|_| DEFAULT_TRADE_BOT_PASSWORD.to_string())
+}
 
 struct SymbolConfig {
     symbol: &'static str,
@@ -42,15 +58,74 @@ struct PlaceOrderRequest<'a> {
 #[derive(Deserialize)]
 struct PlaceOrderResponse { id: Option<i64> }
 
-async fn login(http: &Client, base: &str) -> anyhow::Result<String> {
+async fn login_with(
+    http: &Client,
+    base: &str,
+    email: &str,
+    password: &str,
+) -> anyhow::Result<String> {
     let resp = http
         .post(format!("{base}/api/auth/login"))
-        .json(&LoginRequest { email: ROBOT_EMAIL, password: ROBOT_PASSWORD })
-        .send().await?;
+        .json(&LoginRequest { email, password })
+        .send()
+        .await?;
     if !resp.status().is_success() {
         anyhow::bail!("login failed: {}", resp.status());
     }
     Ok(resp.json::<LoginResponse>().await?.token)
+}
+
+#[derive(Serialize)]
+struct RegisterRequest<'a> {
+    email: &'a str,
+    password: &'a str,
+}
+
+async fn register(http: &Client, base: &str, email: &str, password: &str) -> anyhow::Result<()> {
+    let resp = http
+        .post(format!("{base}/api/auth/register"))
+        .json(&RegisterRequest { email, password })
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        // 409 / already-exists is acceptable.
+        let s = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !body.contains("already") && s.as_u16() != 409 {
+            anyhow::bail!("register failed: {s} body={body}");
+        }
+    }
+    Ok(())
+}
+
+/// Login as the trade-bot's own account; fall back to the shared robot
+/// account when registration/login both fail (single-user demo).
+async fn login(http: &Client, base: &str) -> anyhow::Result<String> {
+    let bot_email = trade_bot_email();
+    let bot_pass = trade_bot_password();
+
+    // Try the trade-bot account first.
+    if let Ok(token) = login_with(http, base, &bot_email, &bot_pass).await {
+        info!("trade-bot logged in as {bot_email}");
+        return Ok(token);
+    }
+    // Auto-register on first run.
+    if register(http, base, &bot_email, &bot_pass).await.is_ok() {
+        if let Ok(token) = login_with(http, base, &bot_email, &bot_pass).await {
+            info!("trade-bot registered + logged in as {bot_email}");
+            // Note: new accounts have 0 balance. Operator must fund via
+            // /api/test-funds before trade-bot can place orders.
+            warn!(
+                "trade-bot account {bot_email} just registered; needs funding via /api/test-funds"
+            );
+            return Ok(token);
+        }
+    }
+
+    // Fall back to the shared robot account so single-user demos keep
+    // working out of the box. Expected to share fanout with MM.
+    warn!("falling back to shared robot account — MM will see trade-bot fills (cosmetic noise)");
+    login_with(http, base, ROBOT_EMAIL, ROBOT_PASSWORD).await
 }
 
 /// Return a pseudo-random multiplier in [1.0, 2.0] based on seed.

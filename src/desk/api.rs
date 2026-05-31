@@ -144,6 +144,30 @@ pub fn router(state: AppState) -> Router {
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
+/// Warm account_cache for `user_id` from PG. Called on register/login so
+/// subsequent order placement on the hot path never hits a cache miss
+/// (which would otherwise produce "Insufficient balance" errors even when
+/// the user has plenty in PG — the hot path doesn't fall back to PG).
+async fn warm_account_cache_for(s: &AppState, user_id: i64) {
+    let rows: Vec<(String, f64, f64)> = sqlx::query_as(
+        "SELECT asset, balance, frozen FROM accounts WHERE user_id=$1",
+    )
+    .bind(user_id)
+    .fetch_all(s.db.as_ref())
+    .await
+    .unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+    let mut entry = s
+        .account_cache
+        .entry(user_id)
+        .or_insert_with(HashMap::new);
+    for (asset, bal, frz) in rows {
+        entry.insert(asset, (bal, frz));
+    }
+}
+
 async fn handle_register(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -155,7 +179,12 @@ async fn handle_register(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
     match user_service::register(&s.db, req, ip).await {
-        Ok(resp) => (StatusCode::CREATED, Json(json!(resp))),
+        Ok(resp) => {
+            // Warm account_cache so the user's first order doesn't trip
+            // try_freeze_cache's cache-miss path.
+            warm_account_cache_for(&s, resp.user.id).await;
+            (StatusCode::CREATED, Json(json!(resp)))
+        }
         Err(e) => {
             let msg = e.to_string();
             let status = if msg.contains("duplicate key") || msg.contains("unique constraint") {
@@ -173,7 +202,10 @@ async fn handle_login(
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
     match user_service::login(&s.db, req).await {
-        Ok(resp) => (StatusCode::OK, Json(json!(resp))),
+        Ok(resp) => {
+            warm_account_cache_for(&s, resp.user.id).await;
+            (StatusCode::OK, Json(json!(resp)))
+        }
         Err(e) => (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": e.to_string()})),
@@ -703,12 +735,25 @@ async fn handle_place_order(
     let rules = crate::symbol_rules::SymbolRules::for_symbol(&req.symbol);
 
     // Best opposing price (for market orders that need a freeze estimate).
+    // In Aeron mode (no local engine), read from last_depth — same source
+    // ws_handler uses for the WS path. Without this REST market-buy
+    // returns "Unable to determine buy reservation price" because the
+    // freeze_price falls back to 0.
     let best_opposing = if let Some(ref engine) = engine_opt {
         let eng = engine.lock().unwrap();
         let levels = eng.get_top_levels(1, engine_side == Side::Sell);
         levels.first().map(|(p, _)| rules.ticks_to_price(*p))
     } else {
-        None
+        // Aeron mode: read from spin-thread-maintained last_depth.
+        let levels_key = if req.side == "buy" { "asks" } else { "bids" };
+        s.last_depth.get(&req.symbol).and_then(|depth| {
+            depth
+                .get(levels_key)?
+                .as_array()?
+                .first()?
+                .get(0)?
+                .as_f64()
+        })
     };
 
     // Compute the price that actually backs the frozen quote-asset amount.

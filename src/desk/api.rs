@@ -5,7 +5,6 @@ use crate::models::{DbOrder, User};
 use crate::order::{Order, Side, TimeInForce};
 use crate::order_state::{
     db_status_from_engine, db_status_from_update_kind, ws_status_from_engine,
-    ws_status_from_update_kind,
 };
 use crate::tracer::ExchangeTracer;
 use crate::transport::{AeronCmd, OrderMeta, OrderUpdateMsg};
@@ -193,6 +192,33 @@ fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
 }
 
 // ─── Accounts ─────────────────────────────────────────────────────────────────
+
+/// Atomic in-memory freeze: returns true if balance had enough to cover
+/// `amount` (mutates `frozen += amount`), false otherwise (no mutation).
+/// Mirror of the WS-handler helper of the same name; kept local so REST
+/// hot path doesn't reach across modules for it.
+fn try_freeze_cache(
+    cache: &AccountCache,
+    user_id: i64,
+    asset: &str,
+    amount: f64,
+) -> bool {
+    if amount <= 0.0 {
+        return true;
+    }
+    let Some(mut entry) = cache.get_mut(&user_id) else {
+        return false;
+    };
+    let Some(kv) = entry.get_mut(asset) else {
+        return false;
+    };
+    if kv.0 - kv.1 >= amount {
+        kv.1 += amount;
+        true
+    } else {
+        false
+    }
+}
 
 fn cache_set(cache: &AccountCache, user_id: i64, asset: &str, balance: f64, frozen: f64) {
     cache
@@ -556,26 +582,50 @@ async fn handle_place_order(
         }
     };
 
+    // Idempotent check via Redis L1 (replaces PG SELECT — 100× cheaper).
+    // The (user_id, client_order_id) UNIQUE constraint downstream still
+    // catches actual dupes; a Redis miss falls through to placement.
     if let Some(client_order_id) = req.client_order_id.as_deref() {
         if !client_order_id.is_empty() {
-            let existing = sqlx::query_as::<_, DbOrder>(
-                "SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2",
-            )
-            .bind(user_id)
-            .bind(client_order_id)
-            .fetch_optional(s.db.as_ref())
-            .await;
-            match existing {
-                Ok(Some(order)) => {
-                    return (StatusCode::OK, Json(json!(order))).into_response();
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string()})),
+            if let Some(redis_conn) = s.redis.as_ref() {
+                let mut conn = redis_conn.clone();
+                use redis::AsyncCommands;
+                let prior: Option<i64> = conn
+                    .hget(
+                        crate::desk::redis_store::key_user_coid(user_id),
+                        client_order_id,
                     )
-                        .into_response();
+                    .await
+                    .ok();
+                if let Some(id) = prior {
+                    if let Ok(Some(order)) =
+                        crate::desk::redis_store::get_order(&mut conn, id, user_id).await
+                    {
+                        return (StatusCode::OK, Json(json!(order))).into_response();
+                    }
+                }
+            } else {
+                // Cold path: Redis not configured. Keep PG fallback so
+                // idempotency still holds for standalone deployments.
+                let existing = sqlx::query_as::<_, DbOrder>(
+                    "SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2",
+                )
+                .bind(user_id)
+                .bind(client_order_id)
+                .fetch_optional(s.db.as_ref())
+                .await;
+                match existing {
+                    Ok(Some(order)) => {
+                        return (StatusCode::OK, Json(json!(order))).into_response();
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": e.to_string()})),
+                        )
+                            .into_response();
+                    }
                 }
             }
         }
@@ -644,85 +694,68 @@ async fn handle_place_order(
         0.0
     };
 
-    // Freeze funds before touching the engine; update cache with RETURNING value.
+    // Freeze funds in-memory (account_cache) — was a PG UPDATE round-trip
+    // (~3-5ms). Cache is preloaded at boot from PG; the DB worker
+    // BatchUpsertOrder downstream both mirrors the freeze to PG and
+    // publishes AccountSet → Redis. WS PlaceOrders uses the same pattern.
+    // We keep AccountRepository handle around because the engine-rollback
+    // path below still uses repo.release_frozen on Aeron send failure.
     let repo = AccountRepository::new(s.db.as_ref());
-    if req.side == "buy" {
+    let (freeze_asset, freeze_amount): (&str, f64) = if req.side == "buy" {
         if freeze_price > 0.0 {
-            match repo
-                .freeze_for_buy(user_id, quote_asset, freeze_price * req.quantity)
-                .await
-            {
-                Ok((bal, frz)) => {
-                    cache_set(&s.account_cache, user_id, quote_asset, bal, frz);
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": e.to_string()})),
-                    )
-                        .into_response()
-                }
-            }
+            (quote_asset, freeze_price * req.quantity)
+        } else {
+            // Market buy with no opposing depth yet — refuse.
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Unable to determine buy reservation price"})),
+            )
+                .into_response();
         }
     } else {
-        match repo
-            .freeze_for_sell(user_id, base_asset, req.quantity)
-            .await
-        {
-            Ok((bal, frz)) => {
-                cache_set(&s.account_cache, user_id, base_asset, bal, frz);
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response()
-            }
-        }
+        (base_asset, req.quantity)
+    };
+    if !try_freeze_cache(&s.account_cache, user_id, freeze_asset, freeze_amount) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Insufficient balance"})),
+        )
+            .into_response();
     }
 
-    // Insert into DB first to get a stable ID, then use that same ID for the engine order.
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
 
-    // Use the same shared AtomicU64 counter as the WS path so REST and WS IDs
-    // never collide regardless of the Postgres sequence value.
+    // Same shared AtomicU64 counter as the WS path so REST and WS IDs never
+    // collide regardless of the Postgres sequence value.
     let rest_order_id = s.next_order_id.fetch_add(1, Ordering::Relaxed) as i64;
+    let db_order_id = rest_order_id;
 
-    let db_order = sqlx::query_as::<_, DbOrder>(
-        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8, $9) RETURNING *",
-    )
-    .bind(rest_order_id).bind(user_id).bind(&req.symbol).bind(&req.side)
-    .bind(&req.order_type).bind(req.price).bind(req.quantity)
-    .bind(freeze_price).bind(&req.client_order_id)
-    .fetch_one(s.db.as_ref()).await;
-
-    let db_order = match db_order {
-        Ok(o) => o,
-        Err(e) => {
-            // Roll back freeze.
-            if req.side == "buy" {
-                let p = req.price.or(best_opposing).unwrap_or(0.0);
-                if p > 0.0 {
-                    let _ = repo
-                        .release_frozen(user_id, quote_asset, p * req.quantity)
-                        .await;
-                }
-            } else {
-                let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
-            }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
+    // Build the DbOrder shape clients expect directly from the request —
+    // PG INSERT is removed from the hot path. The row will be INSERT'd
+    // asynchronously by the spin thread's BatchUpsertOrder when the engine
+    // returns ACCEPTED (same path WS PlaceOrders uses). Redis L1 sees the
+    // OrderUpsert frame before the engine round-trip completes (via
+    // publish_rest_order_upsert below), so GET /api/orders/:id can find it
+    // immediately.
+    let now_utc = chrono::Utc::now();
+    let db_order = DbOrder {
+        id: db_order_id,
+        user_id,
+        symbol: req.symbol.clone(),
+        side: req.side.clone(),
+        order_type: req.order_type.clone(),
+        price: req.price,
+        quantity: req.quantity,
+        filled: 0.0,
+        status: "PENDING".to_string(),
+        freeze_price,
+        client_order_id: req.client_order_id.clone(),
+        created_at: now_utc,
+        updated_at: now_utc,
     };
-    let db_order_id = db_order.id;
 
     // Mirror the new row to Redis L1 immediately, before the engine round-trip.
     // Standalone mode (persist_pub=None) skips this; Aeron mode keeps Redis
@@ -1065,6 +1098,24 @@ async fn handle_place_order(
             symbol: sym_bytes,
         };
 
+        // Insert pending_meta so the spin thread's ACCEPTED handler triggers
+        // BatchUpsertOrder (PG INSERT). Same pattern as WS PlaceOrders —
+        // REST POST no longer does its own synchronous INSERT, the spin
+        // thread is the sole writer to PG for these rows.
+        s.pending_meta.insert(
+            db_order_id as u64,
+            Box::new(OrderMeta {
+                user_id,
+                symbol: req.symbol.clone(),
+                side: req.side.clone(),
+                order_type: req.order_type.clone(),
+                price: req.price,
+                qty: req.quantity,
+                client_order_id: req.client_order_id.clone().unwrap_or_default(),
+                freeze_price,
+            }),
+        );
+
         let (tx, rx) = oneshot::channel::<OrderUpdateMsg>();
         s.pending_orders.insert(db_order_id as u64, tx);
 
@@ -1113,42 +1164,22 @@ async fn handle_place_order(
         };
 
         let db_status = db_status_from_update_kind(update.kind).as_str();
-        let ws_status = ws_status_from_update_kind(update.kind).as_str();
 
         // Copy packed struct fields to locals before use (avoids misaligned ref).
         let fill_qty: f64 = update.fill_qty;
 
-        let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
-            .bind(db_status)
-            .bind(fill_qty)
-            .bind(db_order_id)
-            .execute(s.db.as_ref())
-            .await;
+        // PG INSERT/UPDATE happen on the spin thread (BatchUpsertOrder/
+        // BatchDeleteOrder) after the engine event; this REST handler no
+        // longer waits for that. Build the response from in-memory state
+        // (db_order assembled before Aeron send) + the engine ACK fields.
+        // Redis already mirrors the row via publish_rest_order_upsert above
+        // for subsequent GET /api/orders/:id reads.
+        let mut response_order = db_order.clone();
+        response_order.status = db_status.to_string();
+        response_order.filled = fill_qty;
+        response_order.updated_at = chrono::Utc::now();
 
-        if let Some(tx) = s.user_tx.get(&user_id) {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_micros() as u64)
-                .unwrap_or(0);
-            let msg = serde_json::json!({
-                "type": "order_update",
-                "order_id": db_order_id,
-                "status": ws_status,
-                "filled_qty": fill_qty,
-                "ts": ts,
-            })
-            .to_string();
-            let _ = tx.send(msg).await;
-        }
-
-        return match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
-            .bind(db_order_id)
-            .fetch_one(s.db.as_ref())
-            .await
-        {
-            Ok(o) => (StatusCode::CREATED, Json(json!(o))).into_response(),
-            Err(_) => (StatusCode::CREATED, Json(json!({"id": db_order_id}))).into_response(),
-        };
+        return (StatusCode::CREATED, Json(json!(response_order))).into_response();
     }
 
     // Neither engine nor Aeron — should not happen.

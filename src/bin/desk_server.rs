@@ -1680,10 +1680,13 @@ async fn main() -> anyhow::Result<()> {
                                 });
                                 if let Some((bal, frz)) = new_vals {
                                     if let Some(tx) = user_tx.get(&meta.user_id) {
-                                        let _ = tx.try_send(serde_json::json!({
-                                            "type": "balance_update", "asset": &asset,
-                                            "balance": bal, "available": bal - frz, "frozen": frz,
-                                        }).to_string());
+                                        // Hand-written JSON for the spin-thread WS push.
+                                        // asset is a short alphanumeric symbol (BTC, USDT, …) —
+                                        // no JSON escaping needed.
+                                        let _ = tx.try_send(format!(
+                                            r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
+                                            asset, bal, bal - frz, frz,
+                                        ));
                                     }
                                 }
                             } else if kind == order_update_kind::CANCELLED {
@@ -1751,29 +1754,37 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(ref t) = spin_tracer {
                             t.record(MS_WS_UPDATE_SEND, client_order_id);
                         }
-                        if user_tx.get(&user_id).is_none() {
+                        // Single DashMap lookup — was previously two (is_none() +
+                        // if let Some()), each taking a shard lock.
+                        let maybe_tx = user_tx.get(&user_id);
+                        if maybe_tx.is_none() {
                             tracing::warn!("no WS channel for user {user_id}, order_update {order_id} lost");
                         }
-                        if let Some(tx) = user_tx.get(&user_id) {
+                        if let Some(tx) = maybe_tx {
                             let ws_status = ws_status_from_update_kind(kind).as_str();
                             let ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_micros() as u64)
                                 .unwrap_or(0);
-                            let mut upd = serde_json::json!({
-                                "type": "order_update",
-                                "order_id": order_id,
-                                "status": ws_status,
-                                "filled_qty": fill_qty,
-                                "avg_price": fill_price,
-                                "ts": ts,
-                            });
-                            // Echo client_order_id back on ACCEPTED so client can correlate
-                            // without a separate lookup (only present in fast-path WS orders).
-                            if let Some(ref coid) = ws_client_oid {
-                                upd["client_order_id"] = serde_json::Value::String(coid.clone());
-                            }
-                            if tx.try_send(upd.to_string()).is_err() {
+                            // Hand-written JSON — serde_json::json! macro
+                            // measures ~600ns per call; format! is ~150ns
+                            // for this fixed shape and runs at every
+                            // order_update event (≈ 400/s steady-state).
+                            // client_order_id is JSON-escape-safe here: it's
+                            // a server-generated session prefix + counter
+                            // (see make_place_msg → "{prefix}-{N}"), so no
+                            // escaping needed.
+                            let upd = match ws_client_oid.as_deref() {
+                                Some(coid) => format!(
+                                    r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{},"client_order_id":"{}"}}"#,
+                                    order_id, ws_status, fill_qty, fill_price, ts, coid,
+                                ),
+                                None => format!(
+                                    r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{}}}"#,
+                                    order_id, ws_status, fill_qty, fill_price, ts,
+                                ),
+                            };
+                            if tx.try_send(upd).is_err() {
                                 tracing::warn!("personal channel full for user {user_id}, dropping order_update {order_id}");
                             }
                         }

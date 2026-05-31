@@ -143,13 +143,47 @@ enum DbCmd {
     BatchDeleteOrder { ids: [i64; 64], count: u8 },
 }
 
+/// Per-order metadata kept in the spin thread's local HashMap so cancel +
+/// settle handling never has to SELECT from PG. PR5 expanded this from
+/// just `user_id` to the full fund-release shape: when CANCELED arrives,
+/// we need to know `freeze_price`, `quantity`, `filled`, `side`, and
+/// `symbol` to release the correct asset and amount.
+///
+/// Fixed-size byte arrays for symbol/side keep this Copy (no String
+/// alloc), and let the spin loop work without heap allocation per
+/// order_update event.
 #[derive(Clone, Copy)]
 struct OrderRuntimeMeta {
     user_id: i64,
+    freeze_price: f64,
+    quantity: f64,
+    filled: f64,
+    /// 0 = buy, 1 = sell — same encoding as SbeNewOrder.side.
+    side: u8,
+    symbol: [u8; 16],
 }
 
-fn remember_runtime_order(cache: &mut HashMap<u64, OrderRuntimeMeta>, order_id: u64, user_id: i64) {
-    cache.insert(order_id, OrderRuntimeMeta { user_id });
+#[allow(clippy::too_many_arguments)]
+fn remember_runtime_order(
+    cache: &mut HashMap<u64, OrderRuntimeMeta>,
+    order_id: u64,
+    user_id: i64,
+    freeze_price: f64,
+    quantity: f64,
+    side: u8,
+    symbol: [u8; 16],
+) {
+    cache.insert(
+        order_id,
+        OrderRuntimeMeta {
+            user_id,
+            freeze_price,
+            quantity,
+            filled: 0.0,
+            side,
+            symbol,
+        },
+    );
 }
 
 fn remap_runtime_order_id(cache: &mut HashMap<u64, OrderRuntimeMeta>, from: u64, to: u64) {
@@ -164,6 +198,26 @@ fn runtime_user_id(cache: &HashMap<u64, OrderRuntimeMeta>, order_id: u64) -> i64
     cache.get(&order_id).map(|m| m.user_id).unwrap_or(0)
 }
 
+/// Lookup full meta (used by cancel/fill release paths in PR5b/d).
+fn runtime_meta(
+    cache: &HashMap<u64, OrderRuntimeMeta>,
+    order_id: u64,
+) -> Option<OrderRuntimeMeta> {
+    cache.get(&order_id).copied()
+}
+
+/// Update the filled accumulator after a partial-fill event so subsequent
+/// cancel-release uses the right remaining quantity.
+fn runtime_bump_filled(
+    cache: &mut HashMap<u64, OrderRuntimeMeta>,
+    order_id: u64,
+    filled_qty: f64,
+) {
+    if let Some(meta) = cache.get_mut(&order_id) {
+        meta.filled = filled_qty;
+    }
+}
+
 fn remove_runtime_order(cache: &mut HashMap<u64, OrderRuntimeMeta>, order_id: u64, client_id: u64) {
     cache.remove(&order_id);
     if order_id != client_id {
@@ -175,30 +229,56 @@ fn remove_runtime_order(cache: &mut HashMap<u64, OrderRuntimeMeta>, order_id: u6
 mod tests {
     use super::*;
 
+    fn sym(s: &str) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        let n = s.as_bytes().len().min(16);
+        b[..n].copy_from_slice(&s.as_bytes()[..n]);
+        b
+    }
+
     #[test]
     fn runtime_meta_survives_until_terminal_remove() {
         let mut cache = HashMap::new();
-        remember_runtime_order(&mut cache, 10, 7);
+        remember_runtime_order(&mut cache, 10, 7, 73000.0, 0.5, 0, sym("BTC_USDT"));
 
         assert_eq!(runtime_user_id(&cache, 10), 7);
         assert_eq!(runtime_user_id(&cache, 11), 0);
+        let m = runtime_meta(&cache, 10).expect("meta present");
+        assert_eq!(m.freeze_price, 73000.0);
+        assert_eq!(m.quantity, 0.5);
+        assert_eq!(m.side, 0);
 
         remove_runtime_order(&mut cache, 10, 10);
         assert_eq!(runtime_user_id(&cache, 10), 0);
+        assert!(runtime_meta(&cache, 10).is_none());
     }
 
     #[test]
     fn runtime_meta_remaps_client_id_to_engine_order_id() {
         let mut cache = HashMap::new();
-        remember_runtime_order(&mut cache, 10, 7);
+        remember_runtime_order(&mut cache, 10, 7, 100.0, 1.0, 1, sym("BTC_USDT"));
 
         remap_runtime_order_id(&mut cache, 10, 99);
 
         assert_eq!(runtime_user_id(&cache, 10), 0);
         assert_eq!(runtime_user_id(&cache, 99), 7);
+        let m = runtime_meta(&cache, 99).expect("meta present after remap");
+        assert_eq!(m.freeze_price, 100.0);
+        assert_eq!(m.side, 1);
 
         remove_runtime_order(&mut cache, 99, 10);
         assert_eq!(runtime_user_id(&cache, 99), 0);
+    }
+
+    #[test]
+    fn runtime_bump_filled_updates_accumulator() {
+        let mut cache = HashMap::new();
+        remember_runtime_order(&mut cache, 5, 1, 100.0, 2.0, 0, sym("X_Y"));
+        assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 0.0);
+        runtime_bump_filled(&mut cache, 5, 0.5);
+        assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 0.5);
+        runtime_bump_filled(&mut cache, 5, 1.5);
+        assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 1.5);
     }
 }
 
@@ -1198,13 +1278,44 @@ async fn main() -> anyhow::Result<()> {
 
     let mut open_order_meta: HashMap<u64, OrderRuntimeMeta> = HashMap::new();
     {
-        let rows: Vec<(i64, i64)> =
-            sqlx::query_as("SELECT id, user_id FROM orders WHERE status IN ('PENDING','TRADING')")
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default();
-        for (id, user_id) in rows {
-            open_order_meta.insert(id as u64, OrderRuntimeMeta { user_id });
+        // Preload all open orders into the runtime meta cache so cancel/fill
+        // paths can resolve user_id + freeze_price + qty + side without a PG
+        // hit. Surviving restart-time orders may briefly have stale `filled`
+        // until the next event for them lands.
+        let rows: Vec<(
+            i64,
+            i64,
+            String,
+            String,
+            Option<f64>,
+            f64,
+            f64,
+        )> = sqlx::query_as(
+            "SELECT id, user_id, symbol, side,
+                    COALESCE(freeze_price, COALESCE(price, 0.0)) AS freeze_price,
+                    quantity, filled
+             FROM orders WHERE status IN ('PENDING','TRADING')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for (id, user_id, symbol, side, freeze_price, quantity, filled) in rows {
+            let mut sym_bytes = [0u8; 16];
+            let sb = symbol.as_bytes();
+            let n = sb.len().min(16);
+            sym_bytes[..n].copy_from_slice(&sb[..n]);
+            let side_byte: u8 = if side == "buy" { 0 } else { 1 };
+            open_order_meta.insert(
+                id as u64,
+                OrderRuntimeMeta {
+                    user_id,
+                    freeze_price: freeze_price.unwrap_or(0.0),
+                    quantity,
+                    filled,
+                    side: side_byte,
+                    symbol: sym_bytes,
+                },
+            );
         }
         tracing::info!(
             "Order runtime cache preloaded ({} open orders)",
@@ -1425,10 +1536,20 @@ async fn main() -> anyhow::Result<()> {
                             AeronCmd::NewOrder(req) => {
                                 let sym = std::str::from_utf8(&req.symbol)
                                     .unwrap_or("").trim_end_matches('\0');
+                                // Preliminary meta — freeze_price is approximated
+                                // from the request's limit price (correct for limit
+                                // orders, zero for market orders). The ACCEPTED
+                                // handler below overwrites with the authoritative
+                                // freeze_price from pending_meta when available.
+                                let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
                                 remember_runtime_order(
                                     &mut order_meta_cache,
                                     req.client_order_id,
                                     req.participant_id as i64,
+                                    prelim_freeze,
+                                    req.quantity,
+                                    req.side,
+                                    req.symbol,
                                 );
                                 if let Some(pub_) = order_pubs.get_mut(sym) {
                                     let _ = pub_.publish_new_order(&req);
@@ -1475,10 +1596,15 @@ async fn main() -> anyhow::Result<()> {
                                 for req in &reqs {
                                     let sym = std::str::from_utf8(&req.symbol)
                                         .unwrap_or("").trim_end_matches('\0');
+                                    let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
                                     remember_runtime_order(
                                         &mut order_meta_cache,
                                         req.client_order_id,
                                         req.participant_id as i64,
+                                        prelim_freeze,
+                                        req.quantity,
+                                        req.side,
+                                        req.symbol,
                                     );
                                     if let Some(pub_) = order_pubs.get_mut(sym) {
                                         let _ = pub_.publish_new_order(req);
@@ -1599,10 +1725,25 @@ async fn main() -> anyhow::Result<()> {
                         }
                         if let Some(meta_ref) = pending_meta.get(&lookup_id) {
                             if kind != order_update_kind::REJECTED {
+                                // Pending_meta has the authoritative freeze_price
+                                // (best_opposing for markets, limit price for buys,
+                                // 0 for sells). Overwrite the preliminary value
+                                // stored at NewOrder/BatchNewOrder time so cancel
+                                // releases use the right amount. side/symbol/qty
+                                // unchanged.
+                                let mut sym_bytes = [0u8; 16];
+                                let sb = meta_ref.symbol.as_bytes();
+                                let n = sb.len().min(16);
+                                sym_bytes[..n].copy_from_slice(&sb[..n]);
+                                let side_byte: u8 = if meta_ref.side == "buy" { 0 } else { 1 };
                                 remember_runtime_order(
                                     &mut order_meta_cache,
                                     order_id,
                                     meta_ref.user_id,
+                                    meta_ref.freeze_price,
+                                    meta_ref.qty,
+                                    side_byte,
+                                    sym_bytes,
                                 );
                             }
                         }

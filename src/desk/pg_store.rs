@@ -335,6 +335,41 @@ impl PgWriteBatch {
         true
     }
 
+    /// Public hook for backfill: stage a fully-decoded row from Redis
+    /// into the upsert buffer without going through PersistFrame parsing.
+    /// Used by `backfill_from_redis` below.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_upsert_row(
+        &mut self,
+        id: i64,
+        user_id: i64,
+        symbol: String,
+        side: &'static str,
+        order_type: String,
+        price: Option<f64>,
+        quantity: f64,
+        filled: f64,
+        status: &'static str,
+        freeze_price: f64,
+        client_order_id: Option<String>,
+        created_at: DateTime<Utc>,
+    ) {
+        self.upserts.push(UpsertRow {
+            id,
+            user_id,
+            symbol,
+            side,
+            order_type,
+            price,
+            quantity,
+            filled,
+            status,
+            freeze_price,
+            client_order_id,
+            created_at,
+        });
+    }
+
     /// Apply everything to PG inside one transaction per kind. Returns
     /// total rows written (sum of affected per kind). Empties self.
     pub async fn flush(&mut self, pool: &PgPool) -> anyhow::Result<usize> {
@@ -591,6 +626,151 @@ async fn flush_trades(pool: &PgPool, rows: Vec<TradeRow>) -> anyhow::Result<usiz
     .execute(pool)
     .await?;
     Ok(res.rows_affected() as usize)
+}
+
+/// Stats from `backfill_from_redis` — how many ids were checked, how
+/// many were missing in PG, how many we successfully INSERTed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BackfillStats {
+    pub redis_orders_scanned: u64,
+    pub missing_in_pg: u64,
+    pub backfilled: u64,
+    /// Could not decode the Redis HASH (incomplete fields, bad parse).
+    /// These are dropped rather than inserted with sentinels.
+    pub skipped_decode: u64,
+}
+
+/// Recover PG state for orders that exist in Redis but not in PG. This
+/// happens after a pg-writer restart that left a gap (the Aeron persist
+/// stream is not replayable — frames published before the subscriber
+/// joins are lost).
+///
+/// Approach:
+/// 1. Read Redis `active_orders` SMEMBERS.
+/// 2. Ask PG which of those ids already exist.
+/// 3. For each missing id, HGETALL `order:{id}` → INSERT into PG using
+///    UNNEST batching. Same code path as flush_upserts.
+///
+/// Idempotent — safe to call alongside live writes; the INSERT uses
+/// ON CONFLICT DO UPDATE so concurrent pg-writer flushes don't conflict.
+pub async fn backfill_from_redis(
+    pg: &PgPool,
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> anyhow::Result<BackfillStats> {
+    use redis::AsyncCommands;
+    use std::collections::HashSet;
+
+    let mut stats = BackfillStats::default();
+
+    let redis_ids: Vec<i64> = conn.smembers(crate::desk::redis_store::KEY_ACTIVE_ORDERS).await?;
+    stats.redis_orders_scanned = redis_ids.len() as u64;
+    if redis_ids.is_empty() {
+        return Ok(stats);
+    }
+
+    let pg_existing: Vec<(i64,)> = sqlx::query_as(
+        "SELECT id FROM orders WHERE id = ANY($1::bigint[])",
+    )
+    .bind(&redis_ids)
+    .fetch_all(pg)
+    .await?;
+    let pg_set: HashSet<i64> = pg_existing.into_iter().map(|(id,)| id).collect();
+
+    let missing: Vec<i64> = redis_ids
+        .into_iter()
+        .filter(|id| !pg_set.contains(id))
+        .collect();
+    stats.missing_in_pg = missing.len() as u64;
+    if missing.is_empty() {
+        return Ok(stats);
+    }
+
+    // Pull HGETALL for every missing id in one pipelined burst.
+    let mut pipe = redis::pipe();
+    for id in &missing {
+        pipe.hgetall(crate::desk::redis_store::key_order(*id));
+    }
+    let hashes: Vec<std::collections::HashMap<String, String>> =
+        pipe.query_async(conn).await?;
+
+    let mut batch = PgWriteBatch::new();
+    for (id, h) in missing.iter().zip(hashes.into_iter()) {
+        // Decode the HASH back into UpsertRow fields. Mirror of
+        // redis_store::decode_hash but adapted for the pg_store side
+        // (string-typed status/side rather than serde DbOrder).
+        let user_id: Option<i64> = h.get("user_id").and_then(|s| s.parse().ok());
+        let symbol = h.get("symbol").cloned();
+        let side = h.get("side").cloned();
+        let order_type = h.get("order_type").cloned();
+        let status = h.get("status").cloned();
+        let qty: Option<f64> = h.get("qty").and_then(|s| s.parse().ok());
+        let filled: Option<f64> = h.get("filled").and_then(|s| s.parse().ok());
+        let freeze_price: Option<f64> = h.get("freeze_price").and_then(|s| s.parse().ok());
+        let price_raw: Option<f64> = h.get("price").and_then(|s| s.parse().ok());
+        let created_at_ms: Option<i64> = h.get("created_at_ms").and_then(|s| s.parse().ok());
+
+        let (user_id, symbol, side, order_type, status, qty, filled, freeze_price, created_at_ms) =
+            match (user_id, symbol, side, order_type, status, qty, filled, freeze_price, created_at_ms) {
+                (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g), Some(h), Some(i)) =>
+                    (a, b, c, d, e, f, g, h, i),
+                _ => {
+                    stats.skipped_decode += 1;
+                    continue;
+                }
+            };
+
+        let side_static: &'static str = match side.as_str() {
+            "buy" => "buy",
+            "sell" => "sell",
+            _ => {
+                stats.skipped_decode += 1;
+                continue;
+            }
+        };
+        let status_static: &'static str = match status.as_str() {
+            "PENDING" => "PENDING",
+            "TRADING" => "TRADING",
+            "COMPLETED" => "COMPLETED",
+            "CANCELED" => "CANCELED",
+            "REJECTED" => "REJECTED",
+            _ => {
+                stats.skipped_decode += 1;
+                continue;
+            }
+        };
+        let price = if let Some(p) = price_raw {
+            if p == 0.0 { None } else { Some(p) }
+        } else {
+            None
+        };
+        let client_order_id = match h.get("client_order_id") {
+            Some(s) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        };
+        let Some(created_at) = from_unix_ms(created_at_ms) else {
+            stats.skipped_decode += 1;
+            continue;
+        };
+
+        batch.push_upsert_row(
+            *id,
+            user_id,
+            symbol,
+            side_static,
+            order_type,
+            price,
+            qty,
+            filled,
+            status_static,
+            freeze_price,
+            client_order_id,
+            created_at,
+        );
+    }
+
+    let written = batch.flush(pg).await?;
+    stats.backfilled = written as u64;
+    Ok(stats)
 }
 
 #[cfg(test)]

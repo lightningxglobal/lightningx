@@ -17,7 +17,7 @@
 
 use aeron_wrapper::AeronClient;
 use anyhow::Context;
-use lightning_exchange::desk::pg_store::PgWriteBatch;
+use lightning_exchange::desk::pg_store::{backfill_from_redis, PgWriteBatch};
 use lightning_exchange::transport::aeron_channels::{aeron_dir, PERSIST_CHANNEL, PERSIST_STREAM};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
 use std::sync::Arc;
@@ -32,13 +32,22 @@ async fn main() -> anyhow::Result<()> {
     let max_conns: u32 = parse_env_u32("PG_WRITER_MAX_CONNS", 8);
     let max_batch: usize = parse_env_u32("PG_WRITER_BATCH", 256) as usize;
     let flush_ms: u64 = parse_env_u32("PG_WRITER_FLUSH_MS", 50) as u64;
+    let backfill = std::env::var("BACKFILL_ON_START")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let oneshot_backfill = std::env::var("ONESHOT_BACKFILL")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
 
     info!(
-        "pg-writer starting (pg={}, max_conns={}, max_batch={}, flush_ms={})",
+        "pg-writer starting (pg={}, max_conns={}, max_batch={}, flush_ms={}, backfill={})",
         redacted(&pg_url),
         max_conns,
         max_batch,
-        flush_ms
+        flush_ms,
+        backfill,
     );
 
     let pg = sqlx::postgres::PgPoolOptions::new()
@@ -46,6 +55,39 @@ async fn main() -> anyhow::Result<()> {
         .connect(&pg_url)
         .await
         .context("connect PG")?;
+
+    // Optional one-shot backfill: any id present in Redis active_orders
+    // but missing from PG is rebuilt from the Redis HASH and INSERTed
+    // into PG. Closes the startup gap when pg-writer is brought up after
+    // desk-server (Aeron stream subscriptions don't replay historical
+    // frames). Idempotent — safe to run repeatedly.
+    if backfill {
+        info!("BACKFILL_ON_START set — reconciling PG from Redis");
+        match redis::Client::open(redis_url.as_str()) {
+            Ok(client) => match client.get_multiplexed_async_connection().await {
+                Ok(mut conn) => {
+                    let _: Result<String, _> =
+                        redis::cmd("PING").query_async(&mut conn).await;
+                    match backfill_from_redis(&pg, &mut conn).await {
+                        Ok(stats) => info!(
+                            "backfill done: scanned={} missing={} backfilled={} skipped_decode={}",
+                            stats.redis_orders_scanned,
+                            stats.missing_in_pg,
+                            stats.backfilled,
+                            stats.skipped_decode,
+                        ),
+                        Err(e) => warn!("backfill failed: {e} — continuing anyway"),
+                    }
+                }
+                Err(e) => warn!("Redis connect failed at {redis_url}: {e} — skipping backfill"),
+            },
+            Err(e) => warn!("Invalid REDIS_URL '{redis_url}': {e} — skipping backfill"),
+        }
+        if oneshot_backfill {
+            info!("ONESHOT_BACKFILL set; exiting after backfill");
+            return Ok(());
+        }
+    }
 
     let dir = aeron_dir();
     info!("connecting Aeron client (dir={})", dir);

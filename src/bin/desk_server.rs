@@ -459,16 +459,8 @@ async fn process_db_cmd(
         }
 
         DbCmd::UpdateStatus { id, status, filled } => {
-            let _ =
-                sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
-                    .bind(db_cmd::status_str(status))
-                    .bind(filled)
-                    .bind(id)
-                    .execute(db.as_ref())
-                    .await;
-            // PR2 dual-write: mirror to Redis so REST reads see the updated
-            // filled/status instead of the stale PENDING the OrderUpsert
-            // first published. OrderFillUpdate preserves price / qty / freeze.
+            // PR5e: publish only. pg-writer applies the same status/filled
+            // change to PG asynchronously via OrderFillUpdate.
             publish_frame(
                 &persist_pub,
                 &PersistFrame::order_fill_update(OrderFillUpdatePayload {
@@ -554,54 +546,55 @@ async fn process_db_cmd(
             qty,
             freeze_price,
         } => {
+            // PR5e: cache-only release. Was a PG UPDATE accounts via
+            // repo.release_frozen. Same correctness — cache is source of
+            // truth; pg-writer mirrors the AccountSet to PG asynchronously.
             let sym_end = symbol.iter().position(|&b| b == 0).unwrap_or(16);
             let sym_str = std::str::from_utf8(&symbol[..sym_end]).unwrap_or("BTC_USDT");
             let parts: Vec<&str> = sym_str.splitn(2, '_').collect();
             let base = parts.first().copied().unwrap_or("BTC");
             let quote = parts.last().copied().unwrap_or("USDT");
-            let repo = AccountRepository::new(&db);
-            let release_result = if side == 0 {
-                repo.release_frozen(user_id, quote, freeze_price * qty)
-                    .await
-                    .map(|row| (quote, row))
+            let (asset, amount) = if side == 0 {
+                (quote.to_string(), freeze_price * qty)
             } else {
-                repo.release_frozen(user_id, base, qty)
-                    .await
-                    .map(|row| (base, row))
+                (base.to_string(), qty)
             };
-            if let Ok((asset, (bal, frz))) = release_result {
-                account_cache
-                    .entry(user_id)
-                    .or_insert_with(HashMap::new)
-                    .insert(asset.to_string(), (bal, frz));
+            if amount <= 0.0 {
+                return;
+            }
+            let new_vals = account_cache.get_mut(&user_id).and_then(|mut entry| {
+                let kv = entry.get_mut(&asset)?;
+                kv.1 = (kv.1 - amount).max(0.0);
+                Some((kv.0, kv.1))
+            });
+            if let Some((bal, frz)) = new_vals {
+                publish_frame(
+                    &persist_pub,
+                    &PersistFrame::account_set(AccountSetPayload {
+                        user_id,
+                        asset: pack_str(&asset),
+                        balance: bal,
+                        frozen: frz,
+                    }),
+                );
                 if let Some(tx) = user_tx.get(&user_id) {
-                    let _ = tx.try_send(
-                        serde_json::json!({
-                            "type": "balance_update",
-                            "asset": asset,
-                            "balance": bal,
-                            "available": bal - frz,
-                            "frozen": frz,
-                        })
-                        .to_string(),
-                    );
+                    let _ = tx.try_send(format!(
+                        r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
+                        asset, bal, bal - frz, frz,
+                    ));
                 }
             }
         }
 
 
         DbCmd::BatchDeleteOrder { ids, count } => {
+            // PR5e: pure publish. PG DELETE is now pg-writer's job.
             let count = count as usize;
             if count == 0 {
                 return;
             }
-            let ids_vec: Vec<i64> = ids[..count].to_vec();
-            let _ = sqlx::query("DELETE FROM orders WHERE id = ANY($1)")
-                .bind(&ids_vec)
-                .execute(db.as_ref())
-                .await;
-            // PR2 dual-write: tell redis-writer to drop the same ids.
-            for &id in &ids_vec {
+            let ids_vec = &ids[..count];
+            for &id in ids_vec {
                 publish_frame(
                     &persist_pub,
                     &PersistFrame::order_delete(OrderDeletePayload { id }),

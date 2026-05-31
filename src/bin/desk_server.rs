@@ -348,7 +348,7 @@ async fn process_db_cmd(
     match cmd {
         DbCmd::UpsertOrder {
             id,
-            user_id,
+            user_id: _user_id,
             symbol,
             side,
             order_type,
@@ -357,253 +357,48 @@ async fn process_db_cmd(
             filled,
             status,
             freeze_price,
-            do_freeze,
+            do_freeze: _do_freeze,
             client_order_id,
         } => {
-            let sym_end = symbol.iter().position(|&b| b == 0).unwrap_or(16);
-            let ot_end = order_type.iter().position(|&b| b == 0).unwrap_or(16);
-            let coid_end = client_order_id.iter().position(|&b| b == 0).unwrap_or(32);
-            let sym_str = std::str::from_utf8(&symbol[..sym_end]).unwrap_or("BTC_USDT");
-            let ot_str = std::str::from_utf8(&order_type[..ot_end]).unwrap_or("limit");
-            let coid_str = std::str::from_utf8(&client_order_id[..coid_end])
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_owned());
-            let side_str = if side == 0 { "buy" } else { "sell" };
-            let status_str = db_cmd::status_str(status);
-
-            // INSERT (or UPDATE on id conflict). If the caller-supplied
-            // client_order_id collides with another row of the same user
-            // (UNIQUE (user_id, client_order_id) WHERE client_order_id IS NOT NULL),
-            // retry once with client_order_id=NULL — losing the coid annotation
-            // is acceptable; silently dropping the entire order row is not.
-            if let Err(e) = sqlx::query(
-                "INSERT INTO orders \
-                 (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
-                 ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()",
-            )
-            .bind(id).bind(user_id).bind(sym_str)
-            .bind(side_str).bind(ot_str)
-            .bind(price).bind(qty).bind(filled).bind(status_str).bind(freeze_price)
-            .bind(coid_str.clone())
-            .execute(db.as_ref()).await
-            {
-                let is_coid_conflict = e.as_database_error()
-                    .and_then(|de| de.constraint())
-                    .map(|c| c.contains("client_order_id"))
-                    .unwrap_or(false);
-                if is_coid_conflict {
-                    if let Err(e2) = sqlx::query(
-                        "INSERT INTO orders \
-                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL) \
-                         ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()",
-                    )
-                    .bind(id).bind(user_id).bind(sym_str)
-                    .bind(side_str).bind(ot_str)
-                    .bind(price).bind(qty).bind(filled).bind(status_str).bind(freeze_price)
-                    .execute(db.as_ref()).await
-                    {
-                        tracing::error!("orders insert failed (retry without coid) id={id} user={user_id}: {e2}");
-                    }
-                } else {
-                    tracing::error!("orders insert failed id={id} user={user_id}: {e}");
-                }
-            }
-
-            if do_freeze {
-                let repo = AccountRepository::new(&db);
-                let parts: Vec<&str> = sym_str.splitn(2, '_').collect();
-                let base = parts.first().copied().unwrap_or("BTC");
-                let quote = parts.last().copied().unwrap_or("USDT");
-                let freeze_ok = if side == 0 {
-                    // buy: freeze quote
-                    let amount = freeze_price * qty;
-                    if amount > 0.0 {
-                        match repo.freeze_for_buy(user_id, quote, amount).await {
-                            Ok((bal, frz)) => {
-                                account_cache
-                                    .entry(user_id)
-                                    .or_insert_with(HashMap::new)
-                                    .insert(quote.to_string(), (bal, frz));
-                                true
-                            }
-                            Err(_) => false,
-                        }
-                    } else {
-                        true
-                    }
-                } else {
-                    // sell: freeze base
-                    match repo.freeze_for_sell(user_id, base, qty).await {
-                        Ok((bal, frz)) => {
-                            account_cache
-                                .entry(user_id)
-                                .or_insert_with(HashMap::new)
-                                .insert(base.to_string(), (bal, frz));
-                            true
-                        }
-                        Err(_) => false,
-                    }
-                };
-
-                if !freeze_ok {
-                    // Insufficient funds: cancel the resting order so it doesn't
-                    // fill without backing funds. Update DB, notify user, and tell
-                    // the engine to remove it from the book.
-                    tracing::warn!("freeze failed for order {id} user {user_id} — cancelling");
-                    let _ = sqlx::query(
-                        "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1",
-                    )
-                    .bind(id)
-                    .execute(db.as_ref())
-                    .await;
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_micros() as u64)
-                        .unwrap_or(0);
-                    if let Some(tx) = user_tx.get(&(user_id as u64 as i64)) {
-                        let _ = tx.try_send(
-                            serde_json::json!({
-                                "type": "order_update",
-                                "order_id": id,
-                                "status": "CANCELED",
-                                "reason": "insufficient_balance",
-                                "ts": ts,
-                            })
-                            .to_string(),
-                        );
-                    }
-                    if let Some(ref tx) = aeron_cancel_tx {
-                        let _ = tx.send(AeronCmd::Cancel(
-                            lightning_exchange::sbe::CancelOrderRequest {
-                                order_id: id as u64,
-                                participant_id: user_id as u64,
-                            },
-                        ));
-                    }
-                }
-            }
+            // PR5c: this variant is now only pushed by the PARTIAL_FILL
+            // path in the spin thread (do_freeze=false). Publish an
+            // OrderFillUpdate frame so Redis HASH sees the new
+            // filled/status, and let pg-writer apply the same update
+            // asynchronously to PG. No DB worker SQL here.
+            let _ = price;
+            let _ = qty;
+            let _ = freeze_price;
+            let _ = symbol;
+            let _ = order_type;
+            let _ = client_order_id;
+            let _ = side;
+            publish_frame(
+                &persist_pub,
+                &PersistFrame::order_fill_update(OrderFillUpdatePayload {
+                    id,
+                    filled,
+                    status,
+                    _pad: [0; 7],
+                }),
+            );
         }
 
         DbCmd::BatchUpsertOrder { entries, count } => {
-            // Multi-row INSERT + grouped UPDATE accounts. ~11× local /
-            // expected ~15-17× on EC2 vs per-id UpsertOrder (see
-            // examples/bench_upsert_order). All entries assumed do_freeze=true
-            // (the only caller is the MM-batch ACCEPTED path).
+            // PR5c: no more PG. Cache was already updated at freeze time
+            // by ws_handler::try_freeze_cache / REST handler's same path;
+            // the WS-handler also already pushed balance_update. Here we
+            // just publish OrderUpsert (so pg-writer + redis-writer mirror
+            // the new rows) and AccountSet (with current cache values)
+            // for completeness.
             let count = count as usize;
             if count == 0 {
                 return;
             }
             let entries = &entries[..count];
 
-            // 1) Multi-row INSERT.
-            let mut sql = String::with_capacity(256 + count * 80);
-            sql.push_str(
-                "INSERT INTO orders \
-                 (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
-                 VALUES ",
-            );
-            for i in 0..count {
-                let b = i * 11;
-                if i > 0 {
-                    sql.push(',');
-                }
-                use std::fmt::Write;
-                let _ = write!(
-                    sql,
-                    "(${},${},${},${},${},${},${},${},${},${},${})",
-                    b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7, b + 8, b + 9, b + 10, b + 11,
-                );
-            }
-            sql.push_str(
-                " ON CONFLICT (id) DO UPDATE \
-                 SET status=EXCLUDED.status, filled=EXCLUDED.filled, updated_at=NOW()",
-            );
-
-            let mut q = sqlx::query(&sql);
-            // Hold owned strings alive until the query is executed.
-            let mut owned_syms: smallvec::SmallVec<[String; 64]> =
-                smallvec::SmallVec::with_capacity(count);
-            let mut owned_ots: smallvec::SmallVec<[String; 64]> =
-                smallvec::SmallVec::with_capacity(count);
-            let mut owned_coids: smallvec::SmallVec<[Option<String>; 64]> =
-                smallvec::SmallVec::with_capacity(count);
-            for e in entries {
-                let sym_end = e.symbol.iter().position(|&b| b == 0).unwrap_or(16);
-                let ot_end = e.order_type.iter().position(|&b| b == 0).unwrap_or(16);
-                let coid_end = e.client_order_id.iter().position(|&b| b == 0).unwrap_or(32);
-                owned_syms.push(
-                    std::str::from_utf8(&e.symbol[..sym_end])
-                        .unwrap_or("BTC_USDT")
-                        .to_owned(),
-                );
-                owned_ots.push(
-                    std::str::from_utf8(&e.order_type[..ot_end])
-                        .unwrap_or("limit")
-                        .to_owned(),
-                );
-                let coid = std::str::from_utf8(&e.client_order_id[..coid_end])
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_owned());
-                owned_coids.push(coid);
-            }
-            for (i, e) in entries.iter().enumerate() {
-                q = q
-                    .bind(e.id)
-                    .bind(e.user_id)
-                    .bind(&owned_syms[i])
-                    .bind(if e.side == 0 { "buy" } else { "sell" })
-                    .bind(&owned_ots[i])
-                    .bind(e.price)
-                    .bind(e.qty)
-                    .bind(e.filled)
-                    .bind(db_cmd::status_str(e.status))
-                    .bind(e.freeze_price)
-                    .bind(owned_coids[i].clone());
-            }
-            if let Err(err) = q.execute(db.as_ref()).await {
-                tracing::error!("batch orders INSERT failed (count={count}): {err}");
-                // Fallback: try per-id INSERTs so a single bad row doesn't
-                // sink the whole batch (e.g. coid UNIQUE conflict from a
-                // legacy reused client_order_id).
-                for e in entries {
-                    let _ = sqlx::query(
-                        "INSERT INTO orders \
-                         (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price, client_order_id) \
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL) \
-                         ON CONFLICT (id) DO UPDATE SET status=$9, filled=$8, updated_at=NOW()",
-                    )
-                    .bind(e.id)
-                    .bind(e.user_id)
-                    .bind(
-                        std::str::from_utf8(
-                            &e.symbol[..e.symbol.iter().position(|&b| b == 0).unwrap_or(16)],
-                        )
-                        .unwrap_or("BTC_USDT"),
-                    )
-                    .bind(if e.side == 0 { "buy" } else { "sell" })
-                    .bind(
-                        std::str::from_utf8(
-                            &e.order_type[..e.order_type.iter().position(|&b| b == 0).unwrap_or(16)],
-                        )
-                        .unwrap_or("limit"),
-                    )
-                    .bind(e.price)
-                    .bind(e.qty)
-                    .bind(e.filled)
-                    .bind(db_cmd::status_str(e.status))
-                    .bind(e.freeze_price)
-                    .execute(db.as_ref())
-                    .await;
-                }
-            }
-
-            // 2) Group freezes by (user_id, asset) and UPDATE accounts per group.
-            // All entries from MM ACCEPTED carry do_freeze=true.
-            let mut freezes: HashMap<(i64, String), f64> = HashMap::new();
+            // For AccountSet: dedupe by (user_id, asset). We read from cache,
+            // so we don't accumulate amounts here — just one set per pair.
+            let mut accounts_to_emit: HashMap<(i64, String), ()> = HashMap::new();
             for e in entries {
                 if !e.do_freeze {
                     continue;
@@ -613,34 +408,18 @@ async fn process_db_cmd(
                 let parts: Vec<&str> = sym.splitn(2, '_').collect();
                 let base = parts.first().copied().unwrap_or("BTC");
                 let quote = parts.last().copied().unwrap_or("USDT");
-                let (asset, amount) = if e.side == 0 {
-                    (quote.to_string(), e.freeze_price * e.qty)
+                let asset = if e.side == 0 {
+                    quote.to_string()
                 } else {
-                    (base.to_string(), e.qty)
+                    base.to_string()
                 };
-                if amount > 0.0 {
-                    *freezes.entry((e.user_id, asset)).or_insert(0.0) += amount;
-                }
+                accounts_to_emit.insert((e.user_id, asset), ());
             }
-            for ((uid, asset), amount) in freezes {
-                let updated: Option<(f64, f64)> = sqlx::query_as(
-                    "UPDATE accounts \
-                     SET frozen = frozen + $1, updated_at = NOW() \
-                     WHERE user_id=$2 AND asset=$3 \
-                     RETURNING balance, frozen",
-                )
-                .bind(amount)
-                .bind(uid)
-                .bind(&asset)
-                .fetch_optional(db.as_ref())
-                .await
-                .unwrap_or(None);
-                if let Some((bal, frz)) = updated {
-                    account_cache
-                        .entry(uid)
-                        .or_insert_with(HashMap::new)
-                        .insert(asset.clone(), (bal, frz));
-                    // PR2 dual-write: publish AccountSet for redis-writer.
+            for ((uid, asset), _) in accounts_to_emit {
+                let snapshot: Option<(f64, f64)> = account_cache
+                    .get(&uid)
+                    .and_then(|entry| entry.get(asset.as_str()).copied());
+                if let Some((bal, frz)) = snapshot {
                     publish_frame(
                         &persist_pub,
                         &PersistFrame::account_set(AccountSetPayload {
@@ -650,23 +429,13 @@ async fn process_db_cmd(
                             frozen: frz,
                         }),
                     );
-                    if let Some(tx) = user_tx.get(&uid) {
-                        let _ = tx.try_send(
-                            serde_json::json!({
-                                "type": "balance_update",
-                                "asset": asset,
-                                "balance": bal,
-                                "available": bal - frz,
-                                "frozen": frz,
-                            })
-                            .to_string(),
-                        );
-                    }
+                    // No WS push here — try_freeze_cache already sent it.
+                    let _ = user_tx.get(&uid);
                 }
             }
 
-            // PR2 dual-write: publish OrderUpsert per row so redis-writer
-            // sees the same active orders that just landed in PG.
+            // Publish OrderUpsert per row so redis-writer + pg-writer mirror
+            // the new rows.
             for e in entries {
                 publish_frame(
                     &persist_pub,

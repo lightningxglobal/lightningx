@@ -29,6 +29,18 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 /// Updated after every DB write so GET /api/balances never hits the DB.
 pub type AccountCache = Arc<DashMap<i64, HashMap<String, (f64, f64)>>>;
 
+/// Running VWAP of a user's BUY fills per (user_id, base_asset).
+/// Updated on every BatchSettleTrade so GET /api/positions can compute
+/// entry_price = weighted_sum / qty_sum in O(1) instead of a 90ms
+/// PG aggregate over the trades table.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct VwapStats {
+    pub weighted_sum: f64, // Σ price * qty
+    pub qty_sum: f64,      // Σ qty
+}
+
+pub type VwapCache = Arc<DashMap<(i64, String), VwapStats>>;
+
 /// Shared Redis L1 connection. MultiplexedConnection is cheap-to-clone and
 /// safe under concurrent use, so each request handler clones its own copy
 /// before issuing commands. `None` means Redis is not available (e.g.
@@ -86,6 +98,9 @@ pub struct AppState {
     /// PersistEvent publisher (Aeron IPC stream consumed by redis-writer).
     /// None ⇒ standalone mode without Aeron — REST POST will not publish.
     pub persist_pub: Option<PersistPubHandle>,
+    /// Per (user_id, base_asset) running VWAP of BUY fills. Updated by
+    /// the spin thread on every BatchSettleTrade. Read by /api/positions.
+    pub vwap_cache: VwapCache,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -545,7 +560,18 @@ async fn handle_positions(State(s): State<AppState>, headers: HeaderMap) -> impl
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let positions = crate::positions::all_positions_for_user(s.db.as_ref(), user_id).await;
+    // All-in-memory path — was a 3-query PG call (90ms p50). Each piece:
+    //   • (balance, frozen) from account_cache (DashMap)
+    //   • current_price from last_trade_price (DashMap, spin-thread maintained)
+    //   • entry_price from vwap_cache (DashMap, spin-thread maintained from
+    //     BUY fills in BatchSettleTrade) — preload happens at boot from
+    //     `SELECT user_id, base_asset, SUM(price*qty), SUM(qty) FROM trades`.
+    let positions = crate::positions::all_positions_in_memory(
+        user_id,
+        &s.account_cache,
+        s.last_trade_price.as_ref(),
+        &s.vwap_cache,
+    );
     (StatusCode::OK, Json(json!(positions))).into_response()
 }
 

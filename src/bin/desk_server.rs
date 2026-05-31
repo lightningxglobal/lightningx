@@ -331,6 +331,7 @@ fn publish_frame(
     let _ = pp.lock().publish(frame);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_db_cmd(
     cmd: DbCmd,
     db: std::sync::Arc<sqlx::PgPool>,
@@ -343,6 +344,7 @@ async fn process_db_cmd(
     _last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
+    vwap_cache: lightning_exchange::api::VwapCache,
 ) {
     use lightning_exchange::account_repository::AccountRepository;
     match cmd {
@@ -672,6 +674,17 @@ async fn process_db_cmd(
 
                 let e = deltas.entry((seller_uid, quote.to_string())).or_default();
                 e.balance += cost;
+
+                // VWAP cache for /api/positions: running weighted sum of
+                // BUY fills per (user_id, base_asset). Replaces the 90ms
+                // PG aggregate previously done per call. Sell fills do
+                // not contribute to entry_price (no avg-cost change on
+                // exit — already accounted for as realized PnL).
+                let mut vw = vwap_cache
+                    .entry((buyer_uid, base.to_string()))
+                    .or_default();
+                vw.weighted_sum += cost;
+                vw.qty_sum += r.qty;
             }
 
             // Apply each delta to the in-memory cache atomically. For assets
@@ -768,6 +781,7 @@ async fn process_db_cmd(
 }
 
 // ── spawn_db_worker: drain rtrb DbCmd ring buffer off the spin thread ─────────
+#[allow(clippy::too_many_arguments)]
 fn spawn_db_worker(
     mut db_rx: rtrb::Consumer<DbCmd>,
     rt: tokio::runtime::Handle,
@@ -778,6 +792,7 @@ fn spawn_db_worker(
     last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
+    vwap_cache: lightning_exchange::api::VwapCache,
 ) {
     std::thread::Builder::new()
         .name("db-worker".to_string())
@@ -795,7 +810,8 @@ fn spawn_db_worker(
                     let ltp2 = last_trade_price.clone();
                     let pp2 = persist_pub.clone();
                     let at2 = aeron_cancel_tx.clone();
-                    rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, ltp2, pp2, at2));
+                    let vc2 = vwap_cache.clone();
+                    rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, ltp2, pp2, at2, vc2));
                 }
                 if !did_work {
                     idle_us = (idle_us * 2 + 10).min(200);
@@ -848,6 +864,34 @@ async fn main() -> anyhow::Result<()> {
                 .insert(asset, (bal, frz));
         }
         tracing::info!("Account cache loaded ({} rows)", account_cache.len());
+    }
+
+    // Preload VWAP from the trades table so /api/positions returns the
+    // correct entry_price even immediately after restart (before any new
+    // fills land). Single PG aggregate at boot — never touches PG again.
+    let vwap_cache: lightning_exchange::api::VwapCache =
+        std::sync::Arc::new(dashmap::DashMap::new());
+    {
+        let rows: Vec<(i64, String, f64, f64)> = sqlx::query_as(
+            "SELECT o.user_id, SPLIT_PART(t.symbol, '_', 1) AS base_asset,
+                    SUM(t.price * t.quantity) AS weighted_sum,
+                    SUM(t.quantity)            AS qty_sum
+             FROM trades t JOIN orders o ON o.id = t.buy_order_id
+             GROUP BY o.user_id, base_asset",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        for (uid, base, w, q) in rows {
+            vwap_cache.insert(
+                (uid, base),
+                lightning_exchange::api::VwapStats {
+                    weighted_sum: w,
+                    qty_sum: q,
+                },
+            );
+        }
+        tracing::info!("VWAP cache loaded ({} (user, base) keys)", vwap_cache.len());
     }
 
     let mut open_order_meta: HashMap<u64, OrderRuntimeMeta> = HashMap::new();
@@ -1029,6 +1073,7 @@ async fn main() -> anyhow::Result<()> {
         valid_symbols: Arc::new(valid_symbols),
         redis: redis_conn,
         persist_pub: Some(persist_pub.clone()),
+        vwap_cache: vwap_cache.clone(),
     };
 
     // ── DB worker: rtrb ring buffer spin thread → DB worker thread ───────────
@@ -1043,6 +1088,7 @@ async fn main() -> anyhow::Result<()> {
         state.last_trade_price.clone(),
         persist_pub.clone(),
         Some(db_worker_aeron_tx),
+        vwap_cache.clone(),
     );
 
     // ── Aeron spin thread: WS command drain + inbound event loop ─────────────

@@ -337,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
         valid_symbols: Arc::new(std::collections::HashSet::new()),
         redis: None,
         persist_pub: None,
+        vwap_cache: Arc::new(dashmap::DashMap::new()),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

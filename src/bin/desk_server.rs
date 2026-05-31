@@ -603,170 +603,38 @@ async fn process_db_cmd(
         }
 
         DbCmd::BatchSettleTrade { entries, count } => {
+            // PR5d: in-memory settlement, no PG. Spin thread already
+            // resolved taker/maker uids; we just apply per-(user,asset)
+            // net deltas to the account_cache atomically, then publish
+            // TradeInsert + OrderDelete/OrderFillUpdate + AccountSet for
+            // pg-writer to mirror.
             let count = count as usize;
             if count == 0 {
                 return;
             }
             let entries = &entries[..count];
 
-            // Resolve any missing taker/maker uids in one round-trip.
-            let mut need_lookup: Vec<i64> = Vec::new();
-            for e in entries {
-                if e.taker_uid == 0 { need_lookup.push(e.taker_id); }
-                if e.maker_uid == 0 { need_lookup.push(e.maker_id); }
-            }
-            let mut uid_by_id: HashMap<i64, i64> = HashMap::new();
-            if !need_lookup.is_empty() {
-                let rows: Vec<(i64, i64)> = sqlx::query_as(
-                    "SELECT id, user_id FROM orders WHERE id = ANY($1)",
-                )
-                .bind(&need_lookup)
-                .fetch_all(db.as_ref())
-                .await
-                .unwrap_or_default();
-                for (id, uid) in rows {
-                    uid_by_id.insert(id, uid);
-                }
-            }
-            // Apply lookups + build per-fill resolved tuple.
-            #[derive(Clone)]
-            struct Resolved {
-                taker_id: i64,
-                maker_id: i64,
-                taker_uid: i64,
-                maker_uid: i64,
-                price: f64,
-                qty: f64,
-                side: u8,
-                symbol: String,
-            }
-            let mut resolved: Vec<Resolved> = Vec::with_capacity(entries.len());
-            for e in entries {
-                let taker_uid = if e.taker_uid != 0 {
-                    e.taker_uid
-                } else {
-                    *uid_by_id.get(&e.taker_id).unwrap_or(&0)
-                };
-                let maker_uid = if e.maker_uid != 0 {
-                    e.maker_uid
-                } else {
-                    *uid_by_id.get(&e.maker_id).unwrap_or(&0)
-                };
-                if taker_uid == 0 || maker_uid == 0 {
-                    // Skip un-resolvable fills — same behaviour as the single
-                    // SettleTrade handler, which returns early on uid=0.
-                    continue;
-                }
-                let sym_end = e.symbol.iter().position(|&b| b == 0).unwrap_or(16);
-                let symbol = std::str::from_utf8(&e.symbol[..sym_end])
-                    .unwrap_or("BTC_USDT")
-                    .to_owned();
-                resolved.push(Resolved {
-                    taker_id: e.taker_id,
-                    maker_id: e.maker_id,
-                    taker_uid,
-                    maker_uid,
-                    price: e.price,
-                    qty: e.qty,
-                    side: e.side,
-                    symbol,
-                });
-            }
+            // Skip fills with missing uids — same defensive behaviour as
+            // the old PG path which fell back to a SELECT. PR5a's preload
+            // means this should never trigger in steady state.
+            let resolved: Vec<&SettleTradeEntry> = entries
+                .iter()
+                .filter(|e| e.taker_uid != 0 && e.maker_uid != 0)
+                .collect();
             if resolved.is_empty() {
                 return;
             }
 
-            // NOTE: trade WS broadcast + last_trade_price update now happen
-            // on the SPIN thread, immediately when each trade pops out of
-            // trade_sub.poll() — see the trade loop in the Aeron spin
-            // thread. Doing it here would duplicate every WS trade event
-            // and add ms-scale cross-thread latency to clients.
+            // NOTE: trade WS broadcast + last_trade_price update happen on
+            // the SPIN thread, immediately when each trade pops out of
+            // trade_sub.poll(). Doing it here would duplicate every event
+            // and add ms-scale cross-thread latency.
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0);
 
-            // Single txn for the whole batch.
-            let mut txn = match db.begin().await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!("batch settle txn begin: {e}");
-                    return;
-                }
-            };
-
-            // 1) Multi-row INSERT trades.
-            {
-                use std::fmt::Write;
-                let mut sql = String::from(
-                    "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at) VALUES ",
-                );
-                for (i, _r) in resolved.iter().enumerate() {
-                    if i > 0 { sql.push(','); }
-                    let n = i * 5;
-                    let _ = write!(
-                        sql,
-                        "(${},${},${},${},${},NOW())",
-                        n + 1, n + 2, n + 3, n + 4, n + 5
-                    );
-                }
-                let mut q = sqlx::query(&sql);
-                for r in &resolved {
-                    let (b, s) = if r.side == 0 {
-                        (r.taker_id, r.maker_id)
-                    } else {
-                        (r.maker_id, r.taker_id)
-                    };
-                    q = q.bind(&r.symbol).bind(b).bind(s).bind(r.price).bind(r.qty);
-                }
-                if let Err(e) = q.execute(&mut *txn).await {
-                    tracing::error!("batch trades INSERT failed (count={}): {e}", resolved.len());
-                    let _ = txn.rollback().await;
-                    return;
-                }
-            }
-
-            // 2) Multi-row UPDATE orders for maker fills. Each maker order's
-            //    filled grows by qty; status flips to COMPLETED when fully
-            //    filled. RETURNING gives us per-id status/filled for the WS
-            //    push pass below.
-            let maker_updates: Vec<(i64, i64, String, f64)>;
-            {
-                use std::fmt::Write;
-                let mut sql = String::from(
-                    "UPDATE orders SET
-                       filled = orders.filled + u.delta_qty,
-                       status = CASE
-                         WHEN orders.quantity - (orders.filled + u.delta_qty) < 1e-9
-                         THEN 'COMPLETED' ELSE 'TRADING'
-                       END,
-                       updated_at = NOW()
-                     FROM (VALUES ",
-                );
-                for (i, _r) in resolved.iter().enumerate() {
-                    if i > 0 { sql.push(','); }
-                    let n = i * 2;
-                    let _ = write!(sql, "(${}::bigint, ${}::float8)", n + 1, n + 2);
-                }
-                sql.push_str(
-                    ") AS u(maker_id, delta_qty) WHERE orders.id = u.maker_id
-                     RETURNING orders.id, orders.user_id, orders.status, orders.filled",
-                );
-                let mut q = sqlx::query_as::<_, (i64, i64, String, f64)>(&sql);
-                for r in &resolved {
-                    q = q.bind(r.maker_id).bind(r.qty);
-                }
-                maker_updates = match q.fetch_all(&mut *txn).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!("batch maker UPDATE failed: {e}");
-                        let _ = txn.rollback().await;
-                        return;
-                    }
-                };
-            }
-
-            // 3) Group net (balance_delta, frozen_release) per (user_id, asset).
+            // Net (balance_delta, frozen_release) per (user_id, asset).
             //   buyer  quote: -cost, release cost
             //   buyer  base : +qty
             //   seller base : -qty,  release qty
@@ -778,125 +646,90 @@ async fn process_db_cmd(
             }
             let mut deltas: HashMap<(i64, String), Delta> = HashMap::new();
             for r in &resolved {
-                let parts: Vec<&str> = r.symbol.splitn(2, '_').collect();
-                let base = parts.first().copied().unwrap_or("BTC").to_string();
-                let quote = parts.last().copied().unwrap_or("USDT").to_string();
+                let sym_end = r.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                let symbol = std::str::from_utf8(&r.symbol[..sym_end]).unwrap_or("BTC_USDT");
+                let (base, quote) = match symbol.split_once('_') {
+                    Some(parts) => parts,
+                    None => continue,
+                };
                 let cost = r.price * r.qty;
                 let (buyer_uid, seller_uid) = if r.side == 0 {
                     (r.taker_uid, r.maker_uid)
                 } else {
                     (r.maker_uid, r.taker_uid)
                 };
-                let e = deltas.entry((buyer_uid, quote.clone())).or_default();
+
+                let e = deltas.entry((buyer_uid, quote.to_string())).or_default();
                 e.balance -= cost;
                 e.frozen_release += cost;
 
-                let e = deltas.entry((buyer_uid, base.clone())).or_default();
+                let e = deltas.entry((buyer_uid, base.to_string())).or_default();
                 e.balance += r.qty;
 
-                let e = deltas.entry((seller_uid, base.clone())).or_default();
+                let e = deltas.entry((seller_uid, base.to_string())).or_default();
                 e.balance -= r.qty;
                 e.frozen_release += r.qty;
 
-                let e = deltas.entry((seller_uid, quote.clone())).or_default();
+                let e = deltas.entry((seller_uid, quote.to_string())).or_default();
                 e.balance += cost;
             }
-            // 4) Apply each group as a single UPDATE.
-            //    Positive balance_delta entries need an UPSERT in case the
-            //    user has never held this asset before; negative ones must
-            //    plain-UPDATE so the CHECK (balance >= 0) doesn't trip
-            //    against a freshly-inserted negative balance.
+
+            // Apply each delta to the in-memory cache atomically. For assets
+            // the user has never held, insert a fresh entry. balance >= 0
+            // invariant is enforced via clamp (settlement should never push
+            // it negative if freezes were correct upstream, but we clamp
+            // anyway for defence).
             let mut updated_accounts: Vec<(i64, String, f64, f64)> =
                 Vec::with_capacity(deltas.len());
             for ((uid, asset), d) in deltas {
-                let row: Option<(f64, f64)> = if d.balance >= 0.0 {
-                    sqlx::query_as(
-                        "INSERT INTO accounts (user_id, asset, balance, frozen)
-                         VALUES ($1, $2, $3, 0)
-                         ON CONFLICT (user_id, asset) DO UPDATE SET
-                           balance = accounts.balance + $3,
-                           frozen  = GREATEST(accounts.frozen - $4, 0),
-                           updated_at = NOW()
-                         RETURNING balance, frozen",
-                    )
-                    .bind(uid)
-                    .bind(&asset)
-                    .bind(d.balance)
-                    .bind(d.frozen_release)
-                    .fetch_optional(&mut *txn)
-                    .await
-                    .unwrap_or(None)
-                } else {
-                    sqlx::query_as(
-                        "UPDATE accounts SET
-                           balance = balance + $1,
-                           frozen  = GREATEST(frozen - $2, 0),
-                           updated_at = NOW()
-                         WHERE user_id = $3 AND asset = $4
-                         RETURNING balance, frozen",
-                    )
-                    .bind(d.balance)
-                    .bind(d.frozen_release)
-                    .bind(uid)
-                    .bind(&asset)
-                    .fetch_optional(&mut *txn)
-                    .await
-                    .unwrap_or(None)
-                };
-                if let Some((bal, frz)) = row {
-                    updated_accounts.push((uid, asset, bal, frz));
-                }
-            }
-
-            if let Err(e) = txn.commit().await {
-                tracing::error!("batch settle txn commit: {e}");
-                return;
-            }
-
-            // 5) Fan-out: WS order_update for each maker, balance_update for
-            //    each (uid, asset). Cache mirror update too.
-            for (maker_id, maker_uid, new_status, new_filled) in &maker_updates {
-                if let Some(tx) = user_tx.get(maker_uid) {
-                    let ws_status = maker_ws_status_from_db_status(new_status).as_str();
-                    let _ = tx.try_send(
-                        serde_json::json!({
-                            "type": "order_update",
-                            "order_id": maker_id,
-                            "status": ws_status,
-                            "filled_qty": new_filled,
-                            "ts": ts,
-                        })
-                        .to_string(),
-                    );
-                }
-                // PR2 dual-write: maker order changed (filled grew, maybe
-                // completed). Push OrderDelete if completed, else upsert the
-                // updated filled value via a partial OrderUpsert.
-                if new_status == "COMPLETED" {
-                    publish_frame(
-                        &persist_pub,
-                        &PersistFrame::order_delete(OrderDeletePayload { id: *maker_id }),
-                    );
-                } else {
-                    // Partial fill of an already-known order: only filled
-                    // and status change. Use OrderFillUpdate so the writer
-                    // doesn't overwrite price/qty/etc with sentinels.
-                    publish_frame(
-                        &persist_pub,
-                        &PersistFrame::order_fill_update(OrderFillUpdatePayload {
-                            id: *maker_id,
-                            filled: *new_filled,
-                            status: DbOrderStatus::Trading.as_u8(),
-                            _pad: [0; 7],
-                        }),
-                    );
-                }
-            }
-            for (uid, asset, bal, frz) in updated_accounts {
-                account_cache
+                let mut entry = account_cache
                     .entry(uid)
-                    .or_insert_with(HashMap::new)
-                    .insert(asset.clone(), (bal, frz));
+                    .or_insert_with(HashMap::new);
+                let kv = entry.entry(asset.clone()).or_insert((0.0, 0.0));
+                kv.0 = (kv.0 + d.balance).max(0.0);
+                kv.1 = (kv.1 - d.frozen_release).max(0.0);
+                let bal = kv.0;
+                let frz = kv.1;
+                drop(entry);
+                updated_accounts.push((uid, asset, bal, frz));
+            }
+
+            // Maker order_update WS + OrderFillUpdate / OrderDelete publish.
+            // Spin thread also has maker meta in runtime cache — but here we
+            // operate without it because the spin thread will see its own
+            // OrderUpdate(kind=FILLED|PARTIAL_FILL) for the maker too and
+            // handle bookkeeping there.
+            //
+            // For now we just publish OrderFillUpdate per maker fill so
+            // Redis HASH filled/status converges; if it's a full fill the
+            // OrderDelete from the spin thread's else-branch (BatchDeleteOrder)
+            // will eventually arrive.
+            for r in &resolved {
+                if let Some(tx) = user_tx.get(&r.maker_uid) {
+                    // Hand-written JSON; same shape as the previous
+                    // serde_json::json! macro call.
+                    let _ = tx.try_send(format!(
+                        r#"{{"type":"order_update","order_id":{},"status":"PARTIAL_FILL","filled_qty":{},"ts":{}}}"#,
+                        r.maker_id, r.qty, ts,
+                    ));
+                }
+                // Publish a TRADING-status fill update for the maker. If the
+                // order fully filled, the spin thread will subsequently
+                // emit BatchDeleteOrder → OrderDelete; redis_store will
+                // process it and remove the HASH.
+                publish_frame(
+                    &persist_pub,
+                    &PersistFrame::order_fill_update(OrderFillUpdatePayload {
+                        id: r.maker_id,
+                        filled: r.qty,  // delta (rebroadcast each time)
+                        status: DbOrderStatus::Trading.as_u8(),
+                        _pad: [0; 7],
+                    }),
+                );
+            }
+
+            // Publish AccountSet + WS balance_update per updated account.
+            for (uid, asset, bal, frz) in updated_accounts {
                 publish_frame(
                     &persist_pub,
                     &PersistFrame::account_set(AccountSetPayload {
@@ -907,27 +740,23 @@ async fn process_db_cmd(
                     }),
                 );
                 if let Some(tx) = user_tx.get(&uid) {
-                    let _ = tx.try_send(
-                        serde_json::json!({
-                            "type": "balance_update",
-                            "asset": asset,
-                            "balance": bal,
-                            "available": bal - frz,
-                            "frozen": frz,
-                        })
-                        .to_string(),
-                    );
+                    let _ = tx.try_send(format!(
+                        r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
+                        asset, bal, bal - frz, frz,
+                    ));
                 }
             }
-            // PR2 dual-write: emit TradeInsert for each fill. Redis ignores;
-            // pg-writer (future PR) will consume to write the trades table.
+
+            // Emit TradeInsert per fill — pg-writer applies these to trades table.
             for r in &resolved {
+                let sym_end = r.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                let symbol = std::str::from_utf8(&r.symbol[..sym_end]).unwrap_or("BTC_USDT");
                 publish_frame(
                     &persist_pub,
                     &PersistFrame::trade_insert(TradeInsertPayload {
                         buy_order_id: if r.side == 0 { r.taker_id } else { r.maker_id },
                         sell_order_id: if r.side == 0 { r.maker_id } else { r.taker_id },
-                        symbol: pack_str(&r.symbol),
+                        symbol: pack_str(symbol),
                         price: r.price,
                         qty: r.qty,
                         ts_ms: (ts / 1000) as i64,

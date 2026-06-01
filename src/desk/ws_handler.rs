@@ -15,7 +15,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -47,6 +47,16 @@ fn unix_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn ws_place_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("WS_PLACE_PROFILE").map(|v| v == "1").unwrap_or(false))
+}
+
+fn ws_push_bal_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("WS_PUSH_BAL").map(|v| v == "1").unwrap_or(false))
 }
 
 // ─── Client → Server message types ───────────────────────────────────────────
@@ -239,7 +249,7 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                                 market_registered = true;
                             }
                             if let Some(reply) = handle_client_message(
-                                text, &mut session, &state, personal_tx.clone()
+                                text, &mut session, &state, &personal_tx
                             ).await {
                                 if socket.write_frame(Frame::text(Payload::Owned(reply.into_bytes()))).await.is_err() {
                                     break 'conn;
@@ -328,7 +338,7 @@ async fn handle_client_message(
     text: &str,
     session: &mut WsSession,
     state: &AppState,
-    personal_tx: mpsc::Sender<String>,
+    personal_tx: &mpsc::Sender<String>,
 ) -> Option<String> {
     let msg: ClientMsg = match ClientMsg::parse(text) {
         Some(m) => m,
@@ -341,7 +351,7 @@ async fn handle_client_message(
         ClientMsg::Auth { token } => match user_service::verify_token(&token) {
             Ok(claims) => {
                 session.user_id = Some(claims.sub);
-                state.user_tx.register(claims.sub, personal_tx);
+                state.user_tx.register(claims.sub, personal_tx.clone());
                 Some(json!({"type": "auth_ok"}).to_string())
             }
             Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
@@ -351,7 +361,7 @@ async fn handle_client_message(
             match user_service::verify_api_key(&state.db, &api_key).await {
                 Ok(user_id) => {
                     session.user_id = Some(user_id);
-                    state.user_tx.register(user_id, personal_tx);
+                    state.user_tx.register(user_id, personal_tx.clone());
                     Some(json!({"type": "auth_ok", "user_id": user_id}).to_string())
                 }
                 Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
@@ -496,12 +506,17 @@ async fn handle_client_message(
             // Capture best opposing price before matching — used as the fill
             // price for market orders AND persisted as freeze_price so the
             // restart cleanup can release the exact amount later.
-            let best_opposing_price: Option<f64> = if let Some(ref engine) = engine_opt {
-                let eng = engine.lock().unwrap();
-                let levels = eng.get_top_levels(1, engine_side == Side::Sell);
-                levels.first().map(|(p, _)| rules.ticks_to_price(*p))
-            } else if state.aeron_cmd_tx.is_some() {
-                best_opposing_from_depth(state, &symbol, &side)
+            let needs_opposing_price = side == "buy" && price.is_none();
+            let best_opposing_price: Option<f64> = if needs_opposing_price {
+                if let Some(ref engine) = engine_opt {
+                    let eng = engine.lock().unwrap();
+                    let levels = eng.get_top_levels(1, engine_side == Side::Sell);
+                    levels.first().map(|(p, _)| rules.ticks_to_price(*p))
+                } else if state.aeron_cmd_tx.is_some() {
+                    best_opposing_from_depth(state, &symbol, &side)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -524,14 +539,14 @@ async fn handle_client_message(
 
                 // PERF DIAG (off by default): sample ~1/256 PlaceOrders per-section timing.
                 // Enable via WS_PLACE_PROFILE=1 env on desk-server.
-                let dbg = std::env::var("WS_PLACE_PROFILE").map(|v| v == "1").unwrap_or(false);
+                let dbg = ws_place_profile_enabled();
                 let t0 = if dbg { Some(std::time::Instant::now()) } else { None };
                 // Skip the per-place balance_update push by default — it adds
                 // a second WS frame per place to the client, which would
                 // double the queued-frame drain cost on the client's NEXT
                 // place read. Keep gated for backwards-compat clients that
                 // expect the snapshot.
-                let push_bal = std::env::var("WS_PUSH_BAL").map(|v| v == "1").unwrap_or(false);
+                let push_bal = ws_push_bal_enabled();
 
                 // Reject unknown symbols immediately — before sending order_submitted —
                 // so clients don't track phantom orders waiting for a response that

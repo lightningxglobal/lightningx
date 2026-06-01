@@ -297,30 +297,7 @@ mod tests {
     }
 }
 
-fn push_db_cmd(db_tx: &mut rtrb::Producer<DbCmd>, mut cmd: DbCmd, context: &'static str) {
-    let mut attempts: u64 = 0;
-    loop {
-        match db_tx.push(cmd) {
-            Ok(()) => return,
-            Err(rtrb::PushError::Full(returned)) => {
-                cmd = returned;
-                attempts += 1;
-                if attempts == 1 || attempts % 10_000 == 0 {
-                    tracing::warn!(
-                        "DB command ring full while pushing {context}; retrying (attempt={attempts})"
-                    );
-                }
-                if attempts % 1_024 == 0 {
-                    std::thread::yield_now();
-                } else {
-                    std::hint::spin_loop();
-                }
-            }
-        }
-    }
-}
-
-// ── process_db_cmd: runs in the tokio runtime, off the spin thread ────────────
+// ── process_db_cmd: now sync, called directly from the recv-spin thread ──────
 /// Lock-and-publish helper for PersistFrames. Lock is held for the duration
 /// of a single Aeron `publish` (~µs).
 fn publish_frame(
@@ -331,21 +308,18 @@ fn publish_frame(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_db_cmd(
+/// Now pure-sync — every PG SQL call was already removed by PR5; what
+/// remains is publish_frame (Aeron offer ~1µs), DashMap updates on
+/// account_cache + vwap_cache, and user_tx.try_send. Callable directly
+/// from the recv-spin thread; no need for a separate db-worker thread
+/// or tokio::spawn wrapping. Saves one thread + one rtrb hop per command.
+fn process_db_cmd(
     cmd: DbCmd,
-    db: std::sync::Arc<sqlx::PgPool>,
-    account_cache: lightning_exchange::api::AccountCache,
-    user_tx: std::sync::Arc<lightning_exchange::api::UserTxRegistry>,
-    // Trade WS broadcast + last_trade_price update moved to the spin thread
-    // for lower latency. DB worker no longer reads either; kept to avoid a
-    // wider signature refactor.
-    _market_fanout: std::sync::Arc<lightning_exchange::api::MarketFanout>,
-    _last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
-    persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
-    aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
-    vwap_cache: lightning_exchange::api::VwapCache,
+    account_cache: &lightning_exchange::api::AccountCache,
+    user_tx: &lightning_exchange::api::UserTxRegistry,
+    persist_pub: &std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
+    vwap_cache: &lightning_exchange::api::VwapCache,
 ) {
-    use lightning_exchange::account_repository::AccountRepository;
     match cmd {
         DbCmd::UpsertOrder {
             id,
@@ -779,52 +753,25 @@ async fn process_db_cmd(
     }
 }
 
-// ── spawn_db_worker: drain rtrb DbCmd ring buffer off the spin thread ─────────
-#[allow(clippy::too_many_arguments)]
-fn spawn_db_worker(
-    mut db_rx: rtrb::Consumer<DbCmd>,
-    rt: tokio::runtime::Handle,
-    db: std::sync::Arc<sqlx::PgPool>,
-    account_cache: lightning_exchange::api::AccountCache,
-    user_tx: std::sync::Arc<lightning_exchange::api::UserTxRegistry>,
-    market_fanout: std::sync::Arc<lightning_exchange::api::MarketFanout>,
-    last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
-    persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
-    aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
-    vwap_cache: lightning_exchange::api::VwapCache,
-) {
-    std::thread::Builder::new()
-        .name("db-worker".to_string())
-        .spawn(move || {
-            let mut idle_us: u64 = 0;
-            loop {
-                let mut did_work = false;
-                while let Ok(cmd) = db_rx.pop() {
-                    did_work = true;
-                    idle_us = 0;
-                    let db2 = db.clone();
-                    let ac2 = account_cache.clone();
-                    let ut2 = user_tx.clone();
-                    let mt2 = market_fanout.clone();
-                    let ltp2 = last_trade_price.clone();
-                    let pp2 = persist_pub.clone();
-                    let at2 = aeron_cancel_tx.clone();
-                    let vc2 = vwap_cache.clone();
-                    rt.spawn(process_db_cmd(cmd, db2, ac2, ut2, mt2, ltp2, pp2, at2, vc2));
-                }
-                if !did_work {
-                    idle_us = (idle_us * 2 + 10).min(200);
-                    std::thread::sleep(std::time::Duration::from_micros(idle_us));
-                }
-            }
-        })
-        .unwrap();
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+    // Default to 8 worker threads (vs num_cpus≈14 default). Even at 400K
+    // WS conns each worker only handles ~28K parked sockets; reactor
+    // wake-ups are well under 10K/s/worker. Six fewer threads = ~6 MB
+    // less stack + less scheduler context + less L1 churn. Override with
+    // TOKIO_WORKER_THREADS env when needed.
+    let worker_threads: usize = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
+async fn async_main() -> anyhow::Result<()> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
     let port = std::env::var("DESK_PORT").unwrap_or_else(|_| "4003".to_string());
@@ -1086,20 +1033,11 @@ async fn main() -> anyhow::Result<()> {
         vwap_cache: vwap_cache.clone(),
     };
 
-    // ── DB worker: rtrb ring buffer spin thread → DB worker thread ───────────
-    let (mut db_tx, db_rx) = rtrb::RingBuffer::<DbCmd>::new(8 * 1024);
-    spawn_db_worker(
-        db_rx,
-        tokio::runtime::Handle::current(),
-        state.db.clone(),
-        account_cache.clone(),
-        state.user_tx.clone(),
-        state.market_fanout.clone(),
-        state.last_trade_price.clone(),
-        persist_pub.clone(),
-        Some(db_worker_aeron_tx),
-        vwap_cache.clone(),
-    );
+    // DB worker thread removed. PR5 took every PG SQL call out of
+    // process_db_cmd; what's left (publish_frame + DashMap updates +
+    // user_tx.try_send) is all sync µs-scale work that's now called
+    // directly from the recv-spin thread. Saves one thread + one rtrb hop.
+    let _ = db_worker_aeron_tx; // legacy cancel route; kept for ABI parity.
 
     // DESK_SPIN=false → exponential backoff (EC2/CPU-constrained hosts).
     // Default: spin_loop() for lowest latency on dedicated cores.
@@ -1267,6 +1205,8 @@ async fn main() -> anyhow::Result<()> {
         let account_cache = account_cache.clone();
         let last_depth = state.last_depth.clone();
         let last_trade_price = state.last_trade_price.clone();
+        let persist_pub = persist_pub.clone();
+        let vwap_cache = vwap_cache.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
         let order_meta_cache = open_order_meta;
@@ -1372,14 +1312,10 @@ async fn main() -> anyhow::Result<()> {
                         // Flushed below as a single DbCmd::BatchSettleTrade
                         // after all bursts (trade + order_update) drain.
                         if settle_count >= 64 {
-                            push_db_cmd(
-                                &mut db_tx,
-                                DbCmd::BatchSettleTrade {
+                            process_db_cmd(DbCmd::BatchSettleTrade {
                                     entries: settle_batch,
                                     count: settle_count as u8,
-                                },
-                                "batch settle trade (overflow)",
-                            );
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                             settle_count = 0;
                         }
                         settle_batch[settle_count] = SettleTradeEntry {
@@ -1459,14 +1395,10 @@ async fn main() -> anyhow::Result<()> {
                                 // after the poll burst ends (~11× faster than
                                 // per-id UpsertOrder; see bench_upsert_order).
                                 if accepted_count >= 64 {
-                                    push_db_cmd(
-                                        &mut db_tx,
-                                        DbCmd::BatchUpsertOrder {
+                                    process_db_cmd(DbCmd::BatchUpsertOrder {
                                             entries: accepted_batch,
                                             count: accepted_count as u8,
-                                        },
-                                        "batch upsert order (overflow)",
-                                    );
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                                     accepted_count = 0;
                                 }
                                 accepted_batch[accepted_count] = OrderInsertEntry {
@@ -1486,7 +1418,7 @@ async fn main() -> anyhow::Result<()> {
                                 accepted_count += 1;
                             } else if kind == order_update_kind::PARTIAL_FILL {
                                 // Order is still resting — UpsertOrder writes the live row.
-                                push_db_cmd(&mut db_tx, DbCmd::UpsertOrder {
+                                process_db_cmd(DbCmd::UpsertOrder {
                                     id:              order_id as i64,
                                     user_id:         meta.user_id,
                                     symbol:          db_cmd::str_bytes(&meta.symbol),
@@ -1499,7 +1431,7 @@ async fn main() -> anyhow::Result<()> {
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       false,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
-                                }, "upsert partially-filled order");
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                             }
                             // kind == FILLED here means "first event was a full fill"
                             // (market / IOC). Skip INSERT — the order is already terminal,
@@ -1532,13 +1464,13 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             } else if kind == order_update_kind::CANCELLED {
-                                push_db_cmd(&mut db_tx, DbCmd::ReleaseReservation {
+                                process_db_cmd(DbCmd::ReleaseReservation {
                                     user_id: meta.user_id,
                                     symbol: db_cmd::str_bytes(&meta.symbol),
                                     side: if meta.side == "buy" { 0 } else { 1 },
                                     qty: meta.qty,
                                     freeze_price: meta.freeze_price,
-                                }, "release cancelled reservation");
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                             }
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).
@@ -1593,14 +1525,10 @@ async fn main() -> anyhow::Result<()> {
                                         release_amount: 0.0,
                                     });
                                 if cancel_count >= 64 {
-                                    push_db_cmd(
-                                        &mut db_tx,
-                                        DbCmd::BatchCancelConfirmed {
+                                    process_db_cmd(DbCmd::BatchCancelConfirmed {
                                             entries: cancel_batch,
                                             count: cancel_count as u8,
-                                        },
-                                        "batch cancel confirmed (overflow)",
-                                    );
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                                     cancel_count = 0;
                                 }
                                 cancel_batch[cancel_count] = entry;
@@ -1610,25 +1538,21 @@ async fn main() -> anyhow::Result<()> {
                             {
                                 // Batched DELETE — flushed after the burst.
                                 if delete_count >= 64 {
-                                    push_db_cmd(
-                                        &mut db_tx,
-                                        DbCmd::BatchDeleteOrder {
+                                    process_db_cmd(DbCmd::BatchDeleteOrder {
                                             ids: delete_batch,
                                             count: delete_count as u8,
-                                        },
-                                        "batch delete order (overflow)",
-                                    );
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                                     delete_count = 0;
                                 }
                                 delete_batch[delete_count] = order_id as i64;
                                 delete_count += 1;
                             } else {
                                 let status = db_status_from_update_kind(kind).as_u8();
-                                push_db_cmd(&mut db_tx, DbCmd::UpdateStatus {
+                                process_db_cmd(DbCmd::UpdateStatus {
                                     id:     order_id as i64,
                                     status,
                                     filled: fill_qty,
-                                }, "update order status");
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                             }
                         }
 
@@ -1699,14 +1623,10 @@ async fn main() -> anyhow::Result<()> {
                     // grouped UPDATE accounts in one txn. ~5× faster at N=5,
                     // ~10× at N=20 (examples/bench_settle_trade).
                     if settle_count > 0 {
-                        push_db_cmd(
-                            &mut db_tx,
-                            DbCmd::BatchSettleTrade {
+                        process_db_cmd(DbCmd::BatchSettleTrade {
                                 entries: settle_batch,
                                 count: settle_count as u8,
-                            },
-                            "batch settle trade",
-                        );
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                         settle_count = 0;
                     }
 
@@ -1715,28 +1635,20 @@ async fn main() -> anyhow::Result<()> {
                     // an MM 20-id place cycle from 40 round-trips (2 per id)
                     // to ~3 total.
                     if accepted_count > 0 {
-                        push_db_cmd(
-                            &mut db_tx,
-                            DbCmd::BatchUpsertOrder {
+                        process_db_cmd(DbCmd::BatchUpsertOrder {
                                 entries: accepted_batch,
                                 count: accepted_count as u8,
-                            },
-                            "batch upsert order",
-                        );
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                         accepted_count = 0;
                     }
 
                     // Flush per-burst FILLED/REJECTED DELETE accumulator.
                     // ~9× faster than per-id DELETE (examples/bench_delete_order).
                     if delete_count > 0 {
-                        push_db_cmd(
-                            &mut db_tx,
-                            DbCmd::BatchDeleteOrder {
+                        process_db_cmd(DbCmd::BatchDeleteOrder {
                                 ids: delete_batch,
                                 count: delete_count as u8,
-                            },
-                            "batch delete order",
-                        );
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                         delete_count = 0;
                     }
 
@@ -1744,14 +1656,10 @@ async fn main() -> anyhow::Result<()> {
                     // DB cmd. Cuts DB work for an MM 20-id cancel cycle from
                     // 60 round-trips (3 per id) to ~3 total.
                     if cancel_count > 0 {
-                        push_db_cmd(
-                            &mut db_tx,
-                            DbCmd::BatchCancelConfirmed {
+                        process_db_cmd(DbCmd::BatchCancelConfirmed {
                                 entries: cancel_batch,
                                 count: cancel_count as u8,
-                            },
-                            "batch cancel confirmed",
-                        );
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                         cancel_count = 0;
                     }
 

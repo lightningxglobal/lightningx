@@ -99,12 +99,29 @@ fn spawn_symbol_thread(
 
             tracing::info!("[{}] matching thread started", symbol);
 
+            // Burst telemetry: how many msgs per poll-batch + how long the
+            // batch took. Logged every 10s so we can tell whether tail p99 is
+            // dominated by big bursts (MM 20-quote cancel-replace) or by
+            // long per-msg matching, without adding more beacon milestones.
+            let mut stats_iters: u64 = 0;
+            let mut stats_msgs: u64 = 0;
+            let mut stats_burst_max: u32 = 0;
+            let mut stats_burst_5: u64 = 0;
+            let mut stats_burst_10: u64 = 0;
+            let mut stats_burst_20: u64 = 0;
+            let mut stats_dur_sum_us: u64 = 0;
+            let mut stats_dur_max_us: u64 = 0;
+            let mut stats_last = Instant::now();
+
             loop {
                 // Only the subscriber needs do_work() — it processes the incoming IPC ring.
                 // IPC publishers write directly to mapped memory; no do_work() needed.
                 subscriber.do_work();
 
+                let batch_start = Instant::now();
+                let mut batch_count: u32 = 0;
                 while let Some(msg) = subscriber.poll() {
+                    batch_count += 1;
                     match msg {
                         InboundMsg::NewOrder(req) => {
                             let req_symbol = symbol_from_bytes(&req.symbol);
@@ -332,6 +349,36 @@ fn spawn_symbol_thread(
                             }
                         }
                     }
+                }
+
+                // Burst telemetry: only count non-empty batches so the avg
+                // reflects real work, not idle spin loops.
+                if batch_count > 0 {
+                    let dur_us = batch_start.elapsed().as_micros() as u64;
+                    stats_iters += 1;
+                    stats_msgs += batch_count as u64;
+                    if batch_count > stats_burst_max { stats_burst_max = batch_count; }
+                    if batch_count >= 5 { stats_burst_5 += 1; }
+                    if batch_count >= 10 { stats_burst_10 += 1; }
+                    if batch_count >= 20 { stats_burst_20 += 1; }
+                    stats_dur_sum_us += dur_us;
+                    if dur_us > stats_dur_max_us { stats_dur_max_us = dur_us; }
+                }
+                if stats_last.elapsed() >= Duration::from_secs(10) {
+                    if stats_iters > 0 {
+                        let dur_avg = stats_dur_sum_us / stats_iters;
+                        let msgs_per_iter = stats_msgs as f64 / stats_iters as f64;
+                        tracing::info!(
+                            "[{}] burst stats (10s): iters={} msgs={} msgs/iter={:.1} burst_max={} ≥5={} ≥10={} ≥20={} batch_dur_us avg={} max={}",
+                            symbol, stats_iters, stats_msgs, msgs_per_iter,
+                            stats_burst_max, stats_burst_5, stats_burst_10, stats_burst_20,
+                            dur_avg, stats_dur_max_us,
+                        );
+                    }
+                    stats_iters = 0; stats_msgs = 0; stats_burst_max = 0;
+                    stats_burst_5 = 0; stats_burst_10 = 0; stats_burst_20 = 0;
+                    stats_dur_sum_us = 0; stats_dur_max_us = 0;
+                    stats_last = Instant::now();
                 }
 
                 // Depth snapshot every 10ms.

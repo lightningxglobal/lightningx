@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use lightning_exchange::{
     account_repository::AccountRepository,
-    api::{router, AppState, AccountCache},
+    api::{router, AppState, AccountCache, UserTxRegistry},
     db,
     engine::{MatchingEngine, PoolConfig},
     models::DbOrder,
@@ -323,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
         db: Arc::new(pool),
         engines: Some(Arc::new(engines)),
         market_fanout,
-        user_tx: Arc::new(DashMap::new()),
+        user_tx: Arc::new(UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
         aeron_cmd_tx: None,
         pending_meta: Arc::new(DashMap::new()),

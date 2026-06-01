@@ -101,6 +101,68 @@ impl Default for MarketFanout {
     }
 }
 
+/// Per-user personal-channel registry indexed by `user_id` directly.
+///
+/// Replaces `DashMap<i64, mpsc::Sender<String>>`. At 400K users the DashMap
+/// shard lock dominated the recv-spin's OrderUpdate dispatch (DashMap.get
+/// takes a shard read lock ≈ 100-500 ns under contention). This is a
+/// fixed-size slab of lock-free `ArcSwapOption` cells; load is ~10-20 ns,
+/// register/unregister is a single atomic swap.
+///
+/// Memory: 1 048 576 cells × 16 B ≈ 16 MB upfront. Cheap relative to the
+/// gain.
+pub struct UserTxRegistry {
+    slots: Box<[arc_swap::ArcSwapOption<mpsc::Sender<String>>]>,
+}
+
+const USER_TX_CAPACITY: usize = 1 << 20; // 1 048 576
+
+impl UserTxRegistry {
+    pub fn new() -> Self {
+        let mut v = Vec::with_capacity(USER_TX_CAPACITY);
+        for _ in 0..USER_TX_CAPACITY {
+            v.push(arc_swap::ArcSwapOption::const_empty());
+        }
+        Self { slots: v.into_boxed_slice() }
+    }
+
+    #[inline]
+    fn idx(&self, user_id: i64) -> Option<usize> {
+        let u = user_id as usize;
+        if user_id > 0 && u < self.slots.len() {
+            Some(u)
+        } else {
+            None
+        }
+    }
+
+    pub fn register(&self, user_id: i64, sender: mpsc::Sender<String>) {
+        if let Some(idx) = self.idx(user_id) {
+            self.slots[idx].store(Some(Arc::new(sender)));
+        }
+    }
+
+    pub fn unregister(&self, user_id: i64) {
+        if let Some(idx) = self.idx(user_id) {
+            self.slots[idx].store(None);
+        }
+    }
+
+    /// Returns an `Arc<mpsc::Sender>` ready for `try_send`. The Arc clone
+    /// makes the call safe against concurrent unregister mid-send.
+    #[inline]
+    pub fn get(&self, user_id: i64) -> Option<Arc<mpsc::Sender<String>>> {
+        let idx = self.idx(user_id)?;
+        self.slots[idx].load_full()
+    }
+}
+
+impl Default for UserTxRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared handle to the PersistEvent publisher (Aeron). Wrapped in a
 /// parking_lot Mutex because aeron-wrapper's Publisher is not Send+Sync.
 /// REST POST /api/orders uses this to publish OrderUpsert+AccountSet so
@@ -121,7 +183,9 @@ pub struct AppState {
     /// Replaces tokio::sync::broadcast which lock-contended at 40K+ subs.
     pub market_fanout: Arc<MarketFanout>,
     /// Per-user personal update channel (order fills, balance changes).
-    pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
+    /// Lock-free slab indexed by user_id. See UserTxRegistry for why we
+    /// replaced `DashMap<i64, _>` (broke down at 400K subscribers).
+    pub user_tx: Arc<UserTxRegistry>,
     /// Monotonically increasing order ID counter (desk_server Aeron mode uses this directly).
     pub next_order_id: Arc<AtomicU64>,
     /// Lock-free command channel to the Aeron spin thread (desk_server mode only).
@@ -1083,7 +1147,7 @@ async fn handle_place_order(
             .chain(notified_maker_uids.into_iter())
             .collect();
         for uid in all_notify {
-            if let Some(tx) = s.user_tx.get(&uid) {
+            if let Some(tx) = s.user_tx.get(uid) {
                 let repo2 = AccountRepository::new(s.db.as_ref());
                 if let Ok(accounts) = repo2.get_all_accounts(uid).await {
                     for acc in accounts {
@@ -1170,7 +1234,7 @@ async fn handle_place_order(
         }
 
         let ws_status = ws_status_from_engine(result.status, false).as_str();
-        if let Some(tx) = s.user_tx.get(&user_id) {
+        if let Some(tx) = s.user_tx.get(user_id) {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
@@ -1458,7 +1522,7 @@ async fn handle_cancel_order(
 
     // Notify the user's WS subscribers (other tabs, etc.) that the order is
     // gone — the WS path does this too, this brings the REST path in line.
-    if let Some(tx) = s.user_tx.get(&user_id) {
+    if let Some(tx) = s.user_tx.get(user_id) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
@@ -1599,7 +1663,7 @@ async fn handle_cancel_all_orders(
         }
 
         // Notify open WS connections for this user.
-        if let Some(tx) = s.user_tx.get(&user_id) {
+        if let Some(tx) = s.user_tx.get(user_id) {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)

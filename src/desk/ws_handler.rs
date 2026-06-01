@@ -304,7 +304,7 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
 
     // Remove personal channel on disconnect.
     if let Some(uid) = session.user_id {
-        state.user_tx.remove(&uid);
+        state.user_tx.unregister(uid);
     }
 }
 
@@ -341,7 +341,7 @@ async fn handle_client_message(
         ClientMsg::Auth { token } => match user_service::verify_token(&token) {
             Ok(claims) => {
                 session.user_id = Some(claims.sub);
-                state.user_tx.insert(claims.sub, personal_tx);
+                state.user_tx.register(claims.sub, personal_tx);
                 Some(json!({"type": "auth_ok"}).to_string())
             }
             Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
@@ -351,7 +351,7 @@ async fn handle_client_message(
             match user_service::verify_api_key(&state.db, &api_key).await {
                 Ok(user_id) => {
                     session.user_id = Some(user_id);
-                    state.user_tx.insert(user_id, personal_tx);
+                    state.user_tx.register(user_id, personal_tx);
                     Some(json!({"type": "auth_ok", "user_id": user_id}).to_string())
                 }
                 Err(e) => Some(json!({"type": "auth_error", "message": e.to_string()}).to_string()),
@@ -649,7 +649,7 @@ async fn handle_client_message(
                 if push_bal {
                     if let Some(user_assets) = state.account_cache.get(&user_id) {
                         if let Some(&(bal, frz)) = user_assets.get(freeze_asset) {
-                            if let Some(tx) = state.user_tx.get(&user_id) {
+                            if let Some(tx) = state.user_tx.get(user_id) {
                                 let _ = tx.try_send(format!(
                                     r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
                                     freeze_asset, bal, bal - frz, frz,
@@ -877,7 +877,7 @@ async fn handle_client_message(
                             .entry(user_id)
                             .or_insert_with(std::collections::HashMap::new)
                             .insert(frozen_asset.to_string(), (bal, frz));
-                        if let Some(tx) = state.user_tx.get(&user_id) {
+                        if let Some(tx) = state.user_tx.get(user_id) {
                             let _ = tx.try_send(
                                 json!({
                                     "type": "balance_update",
@@ -1036,7 +1036,7 @@ async fn handle_client_message(
                             for asset in [m_debit, m_credit] {
                                 if let Ok(acc) = repo.get_account(maker_id, asset).await {
                                     let msg = json!({"type":"balance_update","asset":asset,"balance":acc.balance,"available":acc.balance-acc.frozen,"frozen":acc.frozen}).to_string();
-                                    if let Some(tx) = state.user_tx.get(&maker_id) {
+                                    if let Some(tx) = state.user_tx.get(maker_id) {
                                         let _ = tx.try_send(msg);
                                     }
                                 }
@@ -1048,7 +1048,7 @@ async fn handle_client_message(
                             )
                             .await
                             {
-                                if let Some(tx) = state.user_tx.get(&maker_id) {
+                                if let Some(tx) = state.user_tx.get(maker_id) {
                                     let _ = tx.try_send(pos_msg);
                                 }
                             }
@@ -1085,7 +1085,7 @@ async fn handle_client_message(
                             "ts": ts
                         })
                         .to_string();
-                        if let Some(tx) = state.user_tx.get(&maker_id) {
+                        if let Some(tx) = state.user_tx.get(maker_id) {
                             let _ = tx.try_send(upd);
                         }
                     }
@@ -1158,7 +1158,7 @@ async fn handle_client_message(
                     "ts": ts
                 })
                 .to_string();
-                if let Some(tx) = state.user_tx.get(&user_id) {
+                if let Some(tx) = state.user_tx.get(user_id) {
                     let _ = tx.try_send(update_msg);
                 }
 
@@ -1178,7 +1178,7 @@ async fn handle_client_message(
                             "frozen": acc.frozen
                         })
                         .to_string();
-                        if let Some(tx) = state.user_tx.get(&user_id) {
+                        if let Some(tx) = state.user_tx.get(user_id) {
                             let _ = tx.try_send(bal_msg);
                         }
                     }
@@ -1189,7 +1189,7 @@ async fn handle_client_message(
                     crate::positions::position_update_msg(state.db.as_ref(), user_id, base_asset)
                         .await
                 {
-                    if let Some(tx) = state.user_tx.get(&user_id) {
+                    if let Some(tx) = state.user_tx.get(user_id) {
                         let _ = tx.try_send(pos_msg);
                     }
                 }
@@ -1205,7 +1205,7 @@ async fn handle_client_message(
                     "ts": ts
                 })
                 .to_string();
-                if let Some(tx) = state.user_tx.get(&user_id) {
+                if let Some(tx) = state.user_tx.get(user_id) {
                     let _ = tx.try_send(open_msg);
                 }
                 // New resting order changes the book — push depth so the
@@ -1233,7 +1233,7 @@ async fn handle_client_message(
                     "ts": ts
                 })
                 .to_string();
-                if let Some(tx) = state.user_tx.get(&user_id) {
+                if let Some(tx) = state.user_tx.get(user_id) {
                     let _ = tx.try_send(cancel_msg);
                 }
 
@@ -1248,7 +1248,7 @@ async fn handle_client_message(
                             "frozen": acc.frozen
                         })
                         .to_string();
-                        if let Some(tx) = state.user_tx.get(&user_id) {
+                        if let Some(tx) = state.user_tx.get(user_id) {
                             let _ = tx.try_send(bal_msg);
                         }
                     }
@@ -1425,7 +1425,7 @@ async fn handle_client_message(
             };
 
             // Push balance_update so the frontend OrderForm reflects freed-up funds.
-            if let Some(tx) = state.user_tx.get(&user_id) {
+            if let Some(tx) = state.user_tx.get(user_id) {
                 for asset in [
                     released_asset,
                     if released_asset == base_asset {
@@ -1568,7 +1568,7 @@ async fn handle_client_message(
                     if try_freeze_cache(&state.account_cache, user_id, &v.freeze_asset, v.freeze_amount) {
                         if let Some(user_assets) = state.account_cache.get(&user_id) {
                             if let Some(&(bal, frz)) = user_assets.get(v.freeze_asset.as_str()) {
-                                if let Some(tx) = state.user_tx.get(&user_id) {
+                                if let Some(tx) = state.user_tx.get(user_id) {
                                     let _ = tx.try_send(json!({
                                         "type": "balance_update", "asset": &v.freeze_asset,
                                         "balance": bal, "available": bal - frz, "frozen": frz,
@@ -1791,7 +1791,7 @@ async fn handle_client_message(
                             .entry(user_id)
                             .or_insert_with(std::collections::HashMap::new)
                             .insert(frozen_asset.to_string(), (bal, frz));
-                        if let Some(tx) = state.user_tx.get(&user_id) {
+                        if let Some(tx) = state.user_tx.get(user_id) {
                             let _ = tx.try_send(
                                 json!({
                                     "type": "balance_update",

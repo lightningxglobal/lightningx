@@ -335,7 +335,7 @@ async fn process_db_cmd(
     cmd: DbCmd,
     db: std::sync::Arc<sqlx::PgPool>,
     account_cache: lightning_exchange::api::AccountCache,
-    user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
+    user_tx: std::sync::Arc<lightning_exchange::api::UserTxRegistry>,
     // Trade WS broadcast + last_trade_price update moved to the spin thread
     // for lower latency. DB worker no longer reads either; kept to avoid a
     // wider signature refactor.
@@ -431,7 +431,7 @@ async fn process_db_cmd(
                         }),
                     );
                     // No WS push here — try_freeze_cache already sent it.
-                    let _ = user_tx.get(&uid);
+                    let _ = user_tx.get(uid);
                 }
             }
 
@@ -521,7 +521,7 @@ async fn process_db_cmd(
                             frozen: frz,
                         }),
                     );
-                    if let Some(tx) = user_tx.get(&uid) {
+                    if let Some(tx) = user_tx.get(uid) {
                         let _ = tx.try_send(format!(
                             r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
                             asset, bal, bal - frz, frz,
@@ -578,7 +578,7 @@ async fn process_db_cmd(
                         frozen: frz,
                     }),
                 );
-                if let Some(tx) = user_tx.get(&user_id) {
+                if let Some(tx) = user_tx.get(user_id) {
                     let _ = tx.try_send(format!(
                         r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
                         asset, bal, bal - frz, frz,
@@ -717,7 +717,7 @@ async fn process_db_cmd(
             // OrderDelete from the spin thread's else-branch (BatchDeleteOrder)
             // will eventually arrive.
             for r in &resolved {
-                if let Some(tx) = user_tx.get(&r.maker_uid) {
+                if let Some(tx) = user_tx.get(r.maker_uid) {
                     // Hand-written JSON; same shape as the previous
                     // serde_json::json! macro call.
                     let _ = tx.try_send(format!(
@@ -751,7 +751,7 @@ async fn process_db_cmd(
                         frozen: frz,
                     }),
                 );
-                if let Some(tx) = user_tx.get(&uid) {
+                if let Some(tx) = user_tx.get(uid) {
                     let _ = tx.try_send(format!(
                         r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
                         asset, bal, bal - frz, frz,
@@ -786,7 +786,7 @@ fn spawn_db_worker(
     rt: tokio::runtime::Handle,
     db: std::sync::Arc<sqlx::PgPool>,
     account_cache: lightning_exchange::api::AccountCache,
-    user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
+    user_tx: std::sync::Arc<lightning_exchange::api::UserTxRegistry>,
     market_fanout: std::sync::Arc<lightning_exchange::api::MarketFanout>,
     last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
@@ -1060,7 +1060,7 @@ async fn main() -> anyhow::Result<()> {
         db: Arc::new(pool),
         engines: None,
         market_fanout: market_fanout.clone(),
-        user_tx: Arc::new(DashMap::new()),
+        user_tx: Arc::new(lightning_exchange::api::UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(initial_id)),
         aeron_cmd_tx: Some(aeron_cmd_tx),
         pending_meta: Arc::new(DashMap::new()),
@@ -1144,7 +1144,7 @@ async fn main() -> anyhow::Result<()> {
                                         .as_ref()
                                         .map(|m| m.client_order_id.as_str())
                                         .unwrap_or("");
-                                    if let Some(tx) = user_tx.get(&(uid as i64)) {
+                                    if let Some(tx) = user_tx.get(uid as i64) {
                                         let msg = serde_json::json!({
                                             "type": "order_rejected",
                                             "client_order_id": client_oid,
@@ -1506,7 +1506,7 @@ async fn main() -> anyhow::Result<()> {
                                     Some((kv.0, kv.1))
                                 });
                                 if let Some((bal, frz)) = new_vals {
-                                    if let Some(tx) = user_tx.get(&meta.user_id) {
+                                    if let Some(tx) = user_tx.get(meta.user_id) {
                                         // Hand-written JSON for the spin-thread WS push.
                                         // asset is a short alphanumeric symbol (BTC, USDT, …) —
                                         // no JSON escaping needed.
@@ -1627,7 +1627,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         // Single DashMap lookup — was previously two (is_none() +
                         // if let Some()), each taking a shard lock.
-                        let maybe_tx = user_tx.get(&user_id);
+                        let maybe_tx = user_tx.get(user_id);
                         if maybe_tx.is_none() {
                             tracing::warn!("no WS channel for user {user_id}, order_update {order_id} lost");
                         }

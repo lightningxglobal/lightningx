@@ -17,9 +17,12 @@
 
 use aeron_wrapper::AeronClient;
 use anyhow::Context;
+use crossbeam_queue::ArrayQueue;
 use lightning_exchange::desk::pg_store::{backfill_from_redis, PgWriteBatch};
 use lightning_exchange::transport::aeron_channels::{aeron_dir, PERSIST_CHANNEL, PERSIST_STREAM};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
+use lightning_exchange::transport::persist_event::PersistFrame;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -29,9 +32,19 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let pg_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
-    let max_conns: u32 = parse_env_u32("PG_WRITER_MAX_CONNS", 8);
-    let max_batch: usize = parse_env_u32("PG_WRITER_BATCH", 256) as usize;
+    let max_conns: u32 = parse_env_u32("PG_WRITER_MAX_CONNS", 16);
+    // Bigger batches amortize the per-flush PG round-trip cost. UNNEST
+    // INSERT scales linearly per row, so 5 000-row batches take ~100-200 ms
+    // on commodity PG vs ~20-50 ms for 256-row batches — but cut flush rate
+    // from ~312/s to ~16/s, lifting effective throughput.
+    let max_batch: usize = parse_env_u32("PG_WRITER_BATCH", 5_000) as usize;
     let flush_ms: u64 = parse_env_u32("PG_WRITER_FLUSH_MS", 50) as u64;
+    // Aeron→PG bridge queue. Bounded so we can't OOM, but large enough
+    // (~1 M frames × 144 B ≈ 144 MB) to absorb minutes of overload before
+    // dropping. Sustained PG-can't-keep-up scenarios still drop, but the
+    // Aeron client never times out because the polling thread doesn't
+    // share its loop with PG `.await`.
+    let queue_cap: usize = parse_env_u32("PG_WRITER_QUEUE", 1_000_000) as usize;
     let backfill = std::env::var("BACKFILL_ON_START")
         .map(|s| !s.is_empty())
         .unwrap_or(false);
@@ -91,18 +104,55 @@ async fn main() -> anyhow::Result<()> {
 
     let dir = aeron_dir();
     info!("connecting Aeron client (dir={})", dir);
-    let aeron = AeronClient::new(&dir)
-        .map_err(|e| anyhow::anyhow!("AeronClient::new failed: {e:?}"))?;
-    let aeron = Arc::new(aeron);
 
-    let mut sub = PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
-        .map_err(anyhow::Error::msg)
-        .context("create PersistSubscriber")?;
+    // Bridge queue between Aeron polling (dedicated std::thread) and PG
+    // flushing (tokio task). MUST be separated because flush_now().await
+    // can park the tokio task for 100ms-2s during PG INSERT, and if that
+    // happens on the same thread as Aeron polling, the Aeron client's
+    // conductor timeout fires (10s) → entire client dies. We measured
+    // pg-writer dying with 47s service interval at 40K conn × 1 op/s.
+    let queue: Arc<ArrayQueue<PersistFrame>> = Arc::new(ArrayQueue::new(queue_cap));
+    let dropped_pushes = Arc::new(AtomicU64::new(0));
 
-    info!(
-        "subscribed to persist stream (channel={}, stream={}); waiting for frames…",
-        PERSIST_CHANNEL, PERSIST_STREAM
-    );
+    let queue_tx = queue.clone();
+    let dropped_tx = dropped_pushes.clone();
+    let aeron_dir_owned = dir.clone();
+    std::thread::Builder::new()
+        .name("pg-writer-aeron".to_string())
+        .spawn(move || {
+            let aeron = Arc::new(
+                AeronClient::new(&aeron_dir_owned).expect("AeronClient::new failed"),
+            );
+            let mut sub = PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .expect("create PersistSubscriber");
+            info!(
+                "[aeron] subscribed to persist stream (channel={}, stream={})",
+                PERSIST_CHANNEL, PERSIST_STREAM
+            );
+            loop {
+                aeron.do_work();
+                sub.do_work();
+                let mut did_work = false;
+                while let Some(frame) = sub.poll() {
+                    did_work = true;
+                    if queue_tx.push(frame).is_err() {
+                        // Bridge queue full — PG flush is sustainably
+                        // behind. Drop (rate-limited log). redis-writer is
+                        // still applying so live state is preserved; PG
+                        // can be backfilled later.
+                        let n = dropped_tx.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n % 100_000 == 0 {
+                            warn!("[aeron] bridge queue full — dropped {n} frames");
+                        }
+                    }
+                }
+                if !did_work {
+                    std::hint::spin_loop();
+                }
+            }
+        })
+        .context("spawn pg-writer-aeron thread")?;
 
     let mut batch = PgWriteBatch::new();
     let mut last_flush = Instant::now();
@@ -111,15 +161,11 @@ async fn main() -> anyhow::Result<()> {
     let mut last_log = Instant::now();
 
     loop {
-        aeron.do_work();
-        sub.do_work();
         let mut did_work = false;
-
-        while let Some(frame) = sub.poll() {
+        // Drain frames from the bridge queue.
+        while let Some(frame) = queue.pop() {
             did_work = true;
-            if !batch.push(&frame) {
-                // skipped — already counted internally
-            }
+            let _ = batch.push(&frame);
             if batch.len() >= max_batch {
                 match flush_now(&pg, &mut batch).await {
                     Ok(n) => {
@@ -144,20 +190,18 @@ async fn main() -> anyhow::Result<()> {
             last_flush = Instant::now();
         }
 
-        // batch.skipped() accumulates across the entire batch lifetime; flush
-        // never resets it (see PgWriteBatch::flush — only the per-kind Vecs
-        // are taken). So reporting it directly is correct.
         if last_log.elapsed() >= Duration::from_secs(30) {
             let sc = batch.skip_counts();
             info!(
-                "pg-writer: applied={} flushes={} skipped={} sub_dropped={} \
+                "pg-writer: applied={} flushes={} skipped={} bridge_dropped={} queue_depth={} \
                  [unknown_kind={} upsert_bad_status={} upsert_bad_ts={} upsert_empty_str={} \
                  fill_bad_status={} account_empty_asset={} trade_empty_symbol={} \
                  trade_bad_ts={} decode_failed={}]",
                 total_applied,
                 total_flushes,
                 batch.skipped(),
-                sub.dropped_frames(),
+                dropped_pushes.load(Ordering::Relaxed),
+                queue.len(),
                 sc.unknown_kind,
                 sc.upsert_bad_status,
                 sc.upsert_bad_timestamp,

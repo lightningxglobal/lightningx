@@ -1057,14 +1057,15 @@ async fn async_main() -> anyhow::Result<()> {
         .map(|v| v != "false")
         .unwrap_or(true);
 
-    // ── Aeron SEND spin: WS-command → Aeron publisher (lean, single job) ─────
-    // Splitting this off the recv loop dropped the WS→Aeron pickup gap from
-    // ~150 µs avg / 1.2 ms p99 → see beacon `OnWsOrderRecv→OnAeronOrderSend`.
-    // The recv loop's processing burst (trade settle, batch upsert, JSON
-    // format, user_tx.try_send) used to block command dispatch by 1+ tight-loop
-    // iterations whenever the engine spammed updates.
+    // ── Aeron SEND spin: single thread, owns the Publishers directly ─────────
+    // Phase 2 experiment (N parallel send-spins behind Mutex<Publisher>)
+    // reverted: shards=4 made things WORSE at 400K conn × 1 op/s on macOS
+    // (place avg 345 ms → 499 ms). Mutex contention + CPU starvation of
+    // MM/pressure tokio workers outweighed the parallelism. Bottleneck
+    // is somewhere else (likely OS scheduler tail + WS/TCP overhead at
+    // 350 K parked conns). Future shard experiment lives in git history.
     {
-        let aeron_cmd_rx = aeron_cmd_rx;
+        let aeron_cmd_rx = aeron_cmd_rx.clone();
         let mut order_pubs = order_pubs;
         let order_meta_cache = open_order_meta.clone();
         let pending_meta = state.pending_meta.clone();

@@ -413,86 +413,15 @@ async fn handle_client_message(
                 None => return Some(json!({"type": "order_rejected", "client_order_id": client_order_id, "reason": "Not authenticated"}).to_string()),
             };
 
-            // Idempotent check via Redis L1 (replaces the PG SELECT this used
-            // to do — 100× cheaper on the hot path). user_coid:{uid} maps
-            // each known client_order_id → engine id; if it exists we
-            // echo back the prior submission and skip re-placing. Redis miss
-            // is "no prior submission" — if a duplicate slips through, the
-            // (user_id, client_order_id) UNIQUE constraint catches it
-            // downstream in the DB worker's INSERT (logged but client already
-            // got order_submitted). Standalone mode falls back to PG below.
-            if !client_order_id.is_empty() && state.redis.is_some() {
-                let mut conn = match state.redis.as_ref() {
-                    Some(c) => c.clone(),
-                    None => return None,
-                };
-                use redis::AsyncCommands;
-                let existing_id: Option<i64> = conn
-                    .hget(crate::desk::redis_store::key_user_coid(user_id), &client_order_id)
-                    .await
-                    .ok();
-                if let Some(prior_id) = existing_id {
-                    if let Ok(Some(order)) =
-                        crate::desk::redis_store::get_order(&mut conn, prior_id, user_id).await
-                    {
-                        return Some(
-                            json!({
-                                "type": "order_submitted",
-                                "client_order_id": client_order_id,
-                                "order_id": order.id,
-                                "symbol": order.symbol,
-                                "side": order.side,
-                                "order_type": order.order_type,
-                                "price": order.price,
-                                "quantity": order.quantity,
-                                "status": order.status,
-                                "ts": unix_now()
-                            })
-                            .to_string(),
-                        );
-                    }
-                    // Redis HGET hit but HASH missing — treat as not present
-                    // (e.g. eviction or race after delete). Fall through.
-                }
-            } else if !client_order_id.is_empty() {
-                let existing = sqlx::query_as::<_, crate::models::DbOrder>(
-                    "SELECT * FROM orders WHERE user_id=$1 AND client_order_id=$2",
-                )
-                .bind(user_id)
-                .bind(&client_order_id)
-                .fetch_optional(state.db.as_ref())
-                .await;
-                match existing {
-                    Ok(Some(order)) => {
-                        return Some(
-                            json!({
-                                "type": "order_submitted",
-                                "client_order_id": client_order_id,
-                                "order_id": order.id,
-                                "symbol": order.symbol,
-                                "side": order.side,
-                                "order_type": order.order_type,
-                                "price": order.price,
-                                "quantity": order.quantity,
-                                "status": order.status,
-                                "ts": unix_now()
-                            })
-                            .to_string(),
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Some(
-                            json!({
-                                "type": "order_rejected",
-                                "client_order_id": client_order_id,
-                                "reason": e.to_string()
-                            })
-                            .to_string(),
-                        )
-                    }
-                }
-            }
+            // Client is responsible for ensuring client_order_id uniqueness
+            // — no server-side idempotency check. The DB UNIQUE constraint
+            // on (user_id, client_order_id) is the only safety net; if a
+            // duplicate slips through, the pg-writer INSERT fails and the
+            // duplicate is logged. Removing this check eliminates the
+            // Redis HGET (~50µs) + PG SELECT fallback (~ms at saturation)
+            // on the WS place_order hot path, which was the dominant
+            // bottleneck at 400K conns (609 sqlx pool slow-acquire warnings,
+            // place avg 6 s).
 
             let _fixed_shape = match crate::symbol_rules::normalize_order_shape(
                 &symbol,

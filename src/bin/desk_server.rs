@@ -1412,7 +1412,8 @@ async fn async_main() -> anyhow::Result<()> {
                                 order_id,
                             );
                         }
-                        if let Some(meta_ref) = pending_meta.get(&lookup_id) {
+                        let ws_meta = pending_meta.remove(&lookup_id).map(|(_, m)| m);
+                        if let Some(meta_ref) = ws_meta.as_ref() {
                             if kind != order_update_kind::REJECTED {
                                 // Pending_meta has the authoritative freeze_price
                                 // (best_opposing for markets, limit price for buys,
@@ -1431,7 +1432,6 @@ async fn async_main() -> anyhow::Result<()> {
                                 );
                             }
                         }
-                        let ws_meta = pending_meta.remove(&lookup_id).map(|(_, m)| m);
                         // client_order_id is only available on the first event (ACCEPTED).
                         let ws_client_oid = ws_meta.as_ref().map(|m| m.client_order_id.as_str());
 

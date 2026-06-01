@@ -621,11 +621,6 @@ async fn handle_client_message(
                 );
             }
 
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-
             // Parse base/quote assets from symbol (e.g. "BTC_USDT" → "BTC", "USDT").
             let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
             let base_asset = sym_parts.first().copied().unwrap_or("BTC");
@@ -845,6 +840,11 @@ async fn handle_client_message(
             }
 
             // ── Standalone engine path: DB + freeze + local matching ─────────────
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+
             let engine = match engine_opt {
                 Some(e) => e,
                 None => {

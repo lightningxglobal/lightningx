@@ -1774,8 +1774,8 @@ async fn async_main() -> anyhow::Result<()> {
     // market data from Aeron, and historical kline/ticker DB queries can
     // otherwise contend with pg-writer and the WS runtime.
     let market_broadcaster_enabled = std::env::var("MARKET_DATA_BROADCASTER")
-        .map(|v| v != "0" && v != "false")
-        .unwrap_or(true);
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
     if market_broadcaster_enabled {
         tokio::spawn(market_data_broadcaster(state.clone()));
     }

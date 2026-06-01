@@ -112,6 +112,12 @@ fn spawn_symbol_thread(
             let mut stats_dur_sum_us: u64 = 0;
             let mut stats_dur_max_us: u64 = 0;
             let mut stats_last = Instant::now();
+            let idle_spin_budget: u32 = std::env::var("ENGINE_IDLE_SPINS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000);
+            let mut idle_iters: u32 = 0;
+            let mut idle_sleep_us: u64 = 10;
 
             loop {
                 // Only the subscriber needs do_work() — it processes the incoming IPC ring.
@@ -394,6 +400,7 @@ fn spawn_symbol_thread(
 
                 // Depth snapshot every 10ms.
                 let now = Instant::now();
+                let mut did_work = batch_count > 0;
                 if now.duration_since(last_depth) >= depth_interval {
                     last_depth = now;
                     depth_seq += 1;
@@ -411,10 +418,22 @@ fn spawn_symbol_thread(
                     }
                     snap.num_bids = num_bids as u8;
                     snap.num_asks = num_asks as u8;
-                    let _ = md_pub.publish_depth(&snap);
+                    if num_bids > 0 && num_asks > 0 {
+                        let _ = md_pub.publish_depth(&snap);
+                        did_work = true;
+                    }
                 }
 
-                std::hint::spin_loop();
+                if did_work {
+                    idle_iters = 0;
+                    idle_sleep_us = 10;
+                } else if idle_iters < idle_spin_budget {
+                    idle_iters += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::sleep(Duration::from_micros(idle_sleep_us));
+                    idle_sleep_us = (idle_sleep_us * 2).min(100);
+                }
             }
         })
         .expect("failed to spawn symbol thread")

@@ -915,9 +915,13 @@ async fn async_main() -> anyhow::Result<()> {
         let mut persist_publisher =
             PersistPublisher::new(client.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
                 .map_err(|e| anyhow::anyhow!("PersistPublisher: {}", e))?;
+        let persist_spin = std::env::var("PERSIST_SPIN")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         std::thread::Builder::new()
             .name("persist-send".to_string())
             .spawn(move || {
+                let mut idle_us: u64 = 10;
                 loop {
                     let mut did_work = false;
                     while let Some(frame) = persist_rx.pop() {
@@ -925,7 +929,14 @@ async fn async_main() -> anyhow::Result<()> {
                         let _ = persist_publisher.publish(&frame);
                     }
                     if !did_work {
-                        std::hint::spin_loop();
+                        if persist_spin {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_micros(idle_us));
+                            idle_us = (idle_us * 2).min(500);
+                        }
+                    } else {
+                        idle_us = 10;
                     }
                 }
             })?;

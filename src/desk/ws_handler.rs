@@ -198,16 +198,27 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
 // ─── Socket loop ──────────────────────────────────────────────────────────────
 
 async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState) {
-    socket.set_writev(false);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CONN_ID_GEN: AtomicU64 = AtomicU64::new(1);
+    let conn_id = CONN_ID_GEN.fetch_add(1, Ordering::Relaxed);
+
+    // writev=true → single writev() syscall combines WS header + payload
+    // instead of two write() calls per frame. On loopback this halves the
+    // syscall count per outgoing frame and shaves ~50-100µs off RTT.
+    socket.set_writev(true);
     socket.set_auto_close(true);
     socket.set_auto_pong(true);
     let mut session = WsSession::new();
 
-    // Personal update channel for this connection.
-    // Large capacity to absorb market-making bursts (3 symbols × 120 ops × 2 updates = 720+).
+    // Personal update channel for this connection (order/balance events).
     let (personal_tx, mut personal_rx) = mpsc::channel::<String>(65536);
-    // Broadcast subscriber — create before entering loop so we don't miss messages.
-    let mut market_rx = state.market_tx.subscribe();
+    // Market data channel: registered LAZILY with state.market_fanout when
+    // the client first sends a Subscribe message. Connections that never
+    // subscribe (load tests, trading-only bots) never get registered, so
+    // they impose zero fanout overhead. Eliminates the broadcast::Receiver
+    // lock contention that pushed p50 to 2s at 40K conns.
+    let (market_tx, mut market_rx) = mpsc::channel::<Arc<str>>(8192);
+    let mut market_registered = false;
 
     'conn: loop {
         tokio::select! {
@@ -220,6 +231,13 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                                 Ok(t) => t,
                                 Err(_) => continue 'conn,
                             };
+                            // Lazy register with market_fanout on first
+                            // Subscribe-like message — quick substring check
+                            // avoids a full JSON parse just to detect intent.
+                            if !market_registered && text.contains("\"subscribe\"") {
+                                state.market_fanout.register(conn_id, market_tx.clone());
+                                market_registered = true;
+                            }
                             if let Some(reply) = handle_client_message(
                                 text, &mut session, &state, personal_tx.clone()
                             ).await {
@@ -242,15 +260,11 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                 }
             }
 
-            // Broadcast market data (depth, trades)
-            result = market_rx.recv() => {
-                let msg = match result {
-                    Ok(m) => m,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue 'conn,
-                    Err(_) => break 'conn,
-                };
+            // Market data (depth, trades, ticker, kline) — only flows
+            // here for subscribers.
+            Some(msg) = market_rx.recv() => {
                 // Only forward if this client subscribed to a matching channel.
-                // We do a quick prefix check on the JSON "type" field to avoid
+                // Quick prefix check on the JSON "type" field to avoid
                 // deserializing the whole payload.
                 let should_forward = if msg.contains("\"type\":\"depth\"") {
                     msg_symbol(&msg).map(|sym| {
@@ -277,12 +291,15 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                 };
 
                 if should_forward {
-                    if socket.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
+                    if socket.write_frame(Frame::text(Payload::Owned(msg.as_bytes().to_vec()))).await.is_err() {
                         break 'conn;
                     }
                 }
             }
         }
+    }
+    if market_registered {
+        state.market_fanout.unregister(conn_id);
     }
 
     // Remove personal channel on disconnect.
@@ -576,6 +593,17 @@ async fn handle_client_message(
                 use crate::tracer::MS_WS_ORDER_RECV;
                 use crate::transport::{AeronCmd, OrderMeta};
 
+                // PERF DIAG (off by default): sample ~1/256 PlaceOrders per-section timing.
+                // Enable via WS_PLACE_PROFILE=1 env on desk-server.
+                let dbg = std::env::var("WS_PLACE_PROFILE").map(|v| v == "1").unwrap_or(false);
+                let t0 = if dbg { Some(std::time::Instant::now()) } else { None };
+                // Skip the per-place balance_update push by default — it adds
+                // a second WS frame per place to the client, which would
+                // double the queued-frame drain cost on the client's NEXT
+                // place read. Keep gated for backwards-compat clients that
+                // expect the snapshot.
+                let push_bal = std::env::var("WS_PUSH_BAL").map(|v| v == "1").unwrap_or(false);
+
                 // Reject unknown symbols immediately — before sending order_submitted —
                 // so clients don't track phantom orders waiting for a response that
                 // arrives as order_rejected after the pending entry is gone.
@@ -606,6 +634,7 @@ async fn handle_client_message(
                 } else {
                     (base_asset, qty)
                 };
+                let t_pre_freeze = t0.map(|_| std::time::Instant::now());
                 if !try_freeze_cache(&state.account_cache, user_id, freeze_asset, freeze_amount) {
                     return Some(
                         json!({
@@ -616,22 +645,20 @@ async fn handle_client_message(
                         .to_string(),
                     );
                 }
-                if let Some(user_assets) = state.account_cache.get(&user_id) {
-                    if let Some(&(bal, frz)) = user_assets.get(freeze_asset) {
-                        if let Some(tx) = state.user_tx.get(&user_id) {
-                            let _ = tx.try_send(
-                                json!({
-                                    "type": "balance_update",
-                                    "asset": freeze_asset,
-                                    "balance": bal,
-                                    "available": bal - frz,
-                                    "frozen": frz,
-                                })
-                                .to_string(),
-                            );
+                let t_post_freeze = t0.map(|_| std::time::Instant::now());
+                if push_bal {
+                    if let Some(user_assets) = state.account_cache.get(&user_id) {
+                        if let Some(&(bal, frz)) = user_assets.get(freeze_asset) {
+                            if let Some(tx) = state.user_tx.get(&user_id) {
+                                let _ = tx.try_send(format!(
+                                    r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
+                                    freeze_asset, bal, bal - frz, frz,
+                                ));
+                            }
                         }
                     }
                 }
+                let t_post_balupd = t0.map(|_| std::time::Instant::now());
 
                 let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
                 // Build sym_bytes first so the tracer checkpoint carries the symbol.
@@ -686,21 +713,41 @@ async fn handle_client_message(
                         .to_string(),
                     );
                 }
+                let t_post_aeron = t0.map(|_| std::time::Instant::now());
 
-                return Some(
-                    json!({
-                        "type": "order_submitted",
-                        "client_order_id": client_order_id,
-                        "order_id": order_id,
-                        "symbol": symbol,
-                        "side": side,
-                        "order_type": order_type,
-                        "price": price,
-                        "quantity": qty,
-                        "ts": unix_now()
-                    })
-                    .to_string(),
-                );
+                let reply = json!({
+                    "type": "order_submitted",
+                    "client_order_id": client_order_id,
+                    "order_id": order_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "order_type": order_type,
+                    "price": price,
+                    "quantity": qty,
+                    "ts": unix_now()
+                })
+                .to_string();
+                if let (Some(start), Some(pre_freeze), Some(post_freeze), Some(post_bal), Some(post_aeron)) =
+                    (t0, t_pre_freeze, t_post_freeze, t_post_balupd, t_post_aeron)
+                {
+                    let t_done = std::time::Instant::now();
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static SAMPLE_CTR: AtomicU64 = AtomicU64::new(0);
+                    let n = SAMPLE_CTR.fetch_add(1, Ordering::Relaxed);
+                    if n % 256 == 0 {
+                        tracing::info!(
+                            "place_profile #{}  pre_freeze={}µs  freeze={}µs  balance_push={}µs  aeron_send={}µs  reply_build={}µs  total={}µs",
+                            n,
+                            pre_freeze.duration_since(start).as_micros(),
+                            post_freeze.duration_since(pre_freeze).as_micros(),
+                            post_bal.duration_since(post_freeze).as_micros(),
+                            post_aeron.duration_since(post_bal).as_micros(),
+                            t_done.duration_since(post_aeron).as_micros(),
+                            t_done.duration_since(start).as_micros(),
+                        );
+                    }
+                }
+                return Some(reply);
             }
 
             // ── Standalone engine path: DB + freeze + local matching ─────────────
@@ -1094,7 +1141,7 @@ async fn handle_client_message(
                     "ts": ts
                 })
                 .to_string();
-                let _ = state.market_tx.send(trade_msg);
+                let _ = state.market_fanout.send_owned(trade_msg);
 
                 // Ticker updates are handled by the periodic market_data_broadcaster;
                 // spawning a DB query here on every fill piles up and exhausts the pool.
@@ -2114,12 +2161,12 @@ fn build_depth_json(engine: &Mutex<MatchingEngine>, symbol: &str) -> String {
 pub fn broadcast_depth_pub(state: &AppState, symbol: &str) {
     if let Some(engines) = &state.engines {
         if let Some(engine) = engines.get(symbol) {
-            let _ = state
-                .market_tx
-                .send(build_depth_json(engine.value(), symbol));
+            state
+                .market_fanout
+                .send_owned(build_depth_json(engine.value(), symbol));
         }
     } else if let Some(depth_json) = state.last_depth.get(symbol) {
-        let _ = state.market_tx.send(depth_json.to_string());
+        state.market_fanout.send_owned(depth_json.to_string());
     }
 }
 
@@ -2158,7 +2205,7 @@ pub async fn broadcast_kline_pub(state: &AppState, symbol: &str) {
             }
         })
         .to_string();
-        let _ = state.market_tx.send(msg);
+        let _ = state.market_fanout.send_owned(msg);
     }
 }
 
@@ -2227,7 +2274,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                             "asks": asks,
                             "ts": unix_now()
                         }).to_string();
-                        let _ = state.market_tx.send(msg);
+                        let _ = state.market_fanout.send_owned(msg);
                     }
                 } else {
                     // In Aeron mode, collect last prices from last_depth cache.
@@ -2272,7 +2319,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                             c.entry(symbol.clone()).or_insert((0.0, 0.0, 0.0, 0.0, 0_i64)).4 = now_secs;
                         }
                         let db = state.db.clone();
-                        let mtx = state.market_tx.clone();
+                        let mtx = state.market_fanout.clone();
                         let last_ticker = state.last_ticker.clone();
                         let tc2 = ticker_cache.clone();
                         let sym2 = symbol.clone();
@@ -2315,7 +2362,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                                 "volume": v,
                             }).to_string();
                             last_ticker.insert(sym2.clone(), payload.clone());
-                            let _ = mtx.send(payload);
+                            mtx.send_owned(payload);
                         });
                     } else if let Some((open, high, low, volume, _)) = cached {
                         // Broadcast cached stats with current last price — no DB hit.
@@ -2330,7 +2377,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                             "volume": volume,
                         }).to_string();
                         state.last_ticker.insert(symbol.clone(), payload.clone());
-                        let _ = state.market_tx.send(payload);
+                        let _ = state.market_fanout.send_owned(payload);
                     }
                 }
             }
@@ -2348,7 +2395,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                 };
                 for symbol in symbols {
                     let db = state.db.clone();
-                    let mtx = state.market_tx.clone();
+                    let mtx = state.market_fanout.clone();
                     tokio::spawn(async move {
                         let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64), _> = sqlx::query_as(
                             "SELECT
@@ -2382,7 +2429,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                                         "volume": volume
                                     }
                                 }).to_string();
-                                let _ = mtx.send(msg);
+                                mtx.send_owned(msg);
                             }
                             Ok(_) => {
                                 // No trades in the last 60s — skip sending kline.
@@ -2409,7 +2456,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                         ("5s", "5 seconds", bucket_5s),
                     ] {
                         let db = state.db.clone();
-                        let mtx = state.market_tx.clone();
+                        let mtx = state.market_fanout.clone();
                         let sym = symbol.clone();
                         let sql = format!(
                             "SELECT
@@ -2446,7 +2493,7 @@ pub async fn market_data_broadcaster(state: AppState) {
                                     "volume": volume,
                                     "trade_count": trade_count,
                                 }).to_string();
-                                let _ = mtx.send(msg);
+                                mtx.send_owned(msg);
                             }
                         });
                     }

@@ -31,7 +31,6 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
 // ── DB status byte constants ──────────────────────────────────────────────────
@@ -181,7 +180,7 @@ struct OrderRuntimeMeta {
 
 #[allow(clippy::too_many_arguments)]
 fn remember_runtime_order(
-    cache: &mut HashMap<u64, OrderRuntimeMeta>,
+    cache: &DashMap<u64, OrderRuntimeMeta>,
     order_id: u64,
     user_id: i64,
     freeze_price: f64,
@@ -202,39 +201,39 @@ fn remember_runtime_order(
     );
 }
 
-fn remap_runtime_order_id(cache: &mut HashMap<u64, OrderRuntimeMeta>, from: u64, to: u64) {
+fn remap_runtime_order_id(cache: &DashMap<u64, OrderRuntimeMeta>, from: u64, to: u64) {
     if from != to {
-        if let Some(meta) = cache.remove(&from) {
+        if let Some((_, meta)) = cache.remove(&from) {
             cache.insert(to, meta);
         }
     }
 }
 
-fn runtime_user_id(cache: &HashMap<u64, OrderRuntimeMeta>, order_id: u64) -> i64 {
+fn runtime_user_id(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64) -> i64 {
     cache.get(&order_id).map(|m| m.user_id).unwrap_or(0)
 }
 
 /// Lookup full meta (used by cancel/fill release paths in PR5b/d).
 fn runtime_meta(
-    cache: &HashMap<u64, OrderRuntimeMeta>,
+    cache: &DashMap<u64, OrderRuntimeMeta>,
     order_id: u64,
 ) -> Option<OrderRuntimeMeta> {
-    cache.get(&order_id).copied()
+    cache.get(&order_id).map(|r| *r)
 }
 
 /// Update the filled accumulator after a partial-fill event so subsequent
 /// cancel-release uses the right remaining quantity.
 fn runtime_bump_filled(
-    cache: &mut HashMap<u64, OrderRuntimeMeta>,
+    cache: &DashMap<u64, OrderRuntimeMeta>,
     order_id: u64,
     filled_qty: f64,
 ) {
-    if let Some(meta) = cache.get_mut(&order_id) {
+    if let Some(mut meta) = cache.get_mut(&order_id) {
         meta.filled = filled_qty;
     }
 }
 
-fn remove_runtime_order(cache: &mut HashMap<u64, OrderRuntimeMeta>, order_id: u64, client_id: u64) {
+fn remove_runtime_order(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64, client_id: u64) {
     cache.remove(&order_id);
     if order_id != client_id {
         cache.remove(&client_id);
@@ -254,8 +253,8 @@ mod tests {
 
     #[test]
     fn runtime_meta_survives_until_terminal_remove() {
-        let mut cache = HashMap::new();
-        remember_runtime_order(&mut cache, 10, 7, 73000.0, 0.5, 0, sym("BTC_USDT"));
+        let cache = DashMap::new();
+        remember_runtime_order(&cache, 10, 7, 73000.0, 0.5, 0, sym("BTC_USDT"));
 
         assert_eq!(runtime_user_id(&cache, 10), 7);
         assert_eq!(runtime_user_id(&cache, 11), 0);
@@ -264,17 +263,17 @@ mod tests {
         assert_eq!(m.quantity, 0.5);
         assert_eq!(m.side, 0);
 
-        remove_runtime_order(&mut cache, 10, 10);
+        remove_runtime_order(&cache, 10, 10);
         assert_eq!(runtime_user_id(&cache, 10), 0);
         assert!(runtime_meta(&cache, 10).is_none());
     }
 
     #[test]
     fn runtime_meta_remaps_client_id_to_engine_order_id() {
-        let mut cache = HashMap::new();
-        remember_runtime_order(&mut cache, 10, 7, 100.0, 1.0, 1, sym("BTC_USDT"));
+        let cache = DashMap::new();
+        remember_runtime_order(&cache, 10, 7, 100.0, 1.0, 1, sym("BTC_USDT"));
 
-        remap_runtime_order_id(&mut cache, 10, 99);
+        remap_runtime_order_id(&cache, 10, 99);
 
         assert_eq!(runtime_user_id(&cache, 10), 0);
         assert_eq!(runtime_user_id(&cache, 99), 7);
@@ -282,18 +281,18 @@ mod tests {
         assert_eq!(m.freeze_price, 100.0);
         assert_eq!(m.side, 1);
 
-        remove_runtime_order(&mut cache, 99, 10);
+        remove_runtime_order(&cache, 99, 10);
         assert_eq!(runtime_user_id(&cache, 99), 0);
     }
 
     #[test]
     fn runtime_bump_filled_updates_accumulator() {
-        let mut cache = HashMap::new();
-        remember_runtime_order(&mut cache, 5, 1, 100.0, 2.0, 0, sym("X_Y"));
+        let cache = DashMap::new();
+        remember_runtime_order(&cache, 5, 1, 100.0, 2.0, 0, sym("X_Y"));
         assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 0.0);
-        runtime_bump_filled(&mut cache, 5, 0.5);
+        runtime_bump_filled(&cache, 5, 0.5);
         assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 0.5);
-        runtime_bump_filled(&mut cache, 5, 1.5);
+        runtime_bump_filled(&cache, 5, 1.5);
         assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 1.5);
     }
 }
@@ -340,7 +339,7 @@ async fn process_db_cmd(
     // Trade WS broadcast + last_trade_price update moved to the spin thread
     // for lower latency. DB worker no longer reads either; kept to avoid a
     // wider signature refactor.
-    _market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    _market_fanout: std::sync::Arc<lightning_exchange::api::MarketFanout>,
     _last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
@@ -788,7 +787,7 @@ fn spawn_db_worker(
     db: std::sync::Arc<sqlx::PgPool>,
     account_cache: lightning_exchange::api::AccountCache,
     user_tx: std::sync::Arc<dashmap::DashMap<i64, tokio::sync::mpsc::Sender<String>>>,
-    market_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    market_fanout: std::sync::Arc<lightning_exchange::api::MarketFanout>,
     last_trade_price: std::sync::Arc<dashmap::DashMap<String, f64>>,
     persist_pub: std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
     aeron_cancel_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
@@ -806,7 +805,7 @@ fn spawn_db_worker(
                     let db2 = db.clone();
                     let ac2 = account_cache.clone();
                     let ut2 = user_tx.clone();
-                    let mt2 = market_tx.clone();
+                    let mt2 = market_fanout.clone();
                     let ltp2 = last_trade_price.clone();
                     let pp2 = persist_pub.clone();
                     let at2 = aeron_cancel_tx.clone();
@@ -894,7 +893,8 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("VWAP cache loaded ({} (user, base) keys)", vwap_cache.len());
     }
 
-    let mut open_order_meta: HashMap<u64, OrderRuntimeMeta> = HashMap::new();
+    let open_order_meta: std::sync::Arc<DashMap<u64, OrderRuntimeMeta>> =
+        std::sync::Arc::new(DashMap::new());
     {
         // Preload all open orders into the runtime meta cache so cancel/fill
         // paths can resolve user_id + freeze_price + qty + side without a PG
@@ -1020,7 +1020,7 @@ async fn main() -> anyhow::Result<()> {
     let initial_id = (max_db_id as u64) + 1;
 
     // ── Shared state ──────────────────────────────────────────────────────────
-    let (market_tx, _) = broadcast::channel::<String>(1024);
+    let market_fanout = std::sync::Arc::new(lightning_exchange::api::MarketFanout::new());
 
     let valid_symbols: std::collections::HashSet<String> = order_pubs.keys().cloned().collect();
 
@@ -1059,7 +1059,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db: Arc::new(pool),
         engines: None,
-        market_tx: Arc::new(market_tx),
+        market_fanout: market_fanout.clone(),
         user_tx: Arc::new(DashMap::new()),
         next_order_id: Arc::new(AtomicU64::new(initial_id)),
         aeron_cmd_tx: Some(aeron_cmd_tx),
@@ -1084,17 +1084,173 @@ async fn main() -> anyhow::Result<()> {
         state.db.clone(),
         account_cache.clone(),
         state.user_tx.clone(),
-        state.market_tx.clone(),
+        state.market_fanout.clone(),
         state.last_trade_price.clone(),
         persist_pub.clone(),
         Some(db_worker_aeron_tx),
         vwap_cache.clone(),
     );
 
-    // ── Aeron spin thread: WS command drain + inbound event loop ─────────────
-    // order_pub lives here exclusively — no mutex needed.
+    // DESK_SPIN=false → exponential backoff (EC2/CPU-constrained hosts).
+    // Default: spin_loop() for lowest latency on dedicated cores.
+    let use_spin = std::env::var("DESK_SPIN")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+
+    // ── Aeron SEND spin: WS-command → Aeron publisher (lean, single job) ─────
+    // Splitting this off the recv loop dropped the WS→Aeron pickup gap from
+    // ~150 µs avg / 1.2 ms p99 → see beacon `OnWsOrderRecv→OnAeronOrderSend`.
+    // The recv loop's processing burst (trade settle, batch upsert, JSON
+    // format, user_tx.try_send) used to block command dispatch by 1+ tight-loop
+    // iterations whenever the engine spammed updates.
     {
-        let market_tx = state.market_tx.clone();
+        let mut aeron_cmd_rx = aeron_cmd_rx;
+        let mut order_pubs = order_pubs;
+        let order_meta_cache = open_order_meta.clone();
+        let pending_meta = state.pending_meta.clone();
+        let user_tx = state.user_tx.clone();
+        let spin_tracer = tracer.clone();
+        std::thread::Builder::new()
+            .name("aeron-send".to_string())
+            .spawn(move || {
+                let mut idle_us: u64 = 0;
+                loop {
+                    let mut did_work = false;
+                    while let Ok(cmd) = aeron_cmd_rx.try_recv() {
+                        did_work = true;
+                        match cmd {
+                            AeronCmd::NewOrder(req) => {
+                                let sym = std::str::from_utf8(&req.symbol)
+                                    .unwrap_or("")
+                                    .trim_end_matches('\0');
+                                let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
+                                remember_runtime_order(
+                                    &order_meta_cache,
+                                    req.client_order_id,
+                                    req.participant_id as i64,
+                                    prelim_freeze,
+                                    req.quantity,
+                                    req.side,
+                                    req.symbol,
+                                );
+                                if let Some(pub_) = order_pubs.get_mut(sym) {
+                                    let _ = pub_.publish_new_order(&req);
+                                } else {
+                                    let coid: u64 = req.client_order_id;
+                                    let uid: u64 = req.participant_id;
+                                    let ws_meta = pending_meta.remove(&coid).map(|(_, m)| m);
+                                    remove_runtime_order(&order_meta_cache, coid, coid);
+                                    let client_oid = ws_meta
+                                        .as_ref()
+                                        .map(|m| m.client_order_id.as_str())
+                                        .unwrap_or("");
+                                    if let Some(tx) = user_tx.get(&(uid as i64)) {
+                                        let msg = serde_json::json!({
+                                            "type": "order_rejected",
+                                            "client_order_id": client_oid,
+                                            "reason": format!("No engine for symbol: {}", sym),
+                                        })
+                                        .to_string();
+                                        let _ = tx.try_send(msg);
+                                    }
+                                }
+                                if let Some(ref t) = spin_tracer {
+                                    t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
+                                }
+                            }
+                            AeronCmd::Cancel(req) => {
+                                let symbol_bytes = runtime_meta(&order_meta_cache, req.order_id)
+                                    .map(|m| m.symbol);
+                                let routed = if let Some(sym_bytes) = symbol_bytes {
+                                    let sym_end = sym_bytes
+                                        .iter()
+                                        .position(|&b| b == 0)
+                                        .unwrap_or(16);
+                                    let sym = std::str::from_utf8(&sym_bytes[..sym_end]).unwrap_or("");
+                                    if let Some(pub_) = order_pubs.get_mut(sym) {
+                                        let _ = pub_.publish_cancel(&req);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !routed {
+                                    for pub_ in order_pubs.values_mut() {
+                                        let _ = pub_.publish_cancel(&req);
+                                    }
+                                }
+                            }
+                            AeronCmd::BatchCancel(reqs) => {
+                                for req in &reqs {
+                                    let symbol_bytes = runtime_meta(&order_meta_cache, req.order_id)
+                                        .map(|m| m.symbol);
+                                    let routed = if let Some(sym_bytes) = symbol_bytes {
+                                        let sym_end = sym_bytes
+                                            .iter()
+                                            .position(|&b| b == 0)
+                                            .unwrap_or(16);
+                                        let sym = std::str::from_utf8(&sym_bytes[..sym_end])
+                                            .unwrap_or("");
+                                        if let Some(pub_) = order_pubs.get_mut(sym) {
+                                            let _ = pub_.publish_cancel(req);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+                                    if !routed {
+                                        for pub_ in order_pubs.values_mut() {
+                                            let _ = pub_.publish_cancel(req);
+                                        }
+                                    }
+                                }
+                            }
+                            AeronCmd::BatchNewOrder(reqs) => {
+                                for req in &reqs {
+                                    let sym = std::str::from_utf8(&req.symbol)
+                                        .unwrap_or("")
+                                        .trim_end_matches('\0');
+                                    let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
+                                    remember_runtime_order(
+                                        &order_meta_cache,
+                                        req.client_order_id,
+                                        req.participant_id as i64,
+                                        prelim_freeze,
+                                        req.quantity,
+                                        req.side,
+                                        req.symbol,
+                                    );
+                                    if let Some(pub_) = order_pubs.get_mut(sym) {
+                                        let _ = pub_.publish_new_order(req);
+                                    }
+                                    if let Some(ref t) = spin_tracer {
+                                        t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !did_work {
+                        if use_spin {
+                            std::hint::spin_loop();
+                        } else {
+                            idle_us = (idle_us * 2 + 10).min(500);
+                            std::thread::sleep(std::time::Duration::from_micros(idle_us));
+                        }
+                    } else {
+                        idle_us = 0;
+                    }
+                }
+            })?;
+    }
+
+    // ── Aeron RECV spin: subscribers + event processing ──────────────────────
+    {
+        let market_fanout = state.market_fanout.clone();
         let pending_orders = state.pending_orders.clone();
         let pending_meta = state.pending_meta.clone();
         let user_tx = state.user_tx.clone();
@@ -1103,15 +1259,10 @@ async fn main() -> anyhow::Result<()> {
         let last_trade_price = state.last_trade_price.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
-        let mut order_meta_cache = open_order_meta;
-        // DESK_SPIN=false → exponential backoff (EC2/CPU-constrained hosts).
-        // Default: spin_loop() for lowest latency on dedicated cores.
-        let use_spin = std::env::var("DESK_SPIN")
-            .map(|v| v != "false")
-            .unwrap_or(true);
+        let order_meta_cache = open_order_meta;
 
         std::thread::Builder::new()
-            .name("aeron-event-loop".to_string())
+            .name("aeron-recv".to_string())
             .spawn(move || {
                 let mut idle_us: u64 = 0;
                 // Accumulator for CANCELLED events observed in one poll burst.
@@ -1151,93 +1302,6 @@ async fn main() -> anyhow::Result<()> {
                 let mut delete_count: usize = 0;
                 loop {
                     let mut did_work = false;
-                    // Drain outbound commands (WS/REST → engine) without blocking.
-                    while let Ok(cmd) = aeron_cmd_rx.try_recv() {
-                        did_work = true;
-                        match cmd {
-                            AeronCmd::NewOrder(req) => {
-                                let sym = std::str::from_utf8(&req.symbol)
-                                    .unwrap_or("").trim_end_matches('\0');
-                                // Preliminary meta — freeze_price is approximated
-                                // from the request's limit price (correct for limit
-                                // orders, zero for market orders). The ACCEPTED
-                                // handler below overwrites with the authoritative
-                                // freeze_price from pending_meta when available.
-                                let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
-                                remember_runtime_order(
-                                    &mut order_meta_cache,
-                                    req.client_order_id,
-                                    req.participant_id as i64,
-                                    prelim_freeze,
-                                    req.quantity,
-                                    req.side,
-                                    req.symbol,
-                                );
-                                if let Some(pub_) = order_pubs.get_mut(sym) {
-                                    let _ = pub_.publish_new_order(&req);
-                                } else {
-                                    // No engine for this symbol — reject immediately so the
-                                    // client doesn't time out and clean up pending_meta.
-                                    let coid: u64 = req.client_order_id;
-                                    let uid: u64  = req.participant_id;
-                                    let ws_meta = pending_meta.remove(&coid).map(|(_, m)| m);
-                                    remove_runtime_order(&mut order_meta_cache, coid, coid);
-                                    let client_oid = ws_meta.as_ref().map(|m| m.client_order_id.as_str()).unwrap_or("");
-                                    if let Some(tx) = user_tx.get(&(uid as i64)) {
-                                        let msg = serde_json::json!({
-                                            "type": "order_rejected",
-                                            "client_order_id": client_oid,
-                                            "reason": format!("No engine for symbol: {}", sym),
-                                        }).to_string();
-                                        let _ = tx.try_send(msg);
-                                    }
-                                }
-                                if let Some(ref t) = spin_tracer {
-                                    t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
-                                }
-                            }
-                            AeronCmd::Cancel(req) => {
-                                // Cancel doesn't carry a symbol — broadcast to all streams.
-                                // Only the engine that owns the order will find it and confirm.
-                                for pub_ in order_pubs.values_mut() {
-                                    let _ = pub_.publish_cancel(&req);
-                                }
-                            }
-                            AeronCmd::BatchCancel(reqs) => {
-                                // Publish all cancels in one tight inner loop per publisher,
-                                // avoiding per-cancel channel overhead.
-                                for req in &reqs {
-                                    for pub_ in order_pubs.values_mut() {
-                                        let _ = pub_.publish_cancel(req);
-                                    }
-                                }
-                            }
-                            AeronCmd::BatchNewOrder(reqs) => {
-                                // Publish all new orders in one tight inner loop so the engine
-                                // sees the entire batch before the next depth snapshot (10ms).
-                                for req in &reqs {
-                                    let sym = std::str::from_utf8(&req.symbol)
-                                        .unwrap_or("").trim_end_matches('\0');
-                                    let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
-                                    remember_runtime_order(
-                                        &mut order_meta_cache,
-                                        req.client_order_id,
-                                        req.participant_id as i64,
-                                        prelim_freeze,
-                                        req.quantity,
-                                        req.side,
-                                        req.symbol,
-                                    );
-                                    if let Some(pub_) = order_pubs.get_mut(sym) {
-                                        let _ = pub_.publish_new_order(req);
-                                    }
-                                    if let Some(ref t) = spin_tracer {
-                                        t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
-                                    }
-                                }
-                            }
-                        }
-                    }
 
                     order_update_sub.do_work();
                     trade_sub.do_work();
@@ -1285,7 +1349,7 @@ async fn main() -> anyhow::Result<()> {
                                 r#"{{"type":"trade","symbol":"{}","price":{},"qty":{},"side":"{}","ts":{}}}"#,
                                 symbol_str, price, qty, side_str, ts,
                             );
-                            let _ = market_tx.send(msg);
+                            market_fanout.send_owned(msg);
                             last_trade_price.insert(symbol_str.to_string(), price);
                         }
 
@@ -1340,7 +1404,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         if kind == order_update_kind::ACCEPTED {
                             remap_runtime_order_id(
-                                &mut order_meta_cache,
+                                &order_meta_cache,
                                 client_order_id,
                                 order_id,
                             );
@@ -1359,7 +1423,7 @@ async fn main() -> anyhow::Result<()> {
                                 sym_bytes[..n].copy_from_slice(&sb[..n]);
                                 let side_byte: u8 = if meta_ref.side == "buy" { 0 } else { 1 };
                                 remember_runtime_order(
-                                    &mut order_meta_cache,
+                                    &order_meta_cache,
                                     order_id,
                                     meta_ref.user_id,
                                     meta_ref.freeze_price,
@@ -1600,7 +1664,7 @@ async fn main() -> anyhow::Result<()> {
                             || kind == order_update_kind::CANCELLED
                             || kind == order_update_kind::REJECTED
                         {
-                            remove_runtime_order(&mut order_meta_cache, order_id, client_order_id);
+                            remove_runtime_order(&order_meta_cache, order_id, client_order_id);
                         }
                     }
 
@@ -1690,7 +1754,7 @@ async fn main() -> anyhow::Result<()> {
                                     continue;
                                 }
 
-                                let market_tx2 = market_tx.clone();
+                                let mf2 = market_fanout.clone();
                                 let last_depth2 = last_depth.clone();
                                 rt.spawn(async move {
                                     let bids: Vec<[f64; 2]> = bids_raw[..nb]
@@ -1707,7 +1771,7 @@ async fn main() -> anyhow::Result<()> {
                                         "bids": bids, "asks": asks, "ts": ts,
                                     });
                                     last_depth2.insert(symbol, depth_json.clone());
-                                    let _ = market_tx2.send(depth_json.to_string());
+                                    mf2.send_owned(depth_json.to_string());
                                 });
                             }
                             DeskDepthMsg::Depth50(_) | DeskDepthMsg::Level2(_) => {}
@@ -1741,6 +1805,37 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     tracing::info!("Desk Server (Aeron) listening on {}", addr);
     let listener = TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+
+    // Custom accept loop so we can call set_nodelay(true) on every accepted
+    // socket. Default TCP Nagle adds ~hundreds-of-µs per write on loopback
+    // (delayed ACK + small WS frames), which dominates WS PlaceOrder latency
+    // (handler CPU is only 4-9µs but client-perceived RTT was 600µs).
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder as ConnBuilder;
+    use tower_service::Service;
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("accept error: {e}");
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        // axum Router is cheap to clone (Arc internally). One clone per
+        // connection; no shared Mutex on the hot path.
+        let app_per_conn = app.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let builder = ConnBuilder::new(TokioExecutor::new());
+            let svc_fn = hyper::service::service_fn(move |req| {
+                let mut svc = app_per_conn.clone();
+                async move { svc.call(req).await }
+            });
+            let conn = builder.serve_connection_with_upgrades(io, svc_fn);
+            if let Err(e) = conn.await {
+                tracing::debug!("conn from {peer} ended: {e}");
+            }
+        });
+    }
 }

@@ -23,7 +23,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 /// In-memory account cache: user_id → { asset → (balance, frozen) }.
 /// Updated after every DB write so GET /api/balances never hits the DB.
@@ -48,6 +48,59 @@ pub type VwapCache = Arc<DashMap<(i64, String), VwapStats>>;
 /// readers fall back to PG.
 pub type RedisConn = redis::aio::MultiplexedConnection;
 
+/// Market data fanout via per-conn independent mpsc channels.
+///
+/// Why not tokio::sync::broadcast? Internally lock-based — at 40K
+/// subscribers the lock contention on `recv()` dominates and pushes
+/// p50 latency from ms into seconds. With per-conn mpsc::Sender<Arc<str>>,
+/// each broadcast is N atomic Arc clones + N lock-free try_send (~50 ns
+/// each), no shared lock. 40K × 30 broadcasts/s ≈ 60 ms/s CPU — fine.
+///
+/// Subscribers register LAZILY — only when the client sends a
+/// `ClientMsg::Subscribe`. Connections that never subscribe (load tests,
+/// trading-only bots) impose zero broadcast overhead.
+pub struct MarketFanout {
+    /// (conn_id, sender). conn_id is a process-local atomic counter
+    /// generated when the WS handler starts.
+    subscribers: DashMap<u64, mpsc::Sender<Arc<str>>>,
+}
+
+impl MarketFanout {
+    pub fn new() -> Self {
+        Self {
+            subscribers: DashMap::with_capacity(1024),
+        }
+    }
+    pub fn register(&self, conn_id: u64, tx: mpsc::Sender<Arc<str>>) {
+        self.subscribers.insert(conn_id, tx);
+    }
+    pub fn unregister(&self, conn_id: u64) {
+        self.subscribers.remove(&conn_id);
+    }
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
+    }
+    /// Fan a single message out to every registered subscriber. Drops
+    /// silently when a subscriber's mpsc is full (back-pressure protection
+    /// — slow consumers don't block the publisher).
+    pub fn send_str(&self, msg: Arc<str>) {
+        for entry in self.subscribers.iter() {
+            let _ = entry.value().try_send(msg.clone());
+        }
+    }
+    /// Convenience: take ownership of a String and dispatch.
+    pub fn send_owned(&self, msg: String) {
+        let arc: Arc<str> = Arc::from(msg);
+        self.send_str(arc);
+    }
+}
+
+impl Default for MarketFanout {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared handle to the PersistEvent publisher (Aeron). Wrapped in a
 /// parking_lot Mutex because aeron-wrapper's Publisher is not Send+Sync.
 /// REST POST /api/orders uses this to publish OrderUpsert+AccountSet so
@@ -63,8 +116,10 @@ pub struct AppState {
     /// Per-symbol matching engines keyed by symbol (e.g. "BTC_USDT").
     /// None in Aeron-connected desk_server mode.
     pub engines: Option<Arc<DashMap<String, Arc<Mutex<MatchingEngine>>>>>,
-    /// Broadcast market data (depth snapshots, trades) to all subscribed connections.
-    pub market_tx: Arc<broadcast::Sender<String>>,
+    /// Market data fanout. Subscribers register on `ClientMsg::Subscribe`
+    /// (lazy — connections that never subscribe pay zero broadcast cost).
+    /// Replaces tokio::sync::broadcast which lock-contended at 40K+ subs.
+    pub market_fanout: Arc<MarketFanout>,
     /// Per-user personal update channel (order fills, balance changes).
     pub user_tx: Arc<DashMap<i64, mpsc::Sender<String>>>,
     /// Monotonically increasing order ID counter (desk_server Aeron mode uses this directly).
@@ -1075,11 +1130,11 @@ async fn handle_place_order(
                 "ts": now_us,
             })
             .to_string();
-            let _ = s.market_tx.send(trade_msg);
+            let _ = s.market_fanout.send_owned(trade_msg);
 
             let sym_clone = req.symbol.clone();
             let db_clone = s.db.clone();
-            let mtx_clone = s.market_tx.clone();
+            let mtx_clone = s.market_fanout.clone();
             tokio::spawn(async move {
                 let open_24h: Option<f64> = sqlx::query_scalar(
                     "SELECT price FROM trades WHERE symbol=$1
@@ -1101,7 +1156,7 @@ async fn handle_place_order(
                     "change": change,
                 })
                 .to_string();
-                let _ = mtx_clone.send(ticker);
+                mtx_clone.send_owned(ticker);
             });
         }
 

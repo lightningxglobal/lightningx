@@ -13,7 +13,6 @@ use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
 /// Seed demo K-line trade history on first startup so charts show meaningful data.
@@ -318,12 +317,12 @@ async fn main() -> anyhow::Result<()> {
 
     seed_demo_if_empty(&pool).await;
 
-    let (market_tx, _) = broadcast::channel::<String>(1024);
+    let market_fanout = Arc::new(lightning_exchange::api::MarketFanout::new());
 
     let state = AppState {
         db: Arc::new(pool),
         engines: Some(Arc::new(engines)),
-        market_tx: Arc::new(market_tx),
+        market_fanout,
         user_tx: Arc::new(DashMap::new()),
         next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
         aeron_cmd_tx: None,

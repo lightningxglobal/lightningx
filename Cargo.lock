@@ -1482,6 +1482,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-http 0.5.2",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "uuid",

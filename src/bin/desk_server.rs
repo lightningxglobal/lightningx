@@ -28,7 +28,7 @@ use lightning_exchange::{
     ws_handler::market_data_broadcaster,
 };
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
@@ -1310,6 +1310,11 @@ async fn main() -> anyhow::Result<()> {
                 // (~9× faster locally; see examples/bench_delete_order).
                 let mut delete_batch: [i64; 64] = [0; 64];
                 let mut delete_count: usize = 0;
+                // Hot-path warning counters: rate-limited to once per 10K.
+                // At 400K conns the unrate-limited warns were costing ~1.7 s
+                // of CPU per test inside the recv-spin critical section.
+                let lost_order_updates = AtomicU64::new(0);
+                let full_channels = AtomicU64::new(0);
                 loop {
                     let mut did_work = false;
 
@@ -1639,7 +1644,15 @@ async fn main() -> anyhow::Result<()> {
                         // if let Some()), each taking a shard lock.
                         let maybe_tx = user_tx.get(user_id);
                         if maybe_tx.is_none() {
-                            tracing::warn!("no WS channel for user {user_id}, order_update {order_id} lost");
+                            // Rate-limited counter — at 400K conns this used to
+                            // hit ~175K times/test, each `tracing::warn!` is
+                            // ~10µs format + stderr lock → ~1.7s of pure log
+                            // time on the recv-spin's critical path. Now we
+                            // count and only print every 10K.
+                            let n = lost_order_updates.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n % 10_000 == 0 {
+                                tracing::warn!("no WS channel — order_update lost (total: {n})");
+                            }
                         }
                         if let Some(tx) = maybe_tx {
                             let ws_status = ws_status_from_update_kind(kind).as_str();
@@ -1666,7 +1679,10 @@ async fn main() -> anyhow::Result<()> {
                                 ),
                             };
                             if tx.try_send(upd).is_err() {
-                                tracing::warn!("personal channel full for user {user_id}, dropping order_update {order_id}");
+                                let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n % 10_000 == 0 {
+                                    tracing::warn!("personal channel full — order_update dropped (total: {n})");
+                                }
                             }
                         }
 

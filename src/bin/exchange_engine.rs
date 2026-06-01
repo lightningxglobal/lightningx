@@ -409,7 +409,11 @@ fn spawn_symbol_thread(
         .expect("failed to spawn symbol thread")
 }
 
-#[tokio::main]
+// Engine matching loop runs on its own std::thread per symbol (see
+// spawn_symbol_thread). Tokio is only used here for sqlx startup queries
+// and ctrl-c handling — `current_thread` skips spinning up 14 idle worker
+// threads that sit parked the entire process lifetime.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 

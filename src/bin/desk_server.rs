@@ -993,13 +993,23 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Aeron subscribers and publisher created");
 
     // ── Latency tracer (optional — disabled if is not running) ────────
-    let tracer = spawn_tracer(
-        &aeron_dir(),
-        METRICS_CHANNEL,
-        METRICS_STREAM,
-        DESK_INSTANCE_ID,
-    )
-    .map(Arc::new);
+    // Gated by TRACER_ENABLED env (default = off). Each hot-path call site
+    // pays one `if let Some` check either way, but when the env is "0" we
+    // never spawn the Aeron publisher + drain thread + per-msg mpsc send.
+    // At 400K conns the live tracer drove desk-server recv-spin into a
+    // 300×-slower regime (see exchange_engine.rs comment); leaving it off
+    // by default and flipping on for diagnosis.
+    let tracer = if std::env::var("TRACER_ENABLED").map(|v| v == "1").unwrap_or(false) {
+        spawn_tracer(
+            &aeron_dir(),
+            METRICS_CHANNEL,
+            METRICS_STREAM,
+            DESK_INSTANCE_ID,
+        )
+        .map(Arc::new)
+    } else {
+        None
+    };
     if tracer.is_some() {
         tracing::info!(
             "Exchange tracer connected (instance_id={})",

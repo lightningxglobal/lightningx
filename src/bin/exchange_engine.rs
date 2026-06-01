@@ -681,13 +681,22 @@ async fn main() -> anyhow::Result<()> {
         symbols.len()
     );
 
-    // ----- Latency tracer (optional) -----------------------------------------
-    let tracer = spawn_tracer(
-        &aeron_dir(),
-        METRICS_CHANNEL,
-        METRICS_STREAM,
-        ENGINE_INSTANCE_ID,
-    );
+    // ----- Latency tracer (optional, gated by TRACER_ENABLED env) ------------
+    // Off by default. At 400K conns the live tracer (3 record_sym per msg)
+    // pushed matching-thread batch_dur from ~4µs to ~276ms — the SystemTime
+    // calls + unbounded mpsc sends + cache-line invalidation crushed the
+    // hot path. Cheap `if let Some` guards remain on every call site so
+    // turning it back on with `TRACER_ENABLED=1` requires no code changes.
+    let tracer = if std::env::var("TRACER_ENABLED").map(|v| v == "1").unwrap_or(false) {
+        spawn_tracer(
+            &aeron_dir(),
+            METRICS_CHANNEL,
+            METRICS_STREAM,
+            ENGINE_INSTANCE_ID,
+        )
+    } else {
+        None
+    };
     if tracer.is_some() {
         tracing::info!(
             "Exchange tracer connected (instance_id={})",

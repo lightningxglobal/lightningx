@@ -128,6 +128,11 @@ impl ClientMsg {
                 return Some(msg);
             }
         }
+        if matches!(json_str_field(text, "type"), Some("cancel_order")) {
+            if let Some(order_id) = json_i64_field(text, "order_id") {
+                return Some(ClientMsg::CancelOrder { order_id });
+            }
+        }
 
         let v: Value = serde_json::from_str(text).ok()?;
         let t = v.get("type")?.as_str()?;
@@ -230,6 +235,20 @@ fn json_f64_field(text: &str, key: &str) -> Option<f64> {
     rest = rest.strip_prefix(':')?.trim_start();
     let end = rest
         .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
+}
+
+fn json_i64_field(text: &str, key: &str) -> Option<i64> {
+    let key_pos = find_json_key(text, key)?;
+    let mut rest = &text[key_pos + key.len() + 2..];
+    rest = rest.trim_start();
+    rest = rest.strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
         .unwrap_or(rest.len());
     if end == 0 {
         return None;
@@ -2572,6 +2591,15 @@ mod tests {
                 assert_eq!(qty, 0.001);
             }
             _ => panic!("expected place_order"),
+        }
+    }
+
+    #[test]
+    fn parse_cancel_order_fast_handles_pressure_shape() {
+        let msg = ClientMsg::parse(r#"{"type":"cancel_order","order_id":12345}"#).unwrap();
+        match msg {
+            ClientMsg::CancelOrder { order_id } => assert_eq!(order_id, 12345),
+            _ => panic!("expected cancel_order"),
         }
     }
 

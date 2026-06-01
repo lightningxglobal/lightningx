@@ -65,6 +65,27 @@ fn env_string(k: &str, default: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| default.to_string())
 }
 
+fn default_run_id() -> String {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    let mut buf = [0u8; 13];
+    let mut n = micros;
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        let digit = (n % 36) as u8;
+        buf[i] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + (digit - 10)
+        };
+        n /= 36;
+    }
+    std::str::from_utf8(&buf[i..]).unwrap_or("0").to_string()
+}
+
 struct Config {
     users: usize,
     conns: usize,
@@ -75,6 +96,7 @@ struct Config {
     symbol: String,
     price: f64,
     qty: f64,
+    run_id: String,
     /// Comma-separated list of source IPs to bind each connection's
     /// socket to. With multiple loopback aliases (127.0.0.1, 127.0.0.2,
     /// …) we can scale past the single-IP ~16K ephemeral-port cap on
@@ -97,6 +119,7 @@ impl Config {
             // without filling, won't affect MM quotes.
             price: env_f64("PRESSURE_PRICE", 5000.0),
             qty: env_f64("PRESSURE_QTY", 0.001),
+            run_id: std::env::var("PRESSURE_RUN_ID").unwrap_or_else(|_| default_run_id()),
             source_ips: env_string("PRESSURE_SOURCE_IPS", "")
                 .split(',')
                 .filter_map(|s| {
@@ -141,7 +164,9 @@ struct Metrics {
     cancel_latency_hist: LatencyHist,
 }
 
-const LATENCY_HIST_MAX_US: usize = 60_000;
+// Keep 1µs precision around the sub-ms target while still diagnosing
+// overload runs that drift into hundreds of milliseconds.
+const LATENCY_HIST_MAX_US: usize = 1_000_000;
 
 struct LatencyHist {
     buckets: Vec<AtomicU64>,
@@ -543,7 +568,7 @@ async fn driver(
 
         // Send place_order.
         counter += 1;
-        let coid = format!("p{conn_idx}-{counter}");
+        let coid = format!("p{}-{conn_idx}-{counter}", cfg.run_id);
         let coid_match = format!(r#""client_order_id":"{}""#, coid);
         let mut order_id_match: Option<String> = None;
         let place_msg = format!(

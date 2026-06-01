@@ -123,6 +123,12 @@ enum ClientMsg {
 
 impl ClientMsg {
     fn parse(text: &str) -> Option<Self> {
+        if matches!(json_str_field(text, "type"), Some("place_order")) {
+            if let Some(msg) = parse_place_order_fast(text) {
+                return Some(msg);
+            }
+        }
+
         let v: Value = serde_json::from_str(text).ok()?;
         let t = v.get("type")?.as_str()?;
         match t {
@@ -192,6 +198,55 @@ impl ClientMsg {
             "ping" => Some(ClientMsg::Ping),
             _ => None,
         }
+    }
+}
+
+fn parse_place_order_fast(text: &str) -> Option<ClientMsg> {
+    Some(ClientMsg::PlaceOrder {
+        client_order_id: json_str_field(text, "client_order_id")?.to_owned(),
+        symbol: json_str_field(text, "symbol")?.to_owned(),
+        side: json_str_field(text, "side")?.to_owned(),
+        order_type: json_str_field(text, "order_type").unwrap_or("limit").to_owned(),
+        time_in_force: json_str_field(text, "time_in_force").map(|s| s.to_ascii_lowercase()),
+        price: json_f64_field(text, "price"),
+        qty: json_f64_field(text, "qty").or_else(|| json_f64_field(text, "quantity"))?,
+    })
+}
+
+fn json_str_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let key_pos = find_json_key(text, key)?;
+    let mut rest = &text[key_pos + key.len() + 2..];
+    rest = rest.trim_start();
+    rest = rest.strip_prefix(':')?.trim_start();
+    rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn json_f64_field(text: &str, key: &str) -> Option<f64> {
+    let key_pos = find_json_key(text, key)?;
+    let mut rest = &text[key_pos + key.len() + 2..];
+    rest = rest.trim_start();
+    rest = rest.strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
+}
+
+fn find_json_key(text: &str, key: &str) -> Option<usize> {
+    let mut start = 0;
+    loop {
+        let pos = text[start..].find('"')? + start;
+        let after_quote = pos + 1;
+        let after_key = after_quote + key.len();
+        if text[after_quote..].starts_with(key) && text[after_key..].starts_with('"') {
+            return Some(pos);
+        }
+        start = after_quote;
     }
 }
 
@@ -2484,13 +2539,40 @@ pub async fn market_data_broadcaster(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::build_depth_json;
+    use super::{build_depth_json, ClientMsg};
     use crate::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
     use serde_json::Value;
     use std::sync::Mutex;
 
     fn empty_engine() -> Mutex<MatchingEngine> {
         Mutex::new(MatchingEngine::new(PoolConfig::default()).unwrap())
+    }
+
+    #[test]
+    fn parse_place_order_fast_handles_pressure_shape() {
+        let msg = ClientMsg::parse(
+            r#"{"type":"place_order","client_order_id":"p7-11","symbol":"BTC_USDT","side":"buy","order_type":"limit","price":5000.0,"qty":0.001}"#,
+        )
+        .unwrap();
+        match msg {
+            ClientMsg::PlaceOrder {
+                client_order_id,
+                symbol,
+                side,
+                order_type,
+                price,
+                qty,
+                ..
+            } => {
+                assert_eq!(client_order_id, "p7-11");
+                assert_eq!(symbol, "BTC_USDT");
+                assert_eq!(side, "buy");
+                assert_eq!(order_type, "limit");
+                assert_eq!(price, Some(5000.0));
+                assert_eq!(qty, 0.001);
+            }
+            _ => panic!("expected place_order"),
+        }
     }
 
     #[test]

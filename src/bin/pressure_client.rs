@@ -132,6 +132,45 @@ struct Metrics {
     place_latency_us_max: AtomicU64,
     cancel_latency_us_sum: AtomicU64,
     cancel_latency_us_max: AtomicU64,
+    place_latency_hist: LatencyHist,
+    cancel_latency_hist: LatencyHist,
+}
+
+const LATENCY_HIST_MAX_US: usize = 60_000;
+
+struct LatencyHist {
+    buckets: Vec<AtomicU64>,
+}
+
+impl Default for LatencyHist {
+    fn default() -> Self {
+        Self {
+            buckets: (0..=LATENCY_HIST_MAX_US).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+}
+
+impl LatencyHist {
+    fn record(&self, value_us: u64) {
+        let idx = (value_us as usize).min(LATENCY_HIST_MAX_US);
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn percentile(&self, pct: f64) -> u64 {
+        let total: u64 = self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum();
+        if total == 0 {
+            return 0;
+        }
+        let rank = ((total as f64 * pct).ceil() as u64).max(1);
+        let mut seen = 0u64;
+        for (idx, bucket) in self.buckets.iter().enumerate() {
+            seen += bucket.load(Ordering::Relaxed);
+            if seen >= rank {
+                return idx as u64;
+            }
+        }
+        LATENCY_HIST_MAX_US as u64
+    }
 }
 
 impl Metrics {
@@ -608,6 +647,7 @@ async fn driver(
             .place_latency_us_sum
             .fetch_add(place_us, Ordering::Relaxed);
         record_max(&metrics.place_latency_us_max, place_us);
+        metrics.place_latency_hist.record(place_us);
 
         // Drain the place→cancel gap. Any late order_update / balance_update
         // / market frame queued in the TCP buffer is read & discarded here, so
@@ -702,6 +742,7 @@ async fn driver(
                 .cancel_latency_us_sum
                 .fetch_add(cancel_us, Ordering::Relaxed);
             record_max(&metrics.cancel_latency_us_max, cancel_us);
+            metrics.cancel_latency_hist.record(cancel_us);
         }
 
         // Sleep until the next cycle, draining any trailing frames so the
@@ -916,8 +957,18 @@ async fn async_main() -> anyhow::Result<()> {
         p_avg_us, cur.place_lat_max_us
     );
     println!(
+        "  place  latency p50/p95 (µs):        {} / {}",
+        metrics.place_latency_hist.percentile(0.50),
+        metrics.place_latency_hist.percentile(0.95),
+    );
+    println!(
         "  cancel latency avg/max (µs):        {} / {}",
         c_avg_us, cur.cancel_lat_max_us
+    );
+    println!(
+        "  cancel latency p50/p95 (µs):        {} / {}",
+        metrics.cancel_latency_hist.percentile(0.50),
+        metrics.cancel_latency_hist.percentile(0.95),
     );
     let total_ops_per_s = (cur.place_sent + cur.cancel_sent) as f64 / elapsed;
     println!("  total ops/s:                        {:.0}", total_ops_per_s);

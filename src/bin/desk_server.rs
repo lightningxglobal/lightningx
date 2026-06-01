@@ -1770,7 +1770,15 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // ── Periodic market data broadcaster (tickers, klines from DB) ────────────
-    tokio::spawn(market_data_broadcaster(state.clone()));
+    // Keep this off for pure trading pressure tests: the trading hot path gets
+    // market data from Aeron, and historical kline/ticker DB queries can
+    // otherwise contend with pg-writer and the WS runtime.
+    let market_broadcaster_enabled = std::env::var("MARKET_DATA_BROADCASTER")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    if market_broadcaster_enabled {
+        tokio::spawn(market_data_broadcaster(state.clone()));
+    }
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

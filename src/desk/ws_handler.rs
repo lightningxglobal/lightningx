@@ -2430,6 +2430,9 @@ pub async fn market_data_broadcaster(state: AppState) {
     loop {
         tokio::select! {
             _ = depth_interval.tick() => {
+                if state.market_fanout.subscriber_count() == 0 {
+                    continue;
+                }
                 // Only broadcast depth from local engines in standalone mode.
                 // In Aeron mode, depth is pushed by exchange_engine via Aeron.
                 if let Some(ref engines) = state.engines {
@@ -2463,6 +2466,9 @@ pub async fn market_data_broadcaster(state: AppState) {
             }
 
             _ = ticker_interval.tick() => {
+                if state.market_fanout.subscriber_count() == 0 {
+                    continue;
+                }
                 // Periodic ticker per symbol that has a known last price.
                 // DB is queried at most once every 60s per symbol (cached in ticker_cache).
                 // Between DB refreshes we broadcast cached 24h stats with live last price.
@@ -2553,6 +2559,9 @@ pub async fn market_data_broadcaster(state: AppState) {
             }
 
             _ = kline_interval.tick() => {
+                if state.market_fanout.subscriber_count() == 0 {
+                    continue;
+                }
                 // Fetch real OHLCV from the trades table for the last 60 seconds,
                 // per active symbol. Skip when the bar has no trades so we don't
                 // corrupt the chart with a fake flat candle.
@@ -2613,6 +2622,9 @@ pub async fn market_data_broadcaster(state: AppState) {
             }
 
             _ = agg_interval.tick() => {
+                if state.market_fanout.subscriber_count() == 0 {
+                    continue;
+                }
                 // Per-second OHLCV+count for the active second and the active
                 // 5s window. Only query symbols that have seen at least one
                 // trade (last_prices entry) to keep DB load bounded.

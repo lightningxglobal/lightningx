@@ -326,7 +326,63 @@ async fn ensure_user(http: &reqwest::Client, base_url: &str, idx: usize) -> anyh
     Ok(UserToken { user_id, token })
 }
 
+/// Read PRESSURE_TOKENS_CSV (lines `user_id,idx`), self-sign JWT for each
+/// using the desk-server's hardcoded JWT_SECRET — bypasses HTTP login
+/// entirely. Drops setup for 400K users from ~10 min (bcrypt-bound) to
+/// ~10 s (local HMAC-SHA256 signing).
+fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<UserToken>>> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct Claims {
+        sub: i64,
+        email: String,
+        exp: usize,
+    }
+    // Matches src/desk/user_service.rs::JWT_SECRET — hardcoded there, not
+    // env-derived, so the stress client must use the same bytes.
+    const JWT_SECRET: &[u8] = b"exchange_jwt_secret_change_in_prod";
+    let exp = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 86400) as usize;
+    let key = EncodingKey::from_secret(JWT_SECRET);
+    let header = Header::default();
+
+    info!("setup: loading user→id map from {path}, self-signing tokens for {} users…", cfg.users);
+    let started = Instant::now();
+    let raw = std::fs::read_to_string(path)?;
+    // Build idx → user_id index for O(1) lookup. CSV is `user_id,idx`.
+    let mut by_idx: std::collections::HashMap<usize, i64> = std::collections::HashMap::with_capacity(raw.lines().count());
+    for line in raw.lines() {
+        let mut it = line.split(',');
+        let uid: i64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("bad CSV row: {line}"))?;
+        let idx: usize = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("bad CSV row: {line}"))?;
+        by_idx.insert(idx, uid);
+    }
+    let mut users = Vec::with_capacity(cfg.users);
+    for i in 0..cfg.users {
+        let user_id = *by_idx.get(&i).ok_or_else(|| anyhow::anyhow!("missing user idx {i} in CSV — pre-create users first"))?;
+        let email = format!("pressure_{i}@stress.test");
+        let claims = Claims { sub: user_id, email, exp };
+        let token = encode(&header, &claims, &key)?;
+        users.push(UserToken { user_id, token });
+    }
+    info!(
+        "setup: {} users via CSV+self-sign in {:?}",
+        users.len(),
+        started.elapsed()
+    );
+    Ok(Arc::new(users))
+}
+
 async fn setup_users(cfg: &Config) -> anyhow::Result<Arc<Vec<UserToken>>> {
+    // Fast path: pre-built CSV + local JWT sign. Used for 400K+ load tests
+    // where HTTP register/login would dominate setup time.
+    if let Ok(path) = std::env::var("PRESSURE_TOKENS_CSV") {
+        return setup_users_from_csv(cfg, &path);
+    }
+
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(64)

@@ -1433,9 +1433,9 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                         let ws_meta = pending_meta.remove(&lookup_id).map(|(_, m)| m);
                         // client_order_id is only available on the first event (ACCEPTED).
-                        let ws_client_oid = ws_meta.as_ref().map(|m| m.client_order_id.clone());
+                        let ws_client_oid = ws_meta.as_ref().map(|m| m.client_order_id.as_str());
 
-                        if let Some(meta) = ws_meta {
+                        if let Some(meta) = ws_meta.as_ref() {
                             if kind == order_update_kind::ACCEPTED {
                                 // Accumulate into the batched-INSERT buffer.
                                 // Flushed below as a single DbCmd::BatchUpsertOrder
@@ -1460,7 +1460,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     status:          DbOrderStatus::Pending.as_u8(),
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       true,
-                                    client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
+                                    client_order_id: db_cmd::str_bytes(ws_client_oid.unwrap_or("")),
                                 };
                                 accepted_count += 1;
                             } else if kind == order_update_kind::PARTIAL_FILL {
@@ -1477,7 +1477,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     status:          DbOrderStatus::Trading.as_u8(),
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       false,
-                                    client_order_id: db_cmd::str_bytes(ws_client_oid.as_deref().unwrap_or("")),
+                                    client_order_id: db_cmd::str_bytes(ws_client_oid.unwrap_or("")),
                                 }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
                             }
                             // kind == FILLED here means "first event was a full fill"
@@ -1626,10 +1626,7 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                         if let Some(tx) = maybe_tx {
                             let ws_status = ws_status_from_update_kind(kind).as_str();
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros() as u64)
-                                .unwrap_or(0);
+                            let ts = msg.timestamp;
                             // Hand-written JSON — serde_json::json! macro
                             // measures ~600ns per call; format! is ~150ns
                             // for this fixed shape and runs at every

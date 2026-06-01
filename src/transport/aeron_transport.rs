@@ -32,18 +32,22 @@ const ORDER_UPDATE_RING: usize = 128 * 1024;
 const TRADE_RING: usize = 16 * 1024;
 const DEPTH_RING: usize = 4 * 1024;
 
-fn publish_with_retry(
+/// Zero-copy publish: retry `try_claim` on back-pressure, then run the
+/// writer directly into Aeron's term-log buffer (saves the staging-array
+/// memcpy + the encoder→buffer memcpy that `publisher.send(&bytes)` does).
+fn publish_with_retry_claim<F: FnOnce(&mut [u8])>(
     publisher: &mut aeron_wrapper::Publisher,
-    data: &[u8],
+    length: usize,
+    writer: F,
 ) -> Result<(), TransportError> {
     let mut spins = 0u32;
-    loop {
-        match publisher.send(data) {
-            Ok(()) => return Ok(()),
+    let claim_result = loop {
+        match publisher.try_claim(length) {
+            Ok(claim) => break Ok(claim),
             Err(AeronError::BackPressured) => {
                 spins += 1;
                 if spins >= MAX_BACKPRESSURE_SPINS {
-                    return Err(TransportError::BackPressured);
+                    break Err(TransportError::BackPressured);
                 }
                 if spins % 1024 == 0 {
                     std::thread::yield_now();
@@ -51,11 +55,14 @@ fn publish_with_retry(
                     std::hint::spin_loop();
                 }
             }
-            Err(AeronError::NotConnected) => return Err(TransportError::Disconnected),
-            Err(AeronError::Closed) => return Err(TransportError::Closed),
-            Err(_) => return Err(TransportError::BackPressured),
+            Err(AeronError::NotConnected) => break Err(TransportError::Disconnected),
+            Err(AeronError::Closed) => break Err(TransportError::Closed),
+            Err(_) => break Err(TransportError::BackPressured),
         }
-    }
+    };
+    let mut claim = claim_result?;
+    writer(claim.as_mut_slice());
+    claim.commit().map_err(|_| TransportError::BackPressured)
 }
 
 // ============================================================================
@@ -221,10 +228,11 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
 
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError> {
         use tracing::info;
-        let mut data = [0u8; 72];
-        sbe::encode_order_update(msg, &mut data).map_err(|_| TransportError::BackPressured)?;
-
-        let result = publish_with_retry(&mut self.publisher, &data);
+        let result = publish_with_retry_claim(&mut self.publisher, 72, |buf| {
+            // Buffer is exactly 72 B (8-byte header + 64-byte body); the
+            // encoder never errors here, so ignore the Result.
+            let _ = sbe::encode_order_update(msg, buf);
+        });
         if let Err(ref e) = result {
             info!("[AeronOrderUpdatePublisher] publish failed: {:?}", e);
         }
@@ -261,11 +269,9 @@ impl TradePublisher for AeronTradePublisher {
     }
 
     fn publish(&mut self, msg: &TradeNotification) -> Result<(), TransportError> {
-        let mut data = [0u8; 72];
-        sbe::encode_trade_notification(msg, &mut data)
-            .map_err(|_| TransportError::BackPressured)?;
-
-        publish_with_retry(&mut self.publisher, &data)
+        publish_with_retry_claim(&mut self.publisher, 72, |buf| {
+            let _ = sbe::encode_trade_notification(msg, buf);
+        })
     }
 }
 
@@ -322,36 +328,36 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
     }
 
     fn publish_depth(&mut self, msg: &DepthSnapshotEvent) -> Result<(), TransportError> {
-        let data = unsafe {
-            std::slice::from_raw_parts(
+        let len = std::mem::size_of::<DepthSnapshotEvent>();
+        publish_with_retry_claim(&mut self.depth_publisher, len, |buf| unsafe {
+            std::ptr::copy_nonoverlapping(
                 msg as *const DepthSnapshotEvent as *const u8,
-                std::mem::size_of::<DepthSnapshotEvent>(),
-            )
-        };
-
-        publish_with_retry(&mut self.depth_publisher, data)
+                buf.as_mut_ptr(),
+                len,
+            );
+        })
     }
 
     fn publish_depth50(&mut self, msg: &Depth50SnapshotEvent) -> Result<(), TransportError> {
-        let data = unsafe {
-            std::slice::from_raw_parts(
+        let len = std::mem::size_of::<Depth50SnapshotEvent>();
+        publish_with_retry_claim(&mut self.depth50_publisher, len, |buf| unsafe {
+            std::ptr::copy_nonoverlapping(
                 msg as *const Depth50SnapshotEvent as *const u8,
-                std::mem::size_of::<Depth50SnapshotEvent>(),
-            )
-        };
-
-        publish_with_retry(&mut self.depth50_publisher, data)
+                buf.as_mut_ptr(),
+                len,
+            );
+        })
     }
 
     fn publish_level2(&mut self, msg: &Level2SnapshotEvent) -> Result<(), TransportError> {
-        let data = unsafe {
-            std::slice::from_raw_parts(
+        let len = std::mem::size_of::<Level2SnapshotEvent>();
+        publish_with_retry_claim(&mut self.level2_publisher, len, |buf| unsafe {
+            std::ptr::copy_nonoverlapping(
                 msg as *const Level2SnapshotEvent as *const u8,
-                std::mem::size_of::<Level2SnapshotEvent>(),
-            )
-        };
-
-        publish_with_retry(&mut self.level2_publisher, data)
+                buf.as_mut_ptr(),
+                len,
+            );
+        })
     }
 }
 
@@ -384,22 +390,18 @@ impl DeskOrderPublisher {
         &mut self,
         req: &crate::sbe::NewOrderRequest,
     ) -> Result<(), crate::transport::TransportError> {
-        let mut data = [0u8; 72]; // 8 header + 64 body
-        crate::sbe::encode_new_order(req, &mut data)
-            .map_err(|_| crate::transport::TransportError::BackPressured)?;
-
-        publish_with_retry(&mut self.publisher, &data)
+        publish_with_retry_claim(&mut self.publisher, 72, |buf| {
+            let _ = crate::sbe::encode_new_order(req, buf);
+        })
     }
 
     pub fn publish_cancel(
         &mut self,
         req: &crate::sbe::CancelOrderRequest,
     ) -> Result<(), crate::transport::TransportError> {
-        let mut data = [0u8; 24]; // 8 header + 16 body
-        crate::sbe::encode_cancel_order(req, &mut data)
-            .map_err(|_| crate::transport::TransportError::BackPressured)?;
-
-        publish_with_retry(&mut self.publisher, &data)
+        publish_with_retry_claim(&mut self.publisher, 24, |buf| {
+            let _ = crate::sbe::encode_cancel_order(req, buf);
+        })
     }
 }
 
@@ -785,7 +787,10 @@ impl PersistPublisher {
     }
 
     pub fn publish(&mut self, frame: &PersistFrame) -> Result<(), TransportError> {
-        publish_with_retry(&mut self.publisher, frame.as_bytes())
+        let bytes = frame.as_bytes();
+        publish_with_retry_claim(&mut self.publisher, bytes.len(), |buf| {
+            buf.copy_from_slice(bytes);
+        })
     }
 }
 

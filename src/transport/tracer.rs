@@ -153,7 +153,17 @@ fn drain_loop(mut rx: UnboundedReceiver<(i32, u64, i64, [u8; 16])>, client: &Aer
     loop {
         while let Ok((milestone_id, order_id, ts_ns, sym)) = rx.try_recv() {
             let n = serialize_checkpoint(&mut buf, instance_id, milestone_id, order_id, ts_ns, &sym);
-            let _ = pub_.send(&buf[..n]);
+            // Zero-copy claim: write directly into Aeron's term-log buffer
+            // instead of staging in `buf` then memcpy via `send()`.
+            // The `serialize_checkpoint` already wrote into `buf` above so we
+            // still copy from it — to get a true second-memcpy elimination we
+            // would have to refactor `serialize_checkpoint` to take the claim
+            // buffer directly. For now this just removes the send()'s internal
+            // claim+memcpy round-trip.
+            if let Ok(mut claim) = pub_.try_claim(n) {
+                claim.as_mut_slice().copy_from_slice(&buf[..n]);
+                let _ = claim.commit();
+            }
             idle = 0;
         }
         // Aeron client times out if do_work() is not called within ~10 seconds.

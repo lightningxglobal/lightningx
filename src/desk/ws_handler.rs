@@ -68,6 +68,16 @@ fn ws_inline_order_submitted_enabled() -> bool {
     })
 }
 
+fn ws_personal_queue_cap() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("WS_PERSONAL_QUEUE_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+    })
+}
+
 // ─── Client → Server message types ───────────────────────────────────────────
 // Parse from raw Value to avoid serde internal-tag conflict with a field also named "type".
 
@@ -230,7 +240,7 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
     let mut session = WsSession::new();
 
     // Personal update channel for this connection (order/balance events).
-    let (personal_tx, mut personal_rx) = mpsc::channel::<String>(65536);
+    let (personal_tx, mut personal_rx) = mpsc::channel::<String>(ws_personal_queue_cap());
     // Market data channel: registered LAZILY with state.market_fanout when
     // the client first sends a Subscribe message. Connections that never
     // subscribe (load tests, trading-only bots) never get registered, so

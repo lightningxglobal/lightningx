@@ -965,15 +965,18 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // ── Command channel: async WS handlers → Aeron spin thread ───────────────
-    // Lock-free MPMC bounded ring. 10 K capacity ≈ 50 ms at 200 K cmd/s
-    // steady-state — absorbs MM's 40-msg cancel-replace bursts but kicks
-    // back pressure to WS handlers as `Err(value)` when a runaway test
-    // floods us, instead of cascading into the matching engine.
+    // Lock-free MPMC bounded ring. 500 K (~40 MB at 80 B per AeronCmd)
+    // absorbs ~1.25 s of 400 K cmd/s peak — enough for any realistic burst
+    // (MM cancel-replace, pressure-test ramp) without rejecting healthy
+    // clients, while still bounded so a runaway load can't OOM the
+    // process. The previous 10 K cap was too tight: at 400 K conn × 1 op/s
+    // it filled in 25 ms, triggering "system busy" rejects to ~65 % of
+    // requests that the engine could have handled given more buffer.
     // Override via AERON_CMD_CAP env.
     let aeron_cmd_cap: usize = std::env::var("AERON_CMD_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10_240);
+        .unwrap_or(500_000);
     let aeron_cmd_ring: std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>> =
         std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(aeron_cmd_cap));
     let aeron_cmd_tx = aeron_cmd_ring.clone();

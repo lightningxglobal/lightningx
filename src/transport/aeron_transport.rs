@@ -23,10 +23,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAX_BACKPRESSURE_SPINS: u32 = 100_000;
-const ORDER_INBOUND_RING: usize = 16 * 1024;
-// 16K saturated on MM restart bursts — 5835 OPEN events dropped in ~5s, which
-// permanently corrupted MM's in-memory book (orders engine knew about but MM
-// did not). 128K survives a full cancel-all+place-all burst from a 40-quote MM
+// 16K saturated on 4K-conn × 1 op/s stress test — 13 K dropped in seconds
+// when recv-spin briefly stalled on persist back-pressure, which then made
+// engine `ou_pub.publish` spin past Aeron's 10 s conductor timeout and the
+// matching thread's whole Aeron client died. Symmetric 128 K matches the
+// outbound ring; absorbs ~1.2 s of 100 K msg/s steady throughput.
+const ORDER_INBOUND_RING: usize = 128 * 1024;
+// 128K survives a full cancel-all+place-all burst from a 40-quote MM
 // with room to spare; cost is ~11MB at sizeof(OrderUpdateMsg)≈88B.
 const ORDER_UPDATE_RING: usize = 128 * 1024;
 const TRADE_RING: usize = 16 * 1024;

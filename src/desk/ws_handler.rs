@@ -59,6 +59,15 @@ fn ws_push_bal_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("WS_PUSH_BAL").map(|v| v == "1").unwrap_or(false))
 }
 
+fn ws_inline_order_submitted_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("WS_INLINE_ORDER_SUBMITTED")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 // ─── Client → Server message types ───────────────────────────────────────────
 // Parse from raw Value to avoid serde internal-tag conflict with a field also named "type".
 
@@ -660,18 +669,24 @@ async fn handle_client_message(
                 }
                 let t_post_aeron = t0.map(|_| std::time::Instant::now());
 
-                let reply = json!({
-                    "type": "order_submitted",
-                    "client_order_id": client_order_id,
-                    "order_id": order_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "order_type": order_type,
-                    "price": price,
-                    "quantity": qty,
-                    "ts": unix_now()
-                })
-                .to_string();
+                let reply = if ws_inline_order_submitted_enabled() {
+                    let price_json = price
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "null".to_string());
+                    Some(format!(
+                        r#"{{"type":"order_submitted","client_order_id":"{}","order_id":{},"symbol":"{}","side":"{}","order_type":"{}","price":{},"quantity":{},"ts":{}}}"#,
+                        client_order_id,
+                        order_id,
+                        symbol,
+                        side,
+                        order_type,
+                        price_json,
+                        qty,
+                        unix_now(),
+                    ))
+                } else {
+                    None
+                };
                 if let (Some(start), Some(pre_freeze), Some(post_freeze), Some(post_bal), Some(post_aeron)) =
                     (t0, t_pre_freeze, t_post_freeze, t_post_balupd, t_post_aeron)
                 {
@@ -692,7 +707,7 @@ async fn handle_client_message(
                         );
                     }
                 }
-                return Some(reply);
+                return reply;
             }
 
             // ── Standalone engine path: DB + freeze + local matching ─────────────

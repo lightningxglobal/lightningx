@@ -19,15 +19,33 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
-fn try_freeze_cache(cache: &crate::api::AccountCache, user_id: i64, asset: &str, amount: f64) -> bool {
-    if amount <= 0.0 { return true; }
-    let Some(mut entry) = cache.get_mut(&user_id) else { return false };
-    let Some(kv) = entry.get_mut(asset) else { return false };
-    if kv.0 - kv.1 >= amount { kv.1 += amount; true } else { false }
+fn try_freeze_cache(
+    cache: &crate::api::AccountCache,
+    user_id: i64,
+    asset: &str,
+    amount: f64,
+) -> bool {
+    if amount <= 0.0 {
+        return true;
+    }
+    let Some(mut entry) = cache.get_mut(&user_id) else {
+        return false;
+    };
+    let Some(kv) = entry.get_mut(asset) else {
+        return false;
+    };
+    if kv.0 - kv.1 >= amount {
+        kv.1 += amount;
+        true
+    } else {
+        false
+    }
 }
 
 fn release_cache_frozen(cache: &crate::api::AccountCache, user_id: i64, asset: &str, amount: f64) {
-    if amount <= 0.0 { return; }
+    if amount <= 0.0 {
+        return;
+    }
     if let Some(mut entry) = cache.get_mut(&user_id) {
         if let Some(kv) = entry.get_mut(asset) {
             kv.1 = (kv.1 - amount).max(0.0);
@@ -51,12 +69,20 @@ fn unix_secs() -> i64 {
 
 fn ws_place_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("WS_PLACE_PROFILE").map(|v| v == "1").unwrap_or(false))
+    *ENABLED.get_or_init(|| {
+        std::env::var("WS_PLACE_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 fn ws_push_bal_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("WS_PUSH_BAL").map(|v| v == "1").unwrap_or(false))
+    *ENABLED.get_or_init(|| {
+        std::env::var("WS_PUSH_BAL")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 fn ws_inline_order_submitted_enabled() -> bool {
@@ -180,8 +206,16 @@ impl ClientMsg {
                 qty: v.get("qty").or_else(|| v.get("quantity"))?.as_f64()?,
             }),
             "place_orders" => {
-                let batch_id = v.get("batch_id").and_then(|b| b.as_str()).unwrap_or("").to_owned();
-                let orders = v.get("orders").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+                let batch_id = v
+                    .get("batch_id")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let orders = v
+                    .get("orders")
+                    .and_then(|a| a.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 Some(ClientMsg::PlaceOrders { batch_id, orders })
             }
             "cancel_order" => Some(ClientMsg::CancelOrder {
@@ -211,7 +245,9 @@ fn parse_place_order_fast(text: &str) -> Option<ClientMsg> {
         client_order_id: json_str_field(text, "client_order_id")?.to_owned(),
         symbol: json_str_field(text, "symbol")?.to_owned(),
         side: json_str_field(text, "side")?.to_owned(),
-        order_type: json_str_field(text, "order_type").unwrap_or("limit").to_owned(),
+        order_type: json_str_field(text, "order_type")
+            .unwrap_or("limit")
+            .to_owned(),
         time_in_force: json_str_field(text, "time_in_force").map(|s| s.to_ascii_lowercase()),
         price: json_f64_field(text, "price"),
         qty: json_f64_field(text, "qty").or_else(|| json_f64_field(text, "quantity"))?,
@@ -628,12 +664,16 @@ async fn handle_client_message(
             if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
                 use crate::tracer::MS_WS_ORDER_RECV;
-                use crate::transport::{AeronCmd, OrderMeta};
+                use crate::transport::{pack_str16, AeronCmd, OrderMeta};
 
                 // PERF DIAG (off by default): sample ~1/256 PlaceOrders per-section timing.
                 // Enable via WS_PLACE_PROFILE=1 env on desk-server.
                 let dbg = ws_place_profile_enabled();
-                let t0 = if dbg { Some(std::time::Instant::now()) } else { None };
+                let t0 = if dbg {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 // Skip the per-place balance_update push by default — it adds
                 // a second WS frame per place to the client, which would
                 // double the queued-frame drain cost on the client's NEXT
@@ -726,22 +766,27 @@ async fn handle_client_message(
 
                 state.pending_meta.insert(
                     order_id,
-                    Box::new(OrderMeta {
+                    OrderMeta {
                         user_id,
-                        symbol: symbol.clone(),
-                        side: side.clone(),
-                        order_type: order_type.clone(),
+                        symbol: sym_bytes,
+                        side: side_byte,
+                        order_type: pack_str16(&order_type),
                         price,
                         qty,
                         client_order_id: client_order_id.clone(),
                         freeze_price: freeze_price_val,
-                    }),
+                    },
                 );
 
                 if aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
                     // ArrayQueue full — apply backpressure to the client.
                     state.pending_meta.remove(&order_id);
-                    release_cache_frozen(&state.account_cache, user_id, freeze_asset, freeze_amount);
+                    release_cache_frozen(
+                        &state.account_cache,
+                        user_id,
+                        freeze_asset,
+                        freeze_amount,
+                    );
                     return Some(
                         json!({
                             "type": "order_rejected",
@@ -771,8 +816,13 @@ async fn handle_client_message(
                 } else {
                     None
                 };
-                if let (Some(start), Some(pre_freeze), Some(post_freeze), Some(post_bal), Some(post_aeron)) =
-                    (t0, t_pre_freeze, t_post_freeze, t_post_balupd, t_post_aeron)
+                if let (
+                    Some(start),
+                    Some(pre_freeze),
+                    Some(post_freeze),
+                    Some(post_bal),
+                    Some(post_aeron),
+                ) = (t0, t_pre_freeze, t_post_freeze, t_post_balupd, t_post_aeron)
                 {
                     let t_done = std::time::Instant::now();
                     use std::sync::atomic::{AtomicU64, Ordering};
@@ -899,12 +949,10 @@ async fn handle_client_message(
                 };
                 match freeze_result {
                     Err(e) => {
-                        let _ = sqlx::query(
-                            "DELETE FROM orders WHERE id=$1",
-                        )
-                        .bind(db_order_id)
-                        .execute(state.db.as_ref())
-                        .await;
+                        let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
+                            .bind(db_order_id)
+                            .execute(state.db.as_ref())
+                            .await;
                         return Some(
                             json!({
                                 "type": "order_rejected",
@@ -946,12 +994,10 @@ async fn handle_client_message(
                 match engine_result {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = sqlx::query(
-                            "DELETE FROM orders WHERE id = $1",
-                        )
-                        .bind(db_order_id)
-                        .execute(state.db.as_ref())
-                        .await;
+                        let _ = sqlx::query("DELETE FROM orders WHERE id = $1")
+                            .bind(db_order_id)
+                            .execute(state.db.as_ref())
+                            .await;
                         if side == "buy" {
                             let p = price.or(best_opposing_price).unwrap_or(0.0);
                             if p > 0.0 {
@@ -1421,12 +1467,10 @@ async fn handle_client_message(
             let remaining = quantity - filled;
 
             // Update DB status.
-            let db_result = sqlx::query(
-                "DELETE FROM orders WHERE id = $1",
-            )
-            .bind(order_id)
-            .execute(state.db.as_ref())
-            .await;
+            let db_result = sqlx::query("DELETE FROM orders WHERE id = $1")
+                .bind(order_id)
+                .execute(state.db.as_ref())
+                .await;
 
             if let Err(e) = db_result {
                 return Some(json!({"type": "error", "message": e.to_string()}).to_string());
@@ -1507,7 +1551,11 @@ async fn handle_client_message(
             };
 
             // Cap batch at 40 orders.
-            let orders = if orders.len() > 40 { &orders[..40] } else { &orders[..] };
+            let orders = if orders.len() > 40 {
+                &orders[..40]
+            } else {
+                &orders[..]
+            };
 
             // ── Aeron fast path: parse all → parallel DB freeze → batch-publish ──────────
             // All DB freezes run concurrently (bids freeze USDT, asks freeze BTC — different
@@ -1515,7 +1563,7 @@ async fn handle_client_message(
             // write so the engine sees the full batch before the next 10ms depth snapshot.
             if state.aeron_cmd_tx.is_some() {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
-                use crate::transport::OrderMeta;
+                use crate::transport::{pack_str16, OrderMeta};
 
                 struct V {
                     idx: usize,
@@ -1531,26 +1579,46 @@ async fn handle_client_message(
                 let mut validated: Vec<V> = Vec::with_capacity(orders.len());
 
                 for (idx, order_val) in orders.iter().enumerate() {
-                    let coid = order_val.get("client_order_id").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                    let coid = order_val
+                        .get("client_order_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_owned();
 
                     macro_rules! rej {
                         ($r:expr) => {{ par_results[idx] = json!({"client_order_id": &coid, "accepted": false, "reason": $r}); continue; }};
                     }
 
                     let symbol = match order_val.get("symbol").and_then(|v| v.as_str()) {
-                        Some(s) => s.to_owned(), None => rej!("Missing symbol"),
+                        Some(s) => s.to_owned(),
+                        None => rej!("Missing symbol"),
                     };
                     let side = match order_val.get("side").and_then(|v| v.as_str()) {
-                        Some(s) => s.to_owned(), None => rej!("Missing side"),
+                        Some(s) => s.to_owned(),
+                        None => rej!("Missing side"),
                     };
-                    let order_type = order_val.get("order_type").and_then(|v| v.as_str()).unwrap_or("limit").to_owned();
-                    let time_in_force: Option<String> = order_val.get("time_in_force").and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase());
+                    let order_type = order_val
+                        .get("order_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("limit")
+                        .to_owned();
+                    let time_in_force: Option<String> = order_val
+                        .get("time_in_force")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_ascii_lowercase());
                     let price: Option<f64> = order_val.get("price").and_then(|v| v.as_f64());
-                    let qty = match order_val.get("qty").or_else(|| order_val.get("quantity")).and_then(|v| v.as_f64()) {
-                        Some(q) => q, None => rej!("Missing qty"),
+                    let qty = match order_val
+                        .get("qty")
+                        .or_else(|| order_val.get("quantity"))
+                        .and_then(|v| v.as_f64())
+                    {
+                        Some(q) => q,
+                        None => rej!("Missing qty"),
                     };
                     let engine_side = match side.as_str() {
-                        "buy" => Side::Buy, "sell" => Side::Sell, _ => rej!("Invalid side"),
+                        "buy" => Side::Buy,
+                        "sell" => Side::Sell,
+                        _ => rej!("Invalid side"),
                     };
                     let tif = match order_type.as_str() {
                         "ioc" => TimeInForce::IOC,
@@ -1575,11 +1643,17 @@ async fn handle_client_message(
                     let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
 
                     let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
-                    let freeze_price_val: f64 = if side == "buy" { price.or(best_opposing_price).unwrap_or(0.0) } else { 0.0 };
+                    let freeze_price_val: f64 = if side == "buy" {
+                        price.or(best_opposing_price).unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
 
                     let (freeze_asset, freeze_amount) = if side == "buy" {
                         let amount = freeze_price_val * qty;
-                        if amount <= 0.0 { rej!("Unable to determine buy reservation price"); }
+                        if amount <= 0.0 {
+                            rej!("Unable to determine buy reservation price");
+                        }
                         (quote_asset.to_owned(), amount)
                     } else {
                         (base_asset.to_owned(), qty)
@@ -1590,37 +1664,68 @@ async fn handle_client_message(
                     let sb = symbol.as_bytes();
                     sym_bytes[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
                     let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
-                    let tif_byte: u8 = match tif { TimeInForce::GTC => 0, TimeInForce::IOC => 1, TimeInForce::FOK => 2, TimeInForce::PostOnly => 3 };
+                    let tif_byte: u8 = match tif {
+                        TimeInForce::GTC => 0,
+                        TimeInForce::IOC => 1,
+                        TimeInForce::FOK => 2,
+                        TimeInForce::PostOnly => 3,
+                    };
 
                     let meta = OrderMeta {
-                        user_id, symbol: symbol.clone(), side: side.clone(),
-                        order_type: order_type.clone(), price, qty,
-                        client_order_id: coid.clone(), freeze_price: freeze_price_val,
+                        user_id,
+                        symbol: sym_bytes,
+                        side: side_byte,
+                        order_type: pack_str16(&order_type),
+                        price,
+                        qty,
+                        client_order_id: coid.clone(),
+                        freeze_price: freeze_price_val,
                     };
                     let sbe_req = SbeNewOrder {
-                        client_order_id: order_id, participant_id: user_id as u64,
-                        price: price.unwrap_or(0.0), quantity: qty,
-                        side: side_byte, time_in_force: tif_byte,
-                        _pad: [0; 14], symbol: sym_bytes,
+                        client_order_id: order_id,
+                        participant_id: user_id as u64,
+                        price: price.unwrap_or(0.0),
+                        quantity: qty,
+                        side: side_byte,
+                        time_in_force: tif_byte,
+                        _pad: [0; 14],
+                        symbol: sym_bytes,
                     };
-                    validated.push(V { idx, coid, order_id, freeze_asset, freeze_amount, sbe_req, meta });
+                    validated.push(V {
+                        idx,
+                        coid,
+                        order_id,
+                        freeze_asset,
+                        freeze_amount,
+                        sbe_req,
+                        meta,
+                    });
                 }
 
                 // Phase 2 + 3: in-memory freeze check + build aeron_batch (no DB on hot path).
-                let mut aeron_batch: smallvec::SmallVec<[SbeNewOrder; 32]> = smallvec::SmallVec::new();
+                let mut aeron_batch: smallvec::SmallVec<[SbeNewOrder; 32]> =
+                    smallvec::SmallVec::new();
                 for v in validated {
-                    if try_freeze_cache(&state.account_cache, user_id, &v.freeze_asset, v.freeze_amount) {
+                    if try_freeze_cache(
+                        &state.account_cache,
+                        user_id,
+                        &v.freeze_asset,
+                        v.freeze_amount,
+                    ) {
                         if let Some(user_assets) = state.account_cache.get(&user_id) {
                             if let Some(&(bal, frz)) = user_assets.get(v.freeze_asset.as_str()) {
                                 if let Some(tx) = state.user_tx.get(user_id) {
-                                    let _ = tx.try_send(json!({
-                                        "type": "balance_update", "asset": &v.freeze_asset,
-                                        "balance": bal, "available": bal - frz, "frozen": frz,
-                                    }).to_string());
+                                    let _ = tx.try_send(
+                                        json!({
+                                            "type": "balance_update", "asset": &v.freeze_asset,
+                                            "balance": bal, "available": bal - frz, "frozen": frz,
+                                        })
+                                        .to_string(),
+                                    );
                                 }
                             }
                         }
-                        state.pending_meta.insert(v.order_id, Box::new(v.meta));
+                        state.pending_meta.insert(v.order_id, v.meta);
                         aeron_batch.push(v.sbe_req);
                         par_results[v.idx] = json!({"client_order_id": v.coid, "order_id": v.order_id, "accepted": true});
                     } else {
@@ -1630,21 +1735,30 @@ async fn handle_client_message(
 
                 if !aeron_batch.is_empty() {
                     if let Some(ref tx) = state.aeron_cmd_tx {
-                        if tx.push(crate::transport::AeronCmd::BatchNewOrder(aeron_batch)).is_err() {
+                        if tx
+                            .push(crate::transport::AeronCmd::BatchNewOrder(aeron_batch))
+                            .is_err()
+                        {
                             // Bounded mpsc full → reject the whole batch.
                             // Better to refuse here than to drop silently
                             // and leave the client expecting acks.
-                            return Some(json!({
-                                "type": "orders_rejected",
-                                "batch_id": batch_id,
-                                "reason": "system busy — aeron command queue full"
-                            }).to_string());
+                            return Some(
+                                json!({
+                                    "type": "orders_rejected",
+                                    "batch_id": batch_id,
+                                    "reason": "system busy — aeron command queue full"
+                                })
+                                .to_string(),
+                            );
                         }
                     }
                 }
 
                 let results: Vec<_> = par_results.into_iter().filter(|v| !v.is_null()).collect();
-                return Some(json!({"type": "orders_placed", "batch_id": batch_id, "results": results}).to_string());
+                return Some(
+                    json!({"type": "orders_placed", "batch_id": batch_id, "results": results})
+                        .to_string(),
+                );
             }
 
             // ── Standalone engine path ─────────────────────────────────────────────────────
@@ -1790,7 +1904,9 @@ async fn handle_client_message(
                 ) {
                     Ok(o) => o,
                     Err(reason) => {
-                        results.push(json!({"client_order_id": coid, "accepted": false, "reason": reason}));
+                        results.push(
+                            json!({"client_order_id": coid, "accepted": false, "reason": reason}),
+                        );
                         continue;
                     }
                 };
@@ -1818,7 +1934,8 @@ async fn handle_client_message(
                 let freeze_result = if side == "buy" {
                     let freeze_amount = freeze_price_val * qty;
                     if freeze_amount > 0.0 {
-                        repo.freeze_for_buy(user_id, quote_asset, freeze_amount).await
+                        repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
+                            .await
                     } else {
                         Ok((0.0, 0.0))
                     }
@@ -1826,15 +1943,17 @@ async fn handle_client_message(
                     repo.freeze_for_sell(user_id, base_asset, qty).await
                 };
 
-                let frozen_asset = if side == "buy" { quote_asset } else { base_asset };
+                let frozen_asset = if side == "buy" {
+                    quote_asset
+                } else {
+                    base_asset
+                };
                 match freeze_result {
                     Err(e) => {
-                        let _ = sqlx::query(
-                            "DELETE FROM orders WHERE id=$1",
-                        )
-                        .bind(db_order_id)
-                        .execute(state.db.as_ref())
-                        .await;
+                        let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
+                            .bind(db_order_id)
+                            .execute(state.db.as_ref())
+                            .await;
                         results.push(json!({"client_order_id": coid, "accepted": false, "reason": e.to_string()}));
                         continue;
                     }
@@ -1867,12 +1986,10 @@ async fn handle_client_message(
                 let result = match engine_result {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = sqlx::query(
-                            "DELETE FROM orders WHERE id = $1",
-                        )
-                        .bind(db_order_id)
-                        .execute(state.db.as_ref())
-                        .await;
+                        let _ = sqlx::query("DELETE FROM orders WHERE id = $1")
+                            .bind(db_order_id)
+                            .execute(state.db.as_ref())
+                            .await;
                         if side == "buy" {
                             let p = price.or(best_opposing_price).unwrap_or(0.0);
                             if p > 0.0 {
@@ -1910,7 +2027,9 @@ async fn handle_client_message(
                     continue;
                 }
 
-                results.push(json!({"client_order_id": coid, "order_id": db_order_id, "accepted": true}));
+                results.push(
+                    json!({"client_order_id": coid, "order_id": db_order_id, "accepted": true}),
+                );
             }
 
             Some(
@@ -2018,12 +2137,11 @@ async fn batch_cancel_by_ids(
 
     // Batch UPDATE all matching orders in one query.
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let _ = sqlx::query(
-        "DELETE FROM orders WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
-    )
-    .bind(&ids[..])
-    .execute(state.db.as_ref())
-    .await;
+    let _ =
+        sqlx::query("DELETE FROM orders WHERE id = ANY($1) AND status IN ('PENDING','TRADING')")
+            .bind(&ids[..])
+            .execute(state.db.as_ref())
+            .await;
 
     let repo = crate::account_repository::AccountRepository::new(state.db.as_ref());
     let ts = unix_now();
@@ -2138,12 +2256,11 @@ async fn bulk_cancel(
 
     // Batch UPDATE all matching orders in one query.
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let _ = sqlx::query(
-        "DELETE FROM orders WHERE id = ANY($1) AND status IN ('PENDING','TRADING')",
-    )
-    .bind(&ids[..])
-    .execute(state.db.as_ref())
-    .await;
+    let _ =
+        sqlx::query("DELETE FROM orders WHERE id = ANY($1) AND status IN ('PENDING','TRADING')")
+            .bind(&ids[..])
+            .execute(state.db.as_ref())
+            .await;
 
     let repo = crate::account_repository::AccountRepository::new(state.db.as_ref());
     let ts = unix_now();

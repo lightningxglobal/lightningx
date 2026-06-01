@@ -1,17 +1,16 @@
-pub mod sbe;
-pub mod order_update;
-pub mod aeron_transport;
 pub mod aeron_channels;
+pub mod aeron_transport;
+pub mod order_update;
 pub mod persist_event;
+pub mod sbe;
 pub mod tracer;
 
 /// Transport层抽象 - Aeron的trait定义 + Mock实现
 ///
 /// 用于屏蔽实际Aeron实现，通过trait定义来实现解耦和测试隔离
-
-pub use self::sbe::{NewOrderRequest, CancelOrderRequest, TradeNotification};
-use crate::market_data::{DepthSnapshotEvent, Depth50SnapshotEvent, Level2SnapshotEvent};
-use std::sync::mpsc::{channel, Sender, Receiver};
+pub use self::sbe::{CancelOrderRequest, NewOrderRequest, TradeNotification};
+use crate::market_data::{Depth50SnapshotEvent, DepthSnapshotEvent, Level2SnapshotEvent};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 // ============================================================================
 // WS fast-path: Aeron command sent from async WS handler to Aeron spin thread
@@ -32,13 +31,28 @@ pub enum AeronCmd {
 /// create the DB row and freeze funds after the engine confirms the order.
 pub struct OrderMeta {
     pub user_id: i64,
-    pub symbol: String,
-    pub side: String,
-    pub order_type: String,
+    pub symbol: [u8; 16],
+    pub side: u8,
+    pub order_type: [u8; 16],
     pub price: Option<f64>,
     pub qty: f64,
     pub client_order_id: String,
     pub freeze_price: f64,
+}
+
+#[inline]
+pub fn pack_str16(value: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let bytes = value.as_bytes();
+    let n = bytes.len().min(16);
+    out[..n].copy_from_slice(&bytes[..n]);
+    out
+}
+
+#[inline]
+pub fn unpack_str16(value: &[u8; 16]) -> Option<&str> {
+    let end = value.iter().position(|&b| b == 0).unwrap_or(16);
+    std::str::from_utf8(&value[..end]).ok()
 }
 
 #[derive(Debug)]
@@ -67,7 +81,7 @@ pub enum MarketDataMsg {
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct OrderUpdateMsg {
-    pub kind: u8,                // ACCEPTED=1, FILLED=2, PARTIAL=3, CANCELLED=4, REJECTED=5
+    pub kind: u8, // ACCEPTED=1, FILLED=2, PARTIAL=3, CANCELLED=4, REJECTED=5
     pub reject_reason: u8,
     pub _pad1: [u8; 6],
     pub order_id: u64,
@@ -105,7 +119,14 @@ impl OrderUpdateMsg {
         }
     }
 
-    pub fn filled(order_id: u64, client_order_id: u64, participant_id: u64, price: f64, qty: f64, ts: u64) -> Self {
+    pub fn filled(
+        order_id: u64,
+        client_order_id: u64,
+        participant_id: u64,
+        price: f64,
+        qty: f64,
+        ts: u64,
+    ) -> Self {
         Self {
             kind: order_update_kind::FILLED,
             reject_reason: 0,
@@ -120,7 +141,15 @@ impl OrderUpdateMsg {
         }
     }
 
-    pub fn partial_fill(order_id: u64, client_order_id: u64, participant_id: u64, price: f64, filled: f64, remaining: f64, ts: u64) -> Self {
+    pub fn partial_fill(
+        order_id: u64,
+        client_order_id: u64,
+        participant_id: u64,
+        price: f64,
+        filled: f64,
+        remaining: f64,
+        ts: u64,
+    ) -> Self {
         Self {
             kind: order_update_kind::PARTIAL_FILL,
             reject_reason: 0,
@@ -135,7 +164,13 @@ impl OrderUpdateMsg {
         }
     }
 
-    pub fn cancelled(order_id: u64, client_order_id: u64, participant_id: u64, cancelled_qty: f64, ts: u64) -> Self {
+    pub fn cancelled(
+        order_id: u64,
+        client_order_id: u64,
+        participant_id: u64,
+        cancelled_qty: f64,
+        ts: u64,
+    ) -> Self {
         Self {
             kind: order_update_kind::CANCELLED,
             reject_reason: 0,
@@ -300,11 +335,15 @@ impl MarketDataPublisher for MockMarketDataPublisher {
     }
 
     fn publish_depth50(&mut self, msg: &Depth50SnapshotEvent) -> Result<(), TransportError> {
-        self.depth50_tx.send(*msg).map_err(|_| TransportError::Closed)
+        self.depth50_tx
+            .send(*msg)
+            .map_err(|_| TransportError::Closed)
     }
 
     fn publish_level2(&mut self, msg: &Level2SnapshotEvent) -> Result<(), TransportError> {
-        self.level2_tx.send(*msg).map_err(|_| TransportError::Closed)
+        self.level2_tx
+            .send(*msg)
+            .map_err(|_| TransportError::Closed)
     }
 
     fn do_work(&mut self) {

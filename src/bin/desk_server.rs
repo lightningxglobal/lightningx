@@ -10,10 +10,6 @@ use lightning_exchange::{
         DeskDepthSubscriber, DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber,
         PersistPublisher,
     },
-    transport::persist_event::{
-        pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload,
-        OrderUpsertPayload, PersistFrame, TradeInsertPayload,
-    },
     api::{router, AccountCache, AppState},
     db,
     order_state::{
@@ -24,7 +20,11 @@ use lightning_exchange::{
         spawn_tracer, DESK_INSTANCE_ID, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV,
         MS_WS_UPDATE_SEND,
     },
-    transport::AeronCmd,
+    transport::persist_event::{
+        pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload,
+        OrderUpsertPayload, PersistFrame, TradeInsertPayload,
+    },
+    transport::{unpack_str16, AeronCmd},
     ws_handler::market_data_broadcaster,
 };
 use std::collections::HashMap;
@@ -124,7 +124,10 @@ enum DbCmd {
     /// Engine-confirmed ACCEPTEDs (batched). Single multi-row INSERT +
     /// grouped UPDATE accounts per (user_id, asset). ~11× faster locally
     /// than per-id sequential INSERT + freeze (examples/bench_upsert_order).
-    BatchUpsertOrder { entries: [OrderInsertEntry; 64], count: u8 },
+    BatchUpsertOrder {
+        entries: [OrderInsertEntry; 64],
+        count: u8,
+    },
     /// UPDATE orders SET status, filled WHERE id  (REST / subsequent update path).
     UpdateStatus { id: i64, status: u8, filled: f64 },
     /// Engine-confirmed cancels (batched). PR5b: spin thread now passes
@@ -214,20 +217,13 @@ fn runtime_user_id(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64) -> i64
 }
 
 /// Lookup full meta (used by cancel/fill release paths in PR5b/d).
-fn runtime_meta(
-    cache: &DashMap<u64, OrderRuntimeMeta>,
-    order_id: u64,
-) -> Option<OrderRuntimeMeta> {
+fn runtime_meta(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64) -> Option<OrderRuntimeMeta> {
     cache.get(&order_id).map(|r| *r)
 }
 
 /// Update the filled accumulator after a partial-fill event so subsequent
 /// cancel-release uses the right remaining quantity.
-fn runtime_bump_filled(
-    cache: &DashMap<u64, OrderRuntimeMeta>,
-    order_id: u64,
-    filled_qty: f64,
-) {
+fn runtime_bump_filled(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64, filled_qty: f64) {
     if let Some(mut meta) = cache.get_mut(&order_id) {
         meta.filled = filled_qty;
     }
@@ -568,7 +564,6 @@ fn process_db_cmd(
             }
         }
 
-
         DbCmd::BatchDeleteOrder { ids, count } => {
             // PR5e: pure publish. PG DELETE is now pg-writer's job.
             let count = count as usize;
@@ -660,9 +655,7 @@ fn process_db_cmd(
                 // PG aggregate previously done per call. Sell fills do
                 // not contribute to entry_price (no avg-cost change on
                 // exit — already accounted for as realized PnL).
-                let mut vw = vwap_cache
-                    .entry((buyer_uid, base.to_string()))
-                    .or_default();
+                let mut vw = vwap_cache.entry((buyer_uid, base.to_string())).or_default();
                 vw.weighted_sum += cost;
                 vw.qty_sum += r.qty;
             }
@@ -675,9 +668,7 @@ fn process_db_cmd(
             let mut updated_accounts: Vec<(i64, String, f64, f64)> =
                 Vec::with_capacity(deltas.len());
             for ((uid, asset), d) in deltas {
-                let mut entry = account_cache
-                    .entry(uid)
-                    .or_insert_with(HashMap::new);
+                let mut entry = account_cache.entry(uid).or_insert_with(HashMap::new);
                 let kv = entry.entry(asset.clone()).or_insert((0.0, 0.0));
                 kv.0 = (kv.0 + d.balance).max(0.0);
                 kv.1 = (kv.1 - d.frozen_release).max(0.0);
@@ -714,7 +705,7 @@ fn process_db_cmd(
                     &persist_pub,
                     &PersistFrame::order_fill_update(OrderFillUpdatePayload {
                         id: r.maker_id,
-                        filled: r.qty,  // delta (rebroadcast each time)
+                        filled: r.qty, // delta (rebroadcast each time)
                         status: DbOrderStatus::Trading.as_u8(),
                         _pad: [0; 7],
                     }),
@@ -789,15 +780,17 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::info!("Migrations applied");
 
     // Ensure the market-maker robot account and its API key exist.
-    let robot_api_key = std::env::var("ROBOT_API_KEY")
-        .unwrap_or_else(|_| "robot_ak_2026_lightningx".to_string());
+    let robot_api_key =
+        std::env::var("ROBOT_API_KEY").unwrap_or_else(|_| "robot_ak_2026_lightningx".to_string());
     match lightning_exchange::desk::user_service::ensure_robot_api_key(
         &pool,
         "robot@lightningx.exchange",
         "robot_secret_2026",
         &robot_api_key,
         "Market Maker Robot",
-    ).await {
+    )
+    .await
+    {
         Ok(uid) => tracing::info!("Robot account ready (user_id={uid}, api_key={robot_api_key})"),
         Err(e) => tracing::warn!("Robot account setup failed: {e}"),
     }
@@ -854,15 +847,7 @@ async fn async_main() -> anyhow::Result<()> {
         // paths can resolve user_id + freeze_price + qty + side without a PG
         // hit. Surviving restart-time orders may briefly have stale `filled`
         // until the next event for them lands.
-        let rows: Vec<(
-            i64,
-            i64,
-            String,
-            String,
-            Option<f64>,
-            f64,
-            f64,
-        )> = sqlx::query_as(
+        let rows: Vec<(i64, i64, String, String, Option<f64>, f64, f64)> = sqlx::query_as(
             "SELECT id, user_id, symbol, side,
                     COALESCE(freeze_price, COALESCE(price, 0.0)) AS freeze_price,
                     quantity, filled
@@ -986,7 +971,10 @@ async fn async_main() -> anyhow::Result<()> {
     // At 400K conns the live tracer drove desk-server recv-spin into a
     // 300×-slower regime (see exchange_engine.rs comment); leaving it off
     // by default and flipping on for diagnosis.
-    let tracer = if std::env::var("TRACER_ENABLED").map(|v| v == "1").unwrap_or(false) {
+    let tracer = if std::env::var("TRACER_ENABLED")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         spawn_tracer(
             &aeron_dir(),
             METRICS_CHANNEL,
@@ -1040,24 +1028,26 @@ async fn async_main() -> anyhow::Result<()> {
     // unreachable at boot, leave it as None — handlers transparently fall
     // back to the existing PG path. We do NOT block startup on Redis.
     let redis_conn: Option<redis::aio::MultiplexedConnection> = {
-        let url = std::env::var("REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
         match redis::Client::open(url.clone()) {
             Ok(client) => match client.get_multiplexed_async_connection().await {
-                Ok(mut c) => {
-                    match redis::cmd("PING").query_async::<String>(&mut c).await {
-                        Ok(_) => {
-                            tracing::info!("Redis L1 reader attached: {url}");
-                            Some(c)
-                        }
-                        Err(e) => {
-                            tracing::warn!("Redis PING failed at {url}: {e} — REST will fall back to PG");
-                            None
-                        }
+                Ok(mut c) => match redis::cmd("PING").query_async::<String>(&mut c).await {
+                    Ok(_) => {
+                        tracing::info!("Redis L1 reader attached: {url}");
+                        Some(c)
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Redis PING failed at {url}: {e} — REST will fall back to PG"
+                        );
+                        None
+                    }
+                },
                 Err(e) => {
-                    tracing::warn!("Redis connect failed at {url}: {e} — REST will fall back to PG");
+                    tracing::warn!(
+                        "Redis connect failed at {url}: {e} — REST will fall back to PG"
+                    );
                     None
                 }
             },
@@ -1159,18 +1149,21 @@ async fn async_main() -> anyhow::Result<()> {
                                     }
                                 }
                                 if let Some(ref t) = spin_tracer {
-                                    t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
+                                    t.record_sym(
+                                        MS_AERON_ORDER_SEND,
+                                        req.client_order_id,
+                                        &req.symbol,
+                                    );
                                 }
                             }
                             AeronCmd::Cancel(req) => {
-                                let symbol_bytes = runtime_meta(&order_meta_cache, req.order_id)
-                                    .map(|m| m.symbol);
+                                let symbol_bytes =
+                                    runtime_meta(&order_meta_cache, req.order_id).map(|m| m.symbol);
                                 let routed = if let Some(sym_bytes) = symbol_bytes {
-                                    let sym_end = sym_bytes
-                                        .iter()
-                                        .position(|&b| b == 0)
-                                        .unwrap_or(16);
-                                    let sym = std::str::from_utf8(&sym_bytes[..sym_end]).unwrap_or("");
+                                    let sym_end =
+                                        sym_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+                                    let sym =
+                                        std::str::from_utf8(&sym_bytes[..sym_end]).unwrap_or("");
                                     if let Some(pub_) = order_pubs.get_mut(sym) {
                                         let _ = pub_.publish_cancel(&req);
                                         true
@@ -1188,13 +1181,12 @@ async fn async_main() -> anyhow::Result<()> {
                             }
                             AeronCmd::BatchCancel(reqs) => {
                                 for req in &reqs {
-                                    let symbol_bytes = runtime_meta(&order_meta_cache, req.order_id)
-                                        .map(|m| m.symbol);
+                                    let symbol_bytes =
+                                        runtime_meta(&order_meta_cache, req.order_id)
+                                            .map(|m| m.symbol);
                                     let routed = if let Some(sym_bytes) = symbol_bytes {
-                                        let sym_end = sym_bytes
-                                            .iter()
-                                            .position(|&b| b == 0)
-                                            .unwrap_or(16);
+                                        let sym_end =
+                                            sym_bytes.iter().position(|&b| b == 0).unwrap_or(16);
                                         let sym = std::str::from_utf8(&sym_bytes[..sym_end])
                                             .unwrap_or("");
                                         if let Some(pub_) = order_pubs.get_mut(sym) {
@@ -1232,7 +1224,11 @@ async fn async_main() -> anyhow::Result<()> {
                                         let _ = pub_.publish_new_order(req);
                                     }
                                     if let Some(ref t) = spin_tracer {
-                                        t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol);
+                                        t.record_sym(
+                                            MS_AERON_ORDER_SEND,
+                                            req.client_order_id,
+                                            &req.symbol,
+                                        );
                                     }
                                 }
                             }
@@ -1424,19 +1420,14 @@ async fn async_main() -> anyhow::Result<()> {
                                 // stored at NewOrder/BatchNewOrder time so cancel
                                 // releases use the right amount. side/symbol/qty
                                 // unchanged.
-                                let mut sym_bytes = [0u8; 16];
-                                let sb = meta_ref.symbol.as_bytes();
-                                let n = sb.len().min(16);
-                                sym_bytes[..n].copy_from_slice(&sb[..n]);
-                                let side_byte: u8 = if meta_ref.side == "buy" { 0 } else { 1 };
                                 remember_runtime_order(
                                     &order_meta_cache,
                                     order_id,
                                     meta_ref.user_id,
                                     meta_ref.freeze_price,
                                     meta_ref.qty,
-                                    side_byte,
-                                    sym_bytes,
+                                    meta_ref.side,
+                                    meta_ref.symbol,
                                 );
                             }
                         }
@@ -1460,9 +1451,9 @@ async fn async_main() -> anyhow::Result<()> {
                                 accepted_batch[accepted_count] = OrderInsertEntry {
                                     id:              order_id as i64,
                                     user_id:         meta.user_id,
-                                    symbol:          db_cmd::str_bytes(&meta.symbol),
-                                    side:            if meta.side == "buy" { 0 } else { 1 },
-                                    order_type:      db_cmd::str_bytes(&meta.order_type),
+                                    symbol:          meta.symbol,
+                                    side:            meta.side,
+                                    order_type:      meta.order_type,
                                     price:           meta.price.unwrap_or(0.0),
                                     qty:             meta.qty,
                                     filled:          0.0,
@@ -1477,9 +1468,9 @@ async fn async_main() -> anyhow::Result<()> {
                                 process_db_cmd(DbCmd::UpsertOrder {
                                     id:              order_id as i64,
                                     user_id:         meta.user_id,
-                                    symbol:          db_cmd::str_bytes(&meta.symbol),
-                                    side:            if meta.side == "buy" { 0 } else { 1 },
-                                    order_type:      db_cmd::str_bytes(&meta.order_type),
+                                    symbol:          meta.symbol,
+                                    side:            meta.side,
+                                    order_type:      meta.order_type,
                                     price:           meta.price.unwrap_or(0.0),
                                     qty:             meta.qty,
                                     filled:          fill_qty,
@@ -1495,16 +1486,15 @@ async fn async_main() -> anyhow::Result<()> {
                             if kind == order_update_kind::REJECTED {
                                 // Freeze was in-memory only (hot path never hit DB).
                                 // Revert the cache and notify; no DB write needed.
-                                let sym_parts: Vec<&str> = meta.symbol.splitn(2, '_').collect();
-                                let base = sym_parts.first().copied().unwrap_or("BTC");
-                                let quote = sym_parts.last().copied().unwrap_or("USDT");
-                                let (asset, rel_amount) = if meta.side == "buy" {
-                                    (quote.to_string(), meta.freeze_price * meta.qty)
+                                let symbol = unpack_str16(&meta.symbol).unwrap_or("BTC_USDT");
+                                let (base, quote) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                                let (asset, rel_amount) = if meta.side == 0 {
+                                    (quote, meta.freeze_price * meta.qty)
                                 } else {
-                                    (base.to_string(), meta.qty)
+                                    (base, meta.qty)
                                 };
                                 let new_vals = account_cache.get_mut(&meta.user_id).and_then(|mut e| {
-                                    let kv = e.get_mut(asset.as_str())?;
+                                    let kv = e.get_mut(asset)?;
                                     kv.1 = (kv.1 - rel_amount).max(0.0);
                                     Some((kv.0, kv.1))
                                 });
@@ -1522,8 +1512,8 @@ async fn async_main() -> anyhow::Result<()> {
                             } else if kind == order_update_kind::CANCELLED {
                                 process_db_cmd(DbCmd::ReleaseReservation {
                                     user_id: meta.user_id,
-                                    symbol: db_cmd::str_bytes(&meta.symbol),
-                                    side: if meta.side == "buy" { 0 } else { 1 },
+                                    symbol: meta.symbol,
+                                    side: meta.side,
                                     qty: meta.qty,
                                     freeze_price: meta.freeze_price,
                                 }, &account_cache, &user_tx, &persist_pub, &vwap_cache);

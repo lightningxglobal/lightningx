@@ -7,7 +7,7 @@ use crate::order_state::{
     db_status_from_engine, db_status_from_update_kind, ws_status_from_engine,
 };
 use crate::tracer::ExchangeTracer;
-use crate::transport::{AeronCmd, OrderMeta, OrderUpdateMsg};
+use crate::transport::{pack_str16, AeronCmd, OrderMeta, OrderUpdateMsg};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
     extract::{Path, Query, State},
@@ -123,7 +123,9 @@ impl UserTxRegistry {
         for _ in 0..USER_TX_CAPACITY {
             v.push(arc_swap::ArcSwapOption::const_empty());
         }
-        Self { slots: v.into_boxed_slice() }
+        Self {
+            slots: v.into_boxed_slice(),
+        }
     }
 
     #[inline]
@@ -194,7 +196,7 @@ pub struct AppState {
     /// the WS handler must reject the client with "system busy".
     pub aeron_cmd_tx: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>>>,
     /// Pending order metadata stored by WS fast path until Aeron event loop handles DB+freeze.
-    pub pending_meta: Arc<DashMap<u64, Box<OrderMeta>>>,
+    pub pending_meta: Arc<DashMap<u64, OrderMeta>>,
     /// Pending REST order responses: order_id → oneshot sender (desk_server mode only).
     pub pending_orders: Arc<DashMap<u64, oneshot::Sender<OrderUpdateMsg>>>,
     /// Last known depth per symbol from Aeron push (desk_server mode only).
@@ -245,7 +247,9 @@ pub fn router(state: AppState) -> Router {
         // Orders
         .route(
             "/api/orders",
-            get(handle_orders).post(handle_place_order).delete(handle_cancel_all_orders),
+            get(handle_orders)
+                .post(handle_place_order)
+                .delete(handle_cancel_all_orders),
         )
         .route(
             "/api/orders/:order_id",
@@ -271,20 +275,16 @@ pub fn router(state: AppState) -> Router {
 /// (which would otherwise produce "Insufficient balance" errors even when
 /// the user has plenty in PG — the hot path doesn't fall back to PG).
 async fn warm_account_cache_for(s: &AppState, user_id: i64) {
-    let rows: Vec<(String, f64, f64)> = sqlx::query_as(
-        "SELECT asset, balance, frozen FROM accounts WHERE user_id=$1",
-    )
-    .bind(user_id)
-    .fetch_all(s.db.as_ref())
-    .await
-    .unwrap_or_default();
+    let rows: Vec<(String, f64, f64)> =
+        sqlx::query_as("SELECT asset, balance, frozen FROM accounts WHERE user_id=$1")
+            .bind(user_id)
+            .fetch_all(s.db.as_ref())
+            .await
+            .unwrap_or_default();
     if rows.is_empty() {
         return;
     }
-    let mut entry = s
-        .account_cache
-        .entry(user_id)
-        .or_insert_with(HashMap::new);
+    let mut entry = s.account_cache.entry(user_id).or_insert_with(HashMap::new);
     for (asset, bal, frz) in rows {
         entry.insert(asset, (bal, frz));
     }
@@ -366,12 +366,7 @@ fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
 /// `amount` (mutates `frozen += amount`), false otherwise (no mutation).
 /// Mirror of the WS-handler helper of the same name; kept local so REST
 /// hot path doesn't reach across modules for it.
-fn try_freeze_cache(
-    cache: &AccountCache,
-    user_id: i64,
-    asset: &str,
-    amount: f64,
-) -> bool {
+fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64) -> bool {
     if amount <= 0.0 {
         return true;
     }
@@ -868,14 +863,9 @@ async fn handle_place_order(
     } else {
         // Aeron mode: read from spin-thread-maintained last_depth.
         let levels_key = if req.side == "buy" { "asks" } else { "bids" };
-        s.last_depth.get(&req.symbol).and_then(|depth| {
-            depth
-                .get(levels_key)?
-                .as_array()?
-                .first()?
-                .get(0)?
-                .as_f64()
-        })
+        s.last_depth
+            .get(&req.symbol)
+            .and_then(|depth| depth.get(levels_key)?.as_array()?.first()?.get(0)?.as_f64())
     };
 
     // Compute the price that actually backs the frozen quote-asset amount.
@@ -1006,12 +996,10 @@ async fn handle_place_order(
         let result = match engine_result {
             Ok(r) => r,
             Err(e) => {
-                let _ = sqlx::query(
-                    "DELETE FROM orders WHERE id=$1",
-                )
-                .bind(db_order_id)
-                .execute(s.db.as_ref())
-                .await;
+                let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
+                    .bind(db_order_id)
+                    .execute(s.db.as_ref())
+                    .await;
                 if req.side == "buy" {
                     let p = req.price.or(best_opposing).unwrap_or(0.0);
                     if p > 0.0 {
@@ -1297,16 +1285,16 @@ async fn handle_place_order(
         // thread is the sole writer to PG for these rows.
         s.pending_meta.insert(
             db_order_id as u64,
-            Box::new(OrderMeta {
+            OrderMeta {
                 user_id,
-                symbol: req.symbol.clone(),
-                side: req.side.clone(),
-                order_type: req.order_type.clone(),
+                symbol: sym_bytes,
+                side: side_byte,
+                order_type: pack_str16(&req.order_type),
                 price: req.price,
                 qty: req.quantity,
                 client_order_id: req.client_order_id.clone().unwrap_or_default(),
                 freeze_price,
-            }),
+            },
         );
 
         let (tx, rx) = oneshot::channel::<OrderUpdateMsg>();
@@ -1314,11 +1302,10 @@ async fn handle_place_order(
 
         if aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
             s.pending_orders.remove(&(db_order_id as u64));
-            let _ =
-                sqlx::query("DELETE FROM orders WHERE id=$1")
-                    .bind(db_order_id)
-                    .execute(s.db.as_ref())
-                    .await;
+            let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
+                .bind(db_order_id)
+                .execute(s.db.as_ref())
+                .await;
             if req.side == "buy" {
                 let p = req.price.or(best_opposing).unwrap_or(0.0);
                 if p > 0.0 {
@@ -1619,7 +1606,11 @@ async fn handle_cancel_all_orders(
                 )
                     .into_response();
             }
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": "Aeron channel closed"}))).into_response();
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "Aeron channel closed"})),
+            )
+                .into_response();
         }
     }
 
@@ -1656,11 +1647,15 @@ async fn handle_cancel_all_orders(
             let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
             if row.side == "buy" {
                 if let Some(fp) = row.price.filter(|&p| p > 0.0) {
-                    if let Ok((bal, frz)) = repo.release_frozen(user_id, quote_asset, fp * remaining).await {
+                    if let Ok((bal, frz)) = repo
+                        .release_frozen(user_id, quote_asset, fp * remaining)
+                        .await
+                    {
                         cache_set(&s.account_cache, user_id, quote_asset, bal, frz);
                     }
                 }
-            } else if let Ok((bal, frz)) = repo.release_frozen(user_id, base_asset, remaining).await {
+            } else if let Ok((bal, frz)) = repo.release_frozen(user_id, base_asset, remaining).await
+            {
                 cache_set(&s.account_cache, user_id, base_asset, bal, frz);
             }
         }
@@ -1707,7 +1702,9 @@ async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let Some(obj) = json.as_object() else { continue };
+            let Some(obj) = json.as_object() else {
+                continue;
+            };
             let mut out = serde_json::Map::with_capacity(obj.len());
             for (k, v) in obj.iter() {
                 if k == "type" {

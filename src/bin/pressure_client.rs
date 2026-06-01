@@ -33,7 +33,6 @@
 
 use anyhow::Context;
 use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
-use futures::FutureExt;
 use http_body_util::Empty;
 use hyper::{
     body::Bytes,
@@ -51,10 +50,16 @@ use tracing::{info, warn};
 // ── Configuration via env ────────────────────────────────────────────────────
 
 fn env_usize(k: &str, default: usize) -> usize {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 fn env_f64(k: &str, default: f64) -> f64 {
-    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 fn env_string(k: &str, default: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| default.to_string())
@@ -145,7 +150,9 @@ struct LatencyHist {
 impl Default for LatencyHist {
     fn default() -> Self {
         Self {
-            buckets: (0..=LATENCY_HIST_MAX_US).map(|_| AtomicU64::new(0)).collect(),
+            buckets: (0..=LATENCY_HIST_MAX_US)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
         }
     }
 }
@@ -287,15 +294,9 @@ async fn ws_connect_plain_from(
             }
             Err(_) => {
                 let addrs = tokio::net::lookup_host(format!("{host}:{port}")).await?;
-                addrs
-                    .filter(|a| a.is_ipv4())
-                    .next()
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "no ipv4 addr resolved",
-                        )
-                    })?
+                addrs.filter(|a| a.is_ipv4()).next().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "no ipv4 addr resolved")
+                })?
             }
         };
         socket.connect(dst).await?
@@ -316,7 +317,11 @@ struct UserToken {
     token: String,
 }
 
-async fn ensure_user(http: &reqwest::Client, base_url: &str, idx: usize) -> anyhow::Result<UserToken> {
+async fn ensure_user(
+    http: &reqwest::Client,
+    base_url: &str,
+    idx: usize,
+) -> anyhow::Result<UserToken> {
     let email = format!("pressure_{idx}@stress.test");
     let password = "pressure-secret-2026";
 
@@ -345,7 +350,11 @@ async fn ensure_user(http: &reqwest::Client, base_url: &str, idx: usize) -> anyh
             .send()
             .await?;
         if !reg.status().is_success() {
-            anyhow::bail!("register failed: {} {}", reg.status(), reg.text().await.unwrap_or_default());
+            anyhow::bail!(
+                "register failed: {} {}",
+                reg.status(),
+                reg.text().await.unwrap_or_default()
+            );
         }
         let body: Value = reg.json().await?;
         token = body["token"]
@@ -388,22 +397,38 @@ fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<User
     let key = EncodingKey::from_secret(JWT_SECRET);
     let header = Header::default();
 
-    info!("setup: loading user→id map from {path}, self-signing tokens for {} users…", cfg.users);
+    info!(
+        "setup: loading user→id map from {path}, self-signing tokens for {} users…",
+        cfg.users
+    );
     let started = Instant::now();
     let raw = std::fs::read_to_string(path)?;
     // Build idx → user_id index for O(1) lookup. CSV is `user_id,idx`.
-    let mut by_idx: std::collections::HashMap<usize, i64> = std::collections::HashMap::with_capacity(raw.lines().count());
+    let mut by_idx: std::collections::HashMap<usize, i64> =
+        std::collections::HashMap::with_capacity(raw.lines().count());
     for line in raw.lines() {
         let mut it = line.split(',');
-        let uid: i64 = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("bad CSV row: {line}"))?;
-        let idx: usize = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("bad CSV row: {line}"))?;
+        let uid: i64 = it
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("bad CSV row: {line}"))?;
+        let idx: usize = it
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("bad CSV row: {line}"))?;
         by_idx.insert(idx, uid);
     }
     let mut users = Vec::with_capacity(cfg.users);
     for i in 0..cfg.users {
-        let user_id = *by_idx.get(&i).ok_or_else(|| anyhow::anyhow!("missing user idx {i} in CSV — pre-create users first"))?;
+        let user_id = *by_idx.get(&i).ok_or_else(|| {
+            anyhow::anyhow!("missing user idx {i} in CSV — pre-create users first")
+        })?;
         let email = format!("pressure_{i}@stress.test");
-        let claims = Claims { sub: user_id, email, exp };
+        let claims = Claims {
+            sub: user_id,
+            email,
+            exp,
+        };
         let token = encode(&header, &claims, &key)?;
         users.push(UserToken { user_id, token });
     }
@@ -474,10 +499,7 @@ async fn driver(
 ) {
     metrics.conn_attempted.fetch_add(1, Ordering::Relaxed);
     let user = &users[conn_idx % users.len()];
-    let ws_url = format!(
-        "{}/ws",
-        cfg.base_url.replacen("http://", "ws://", 1)
-    );
+    let ws_url = format!("{}/ws", cfg.base_url.replacen("http://", "ws://", 1));
     let bind_ip = if cfg.source_ips.is_empty() {
         None
     } else {
@@ -498,7 +520,7 @@ async fn driver(
     metrics.conn_open.fetch_add(1, Ordering::Relaxed);
 
     // Authenticate via WS message — first frame after handshake.
-    let auth_msg = json!({"type":"auth","token": &user.token}).to_string();
+    let auth_msg = format!(r#"{{"type":"auth","token":"{}"}}"#, user.token);
     if ws
         .write_frame(Frame::text(Payload::Owned(auth_msg.into_bytes())))
         .await
@@ -522,16 +544,12 @@ async fn driver(
         // Send place_order.
         counter += 1;
         let coid = format!("p{conn_idx}-{counter}");
-        let place_msg = json!({
-            "type": "place_order",
-            "client_order_id": coid,
-            "symbol": &cfg.symbol,
-            "side": "buy",
-            "order_type": "limit",
-            "price": cfg.price,
-            "qty": cfg.qty,
-        })
-        .to_string();
+        let coid_match = format!(r#""client_order_id":"{}""#, coid);
+        let mut order_id_match: Option<String> = None;
+        let place_msg = format!(
+            r#"{{"type":"place_order","client_order_id":"{}","symbol":"{}","side":"buy","order_type":"limit","price":{},"qty":{}}}"#,
+            coid, cfg.symbol, cfg.price, cfg.qty,
+        );
         let t0 = Instant::now();
         metrics.place_sent.fetch_add(1, Ordering::Relaxed);
         if ws
@@ -553,7 +571,9 @@ async fn driver(
         // leaving an unread order_update in the recv buffer.
         let place_deadline = t0 + wait_after_place;
         let mut placed_ok = false;
-        let dbg = std::env::var("PRESSURE_DEBUG_READS").map(|v| v == "1").unwrap_or(false);
+        let dbg = std::env::var("PRESSURE_DEBUG_READS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let mut frames_read: u32 = 0;
         let mut place_us: u64 = 0;
         loop {
@@ -588,6 +608,7 @@ async fn driver(
                 // the engine `order_update` so place_us reflects e2e RTT.
                 if let Some(id) = extract_order_id(text) {
                     current_order_id = Some(id);
+                    order_id_match = Some(format!(r#""order_id":{},"#, id));
                 }
                 continue;
             }
@@ -599,9 +620,10 @@ async fn driver(
             if text.contains("\"order_update\"") {
                 // Match by client_order_id if present (engine→desk forward
                 // includes it), else fall back to order_id match.
-                let mine = text.contains(&format!("\"client_order_id\":\"{coid}\""))
-                    || current_order_id
-                        .map(|id| text.contains(&format!("\"order_id\":{id},")))
+                let mine = text.contains(&coid_match)
+                    || order_id_match
+                        .as_ref()
+                        .map(|needle| text.contains(needle))
                         .unwrap_or(false);
                 if !mine {
                     // Stale order_update from a prior cycle, or somehow not
@@ -668,7 +690,7 @@ async fn driver(
 
         // Cancel.
         if let Some(id) = current_order_id.take() {
-            let cancel_msg = json!({"type":"cancel_order","order_id": id}).to_string();
+            let cancel_msg = format!(r#"{{"type":"cancel_order","order_id":{}}}"#, id);
             let t1 = Instant::now();
             metrics.cancel_sent.fetch_add(1, Ordering::Relaxed);
             if ws
@@ -696,7 +718,8 @@ async fn driver(
                 if now >= cancel_deadline {
                     break;
                 }
-                let frame = match tokio::time::timeout(cancel_deadline - now, ws.read_frame()).await {
+                let frame = match tokio::time::timeout(cancel_deadline - now, ws.read_frame()).await
+                {
                     Ok(Ok(f)) => f,
                     Ok(Err(_)) => {
                         metrics.conn_open.fetch_sub(1, Ordering::Relaxed);
@@ -791,8 +814,18 @@ async fn reporter(metrics: Arc<Metrics>, deadline: Instant) {
     let mut last = Instant::now();
     println!(
         "{:>5} {:>7} {:>7} {:>7} {:>9} {:>8} {:>9} {:>8} {:>10} {:>10} {:>10} {:>10}",
-        "t", "conns", "open", "failed", "place/s", "p_ok%", "cancel/s", "c_ok%",
-        "p_avg_us", "p_max_us", "c_avg_us", "c_max_us"
+        "t",
+        "conns",
+        "open",
+        "failed",
+        "place/s",
+        "p_ok%",
+        "cancel/s",
+        "c_ok%",
+        "p_avg_us",
+        "p_max_us",
+        "c_avg_us",
+        "c_max_us"
     );
     let start = Instant::now();
     loop {
@@ -811,8 +844,16 @@ async fn reporter(metrics: Arc<Metrics>, deadline: Instant) {
 
         let psent_rate = (dpsent as f64 / dt) as u64;
         let csent_rate = (dcsent as f64 / dt) as u64;
-        let pok_pct = if dpsent > 0 { 100.0 * dpok as f64 / dpsent as f64 } else { 0.0 };
-        let cok_pct = if dcsent > 0 { 100.0 * dcok as f64 / dcsent as f64 } else { 0.0 };
+        let pok_pct = if dpsent > 0 {
+            100.0 * dpok as f64 / dpsent as f64
+        } else {
+            0.0
+        };
+        let cok_pct = if dcsent > 0 {
+            100.0 * dcok as f64 / dcsent as f64
+        } else {
+            0.0
+        };
         let pavg = if dpsent > 0 { dpls / dpsent.max(1) } else { 0 };
         let cavg = if dcsent > 0 { dcls / dcsent.max(1) } else { 0 };
 
@@ -845,7 +886,11 @@ fn worker_threads() -> usize {
     std::env::var("PRESSURE_WORKERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+        })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -924,10 +969,7 @@ async fn async_main() -> anyhow::Result<()> {
     let elapsed = test_started.elapsed().as_secs_f64();
     println!();
     println!("─── final summary ─────────────────────────────────────────");
-    println!(
-        "  duration:            {:.1}s",
-        elapsed
-    );
+    println!("  duration:            {:.1}s", elapsed);
     println!(
         "  conn attempted/open/failed/closed:  {} / {} / {} / {}",
         cur.conn_attempted, cur.conn_open, cur.conn_failed, cur.conn_closed
@@ -950,8 +992,16 @@ async fn async_main() -> anyhow::Result<()> {
         "  cancel sent/ok/fail/ok%:            {} / {} / {} / {:.1}%",
         cur.cancel_sent, cur.cancel_ok, cur.cancel_fail, cancel_pct
     );
-    let p_avg_us = if cur.place_sent > 0 { cur.place_lat_sum_us / cur.place_sent } else { 0 };
-    let c_avg_us = if cur.cancel_sent > 0 { cur.cancel_lat_sum_us / cur.cancel_sent } else { 0 };
+    let p_avg_us = if cur.place_sent > 0 {
+        cur.place_lat_sum_us / cur.place_sent
+    } else {
+        0
+    };
+    let c_avg_us = if cur.cancel_sent > 0 {
+        cur.cancel_lat_sum_us / cur.cancel_sent
+    } else {
+        0
+    };
     println!(
         "  place  latency avg/max (µs):        {} / {}",
         p_avg_us, cur.place_lat_max_us
@@ -971,6 +1021,9 @@ async fn async_main() -> anyhow::Result<()> {
         metrics.cancel_latency_hist.percentile(0.95),
     );
     let total_ops_per_s = (cur.place_sent + cur.cancel_sent) as f64 / elapsed;
-    println!("  total ops/s:                        {:.0}", total_ops_per_s);
+    println!(
+        "  total ops/s:                        {:.0}",
+        total_ops_per_s
+    );
     Ok(())
 }

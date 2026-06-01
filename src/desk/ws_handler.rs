@@ -630,14 +630,15 @@ async fn handle_client_message(
                     }),
                 );
 
-                if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
+                if aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
+                    // ArrayQueue full — apply backpressure to the client.
                     state.pending_meta.remove(&order_id);
                     release_cache_frozen(&state.account_cache, user_id, freeze_asset, freeze_amount);
                     return Some(
                         json!({
                             "type": "order_rejected",
                             "client_order_id": client_order_id,
-                            "reason": "Aeron channel closed"
+                            "reason": "system busy"
                         })
                         .to_string(),
                     );
@@ -1256,11 +1257,11 @@ async fn handle_client_message(
                         participant_id: user_id as u64,
                     };
                     if aeron_cmd_tx
-                        .send(crate::transport::AeronCmd::Cancel(cancel_req))
+                        .push(crate::transport::AeronCmd::Cancel(cancel_req))
                         .is_err()
                     {
                         return Some(
-                            json!({"type": "error", "message": "Aeron channel closed"}).to_string(),
+                            json!({"type": "error", "message": "system busy"}).to_string(),
                         );
                     }
                     return Some(
@@ -1330,7 +1331,7 @@ async fn handle_client_message(
                     order_id: order_id as u64,
                     participant_id: user_id as u64,
                 };
-                let _ = aeron_cmd_tx.send(crate::transport::AeronCmd::Cancel(cancel_req));
+                let _ = aeron_cmd_tx.push(crate::transport::AeronCmd::Cancel(cancel_req));
             }
 
             // Release frozen funds for the unfilled portion.
@@ -1515,7 +1516,16 @@ async fn handle_client_message(
 
                 if !aeron_batch.is_empty() {
                     if let Some(ref tx) = state.aeron_cmd_tx {
-                        let _ = tx.send(crate::transport::AeronCmd::BatchNewOrder(aeron_batch));
+                        if tx.push(crate::transport::AeronCmd::BatchNewOrder(aeron_batch)).is_err() {
+                            // Bounded mpsc full → reject the whole batch.
+                            // Better to refuse here than to drop silently
+                            // and leave the client expecting acks.
+                            return Some(json!({
+                                "type": "orders_rejected",
+                                "batch_id": batch_id,
+                                "reason": "system busy — aeron command queue full"
+                            }).to_string());
+                        }
                     }
                 }
 
@@ -1844,7 +1854,7 @@ async fn batch_cancel_by_ids(
                 })
                 .collect();
             return if aeron_cmd_tx
-                .send(crate::transport::AeronCmd::BatchCancel(reqs))
+                .push(crate::transport::AeronCmd::BatchCancel(reqs))
                 .is_ok()
             {
                 order_ids.len()
@@ -1991,7 +2001,7 @@ async fn bulk_cancel(
                 });
             }
             return if aeron_cmd_tx
-                .send(crate::transport::AeronCmd::BatchCancel(reqs))
+                .push(crate::transport::AeronCmd::BatchCancel(reqs))
                 .is_ok()
             {
                 rows.len()

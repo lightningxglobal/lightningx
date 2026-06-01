@@ -188,8 +188,14 @@ pub struct AppState {
     pub user_tx: Arc<UserTxRegistry>,
     /// Monotonically increasing order ID counter (desk_server Aeron mode uses this directly).
     pub next_order_id: Arc<AtomicU64>,
-    /// Lock-free command channel to the Aeron spin thread (desk_server mode only).
-    pub aeron_cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<AeronCmd>>,
+    /// Bounded lock-free MPMC ring for WS handler → aeron-send spin.
+    /// `crossbeam::queue::ArrayQueue` because the workload is N async
+    /// producers (tokio worker threads) into 1 sync consumer (send-spin);
+    /// rtrb is SPSC-only so doesn't fit, and tokio mpsc adds ~25–40 ns
+    /// per push vs crossbeam's 5–10 ns. Bounded so a runaway pressure
+    /// stream cannot OOM the process — when push returns Err(value),
+    /// the WS handler must reject the client with "system busy".
+    pub aeron_cmd_tx: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>>>,
     /// Pending order metadata stored by WS fast path until Aeron event loop handles DB+freeze.
     pub pending_meta: Arc<DashMap<u64, Box<OrderMeta>>>,
     /// Pending REST order responses: order_id → oneshot sender (desk_server mode only).
@@ -1309,7 +1315,7 @@ async fn handle_place_order(
         let (tx, rx) = oneshot::channel::<OrderUpdateMsg>();
         s.pending_orders.insert(db_order_id as u64, tx);
 
-        if aeron_cmd_tx.send(AeronCmd::NewOrder(sbe_req)).is_err() {
+        if aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
             s.pending_orders.remove(&(db_order_id as u64));
             let _ =
                 sqlx::query("DELETE FROM orders WHERE id=$1")
@@ -1432,7 +1438,7 @@ async fn handle_cancel_order(
                 order_id: order_id as u64,
                 participant_id: user_id as u64,
             };
-            if aeron_cmd_tx.send(AeronCmd::Cancel(cancel_req)).is_err() {
+            if aeron_cmd_tx.push(AeronCmd::Cancel(cancel_req)).is_err() {
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(json!({"error": "Aeron channel closed"})),
@@ -1492,7 +1498,7 @@ async fn handle_cancel_order(
             order_id: order_id as u64,
             participant_id: user_id as u64,
         };
-        let _ = aeron_cmd_tx.send(AeronCmd::Cancel(cancel_req));
+        let _ = aeron_cmd_tx.push(AeronCmd::Cancel(cancel_req));
     }
 
     // Release frozen funds for the unfilled portion.
@@ -1609,7 +1615,7 @@ async fn handle_cancel_all_orders(
                 })
                 .collect();
             let count = reqs.len();
-            if aeron_cmd_tx.send(AeronCmd::BatchCancel(reqs)).is_ok() {
+            if aeron_cmd_tx.push(AeronCmd::BatchCancel(reqs)).is_ok() {
                 return (
                     StatusCode::ACCEPTED,
                     Json(json!({"cancel_submitted": count})),

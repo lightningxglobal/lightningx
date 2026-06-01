@@ -965,7 +965,19 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // ── Command channel: async WS handlers → Aeron spin thread ───────────────
-    let (aeron_cmd_tx, mut aeron_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<AeronCmd>();
+    // Lock-free MPMC bounded ring. 10 K capacity ≈ 50 ms at 200 K cmd/s
+    // steady-state — absorbs MM's 40-msg cancel-replace bursts but kicks
+    // back pressure to WS handlers as `Err(value)` when a runaway test
+    // floods us, instead of cascading into the matching engine.
+    // Override via AERON_CMD_CAP env.
+    let aeron_cmd_cap: usize = std::env::var("AERON_CMD_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_240);
+    let aeron_cmd_ring: std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>> =
+        std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(aeron_cmd_cap));
+    let aeron_cmd_tx = aeron_cmd_ring.clone();
+    let aeron_cmd_rx = aeron_cmd_ring;
     // Clone for DB worker so it can cancel orders when fund freeze fails post-ACCEPTED.
     let db_worker_aeron_tx = aeron_cmd_tx.clone();
 
@@ -1052,7 +1064,7 @@ async fn async_main() -> anyhow::Result<()> {
     // format, user_tx.try_send) used to block command dispatch by 1+ tight-loop
     // iterations whenever the engine spammed updates.
     {
-        let mut aeron_cmd_rx = aeron_cmd_rx;
+        let aeron_cmd_rx = aeron_cmd_rx;
         let mut order_pubs = order_pubs;
         let order_meta_cache = open_order_meta.clone();
         let pending_meta = state.pending_meta.clone();
@@ -1064,7 +1076,7 @@ async fn async_main() -> anyhow::Result<()> {
                 let mut idle_us: u64 = 0;
                 loop {
                     let mut did_work = false;
-                    while let Ok(cmd) = aeron_cmd_rx.try_recv() {
+                    while let Some(cmd) = aeron_cmd_rx.pop() {
                         did_work = true;
                         match cmd {
                             AeronCmd::NewOrder(req) => {

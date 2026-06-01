@@ -1456,6 +1456,7 @@ dependencies = [
  "bcrypt",
  "chrono",
  "criterion",
+ "crossbeam-queue",
  "dashmap",
  "fastwebsockets",
  "futures",

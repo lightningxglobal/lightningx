@@ -163,14 +163,11 @@ impl Default for UserTxRegistry {
     }
 }
 
-/// Shared handle to the PersistEvent publisher (Aeron). Wrapped in a
-/// parking_lot Mutex because aeron-wrapper's Publisher is not Send+Sync.
-/// REST POST /api/orders uses this to publish OrderUpsert+AccountSet so
-/// Redis L1 stays in sync without waiting for the DB worker batch path
-/// (which previously caused ~12 orders of REST→Redis drift). `None` in
-/// standalone mode (no Aeron).
+/// Shared queue for PersistEvent frames. A dedicated sync thread owns the
+/// Aeron publisher so REST/WS hot paths never spin on Aeron backpressure.
+/// `None` in standalone mode (no Aeron).
 pub type PersistPubHandle =
-    std::sync::Arc<parking_lot::Mutex<crate::transport::aeron_transport::PersistPublisher>>;
+    std::sync::Arc<crossbeam_queue::ArrayQueue<crate::transport::persist_event::PersistFrame>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -491,7 +488,7 @@ fn publish_rest_order_upsert(
         client_order_id: pack_str(coid_str),
         created_at_ms: db_order.created_at.timestamp_millis(),
     };
-    let _ = pp.lock().publish(&PersistFrame::order_upsert(upsert));
+    let _ = pp.push(PersistFrame::order_upsert(upsert));
 
     // AccountSet: only the side that was frozen. Read balance/frozen from
     // the in-memory cache which the freeze step already updated with the
@@ -513,7 +510,7 @@ fn publish_rest_order_upsert(
             balance,
             frozen,
         };
-        let _ = pp.lock().publish(&PersistFrame::account_set(acc));
+        let _ = pp.push(PersistFrame::account_set(acc));
     }
 }
 

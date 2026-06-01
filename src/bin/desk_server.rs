@@ -298,13 +298,20 @@ mod tests {
 }
 
 // ── process_db_cmd: now sync, called directly from the recv-spin thread ──────
-/// Lock-and-publish helper for PersistFrames. Lock is held for the duration
-/// of a single Aeron `publish` (~µs).
+/// Enqueue PersistFrames for the dedicated persist-send thread. Never spin on
+/// Aeron from recv-spin; dropping here preserves accepted-update latency under
+/// persistence overload, and Redis/PG can be reconciled from later snapshots.
 fn publish_frame(
-    pp: &std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
+    tx: &std::sync::Arc<crossbeam_queue::ArrayQueue<PersistFrame>>,
     frame: &PersistFrame,
 ) {
-    let _ = pp.lock().publish(frame);
+    static PERSIST_DROPPED: AtomicU64 = AtomicU64::new(0);
+    if tx.push(*frame).is_err() {
+        let n = PERSIST_DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 100_000 == 0 {
+            tracing::warn!("persist queue full — dropped {n} frames");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -317,7 +324,7 @@ fn process_db_cmd(
     cmd: DbCmd,
     account_cache: &lightning_exchange::api::AccountCache,
     user_tx: &lightning_exchange::api::UserTxRegistry,
-    persist_pub: &std::sync::Arc<parking_lot::Mutex<PersistPublisher>>,
+    persist_pub: &std::sync::Arc<crossbeam_queue::ArrayQueue<PersistFrame>>,
     vwap_cache: &lightning_exchange::api::VwapCache,
 ) {
     match cmd {
@@ -897,10 +904,32 @@ async fn async_main() -> anyhow::Result<()> {
     // PR2 dual-write: every DB-worker mutation also publishes the
     // corresponding PersistEvent to the persist Aeron stream, so the
     // (independent) redis-writer consumer keeps Redis L1 in sync.
-    let persist_pub = Arc::new(parking_lot::Mutex::new(
-        PersistPublisher::new(client.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
-            .map_err(|e| anyhow::anyhow!("PersistPublisher: {}", e))?,
-    ));
+    let persist_queue_cap: usize = std::env::var("PERSIST_QUEUE_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
+    let persist_pub: Arc<crossbeam_queue::ArrayQueue<PersistFrame>> =
+        Arc::new(crossbeam_queue::ArrayQueue::new(persist_queue_cap));
+    {
+        let persist_rx = persist_pub.clone();
+        let mut persist_publisher =
+            PersistPublisher::new(client.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
+                .map_err(|e| anyhow::anyhow!("PersistPublisher: {}", e))?;
+        std::thread::Builder::new()
+            .name("persist-send".to_string())
+            .spawn(move || {
+                loop {
+                    let mut did_work = false;
+                    while let Some(frame) = persist_rx.pop() {
+                        did_work = true;
+                        let _ = persist_publisher.publish(&frame);
+                    }
+                    if !did_work {
+                        std::hint::spin_loop();
+                    }
+                }
+            })?;
+    }
 
     // Per-symbol order publishers: each symbol routes to its own Aeron stream so the
     // matching threads never share a stream and there is zero HOL blocking between symbols.

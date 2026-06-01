@@ -122,6 +122,17 @@ fn spawn_symbol_thread(
                 let mut batch_count: u32 = 0;
                 while let Some(msg) = subscriber.poll() {
                     batch_count += 1;
+                    // Refresh Aeron client heartbeat every 256 msgs so a
+                    // big burst (e.g. MM cancel-replace × 40 quotes × N
+                    // re-quotes) can't keep the matching thread inside
+                    // this loop for >10 s — which kills the AeronClient
+                    // conductor (we measured 245 K-msg batches → 18 s
+                    // process time → "service interval exceeded").
+                    // do_work() is a cheap pointer + counter update on
+                    // the conductor heartbeat; ~50 ns when nothing to do.
+                    if batch_count & 0xff == 0 {
+                        client.do_work();
+                    }
                     match msg {
                         InboundMsg::NewOrder(req) => {
                             let req_symbol = symbol_from_bytes(&req.symbol);

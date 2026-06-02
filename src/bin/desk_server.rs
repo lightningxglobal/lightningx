@@ -18,7 +18,7 @@ use lightning_exchange::{
     },
     tracer::{
         spawn_tracer, DESK_INSTANCE_ID, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV,
-        MS_WS_UPDATE_SEND,
+        MS_CMD_RING_POPPED, MS_USER_TX_SENT, MS_WS_UPDATE_SEND,
     },
     transport::persist_event::{
         pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload,
@@ -1203,11 +1203,26 @@ async fn async_main() -> anyhow::Result<()> {
     let db_worker_aeron_tx = aeron_cmd_tx.clone();
 
     // ── Sync next_order_id from DB so WS atomic IDs don't collide ─────────────
+    // Each desk-server has its own AtomicU64 counter — without DESK_ID
+    // offsetting, two desks both starting from MAX(id)+1 hand out the
+    // same order_ids and engine rejects half with DuplicateOrderId.
+    // DESK_ID is a small integer (0,1,2,…); each desk reserves a 1B-id
+    // slab starting at base + DESK_ID*1e9. 1B IDs per desk is enough
+    // for ~32 years at 1k orders/s sustained, and 32 desks × 1B is
+    // well within u64.
     let max_db_id: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM orders")
         .fetch_one(&pool)
         .await
         .unwrap_or(0);
-    let initial_id = (max_db_id as u64) + 1;
+    let desk_id: u64 = std::env::var("DESK_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let initial_id = (max_db_id as u64) + 1 + desk_id * 1_000_000_000;
+    tracing::info!(
+        "next_order_id initial: max_db_id={} desk_id={} initial_id={}",
+        max_db_id, desk_id, initial_id,
+    );
 
     // ── Shared state ──────────────────────────────────────────────────────────
     let market_fanout = std::sync::Arc::new(lightning_exchange::api::MarketFanout::new());
@@ -1316,6 +1331,13 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                         match cmd {
                             AeronCmd::NewOrder(req) => {
+                                if let Some(ref t) = spin_tracer {
+                                    t.record_sym(
+                                        MS_CMD_RING_POPPED,
+                                        req.client_order_id,
+                                        &req.symbol,
+                                    );
+                                }
                                 let sym = std::str::from_utf8(&req.symbol)
                                     .unwrap_or("")
                                     .trim_end_matches('\0');
@@ -1463,7 +1485,163 @@ async fn async_main() -> anyhow::Result<()> {
             })?;
     }
 
-    // ── Aeron RECV spin: subscribers + event processing ──────────────────────
+    // ── Aeron RECV "public" thread: trade + depth (broadcast market data) ────
+    // Public market data (trade tape + depth snapshots) is independent of
+    // private order updates. OKX/Binance split these onto separate WS
+    // endpoints precisely because public data tolerates ms-scale latency
+    // while private order acks need <1ms. Running them on the SAME thread
+    // means processing a 256-msg depth burst stalls OrderUpdate routing
+    // and pumps Aeron-outbound transit from <100µs to ~300µs.
+    {
+        let market_fanout = state.market_fanout.clone();
+        let account_cache_pub = account_cache.clone();
+        let user_tx_pub = state.user_tx.clone();
+        let last_depth = state.last_depth.clone();
+        let last_trade_price = state.last_trade_price.clone();
+        let last_ticker = state.last_ticker.clone();
+        let persist_pub_pub = persist_pub.clone();
+        let vwap_cache_pub = vwap_cache.clone();
+        let rt_pub = tokio::runtime::Handle::current();
+        let order_meta_cache_pub = open_order_meta.clone();
+        std::thread::Builder::new()
+            .name("aeron-recv-public".to_string())
+            .spawn(move || {
+                let mut live_market_data = LiveMarketData::default();
+                let mut settle_batch: [SettleTradeEntry; 64] = [SettleTradeEntry {
+                    taker_id: 0, maker_id: 0, taker_uid: 0, maker_uid: 0,
+                    price: 0.0, qty: 0.0, side: 0, symbol: [0; 16],
+                }; 64];
+                let mut settle_count: usize = 0;
+                let mut idle_us: u64 = 0;
+                loop {
+                    let mut did_work = false;
+                    trade_sub.do_work();
+                    depth_sub.do_work();
+
+                    while let Some(trade) = trade_sub.poll() {
+                        did_work = true;
+                        let price: f64 = trade.price;
+                        let qty: f64 = trade.quantity;
+                        let side: u8 = trade.side;
+                        let taker_id = trade.taker_order_id as i64;
+                        let maker_id = trade.maker_order_id as i64;
+                        let taker_uid =
+                            runtime_user_id(&order_meta_cache_pub, taker_id as u64);
+                        let maker_uid =
+                            runtime_user_id(&order_meta_cache_pub, maker_id as u64);
+                        let mut sym = [0u8; 16];
+                        sym.copy_from_slice(&trade.symbol[..16]);
+                        let sym_end = sym.iter().position(|&b| b == 0).unwrap_or(16);
+                        let symbol_str =
+                            std::str::from_utf8(&sym[..sym_end]).unwrap_or("BTC_USDT");
+                        let side_str = if side == 0 { "buy" } else { "sell" };
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as u64)
+                            .unwrap_or(0);
+                        let msg = format!(
+                            r#"{{"type":"trade","symbol":"{}","price":{},"qty":{},"side":"{}","ts":{}}}"#,
+                            symbol_str, price, qty, side_str, ts,
+                        );
+                        market_fanout.send_owned(msg);
+                        last_trade_price.insert(symbol_str.to_string(), price);
+                        if market_fanout.subscriber_count() != 0 {
+                            let market_msgs =
+                                live_market_data.ingest(symbol_str, ts, price, qty);
+                            last_ticker.insert(symbol_str.to_string(), market_msgs[0].clone());
+                            for msg in market_msgs {
+                                market_fanout.send_owned(msg);
+                            }
+                        }
+                        if settle_count >= 64 {
+                            process_db_cmd(
+                                DbCmd::BatchSettleTrade {
+                                    entries: settle_batch,
+                                    count: settle_count as u8,
+                                },
+                                &account_cache_pub,
+                                &user_tx_pub,
+                                &persist_pub_pub,
+                                &vwap_cache_pub,
+                            );
+                            settle_count = 0;
+                        }
+                        settle_batch[settle_count] = SettleTradeEntry {
+                            taker_id, maker_id, taker_uid, maker_uid,
+                            price, qty, side, symbol: sym,
+                        };
+                        settle_count += 1;
+                    }
+                    if settle_count > 0 {
+                        process_db_cmd(
+                            DbCmd::BatchSettleTrade {
+                                entries: settle_batch,
+                                count: settle_count as u8,
+                            },
+                            &account_cache_pub,
+                            &user_tx_pub,
+                            &persist_pub_pub,
+                            &vwap_cache_pub,
+                        );
+                        settle_count = 0;
+                    }
+
+                    while let Some(depth_msg) = depth_sub.poll() {
+                        did_work = true;
+                        use lightning_exchange::aeron_transport::DeskDepthMsg;
+                        match depth_msg {
+                            DeskDepthMsg::Depth(evt) => {
+                                let nb = evt.num_bids as usize;
+                                let na = evt.num_asks as usize;
+                                let mut bids_raw = [(0.0f64, 0.0f64); 20];
+                                let mut asks_raw = [(0.0f64, 0.0f64); 20];
+                                bids_raw[..nb].copy_from_slice(&evt.bids[..nb]);
+                                asks_raw[..na].copy_from_slice(&evt.asks[..na]);
+                                let end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                                let symbol = std::str::from_utf8(&evt.symbol[..end])
+                                    .unwrap_or("BTC_USDT").to_string();
+                                let symbol = if symbol.is_empty() {
+                                    "BTC_USDT".to_string()
+                                } else { symbol };
+                                if nb == 0 || na == 0 { continue; }
+                                let mf2 = market_fanout.clone();
+                                let last_depth2 = last_depth.clone();
+                                rt_pub.spawn(async move {
+                                    let bids: Vec<[f64; 2]> = bids_raw[..nb]
+                                        .iter().filter(|(_, q)| *q > 0.0)
+                                        .map(|&(p, q)| [p, q]).collect();
+                                    let asks: Vec<[f64; 2]> = asks_raw[..na]
+                                        .iter().filter(|(_, q)| *q > 0.0)
+                                        .map(|&(p, q)| [p, q]).collect();
+                                    let ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_micros() as u64).unwrap_or(0);
+                                    let depth_json = serde_json::json!({
+                                        "type": "depth", "symbol": symbol,
+                                        "bids": bids, "asks": asks, "ts": ts,
+                                    });
+                                    last_depth2.insert(symbol, depth_json.clone());
+                                    mf2.send_owned(depth_json.to_string());
+                                });
+                            }
+                            DeskDepthMsg::Depth50(_) | DeskDepthMsg::Level2(_) => {}
+                        }
+                    }
+
+                    if !did_work {
+                        // Public data is ms-scale tolerant — sleep when idle
+                        // instead of spinning a core. Wakeup latency 50-200µs
+                        // is fine for trade/depth fan-out.
+                        idle_us = (idle_us * 2 + 10).min(500);
+                        std::thread::sleep(std::time::Duration::from_micros(idle_us));
+                    } else {
+                        idle_us = 0;
+                    }
+                }
+            })?;
+    }
+
+    // ── Aeron RECV "private" spin: OrderUpdate only (latency-critical) ───────
     {
         let market_fanout = state.market_fanout.clone();
         let pending_orders = state.pending_orders.clone();
@@ -1504,16 +1682,6 @@ async fn async_main() -> anyhow::Result<()> {
                 }; 64];
                 let mut accepted_count: usize = 0;
 
-                // And SettleTrade — flushed as one DbCmd::BatchSettleTrade.
-                // Multi-row INSERT + UPDATE orders FROM (VALUES) + grouped
-                // UPDATE accounts in a single txn (~5× at N=5, see
-                // examples/bench_settle_trade).
-                let mut settle_batch: [SettleTradeEntry; 64] = [SettleTradeEntry {
-                    taker_id: 0, maker_id: 0, taker_uid: 0, maker_uid: 0,
-                    price: 0.0, qty: 0.0, side: 0, symbol: [0; 16],
-                }; 64];
-                let mut settle_count: usize = 0;
-
                 // FILLED / REJECTED rows deleted in one DELETE…ANY per burst
                 // (~9× faster locally; see examples/bench_delete_order).
                 let mut delete_batch: [i64; 64] = [0; 64];
@@ -1523,85 +1691,12 @@ async fn async_main() -> anyhow::Result<()> {
                 // of CPU per test inside the recv-spin critical section.
                 let lost_order_updates = AtomicU64::new(0);
                 let full_channels = AtomicU64::new(0);
-                let mut live_market_data = LiveMarketData::default();
                 loop {
                     let mut did_work = false;
 
                     order_update_sub.do_work();
-                    trade_sub.do_work();
-                    depth_sub.do_work();
-
-                    // Process trade notifications before terminal order updates remove
-                    // runtime metadata. Engine publishes trades before the corresponding
-                    // update, and this keeps settlement off the DB lookup path.
-                    while let Some(trade) = trade_sub.poll() {
-                        did_work = true;
-                        let price: f64 = trade.price;
-                        let qty: f64 = trade.quantity;
-                        let side: u8 = trade.side;
-                        let taker_id = trade.taker_order_id as i64;
-                        let maker_id = trade.maker_order_id as i64;
-
-                        let taker_uid = runtime_user_id(&order_meta_cache, taker_id as u64);
-                        let maker_uid = runtime_user_id(&order_meta_cache, maker_id as u64);
-
-                        let mut sym = [0u8; 16];
-                        sym.copy_from_slice(&trade.symbol[..16]);
-
-                        // Broadcast trade WS event + bump last_trade_price right
-                        // here on the spin thread, BEFORE handing settlement off
-                        // to the DB worker. Previously this lived inside
-                        // BatchSettleTrade in the DB worker — which meant trade
-                        // WS latency = spin → rtrb → tokio scheduling → DB worker
-                        // dispatch (~ms scale). Direct broadcast::Sender::send
-                        // is lock-free and doesn't need a tokio runtime, so we
-                        // can fan out from the spin thread with a few µs of
-                        // overhead. PG/Redis writes still run async in the
-                        // DB worker via the settle_batch below.
-                        {
-                            let sym_end = sym.iter().position(|&b| b == 0).unwrap_or(16);
-                            let symbol_str = std::str::from_utf8(&sym[..sym_end])
-                                .unwrap_or("BTC_USDT");
-                            let side_str = if side == 0 { "buy" } else { "sell" };
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_micros() as u64)
-                                .unwrap_or(0);
-                            // Hand-written JSON; serde_json::json! macro costs
-                            // ~600ns per call vs format!'s ~150ns for this shape.
-                            let msg = format!(
-                                r#"{{"type":"trade","symbol":"{}","price":{},"qty":{},"side":"{}","ts":{}}}"#,
-                                symbol_str, price, qty, side_str, ts,
-                            );
-                            market_fanout.send_owned(msg);
-                            last_trade_price.insert(symbol_str.to_string(), price);
-                            if market_fanout.subscriber_count() != 0 {
-                                let market_msgs =
-                                    live_market_data.ingest(symbol_str, ts, price, qty);
-                                last_ticker
-                                    .insert(symbol_str.to_string(), market_msgs[0].clone());
-                                for msg in market_msgs {
-                                    market_fanout.send_owned(msg);
-                                }
-                            }
-                        }
-
-                        // Accumulate into the batched settlement buffer.
-                        // Flushed below as a single DbCmd::BatchSettleTrade
-                        // after all bursts (trade + order_update) drain.
-                        if settle_count >= 64 {
-                            process_db_cmd(DbCmd::BatchSettleTrade {
-                                    entries: settle_batch,
-                                    count: settle_count as u8,
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
-                            settle_count = 0;
-                        }
-                        settle_batch[settle_count] = SettleTradeEntry {
-                            taker_id, maker_id, taker_uid, maker_uid,
-                            price, qty, side, symbol: sym,
-                        };
-                        settle_count += 1;
-                    }
+                    // trade/depth poll moved to aeron-recv-public to keep this
+                    // thread laser-focused on private order updates.
 
                     // Process order updates — complete pending REST/WS requests.
                     while let Some(msg) = order_update_sub.poll() {
@@ -1614,6 +1709,28 @@ async fn async_main() -> anyhow::Result<()> {
                         let fill_qty: f64 = msg.fill_qty;
                         let fill_price: f64 = msg.fill_price;
                         let kind: u8 = msg.kind;
+                        // Owner-filter: every desk subscribes to OrderUpdate via
+                        // Aeron fan-out, so without this check each desk re-runs
+                        // user_tx routing + persist publish + account_cache
+                        // mutate for ALL orders — 4 desks = 4× duplicate work
+                        // and 4× write amplification into pg-writer/redis-writer.
+                        //
+                        // Skip if neither (a) the user has a live WS connection
+                        // on this desk, nor (b) a REST request is awaiting this
+                        // order_id locally, nor (c) this desk originated the
+                        // order (pending_meta still holds client_order_id).
+                        // Any one being true means "this is my order".
+                        let lookup_id_for_pending = if kind == order_update_kind::REJECTED {
+                            client_order_id
+                        } else {
+                            order_id
+                        };
+                        let owned = user_tx.get(participant_id as i64).is_some()
+                            || pending_orders.contains_key(&lookup_id_for_pending)
+                            || pending_meta.contains_key(&lookup_id_for_pending);
+                        if !owned {
+                            continue;
+                        }
                         if let Some(ref t) = spin_tracer {
                             t.record(MS_AERON_UPDATE_RECV, client_order_id);
                         }
@@ -1687,6 +1804,9 @@ async fn async_main() -> anyhow::Result<()> {
                                     if n % 10_000 == 0 {
                                         tracing::warn!("personal channel full — order_update dropped (total: {n})");
                                     }
+                                }
+                                if let Some(ref t) = spin_tracer {
+                                    t.record(MS_USER_TX_SENT, client_order_id);
                                 }
                             }
                             update_pushed = true;
@@ -1920,17 +2040,7 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Flush per-burst trade accumulator as one batched settle.
-                    // Multi-row INSERT trades + multi-row UPDATE orders +
-                    // grouped UPDATE accounts in one txn. ~5× faster at N=5,
-                    // ~10× at N=20 (examples/bench_settle_trade).
-                    if settle_count > 0 {
-                        process_db_cmd(DbCmd::BatchSettleTrade {
-                                entries: settle_batch,
-                                count: settle_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
-                        settle_count = 0;
-                    }
+                    // Settle batch lives on aeron-recv-public — nothing to flush here.
 
                     // Flush per-burst ACCEPTED accumulator as one batched
                     // multi-row INSERT + grouped freeze UPDATE. Cuts work for
@@ -1965,54 +2075,7 @@ async fn async_main() -> anyhow::Result<()> {
                         cancel_count = 0;
                     }
 
-                    // Process depth snapshots — spin thread copies raw arrays (~320B memcpy),
-                    // offloads JSON build + DashMap + broadcast to tokio (10-30μs saved).
-                    while let Some(depth_msg) = depth_sub.poll() {
-                        did_work = true;
-                        use lightning_exchange::aeron_transport::DeskDepthMsg;
-                        match depth_msg {
-                            DeskDepthMsg::Depth(evt) => {
-                                let nb = evt.num_bids as usize;
-                                let na = evt.num_asks as usize;
-                                let mut bids_raw = [(0.0f64, 0.0f64); 20];
-                                let mut asks_raw = [(0.0f64, 0.0f64); 20];
-                                bids_raw[..nb].copy_from_slice(&evt.bids[..nb]);
-                                asks_raw[..na].copy_from_slice(&evt.asks[..na]);
-                                let end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
-                                let symbol = std::str::from_utf8(&evt.symbol[..end])
-                                    .unwrap_or("BTC_USDT").to_string();
-                                let symbol = if symbol.is_empty() { "BTC_USDT".to_string() } else { symbol };
-
-                                // Empty or one-sided snapshot: silently drop.
-                                // The frontend keeps its last rendered state — no need to
-                                // broadcast anything. Never send empty depth to clients.
-                                if nb == 0 || na == 0 {
-                                    continue;
-                                }
-
-                                let mf2 = market_fanout.clone();
-                                let last_depth2 = last_depth.clone();
-                                rt.spawn(async move {
-                                    let bids: Vec<[f64; 2]> = bids_raw[..nb]
-                                        .iter().filter(|(_, q)| *q > 0.0)
-                                        .map(|&(p, q)| [p, q]).collect();
-                                    let asks: Vec<[f64; 2]> = asks_raw[..na]
-                                        .iter().filter(|(_, q)| *q > 0.0)
-                                        .map(|&(p, q)| [p, q]).collect();
-                                    let ts = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_micros() as u64).unwrap_or(0);
-                                    let depth_json = serde_json::json!({
-                                        "type": "depth", "symbol": symbol,
-                                        "bids": bids, "asks": asks, "ts": ts,
-                                    });
-                                    last_depth2.insert(symbol, depth_json.clone());
-                                    mf2.send_owned(depth_json.to_string());
-                                });
-                            }
-                            DeskDepthMsg::Depth50(_) | DeskDepthMsg::Level2(_) => {}
-                        }
-                    }
+                    // depth poll moved to aeron-recv-public.
 
                     if !did_work {
                         if use_spin {

@@ -112,14 +112,30 @@ fn spawn_symbol_thread(
             let mut stats_dur_sum_us: u64 = 0;
             let mut stats_dur_max_us: u64 = 0;
             let mut stats_last = Instant::now();
-            // Matching is latency-critical: default to tight spinning on
-            // dedicated cores. Set ENGINE_IDLE_SPINS=<n> to allow idle
-            // backoff after n empty iterations on CPU-constrained hosts.
-            let idle_spin_budget: Option<u32> = std::env::var("ENGINE_IDLE_SPINS")
+            // Matching is latency-critical, but defaulting to infinite spin
+            // burns a whole core per symbol thread even when idle — on shared
+            // hosts (dev macOS, multi-symbol single-machine deploys) this
+            // starves desk/pg-writer of cores. Spin for a budget, then nap
+            // briefly to release the core; arriving bursts pile in the IPC
+            // ring and get drained on the next wake.
+            //
+            // Default budget = 8192 spins (~ tens of µs of polling); start
+            // sleep at 1µs and cap at 50µs to keep wake-up latency low. 8192
+            // is large enough that mid-burst dips don't trigger sleep, but
+            // small enough that truly idle threads quickly release the core.
+            //
+            // ENGINE_IDLE_SPINS=0 forces infinite spin (production with
+            // dedicated cores). Otherwise the value sets the spin budget.
+            let idle_spin_budget: Option<u32> = match std::env::var("ENGINE_IDLE_SPINS")
                 .ok()
-                .and_then(|s| s.parse().ok());
+                .and_then(|s| s.parse().ok())
+            {
+                Some(0u32) => None,
+                Some(n) => Some(n),
+                None => Some(8192),
+            };
             let mut idle_iters: u32 = 0;
-            let mut idle_sleep_us: u64 = 10;
+            let mut idle_sleep_us: u64 = 1;
 
             loop {
                 // Only the subscriber needs do_work() — it processes the incoming IPC ring.
@@ -428,7 +444,7 @@ fn spawn_symbol_thread(
 
                 if did_work {
                     idle_iters = 0;
-                    idle_sleep_us = 10;
+                    idle_sleep_us = 1;
                 } else if idle_spin_budget
                     .map(|budget| idle_iters < budget)
                     .unwrap_or(true)
@@ -439,7 +455,7 @@ fn spawn_symbol_thread(
                     std::hint::spin_loop();
                 } else {
                     std::thread::sleep(Duration::from_micros(idle_sleep_us));
-                    idle_sleep_us = (idle_sleep_us * 2).min(100);
+                    idle_sleep_us = (idle_sleep_us * 2).min(50);
                 }
             }
         })

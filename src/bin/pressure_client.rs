@@ -644,12 +644,12 @@ async fn driver(
                 }
                 continue;
             }
-            if text.contains("\"order_rejected\"") {
+            else if text.contains("\"order_rejected\"") {
                 placed_ok = false;
                 place_us = t0.elapsed().as_micros() as u64;
                 break;
             }
-            if text.contains("\"order_update\"") {
+            else if text.contains("\"order_update\"") {
                 // Match by client_order_id if present (engine→desk forward
                 // includes it), else fall back to order_id match.
                 let mine = text.contains(&coid_match)
@@ -670,14 +670,14 @@ async fn driver(
                     place_us = t0.elapsed().as_micros() as u64;
                     break;
                 }
-                if text.contains("\"status\":\"REJECTED\"") {
+                else if text.contains("\"status\":\"REJECTED\"") {
                     placed_ok = false;
                     place_us = t0.elapsed().as_micros() as u64;
                     break;
                 }
                 // PARTIAL/FILLED on a resting GTC @ 5000 is unexpected for
                 // this test — record as ok and move on.
-                if text.contains("\"status\":\"FILLED\"")
+                else if text.contains("\"status\":\"FILLED\"")
                     || text.contains("\"status\":\"PARTIAL\"")
                     || text.contains("\"status\":\"PARTIAL_FILL\"")
                 {
@@ -777,7 +777,7 @@ async fn driver(
                     // arrives so we don't leave it queued.
                     continue;
                 }
-                if text.contains("\"order_update\"")
+                else if text.contains("\"order_update\"")
                     && text.contains("\"status\":\"CANCELED\"")
                     && text.contains(&id_match)
                 {
@@ -1044,9 +1044,10 @@ async fn async_main() -> anyhow::Result<()> {
         p_avg_us, cur.place_lat_max_us
     );
     println!(
-        "  place  latency p50/p95 (µs):        {} / {}  (all sent)",
+        "  place  latency p50/p90/p99 (µs):    {} / {} / {}  (all sent)",
         metrics.place_latency_hist.percentile(0.50),
-        metrics.place_latency_hist.percentile(0.95),
+        metrics.place_latency_hist.percentile(0.90),
+        metrics.place_latency_hist.percentile(0.99),
     );
     let p_ok_avg_us = if cur.place_ok > 0 {
         cur.place_ok_lat_sum_us / cur.place_ok
@@ -1058,18 +1059,20 @@ async fn async_main() -> anyhow::Result<()> {
         p_ok_avg_us, cur.place_ok_lat_max_us
     );
     println!(
-        "  place OK latency p50/p95 (µs):      {} / {}  (accepted only)",
+        "  place OK latency p50/p90/p99 (µs):  {} / {} / {}  (accepted only)",
         metrics.place_ok_latency_hist.percentile(0.50),
-        metrics.place_ok_latency_hist.percentile(0.95),
+        metrics.place_ok_latency_hist.percentile(0.90),
+        metrics.place_ok_latency_hist.percentile(0.99),
     );
     println!(
         "  cancel latency avg/max (µs):        {} / {}",
         c_avg_us, cur.cancel_lat_max_us
     );
     println!(
-        "  cancel latency p50/p95 (µs):        {} / {}",
+        "  cancel latency p50/p90/p99 (µs):    {} / {} / {}",
         metrics.cancel_latency_hist.percentile(0.50),
-        metrics.cancel_latency_hist.percentile(0.95),
+        metrics.cancel_latency_hist.percentile(0.90),
+        metrics.cancel_latency_hist.percentile(0.99),
     );
     let total_ops_per_s = (cur.place_sent + cur.cancel_sent) as f64 / elapsed;
     println!(

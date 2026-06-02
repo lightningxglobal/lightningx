@@ -2,6 +2,38 @@
 
 ---
 
+## 回归复核（2026-06-02）
+
+本次复核针对“当前撮合 TPS/延迟是否比 `BENCHMARK_SUMMARY.md` 里的基准退化”。
+
+### 结论
+
+- `src/matching/engine.rs` 从 `839e66b` 到当前 `main` 没有生产代码 diff；后续改动主要在 `desk-server`、`exchange-engine` binary、pressure client、writer 等系统路径。
+- 单次 `bench_baseline` 低值可由机器状态/调度噪声触发，不应直接判定为撮合核心回归。
+- 当前 `main` 的 `perf_compare` 仍通过历史基线对比：single 和 deep OB 高于历史，batch-20 低 3.0% 但在 OK 阈值内。
+- `4810ba5` 只增加测试，没有生产路径变化；该点观察到的下降不是代码引入的稳定退化。
+- `839e66b` 修改了 batch inline 容量 20→40，并修复 market order 在 `match_orders_batch` 中无法成交的问题；复测未发现该提交造成稳定退化。
+
+### 当前 main 复测结果
+
+命令：`cargo run --example bench_baseline --release`
+
+| 场景 | TPS | ns/order | 对比 2026-05-28 baseline |
+|------|-----|----------|---------------------------|
+| Single order | 6.56M | 152 ns | 高于 6.08M |
+| Batch-20 | 9.07M | 110 ns | 高于 8.99M |
+| Deep OB Batch-20 | 14.34M | 69 ns | 基本持平 14.61M |
+
+命令：`cargo run --example perf_compare --release`
+
+| 场景 | 当前 TPS | 历史 TPS | 差异 |
+|------|----------|----------|------|
+| Real Business single | 6.70M | 5.33M | +25.7% OK |
+| Real Business batch-20 | 8.20M | 8.46M | -3.0% OK |
+| Deep OB batch-20 | 22.96M | 21.13M | +8.6% OK |
+
+---
+
 ## 🆕 最新基准（2026-05-28）
 
 | 字段 | 值 |

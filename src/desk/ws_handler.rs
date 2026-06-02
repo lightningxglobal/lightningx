@@ -93,7 +93,7 @@ fn ws_personal_queue_cap() -> usize {
         std::env::var("WS_PERSONAL_QUEUE_CAP")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(64)
+            .unwrap_or(4096)
     })
 }
 

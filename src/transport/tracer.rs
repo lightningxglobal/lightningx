@@ -30,9 +30,12 @@ pub const ENGINE_INSTANCE_ID: i32 = 2002;
 
 // ─── Milestone IDs ────────────────────────────────────────────────────────────
 pub const MS_WS_ORDER_RECV: i32     = (8_i32 << 16) | 27; // DeskServer × OnWsOrderRecv
-pub const MS_AERON_ORDER_SEND: i32  = (8_i32 << 16) | 28; // DeskServer × OnAeronOrderSend
+pub const MS_CMD_RING_PUSHED: i32   = (8_i32 << 16) | 34; // DeskServer × OnCmdRingPushed  (WS handler done parsing + queued)
+pub const MS_CMD_RING_POPPED: i32   = (8_i32 << 16) | 35; // DeskServer × OnCmdRingPopped  (send-spin drained from queue)
+pub const MS_AERON_ORDER_SEND: i32  = (8_i32 << 16) | 28; // DeskServer × OnAeronOrderSend (try_claim + commit done)
 pub const MS_AERON_UPDATE_RECV: i32 = (8_i32 << 16) | 32; // DeskServer × OnAeronUpdateRecv
-pub const MS_WS_UPDATE_SEND: i32    = (8_i32 << 16) | 33; // DeskServer × OnWsUpdateSend
+pub const MS_WS_UPDATE_SEND: i32    = (8_i32 << 16) | 33; // DeskServer × OnWsUpdateSend   (about to call user_tx.try_send)
+pub const MS_USER_TX_SENT: i32      = (8_i32 << 16) | 36; // DeskServer × OnUserTxSent     (after user_tx.try_send returned)
 pub const MS_AERON_ORDER_RECV: i32  = (9_i32 << 16) | 29; // Engine × OnAeronOrderRecv
 pub const MS_MATCHING_DONE: i32     = (9_i32 << 16) | 30; // Engine × OnMatchingDone
 pub const MS_AERON_UPDATE_SEND: i32 = (9_i32 << 16) | 31; // Engine × OnAeronUpdateSend
@@ -250,8 +253,8 @@ fn publish_scenario(pub_: &Publisher, instance_id: i32) {
     buf[p] = name.len() as u8; p += 1;
     buf[p..p + name.len()].copy_from_slice(name); p += name.len();
 
-    // 7 milestones
-    buf[p] = 7u8; p += 1;
+    // 10 milestones (added 3 finer ones: cmd_ring push/pop + user_tx sent)
+    buf[p] = 10u8; p += 1;
 
     macro_rules! milestone {
         ($sid:expr, $sname:expr, $aid:expr, $aname:expr) => {{
@@ -267,23 +270,29 @@ fn publish_scenario(pub_: &Publisher, instance_id: i32) {
     }
 
     milestone!(8i16, b"ExchangeDeskServer", 27i16, b"OnWsOrderRecv");
+    milestone!(8i16, b"ExchangeDeskServer", 34i16, b"OnCmdRingPushed");
+    milestone!(8i16, b"ExchangeDeskServer", 35i16, b"OnCmdRingPopped");
     milestone!(8i16, b"ExchangeDeskServer", 28i16, b"OnAeronOrderSend");
     milestone!(9i16, b"ExchangeEngine",     29i16, b"OnAeronOrderRecv");
     milestone!(9i16, b"ExchangeEngine",     30i16, b"OnMatchingDone");
     milestone!(9i16, b"ExchangeEngine",     31i16, b"OnAeronUpdateSend");
     milestone!(8i16, b"ExchangeDeskServer", 32i16, b"OnAeronUpdateRecv");
     milestone!(8i16, b"ExchangeDeskServer", 33i16, b"OnWsUpdateSend");
+    milestone!(8i16, b"ExchangeDeskServer", 36i16, b"OnUserTxSent");
 
-    // 7 gaps
-    buf[p] = 7u8; p += 1;
+    // 10 gaps (3 finer + original 7 still here for back-compat dashboards)
+    buf[p] = 10u8; p += 1;
     for (from, to) in [
-        (MS_WS_ORDER_RECV,    MS_AERON_ORDER_SEND),  // desk WS → Aeron send
+        (MS_WS_ORDER_RECV,    MS_CMD_RING_PUSHED),   // desk WS handler: parse + auth + freeze
+        (MS_CMD_RING_PUSHED,  MS_CMD_RING_POPPED),   // cmd ring residence (queue wait)
+        (MS_CMD_RING_POPPED,  MS_AERON_ORDER_SEND),  // send-spin: SBE encode + Aeron try_claim+commit
+        (MS_WS_ORDER_RECV,    MS_AERON_ORDER_SEND),  // desk send total (sum of above 3)
         (MS_AERON_ORDER_SEND, MS_AERON_ORDER_RECV),  // Aeron transit desk→engine
         (MS_AERON_ORDER_RECV, MS_MATCHING_DONE),     // engine matching time
         (MS_MATCHING_DONE,    MS_AERON_UPDATE_SEND), // engine result serialization
         (MS_AERON_UPDATE_SEND, MS_AERON_UPDATE_RECV),// Aeron transit engine→desk
-        (MS_AERON_UPDATE_RECV, MS_WS_UPDATE_SEND),   // desk processing
-        (MS_WS_ORDER_RECV,    MS_WS_UPDATE_SEND),    // total server-side RTT
+        (MS_WS_UPDATE_SEND,   MS_USER_TX_SENT),      // recv-spin: user_tx.try_send wakeup cost
+        (MS_WS_ORDER_RECV,    MS_USER_TX_SENT),      // end-to-end (spin handoff to tokio)
     ] {
         buf[p..p + 4].copy_from_slice(&from.to_le_bytes()); p += 4;
         buf[p..p + 4].copy_from_slice(&to.to_le_bytes()); p += 4;

@@ -12,6 +12,7 @@
 //!   PRESSURE_SYMBOL        symbol to trade                     (default BTC_USDT)
 //!   PRESSURE_PRICE         limit price (far from market)       (default 1.0  — won't fill)
 //!   PRESSURE_QTY           order quantity                      (default 0.0001)
+//!   PRESSURE_SETUP_PARALLEL concurrent setup HTTP requests      (default 32)
 //!
 //! Workload per connection (single repeating cycle):
 //!   place_order → wait WAIT_AFTER_PLACE → cancel_order → wait remainder.
@@ -481,15 +482,14 @@ async fn setup_users(cfg: &Config) -> anyhow::Result<Arc<Vec<UserToken>>> {
     let started = Instant::now();
     let mut users = Vec::with_capacity(cfg.users);
 
-    // Sequential is slow for 10K but predictable. Run in small parallel
-    // batches to speed up while staying gentle on the auth/register
-    // endpoints.
+    // Run setup in bounded parallel batches; this is outside the measured
+    // WebSocket path.
     use futures::stream::{FuturesUnordered, StreamExt};
-    const PARALLEL: usize = 32;
-    let mut pending: FuturesUnordered<_> = (0..PARALLEL.min(cfg.users))
+    let parallel = env_usize("PRESSURE_SETUP_PARALLEL", 32).max(1);
+    let mut pending: FuturesUnordered<_> = (0..parallel.min(cfg.users))
         .map(|i| ensure_user(&http, &cfg.base_url, i))
         .collect();
-    let mut next_idx = PARALLEL.min(cfg.users);
+    let mut next_idx = parallel.min(cfg.users);
 
     while let Some(res) = pending.next().await {
         match res {

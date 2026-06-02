@@ -327,7 +327,20 @@ impl WsSession {
 // ─── Upgrade handler ──────────────────────────────────────────────────────────
 
 pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Response {
-    let (response, fut) = upgrade::upgrade(&mut req).expect("WS upgrade failed");
+    // A non-WS GET (e.g. curl, health probe) hits the same /ws route — never
+    // panic on bad-shape requests. Return 400 instead so a stray client can't
+    // take down the entire desk-server (we measured one curl request crashing
+    // the whole process via this expect()).
+    let (response, fut) = match upgrade::upgrade(&mut req) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("WS upgrade rejected: {e}");
+            return Response::builder()
+                .status(400)
+                .body(axum::body::Body::from(format!("WS upgrade rejected: {e}")))
+                .unwrap();
+        }
+    };
     tokio::spawn(async move {
         match fut.await {
             Ok(ws) => handle_socket(ws, state).await,

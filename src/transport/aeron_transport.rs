@@ -23,17 +23,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAX_BACKPRESSURE_SPINS: u32 = 100_000;
-// 16K saturated on 4K-conn × 1 op/s stress test — 13 K dropped in seconds
-// when recv-spin briefly stalled on persist back-pressure, which then made
-// engine `ou_pub.publish` spin past Aeron's 10 s conductor timeout and the
-// matching thread's whole Aeron client died. Symmetric 128 K matches the
-// outbound ring; absorbs ~1.2 s of 100 K msg/s steady throughput.
-const ORDER_INBOUND_RING: usize = 128 * 1024;
-// 128K survives a full cancel-all+place-all burst from a 40-quote MM
-// with room to spare; cost is ~11MB at sizeof(OrderUpdateMsg)≈88B.
-const ORDER_UPDATE_RING: usize = 128 * 1024;
-const TRADE_RING: usize = 16 * 1024;
-const DEPTH_RING: usize = 4 * 1024;
+// Bumped to 5 M each so even sustained 100 K msg/s × 50 s pile-ups don't
+// drop. Memory cost: ORDER_INBOUND × 3 engines ≈ 1.2 GB, plus others ≈ 2.3 GB
+// total — fine on a modern host, prevents the silent-drop failure mode
+// where the engine inbound ring full triggers a recv-spin stall → engine
+// ou_pub spin → conductor timeout → entire Aeron client death.
+const ORDER_INBOUND_RING: usize = 5_000_000;
+const ORDER_UPDATE_RING: usize = 5_000_000;
+const TRADE_RING: usize = 5_000_000;
+const DEPTH_RING: usize = 5_000_000;
 
 /// Zero-copy publish: retry `try_claim` on back-pressure, then run the
 /// writer directly into Aeron's term-log buffer (saves the staging-array

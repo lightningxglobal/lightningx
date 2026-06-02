@@ -97,6 +97,16 @@ fn ws_personal_queue_cap() -> usize {
     })
 }
 
+fn aeron_cmd_latency_cap() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("AERON_CMD_LATENCY_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+    })
+}
+
 // ─── Client → Server message types ───────────────────────────────────────────
 // Parse from raw Value to avoid serde internal-tag conflict with a field also named "type".
 
@@ -766,7 +776,10 @@ async fn handle_client_message(
                     },
                 );
 
-                if aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
+                let queue_too_deep = aeron_cmd_latency_cap()
+                    .map(|cap| aeron_cmd_tx.len() >= cap)
+                    .unwrap_or(false);
+                if queue_too_deep || aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
                     // ArrayQueue full — apply backpressure to the client.
                     state.pending_meta.remove(&order_id);
                     release_cache_frozen(

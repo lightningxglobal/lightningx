@@ -1635,6 +1635,37 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                         // client_order_id is only available on the first event (ACCEPTED).
                         let ws_client_oid = ws_meta.as_ref().map(|m| m.client_order_id.as_str());
+                        let mut update_pushed = false;
+
+                        // For the client's place-order SLA, ACCEPTED is the
+                        // critical update. Send it before cache/persist batch
+                        // work below so persistence cannot sit in front of the
+                        // WS notification on the recv spin thread.
+                        if kind == order_update_kind::ACCEPTED {
+                            if let Some(ref t) = spin_tracer {
+                                t.record(MS_WS_UPDATE_SEND, client_order_id);
+                            }
+                            if let Some(tx) = user_tx.get(participant_id as i64) {
+                                let ts = msg.timestamp;
+                                let upd = match ws_client_oid {
+                                    Some(coid) => format!(
+                                        r#"{{"type":"order_update","order_id":{},"status":"OPEN","filled_qty":{},"avg_price":{},"ts":{},"client_order_id":"{}"}}"#,
+                                        order_id, fill_qty, fill_price, ts, coid,
+                                    ),
+                                    None => format!(
+                                        r#"{{"type":"order_update","order_id":{},"status":"OPEN","filled_qty":{},"avg_price":{},"ts":{}}}"#,
+                                        order_id, fill_qty, fill_price, ts,
+                                    ),
+                                };
+                                if tx.try_send(upd).is_err() {
+                                    let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n % 10_000 == 0 {
+                                        tracing::warn!("personal channel full — order_update dropped (total: {n})");
+                                    }
+                                }
+                            }
+                            update_pushed = true;
+                        }
 
                         if let Some(meta) = ws_meta.as_ref() {
                             if kind == order_update_kind::ACCEPTED {
@@ -1803,53 +1834,55 @@ async fn async_main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // Push order_update to user's personal WS channel.
-                        let user_id = participant_id as i64;
-                        // Record latency milestone unconditionally — measures when
-                        // the desk-server is ready to forward the update, regardless
-                        // of whether a WS connection exists for this user.
-                        if let Some(ref t) = spin_tracer {
-                            t.record(MS_WS_UPDATE_SEND, client_order_id);
-                        }
-                        // Single DashMap lookup — was previously two (is_none() +
-                        // if let Some()), each taking a shard lock.
-                        let maybe_tx = user_tx.get(user_id);
-                        if maybe_tx.is_none() {
-                            // Rate-limited counter — at 400K conns this used to
-                            // hit ~175K times/test, each `tracing::warn!` is
-                            // ~10µs format + stderr lock → ~1.7s of pure log
-                            // time on the recv-spin's critical path. Now we
-                            // count and only print every 10K.
-                            let n = lost_order_updates.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n % 10_000 == 0 {
-                                tracing::warn!("no WS channel — order_update lost (total: {n})");
+                        if !update_pushed {
+                            // Push order_update to user's personal WS channel.
+                            let user_id = participant_id as i64;
+                            // Record latency milestone unconditionally — measures when
+                            // the desk-server is ready to forward the update, regardless
+                            // of whether a WS connection exists for this user.
+                            if let Some(ref t) = spin_tracer {
+                                t.record(MS_WS_UPDATE_SEND, client_order_id);
                             }
-                        }
-                        if let Some(tx) = maybe_tx {
-                            let ws_status = ws_status_from_update_kind(kind).as_str();
-                            let ts = msg.timestamp;
-                            // Hand-written JSON — serde_json::json! macro
-                            // measures ~600ns per call; format! is ~150ns
-                            // for this fixed shape and runs at every
-                            // order_update event (≈ 400/s steady-state).
-                            // client_order_id is JSON-escape-safe here: it's
-                            // a server-generated session prefix + counter
-                            // (see make_place_msg → "{prefix}-{N}"), so no
-                            // escaping needed.
-                            let upd = match ws_client_oid.as_deref() {
-                                Some(coid) => format!(
-                                    r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{},"client_order_id":"{}"}}"#,
-                                    order_id, ws_status, fill_qty, fill_price, ts, coid,
-                                ),
-                                None => format!(
-                                    r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{}}}"#,
-                                    order_id, ws_status, fill_qty, fill_price, ts,
-                                ),
-                            };
-                            if tx.try_send(upd).is_err() {
-                                let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
+                            // Single DashMap lookup — was previously two (is_none() +
+                            // if let Some()), each taking a shard lock.
+                            let maybe_tx = user_tx.get(user_id);
+                            if maybe_tx.is_none() {
+                                // Rate-limited counter — at 400K conns this used to
+                                // hit ~175K times/test, each `tracing::warn!` is
+                                // ~10µs format + stderr lock → ~1.7s of pure log
+                                // time on the recv-spin's critical path. Now we
+                                // count and only print every 10K.
+                                let n = lost_order_updates.fetch_add(1, Ordering::Relaxed) + 1;
                                 if n % 10_000 == 0 {
-                                    tracing::warn!("personal channel full — order_update dropped (total: {n})");
+                                    tracing::warn!("no WS channel — order_update lost (total: {n})");
+                                }
+                            }
+                            if let Some(tx) = maybe_tx {
+                                let ws_status = ws_status_from_update_kind(kind).as_str();
+                                let ts = msg.timestamp;
+                                // Hand-written JSON — serde_json::json! macro
+                                // measures ~600ns per call; format! is ~150ns
+                                // for this fixed shape and runs at every
+                                // order_update event (≈ 400/s steady-state).
+                                // client_order_id is JSON-escape-safe here: it's
+                                // a server-generated session prefix + counter
+                                // (see make_place_msg → "{prefix}-{N}"), so no
+                                // escaping needed.
+                                let upd = match ws_client_oid.as_deref() {
+                                    Some(coid) => format!(
+                                        r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{},"client_order_id":"{}"}}"#,
+                                        order_id, ws_status, fill_qty, fill_price, ts, coid,
+                                    ),
+                                    None => format!(
+                                        r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{}}}"#,
+                                        order_id, ws_status, fill_qty, fill_price, ts,
+                                    ),
+                                };
+                                if tx.try_send(upd).is_err() {
+                                    let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if n % 10_000 == 0 {
+                                        tracing::warn!("personal channel full — order_update dropped (total: {n})");
+                                    }
                                 }
                             }
                         }

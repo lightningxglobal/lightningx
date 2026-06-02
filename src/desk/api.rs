@@ -1186,43 +1186,9 @@ async fn handle_place_order(
             })
             .to_string();
             let _ = s.market_fanout.send_owned(trade_msg);
-
-            let sym_clone = req.symbol.clone();
-            let db_clone = s.db.clone();
-            let mtx_clone = s.market_fanout.clone();
-            tokio::spawn(async move {
-                let open_24h: Option<f64> = sqlx::query_scalar(
-                    "SELECT price FROM trades WHERE symbol=$1
-                     AND created_at > NOW() - INTERVAL '24 hours'
-                     ORDER BY created_at ASC LIMIT 1",
-                )
-                .bind(&sym_clone)
-                .fetch_optional(db_clone.as_ref())
-                .await
-                .unwrap_or(None);
-                let change = match open_24h {
-                    Some(o) if o != 0.0 => (avg_fill_price - o) / o * 100.0,
-                    _ => 0.0,
-                };
-                let ticker = serde_json::json!({
-                    "type": "ticker",
-                    "symbol": sym_clone,
-                    "last": avg_fill_price,
-                    "change": change,
-                })
-                .to_string();
-                mtx_clone.send_owned(ticker);
-            });
         }
 
         crate::ws_handler::broadcast_depth_pub(&s, &req.symbol);
-        if filled_qty > 0.0 {
-            let s2 = s.clone();
-            let sym2 = req.symbol.clone();
-            tokio::spawn(async move {
-                crate::ws_handler::broadcast_kline_pub(&s2, &sym2).await;
-            });
-        }
 
         let ws_status = ws_status_from_engine(result.status, false).as_str();
         if let Some(tx) = s.user_tx.get(user_id) {
@@ -1684,8 +1650,8 @@ async fn handle_cancel_all_orders(
 
 async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
     // Fast path: serve from in-memory `last_ticker` DashMap, populated by
-    // the periodic ticker broadcast in market_data_broadcaster (~100ms
-    // cadence). Each entry is the already-stringified WS ticker payload,
+    // live trade-event aggregation. Each entry is the already-stringified WS
+    // ticker payload,
     // so we just collect-and-strip the WS envelope to match the REST
     // response shape. p50 here used to be 243ms (PG aggregate over the
     // trades table) — this path is sub-ms.

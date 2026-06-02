@@ -13,7 +13,7 @@ use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,13 +57,6 @@ fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
-}
-
-fn unix_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
@@ -1233,8 +1226,8 @@ async fn handle_client_message(
                 .to_string();
                 let _ = state.market_fanout.send_owned(trade_msg);
 
-                // Ticker updates are handled by the periodic market_data_broadcaster;
-                // spawning a DB query here on every fill piles up and exhausts the pool.
+                // Live ticker/kline/agg updates are produced from trade events,
+                // not PostgreSQL.
 
                 broadcast_depth_pub(state, &symbol);
 
@@ -2340,45 +2333,6 @@ pub fn broadcast_depth_pub(state: &AppState, symbol: &str) {
     }
 }
 
-/// Build and broadcast the current-minute k-line for `symbol` after a REST trade.
-pub async fn broadcast_kline_pub(state: &AppState, symbol: &str) {
-    let row = sqlx::query(
-        "SELECT
-           extract(epoch FROM date_trunc('minute', created_at))::bigint AS time,
-           (array_agg(price ORDER BY created_at ASC))[1]  AS open,
-           max(price)  AS high,
-           min(price)  AS low,
-           (array_agg(price ORDER BY created_at DESC))[1] AS close,
-           sum(quantity) AS volume
-         FROM trades
-         WHERE symbol = $1
-           AND created_at >= date_trunc('minute', NOW())
-         GROUP BY date_trunc('minute', created_at)
-         LIMIT 1",
-    )
-    .bind(symbol)
-    .fetch_optional(state.db.as_ref())
-    .await;
-
-    if let Ok(Some(row)) = row {
-        use sqlx::Row;
-        let msg = serde_json::json!({
-            "type": "kline",
-            "symbol": symbol,
-            "bar": {
-                "time":   row.get::<i64, _>("time"),
-                "open":   row.get::<f64, _>("open"),
-                "high":   row.get::<f64, _>("high"),
-                "low":    row.get::<f64, _>("low"),
-                "close":  row.get::<f64, _>("close"),
-                "volume": row.get::<f64, _>("volume"),
-            }
-        })
-        .to_string();
-        let _ = state.market_fanout.send_owned(msg);
-    }
-}
-
 // ─── Background market data broadcaster ─────────────────────────────────────
 
 /// Snapshot every engine's top-of-book under brief per-engine locks.
@@ -2413,19 +2367,6 @@ fn snapshot_all_engines(
 pub async fn market_data_broadcaster(state: AppState) {
     let mut depth_interval = tokio::time::interval(std::time::Duration::from_millis(200));
     depth_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut kline_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-    kline_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut ticker_interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    ticker_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut agg_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    agg_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Last-seen top-bid price per symbol — drives ticker broadcasts.
-    let mut last_prices: HashMap<String, f64> = HashMap::new();
-    // 24h stats cache: symbol → (open_24h, high, low, volume, last_queried_secs).
-    // Shared with spawned tasks so they can write results back.
-    // Only re-query the DB every 60 seconds to avoid pool exhaustion on a full table.
-    let ticker_cache: Arc<std::sync::Mutex<HashMap<String, (f64, f64, f64, f64, i64)>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -2437,9 +2378,6 @@ pub async fn market_data_broadcaster(state: AppState) {
                 // In Aeron mode, depth is pushed by exchange_engine via Aeron.
                 if let Some(ref engines) = state.engines {
                     for (symbol, bids, asks) in snapshot_all_engines(engines) {
-                        if let Some((p, _)) = bids.first() {
-                            last_prices.insert(symbol.clone(), *p);
-                        }
                         let msg = json!({
                             "type": "depth",
                             "symbol": symbol,
@@ -2448,236 +2386,6 @@ pub async fn market_data_broadcaster(state: AppState) {
                             "ts": unix_now()
                         }).to_string();
                         let _ = state.market_fanout.send_owned(msg);
-                    }
-                } else {
-                    // In Aeron mode, collect last prices from last_depth cache.
-                    for entry in state.last_depth.iter() {
-                        let sym = entry.key().clone();
-                        let depth_val = entry.value().clone();
-                        if let Some(bids) = depth_val.get("bids").and_then(|b| b.as_array()) {
-                            if let Some(first_bid) = bids.first() {
-                                if let Some(p) = first_bid.get(0).and_then(|v| v.as_f64()) {
-                                    last_prices.insert(sym, p);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            _ = ticker_interval.tick() => {
-                if state.market_fanout.subscriber_count() == 0 {
-                    continue;
-                }
-                // Periodic ticker per symbol that has a known last price.
-                // DB is queried at most once every 60s per symbol (cached in ticker_cache).
-                // Between DB refreshes we broadcast cached 24h stats with live last price.
-                //
-                // `last` = most recent trade price (from state.last_trade_price, written
-                // by SettleTrade). Fallback to best bid (last_prices) only for symbols
-                // that haven't traded yet this session.
-                let now_secs = unix_secs();
-                let symbols: Vec<(String, f64)> = last_prices.iter()
-                    .filter(|(_, &p)| p > 0.0)
-                    .map(|(s, &bid)| {
-                        let last = state.last_trade_price.get(s).map(|v| *v).unwrap_or(bid);
-                        (s.clone(), last)
-                    })
-                    .collect();
-                for (symbol, last_price) in symbols {
-                    let cached = ticker_cache.lock().ok()
-                        .and_then(|c| c.get(&symbol).copied());
-                    let needs_refresh = cached.map(|(_, _, _, _, t)| now_secs - t >= 60).unwrap_or(true);
-
-                    if needs_refresh {
-                        // Mark updated time immediately so concurrent ticks don't pile up queries.
-                        if let Ok(mut c) = ticker_cache.lock() {
-                            c.entry(symbol.clone()).or_insert((0.0, 0.0, 0.0, 0.0, 0_i64)).4 = now_secs;
-                        }
-                        let db = state.db.clone();
-                        let mtx = state.market_fanout.clone();
-                        let last_ticker = state.last_ticker.clone();
-                        let tc2 = ticker_cache.clone();
-                        let sym2 = symbol.clone();
-                        tokio::spawn(async move {
-                            let row: Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
-                                "SELECT
-                                   (SELECT price FROM trades
-                                    WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours'
-                                    ORDER BY created_at ASC LIMIT 1) AS open_24h,
-                                   MAX(price)      AS high,
-                                   MIN(price)      AS low,
-                                   SUM(quantity)   AS volume
-                                 FROM trades
-                                 WHERE symbol=$1 AND created_at > NOW() - INTERVAL '24 hours'"
-                            )
-                            .bind(&sym2)
-                            .fetch_optional(db.as_ref())
-                            .await
-                            .unwrap_or(None);
-                            let (open_24h, high, low, volume) = row.unwrap_or_default();
-                            let open = open_24h.unwrap_or(0.0);
-                            let h = high.unwrap_or(last_price);
-                            let l = low.unwrap_or(last_price);
-                            let v = volume.unwrap_or(0.0);
-                            // Write results back into the shared cache.
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64).unwrap_or(0);
-                            if let Ok(mut c) = tc2.lock() {
-                                c.insert(sym2.clone(), (open, h, l, v, ts));
-                            }
-                            let change = if open != 0.0 { (last_price - open) / open * 100.0 } else { 0.0 };
-                            let payload = serde_json::json!({
-                                "type": "ticker",
-                                "symbol": sym2,
-                                "last": last_price,
-                                "change": change,
-                                "high": h,
-                                "low": l,
-                                "volume": v,
-                            }).to_string();
-                            last_ticker.insert(sym2.clone(), payload.clone());
-                            mtx.send_owned(payload);
-                        });
-                    } else if let Some((open, high, low, volume, _)) = cached {
-                        // Broadcast cached stats with current last price — no DB hit.
-                        let change = if open != 0.0 { (last_price - open) / open * 100.0 } else { 0.0 };
-                        let payload = serde_json::json!({
-                            "type": "ticker",
-                            "symbol": symbol,
-                            "last": last_price,
-                            "change": change,
-                            "high": high,
-                            "low": low,
-                            "volume": volume,
-                        }).to_string();
-                        state.last_ticker.insert(symbol.clone(), payload.clone());
-                        let _ = state.market_fanout.send_owned(payload);
-                    }
-                }
-            }
-
-            _ = kline_interval.tick() => {
-                if state.market_fanout.subscriber_count() == 0 {
-                    continue;
-                }
-                // Fetch real OHLCV from the trades table for the last 60 seconds,
-                // per active symbol. Skip when the bar has no trades so we don't
-                // corrupt the chart with a fake flat candle.
-                let now = unix_secs();
-                let bar_time = now - (now % 60);
-                let symbols: Vec<String> = if let Some(ref engines) = state.engines {
-                    engines.iter().map(|e| e.key().clone()).collect()
-                } else {
-                    last_prices.keys().cloned().collect()
-                };
-                for symbol in symbols {
-                    let db = state.db.clone();
-                    let mtx = state.market_fanout.clone();
-                    tokio::spawn(async move {
-                        let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64), _> = sqlx::query_as(
-                            "SELECT
-                               (array_agg(price ORDER BY created_at ASC))[1]  AS open,
-                               MAX(price)                                      AS high,
-                               MIN(price)                                      AS low,
-                               (array_agg(price ORDER BY created_at DESC))[1] AS close,
-                               COALESCE(SUM(quantity), 0.0)                    AS volume
-                             FROM trades
-                             WHERE symbol = $1
-                               AND created_at >= to_timestamp($2)
-                               AND created_at <  to_timestamp($3)"
-                        )
-                        .bind(&symbol)
-                        .bind(bar_time as f64)
-                        .bind((bar_time + 60) as f64)
-                        .fetch_one(db.as_ref())
-                        .await;
-
-                        match row {
-                            Ok((Some(open), Some(high), Some(low), Some(close), volume)) if volume > 0.0 => {
-                                let msg = json!({
-                                    "type": "kline",
-                                    "symbol": symbol,
-                                    "bar": {
-                                        "time": bar_time,
-                                        "open": open,
-                                        "high": high,
-                                        "low":  low,
-                                        "close": close,
-                                        "volume": volume
-                                    }
-                                }).to_string();
-                                mtx.send_owned(msg);
-                            }
-                            Ok(_) => {
-                                // No trades in the last 60s — skip sending kline.
-                            }
-                            Err(e) => {
-                                eprintln!("kline DB query failed for {}: {}", symbol, e);
-                            }
-                        }
-                    });
-                }
-            }
-
-            _ = agg_interval.tick() => {
-                if state.market_fanout.subscriber_count() == 0 {
-                    continue;
-                }
-                // Per-second OHLCV+count for the active second and the active
-                // 5s window. Only query symbols that have seen at least one
-                // trade (last_prices entry) to keep DB load bounded.
-                let now = unix_secs();
-                let bucket_1s = now;
-                let bucket_5s = now - (now % 5);
-                let symbols: Vec<String> = last_prices.keys().cloned().collect();
-                for symbol in symbols {
-                    for &(interval_label, bin_w, bucket_start) in &[
-                        ("1s", "1 second",  bucket_1s),
-                        ("5s", "5 seconds", bucket_5s),
-                    ] {
-                        let db = state.db.clone();
-                        let mtx = state.market_fanout.clone();
-                        let sym = symbol.clone();
-                        let sql = format!(
-                            "SELECT
-                               (array_agg(price ORDER BY created_at ASC))[1]  AS open,
-                               MAX(price)                                      AS high,
-                               MIN(price)                                      AS low,
-                               (array_agg(price ORDER BY created_at DESC))[1] AS close,
-                               COALESCE(SUM(quantity), 0.0)                    AS volume,
-                               COUNT(*)::bigint                                AS trade_count
-                             FROM trades
-                             WHERE symbol = $1
-                               AND created_at >= date_bin('{bin}', to_timestamp($2), TIMESTAMPTZ '2000-01-01')
-                               AND created_at <  date_bin('{bin}', to_timestamp($2), TIMESTAMPTZ '2000-01-01') + INTERVAL '{bin}'",
-                            bin = bin_w,
-                        );
-                        tokio::spawn(async move {
-                            let row: Result<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, f64, i64), _> =
-                                sqlx::query_as(&sql)
-                                    .bind(&sym)
-                                    .bind(bucket_start as f64)
-                                    .fetch_one(db.as_ref())
-                                    .await;
-                            if let Ok((Some(open), Some(high), Some(low), Some(close), volume, trade_count)) = row {
-                                if trade_count == 0 { return; }
-                                let msg = json!({
-                                    "type": "agg_trade",
-                                    "symbol": sym,
-                                    "interval": interval_label,
-                                    "time": bucket_start,
-                                    "open": open,
-                                    "high": high,
-                                    "low": low,
-                                    "close": close,
-                                    "volume": volume,
-                                    "trade_count": trade_count,
-                                }).to_string();
-                                mtx.send_owned(msg);
-                            }
-                        });
                     }
                 }
             }

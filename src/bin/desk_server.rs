@@ -27,7 +27,7 @@ use lightning_exchange::{
     transport::{unpack_str16, AeronCmd},
     ws_handler::market_data_broadcaster,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -54,6 +54,196 @@ mod db_cmd {
         buf[..n].copy_from_slice(&b[..n]);
         buf
     }
+}
+
+#[derive(Clone, Copy)]
+struct LiveTradePoint {
+    ts_secs: i64,
+    price: f64,
+    qty: f64,
+}
+
+#[derive(Clone, Copy)]
+struct LiveBucket {
+    start: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    trade_count: u64,
+}
+
+impl LiveBucket {
+    fn new(start: i64, price: f64, qty: f64) -> Self {
+        Self {
+            start,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: qty,
+            trade_count: 1,
+        }
+    }
+
+    fn update(&mut self, price: f64, qty: f64) {
+        if price > self.high {
+            self.high = price;
+        }
+        if price < self.low {
+            self.low = price;
+        }
+        self.close = price;
+        self.volume += qty;
+        self.trade_count += 1;
+    }
+}
+
+#[derive(Default)]
+struct LiveSymbolMarketData {
+    trades_24h: VecDeque<LiveTradePoint>,
+    high_24h: f64,
+    low_24h: f64,
+    volume_24h: f64,
+    kline_1m: Option<LiveBucket>,
+    agg_1s: Option<LiveBucket>,
+    agg_5s: Option<LiveBucket>,
+}
+
+impl LiveSymbolMarketData {
+    fn ingest(&mut self, ts_secs: i64, price: f64, qty: f64) -> (String, String, String, String) {
+        self.prune_24h(ts_secs);
+        self.push_24h(ts_secs, price, qty);
+
+        let open_24h = self.trades_24h.front().map(|t| t.price).unwrap_or(price);
+        let change = if open_24h != 0.0 {
+            (price - open_24h) / open_24h * 100.0
+        } else {
+            0.0
+        };
+
+        let kline = update_live_bucket(&mut self.kline_1m, ts_secs - ts_secs % 60, price, qty);
+        let agg_1s = update_live_bucket(&mut self.agg_1s, ts_secs, price, qty);
+        let agg_5s = update_live_bucket(&mut self.agg_5s, ts_secs - ts_secs % 5, price, qty);
+
+        (
+            format!(
+                r#""last":{},"change":{},"high":{},"low":{},"volume":{}"#,
+                price, change, self.high_24h, self.low_24h, self.volume_24h,
+            ),
+            bucket_bar_json(kline),
+            bucket_agg_json("1s", agg_1s),
+            bucket_agg_json("5s", agg_5s),
+        )
+    }
+
+    fn prune_24h(&mut self, ts_secs: i64) {
+        let cutoff = ts_secs - 86_400;
+        let mut recalc = false;
+        while let Some(front) = self.trades_24h.front() {
+            if front.ts_secs >= cutoff {
+                break;
+            }
+            let old = self.trades_24h.pop_front().unwrap();
+            self.volume_24h -= old.qty;
+            if old.price == self.high_24h || old.price == self.low_24h {
+                recalc = true;
+            }
+        }
+        if recalc {
+            self.high_24h = 0.0;
+            self.low_24h = 0.0;
+            for trade in &self.trades_24h {
+                if self.high_24h == 0.0 || trade.price > self.high_24h {
+                    self.high_24h = trade.price;
+                }
+                if self.low_24h == 0.0 || trade.price < self.low_24h {
+                    self.low_24h = trade.price;
+                }
+            }
+        }
+    }
+
+    fn push_24h(&mut self, ts_secs: i64, price: f64, qty: f64) {
+        self.trades_24h.push_back(LiveTradePoint {
+            ts_secs,
+            price,
+            qty,
+        });
+        if self.high_24h == 0.0 || price > self.high_24h {
+            self.high_24h = price;
+        }
+        if self.low_24h == 0.0 || price < self.low_24h {
+            self.low_24h = price;
+        }
+        self.volume_24h += qty;
+    }
+}
+
+#[derive(Default)]
+struct LiveMarketData {
+    by_symbol: HashMap<String, LiveSymbolMarketData>,
+}
+
+impl LiveMarketData {
+    fn ingest(&mut self, symbol: &str, ts_micros: u64, price: f64, qty: f64) -> [String; 4] {
+        let ts_secs = (ts_micros / 1_000_000) as i64;
+        let state = self.by_symbol.entry(symbol.to_string()).or_default();
+        let (ticker_fields, kline_bar, agg_1s, agg_5s) = state.ingest(ts_secs, price, qty);
+        [
+            format!(
+                r#"{{"type":"ticker","symbol":"{}",{}}}"#,
+                symbol, ticker_fields
+            ),
+            format!(
+                r#"{{"type":"kline","symbol":"{}","bar":{}}}"#,
+                symbol, kline_bar
+            ),
+            format!(r#"{{"type":"agg_trade","symbol":"{}",{}}}"#, symbol, agg_1s),
+            format!(r#"{{"type":"agg_trade","symbol":"{}",{}}}"#, symbol, agg_5s),
+        ]
+    }
+}
+
+fn update_live_bucket(
+    bucket: &mut Option<LiveBucket>,
+    start: i64,
+    price: f64,
+    qty: f64,
+) -> LiveBucket {
+    match bucket {
+        Some(existing) if existing.start == start => {
+            existing.update(price, qty);
+            *existing
+        }
+        _ => {
+            let next = LiveBucket::new(start, price, qty);
+            *bucket = Some(next);
+            next
+        }
+    }
+}
+
+fn bucket_bar_json(bucket: LiveBucket) -> String {
+    format!(
+        r#"{{"time":{},"open":{},"high":{},"low":{},"close":{},"volume":{}}}"#,
+        bucket.start, bucket.open, bucket.high, bucket.low, bucket.close, bucket.volume,
+    )
+}
+
+fn bucket_agg_json(interval: &str, bucket: LiveBucket) -> String {
+    format!(
+        r#""interval":"{}","time":{},"open":{},"high":{},"low":{},"close":{},"volume":{},"trade_count":{}"#,
+        interval,
+        bucket.start,
+        bucket.open,
+        bucket.high,
+        bucket.low,
+        bucket.close,
+        bucket.volume,
+        bucket.trade_count,
+    )
 }
 
 // ── DbCmd: fixed-size Copy type for rtrb spin thread → DB worker ─────────────
@@ -1257,6 +1447,7 @@ async fn async_main() -> anyhow::Result<()> {
         let account_cache = account_cache.clone();
         let last_depth = state.last_depth.clone();
         let last_trade_price = state.last_trade_price.clone();
+        let last_ticker = state.last_ticker.clone();
         let persist_pub = persist_pub.clone();
         let vwap_cache = vwap_cache.clone();
         let rt = tokio::runtime::Handle::current();
@@ -1307,6 +1498,7 @@ async fn async_main() -> anyhow::Result<()> {
                 // of CPU per test inside the recv-spin critical section.
                 let lost_order_updates = AtomicU64::new(0);
                 let full_channels = AtomicU64::new(0);
+                let mut live_market_data = LiveMarketData::default();
                 loop {
                     let mut did_work = false;
 
@@ -1358,6 +1550,15 @@ async fn async_main() -> anyhow::Result<()> {
                             );
                             market_fanout.send_owned(msg);
                             last_trade_price.insert(symbol_str.to_string(), price);
+                            if market_fanout.subscriber_count() != 0 {
+                                let market_msgs =
+                                    live_market_data.ingest(symbol_str, ts, price, qty);
+                                last_ticker
+                                    .insert(symbol_str.to_string(), market_msgs[0].clone());
+                                for msg in market_msgs {
+                                    market_fanout.send_owned(msg);
+                                }
+                            }
                         }
 
                         // Accumulate into the batched settlement buffer.
@@ -1769,10 +1970,9 @@ async fn async_main() -> anyhow::Result<()> {
             })?;
     }
 
-    // ── Periodic market data broadcaster (tickers, klines from DB) ────────────
-    // Keep this off for pure trading pressure tests: the trading hot path gets
-    // market data from Aeron, and historical kline/ticker DB queries can
-    // otherwise contend with pg-writer and the WS runtime.
+    // ── Periodic depth broadcaster ───────────────────────────────────────────
+    // Live ticker/kline/agg is generated from Aeron trade events. This
+    // periodic task is off by default and only handles depth snapshots.
     let market_broadcaster_enabled = std::env::var("MARKET_DATA_BROADCASTER")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);

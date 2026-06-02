@@ -31,7 +31,11 @@ const MAX_BACKPRESSURE_SPINS: u32 = 100_000;
 const ORDER_INBOUND_RING: usize = 5_000_000;
 const ORDER_UPDATE_RING: usize = 5_000_000;
 const TRADE_RING: usize = 5_000_000;
-const DEPTH_RING: usize = 5_000_000;
+// Depth events are periodic (every 10-50 ms from the engine), not burst-driven.
+// DeskDepthMsg enum is ~12.9 KB (dominated by Level2SnapshotEvent with 400 levels).
+// 5M entries × 12.9 KB × 3 rings ≈ 193 GB — was causing 10 GB RSS.
+// 1024 is plenty: at 100 snapshots/s the public recv drains faster than they arrive.
+const DEPTH_RING: usize = 1_024;
 
 /// Zero-copy publish: retry `try_claim` on back-pressure, then run the
 /// writer directly into Aeron's term-log buffer (saves the staging-array

@@ -1194,7 +1194,7 @@ async fn async_main() -> anyhow::Result<()> {
     let aeron_cmd_cap: usize = std::env::var("AERON_CMD_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000_000);
+        .unwrap_or(5_000_000);
     let aeron_cmd_ring: std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>> =
         std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(aeron_cmd_cap));
     let aeron_cmd_tx = aeron_cmd_ring.clone();

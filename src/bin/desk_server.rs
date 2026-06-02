@@ -1183,18 +1183,14 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // ── Command channel: async WS handlers → Aeron spin thread ───────────────
-    // Lock-free MPMC bounded ring. 1 M (~80 MB at 80 B per AeronCmd)
-    // absorbs ~2.5 s of 400 K cmd/s peak — enough for any realistic burst
-    // (MM cancel-replace, pressure-test ramp) without rejecting healthy
-    // clients, while still bounded so a runaway load can't OOM the
-    // process. The previous 10 K cap was too tight: at 400 K conn × 1 op/s
-    // it filled in 25 ms, triggering "system busy" rejects to ~65 % of
-    // requests that the engine could have handled given more buffer.
+    // Lock-free MPMC bounded ring. AeronCmd is ~2 KB (SmallVec inline storage),
+    // so 65 536 slots = ~128 MB — enough to absorb a 10 K-connection burst
+    // while still bounded. Old default was 5 M × 2 KB = 9.8 GB (!).
     // Override via AERON_CMD_CAP env.
     let aeron_cmd_cap: usize = std::env::var("AERON_CMD_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5_000_000);
+        .unwrap_or(65_536);
     let aeron_cmd_ring: std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>> =
         std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(aeron_cmd_cap));
     let aeron_cmd_tx = aeron_cmd_ring.clone();

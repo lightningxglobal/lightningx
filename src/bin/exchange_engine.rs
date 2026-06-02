@@ -112,10 +112,12 @@ fn spawn_symbol_thread(
             let mut stats_dur_sum_us: u64 = 0;
             let mut stats_dur_max_us: u64 = 0;
             let mut stats_last = Instant::now();
-            let idle_spin_budget: u32 = std::env::var("ENGINE_IDLE_SPINS")
+            // Matching is latency-critical: default to tight spinning on
+            // dedicated cores. Set ENGINE_IDLE_SPINS=<n> to allow idle
+            // backoff after n empty iterations on CPU-constrained hosts.
+            let idle_spin_budget: Option<u32> = std::env::var("ENGINE_IDLE_SPINS")
                 .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10_000);
+                .and_then(|s| s.parse().ok());
             let mut idle_iters: u32 = 0;
             let mut idle_sleep_us: u64 = 10;
 
@@ -427,8 +429,13 @@ fn spawn_symbol_thread(
                 if did_work {
                     idle_iters = 0;
                     idle_sleep_us = 10;
-                } else if idle_iters < idle_spin_budget {
-                    idle_iters += 1;
+                } else if idle_spin_budget
+                    .map(|budget| idle_iters < budget)
+                    .unwrap_or(true)
+                {
+                    if idle_spin_budget.is_some() {
+                        idle_iters += 1;
+                    }
                     std::hint::spin_loop();
                 } else {
                     std::thread::sleep(Duration::from_micros(idle_sleep_us));

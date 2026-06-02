@@ -159,9 +159,12 @@ struct Metrics {
     // this tool wants for now.
     place_latency_us_sum: AtomicU64,
     place_latency_us_max: AtomicU64,
+    place_ok_latency_us_sum: AtomicU64,
+    place_ok_latency_us_max: AtomicU64,
     cancel_latency_us_sum: AtomicU64,
     cancel_latency_us_max: AtomicU64,
     place_latency_hist: LatencyHist,
+    place_ok_latency_hist: LatencyHist,
     cancel_latency_hist: LatencyHist,
 }
 
@@ -221,6 +224,8 @@ impl Metrics {
             cancel_fail: self.cancel_fail.load(Ordering::Relaxed),
             place_lat_sum_us: self.place_latency_us_sum.load(Ordering::Relaxed),
             place_lat_max_us: self.place_latency_us_max.load(Ordering::Relaxed),
+            place_ok_lat_sum_us: self.place_ok_latency_us_sum.load(Ordering::Relaxed),
+            place_ok_lat_max_us: self.place_ok_latency_us_max.load(Ordering::Relaxed),
             cancel_lat_sum_us: self.cancel_latency_us_sum.load(Ordering::Relaxed),
             cancel_lat_max_us: self.cancel_latency_us_max.load(Ordering::Relaxed),
         }
@@ -241,6 +246,8 @@ struct MetricsSnap {
     cancel_fail: u64,
     place_lat_sum_us: u64,
     place_lat_max_us: u64,
+    place_ok_lat_sum_us: u64,
+    place_ok_lat_max_us: u64,
     cancel_lat_sum_us: u64,
     cancel_lat_max_us: u64,
 }
@@ -687,6 +694,11 @@ async fn driver(
         }
         if placed_ok {
             metrics.place_ok.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .place_ok_latency_us_sum
+                .fetch_add(place_us, Ordering::Relaxed);
+            record_max(&metrics.place_ok_latency_us_max, place_us);
+            metrics.place_ok_latency_hist.record(place_us);
         } else {
             metrics.place_fail.fetch_add(1, Ordering::Relaxed);
         }
@@ -1028,13 +1040,27 @@ async fn async_main() -> anyhow::Result<()> {
         0
     };
     println!(
-        "  place  latency avg/max (µs):        {} / {}",
+        "  place  latency avg/max (µs):        {} / {}  (all sent)",
         p_avg_us, cur.place_lat_max_us
     );
     println!(
-        "  place  latency p50/p95 (µs):        {} / {}",
+        "  place  latency p50/p95 (µs):        {} / {}  (all sent)",
         metrics.place_latency_hist.percentile(0.50),
         metrics.place_latency_hist.percentile(0.95),
+    );
+    let p_ok_avg_us = if cur.place_ok > 0 {
+        cur.place_ok_lat_sum_us / cur.place_ok
+    } else {
+        0
+    };
+    println!(
+        "  place OK latency avg/max (µs):      {} / {}  (accepted only)",
+        p_ok_avg_us, cur.place_ok_lat_max_us
+    );
+    println!(
+        "  place OK latency p50/p95 (µs):      {} / {}  (accepted only)",
+        metrics.place_ok_latency_hist.percentile(0.50),
+        metrics.place_ok_latency_hist.percentile(0.95),
     );
     println!(
         "  cancel latency avg/max (µs):        {} / {}",

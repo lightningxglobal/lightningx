@@ -1294,14 +1294,26 @@ async fn async_main() -> anyhow::Result<()> {
         let pending_meta = state.pending_meta.clone();
         let user_tx = state.user_tx.clone();
         let spin_tracer = tracer.clone();
+        let queue_metrics = std::env::var("DESK_QUEUE_METRICS")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         std::thread::Builder::new()
             .name("aeron-send".to_string())
             .spawn(move || {
                 let mut idle_us: u64 = 0;
+                let mut metric_last = std::time::Instant::now();
+                let mut metric_drained: u64 = 0;
+                let mut metric_max_len: usize = 0;
                 loop {
                     let mut did_work = false;
+                    if queue_metrics {
+                        metric_max_len = metric_max_len.max(aeron_cmd_rx.len());
+                    }
                     while let Some(cmd) = aeron_cmd_rx.pop() {
                         did_work = true;
+                        if queue_metrics {
+                            metric_drained += 1;
+                        }
                         match cmd {
                             AeronCmd::NewOrder(req) => {
                                 let sym = std::str::from_utf8(&req.symbol)
@@ -1433,6 +1445,19 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                     } else {
                         idle_us = 0;
+                    }
+                    if queue_metrics && metric_last.elapsed() >= std::time::Duration::from_secs(1)
+                    {
+                        let len = aeron_cmd_rx.len();
+                        tracing::warn!(
+                            "aeron_cmd queue: len={} max_len={} drained_per_s={}",
+                            len,
+                            metric_max_len,
+                            metric_drained,
+                        );
+                        metric_last = std::time::Instant::now();
+                        metric_drained = 0;
+                        metric_max_len = len;
                     }
                 }
             })?;

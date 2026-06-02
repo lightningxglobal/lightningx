@@ -377,6 +377,20 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
 
     'conn: loop {
         tokio::select! {
+            // biased; → poll branches in declared order on every wake. Personal
+            // responses (order_update / balance_update) carry user-visible
+            // place-order latency; we want them flushed BEFORE we drain the
+            // next incoming frame. Without biased, tokio picks randomly →
+            // outgoing responses can wait one full select cycle.
+            biased;
+
+            // Personal order/balance update for this user — TOP PRIORITY.
+            Some(msg) = personal_rx.recv() => {
+                if socket.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
+                    break 'conn;
+                }
+            }
+
             // Incoming message from client
             frame = socket.read_frame() => {
                 match frame {
@@ -408,15 +422,8 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                 }
             }
 
-            // Personal order/balance update for this user
-            Some(msg) = personal_rx.recv() => {
-                if socket.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
-                    break 'conn;
-                }
-            }
-
-            // Market data (depth, trades, ticker, kline) — only flows
-            // here for subscribers.
+            // Market data (depth, trades, ticker, kline) — lowest priority,
+            // only flows here for subscribers.
             Some(msg) = market_rx.recv() => {
                 // Only forward if this client subscribed to a matching channel.
                 // Quick prefix check on the JSON "type" field to avoid
@@ -638,9 +645,8 @@ async fn handle_client_message(
             }
 
             // Parse base/quote assets from symbol (e.g. "BTC_USDT" → "BTC", "USDT").
-            let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
-            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+            // split_once skips the Vec heap allocation that splitn().collect() did.
+            let (base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
             let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
 
             // Capture best opposing price before matching — used as the fill
@@ -674,7 +680,7 @@ async fn handle_client_message(
             // in the Aeron event loop after the engine confirms ACCEPTED.
             if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
-                use crate::tracer::MS_WS_ORDER_RECV;
+                use crate::tracer::{MS_CMD_RING_PUSHED, MS_WS_ORDER_RECV};
                 use crate::transport::{pack_str16, AeronCmd, OrderMeta};
 
                 // PERF DIAG (off by default): sample ~1/256 PlaceOrders per-section timing.
@@ -809,6 +815,9 @@ async fn handle_client_message(
                         })
                         .to_string(),
                     );
+                }
+                if let Some(ref t) = state.tracer {
+                    t.record_sym(MS_CMD_RING_PUSHED, order_id, &sym_bytes);
                 }
                 let t_post_aeron = t0.map(|_| std::time::Instant::now());
 
@@ -1512,9 +1521,7 @@ async fn handle_client_message(
             }
 
             // Release frozen funds for the unfilled portion.
-            let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
-            let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-            let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+            let (base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
             let repo = AccountRepository::new(state.db.as_ref());
             let released_asset = if side == "buy" {
                 let freeze_price = price.unwrap_or(0.0);
@@ -1657,9 +1664,7 @@ async fn handle_client_message(
                         rej!(format!("No engine for symbol: {}", symbol));
                     }
 
-                    let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
-                    let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-                    let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+                    let (base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
 
                     let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
                     let freeze_price_val: f64 = if side == "buy" {
@@ -1873,9 +1878,7 @@ async fn handle_client_message(
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(0);
 
-                let sym_parts: Vec<&str> = symbol.splitn(2, '_').collect();
-                let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-                let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+                let (base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
                 let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
 
                 let best_opposing_price: Option<f64> = {
@@ -2168,9 +2171,7 @@ async fn batch_cancel_by_ids(
 
     for order in rows {
         let remaining = (order.quantity - order.filled).max(0.0);
-        let sym_parts: Vec<&str> = order.symbol.splitn(2, '_').collect();
-        let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-        let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+        let (base_asset, quote_asset) = order.symbol.split_once('_').unwrap_or(("BTC", "USDT"));
 
         if order.side == "buy" {
             if order.freeze_price > 0.0 && remaining > 0.0 {
@@ -2289,9 +2290,7 @@ async fn bulk_cancel(
         let remaining = (order.quantity - order.filled).max(0.0);
 
         // Release frozen funds for the unfilled portion.
-        let sym_parts: Vec<&str> = order.symbol.splitn(2, '_').collect();
-        let base_asset = sym_parts.first().copied().unwrap_or("BTC");
-        let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
+        let (base_asset, quote_asset) = order.symbol.split_once('_').unwrap_or(("BTC", "USDT"));
 
         if order.side == "buy" {
             if order.freeze_price > 0.0 && remaining > 0.0 {

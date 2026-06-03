@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # 100K WS connection pressure test.
 #
-# Defaults to 3 desk-server processes because 100K needs more than the 2-desk
-# 40K shape, but DESK_COUNT can be overridden for A/B tests:
+# Defaults to 2 desk-server processes on the local macOS test host because it
+# gives the best accepted-order p50 in the current 100K single-machine shape.
+# DESK_COUNT can be overridden for A/B tests:
 #
 #   DESK_COUNT=2 scripts/run_100k_pressure.sh
 #   DESK_COUNT=3 scripts/run_100k_pressure.sh
+#   DESK_COUNT=4 scripts/run_100k_pressure.sh
 #   DESK_COUNT=5 scripts/run_100k_pressure.sh
 #
 # Required loopback aliases for the default 10 source IP pool:
@@ -18,7 +20,8 @@ DATABASE_URL="${DATABASE_URL:-postgres://user:password@localhost:5432/mydb}"
 AERON_DIR="${AERON_DIR:-/tmp/aeron}"
 TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_100k.csv}"
 TOTAL_CONNS="${TOTAL_CONNS:-100000}"
-DESK_COUNT="${DESK_COUNT:-3}"
+DESK_COUNT="${DESK_COUNT:-2}"
+CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
 LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
 
 ENGINE_BIN="${ENGINE_BIN:-$BIN_DIR/exchange-engine}"
@@ -97,9 +100,8 @@ for ((i = 0; i < DESK_COUNT; i++)); do
 
   port=$((4003 + i))
 
-  # macOS loopback usually has ~16K ephemeral ports per source IP. Keep a
-  # margin by assigning at least one IP per ~12K connections.
-  ips_needed=$(((conns + 11999) / 12000))
+  # macOS loopback usually has ~16K ephemeral ports per source IP.
+  ips_needed=$(((conns + CONNS_PER_SOURCE_IP - 1) / CONNS_PER_SOURCE_IP))
   if (( ip_index + ips_needed > ${#SOURCE_IP_POOL[@]} )); then
     echo "not enough source IPs for ${TOTAL_CONNS}/${DESK_COUNT}; need ${ips_needed} more for desk $i" >&2
     exit 2

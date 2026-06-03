@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# 100K WS connection pressure test.
+#
+# Defaults to 3 desk-server processes because 100K needs more than the 2-desk
+# 40K shape, but DESK_COUNT can be overridden for A/B tests:
+#
+#   DESK_COUNT=2 scripts/run_100k_pressure.sh
+#   DESK_COUNT=3 scripts/run_100k_pressure.sh
+#   DESK_COUNT=5 scripts/run_100k_pressure.sh
+#
+# Required loopback aliases for the default 10 source IP pool:
+#   for i in $(seq 2 11); do sudo ifconfig lo0 alias 127.0.0.$i up; done
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN_DIR="${BIN_DIR:-/Users/alphawu/.cargo/global-target/release}"
+DATABASE_URL="${DATABASE_URL:-postgres://user:password@localhost:5432/mydb}"
+AERON_DIR="${AERON_DIR:-/tmp/aeron}"
+TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_100k.csv}"
+TOTAL_CONNS="${TOTAL_CONNS:-100000}"
+DESK_COUNT="${DESK_COUNT:-3}"
+LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
+
+ENGINE_BIN="${ENGINE_BIN:-$BIN_DIR/exchange-engine}"
+DESK_BIN="${DESK_BIN:-$BIN_DIR/desk-server}"
+PRESSURE_BIN="${PRESSURE_BIN:-$BIN_DIR/pressure-client}"
+
+SOURCE_IP_POOL=(
+  127.0.0.2 127.0.0.3 127.0.0.4 127.0.0.5 127.0.0.6
+  127.0.0.7 127.0.0.8 127.0.0.9 127.0.0.10 127.0.0.11
+)
+
+if (( DESK_COUNT < 1 || DESK_COUNT > ${#SOURCE_IP_POOL[@]} )); then
+  echo "DESK_COUNT must be between 1 and ${#SOURCE_IP_POOL[@]} (got $DESK_COUNT)" >&2
+  exit 2
+fi
+
+if [[ ! -f "$TOKENS_CSV" ]]; then
+  echo "missing token csv: $TOKENS_CSV" >&2
+  exit 2
+fi
+
+token_rows=$(wc -l < "$TOKENS_CSV" | tr -d ' ')
+if (( token_rows < TOTAL_CONNS )); then
+  echo "token csv has $token_rows rows, need at least $TOTAL_CONNS: $TOKENS_CSV" >&2
+  exit 2
+fi
+
+for ip in "${SOURCE_IP_POOL[@]}"; do
+  if ! ifconfig lo0 | grep -q "inet ${ip} "; then
+    echo "missing lo0 alias ${ip}; run: sudo ifconfig lo0 alias ${ip} up" >&2
+    exit 2
+  fi
+done
+
+mkdir -p "$LOG_DIR"
+echo "logs: $LOG_DIR"
+echo "shape: ${TOTAL_CONNS} conns across ${DESK_COUNT} desk-server processes"
+
+pids=()
+cleanup() {
+  for pid in "${pids[@]:-}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT
+
+psql "$DATABASE_URL" -c \
+  "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE status IN ('PENDING','TRADING');"
+
+env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+  RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+  "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
+pids+=("$!")
+sleep 2
+
+for ((i = 0; i < DESK_COUNT; i++)); do
+  port=$((4003 + i))
+  env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+    RUST_LOG=warning TRACER_ENABLED=0 DESK_SPIN=true DESK_PORT="$port" DESK_ID="$i" \
+    TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}" NOFILE_LIMIT=524288 \
+    "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
+  pids+=("$!")
+done
+sleep 8
+
+base_conns=$((TOTAL_CONNS / DESK_COUNT))
+extra_conns=$((TOTAL_CONNS % DESK_COUNT))
+user_offset=0
+ip_index=0
+
+for ((i = 0; i < DESK_COUNT; i++)); do
+  conns=$base_conns
+  if (( i < extra_conns )); then
+    conns=$((conns + 1))
+  fi
+
+  port=$((4003 + i))
+
+  # macOS loopback usually has ~16K ephemeral ports per source IP. Keep a
+  # margin by assigning at least one IP per ~12K connections.
+  ips_needed=$(((conns + 11999) / 12000))
+  if (( ip_index + ips_needed > ${#SOURCE_IP_POOL[@]} )); then
+    echo "not enough source IPs for ${TOTAL_CONNS}/${DESK_COUNT}; need ${ips_needed} more for desk $i" >&2
+    exit 2
+  fi
+  source_ip="${SOURCE_IP_POOL[$ip_index]}"
+  for ((j = 1; j < ips_needed; j++)); do
+    source_ip="${source_ip},${SOURCE_IP_POOL[$((ip_index + j))]}"
+  done
+  ip_index=$((ip_index + ips_needed))
+
+  env PRESSURE_TOKENS_CSV="$TOKENS_CSV" \
+    PRESSURE_USERS="$conns" PRESSURE_USER_OFFSET="$user_offset" PRESSURE_CONNS="$conns" \
+    PRESSURE_DURATION_S="${PRESSURE_DURATION_S:-30}" \
+    PRESSURE_RAMP_S="${PRESSURE_RAMP_S:-60}" \
+    PRESSURE_OPS_PER_SEC="${PRESSURE_OPS_PER_SEC:-0.2}" \
+    PRESSURE_BASE_URL="http://127.0.0.1:${port}" \
+    PRESSURE_SOURCE_IPS="$source_ip" PRESSURE_SYMBOL=BTC_USDT \
+    PRESSURE_WORKERS="${PRESSURE_WORKERS:-3}" NOFILE_LIMIT=524288 \
+    RUST_LOG=warning "$PRESSURE_BIN" >"$LOG_DIR/pressure-$i.log" 2>&1 &
+  pids+=("$!")
+
+  echo "pressure-$i: conns=$conns user_offset=$user_offset source_ips=$source_ip port=$port"
+  user_offset=$((user_offset + conns))
+done
+
+wait "${pids[@]:$((DESK_COUNT + 1))}" || true
+
+echo
+echo "===== ${TOTAL_CONNS} PRESSURE TEST RESULTS (${DESK_COUNT} desk) ====="
+for ((i = 0; i < DESK_COUNT; i++)); do
+  port=$((4003 + i))
+  echo
+  echo "===== pressure-$i -> ${port} ====="
+  sed -n '/final summary/,$p' "$LOG_DIR/pressure-$i.log"
+done

@@ -152,6 +152,7 @@ PGPASSWORD=password psql -h localhost -U user -d mydb -c "DELETE FROM orders;"
 | 20K  | 2     | 10K    | 81.5%†  | 100%  | 218 µs   | 1,529 µs  | 5,228 µs  |
 | **40K** | **2** | **20K** | **100%** | **100%** | **~240 µs** | **~863 µs** | **~5.7 ms** |
 | 40K  | 4 ⚠️  | 10K    | 41.4%   | 92.4% | ~19 ms   | ≥1 s      | ≥1 s      |
+| **40K** | **4** ✅ | **10K** | **100%** | **100%** | **~164 µs** | **~1,320 µs** | **~6.5 ms** |
 | 100K | 2 ⚠️  | 50K    | 97.0%   | 0.9%  | ~100 ms  | ≥1 s      | ≥1 s      |
 | 200K | 2 ⚠️  | 100K   | 99.3%   | 9.7%  | ≥1 s     | ≥1 s      | ≥1 s      |
 | 200K | 3 ⚠️  | 67K    | 94.9%   | 2.8%  | ≥1 s     | ≥1 s      | ≥1 s      |
@@ -162,7 +163,7 @@ PGPASSWORD=password psql -h localhost -U user -d mydb -c "DELETE FROM orders;"
 
 ⚠️ 200K/2 desks 和 200K/3 desks：连接建立正常，但委托全部超时。原因见第 6 节。
 
-**当前 baseline：40K / 2 desks（连接 100%，委托 100%，Place p50 ≈ 240 µs）。**
+**当前 baseline：40K / 4 desks（连接 100%，委托 100%，Place p50 ≈ 164 µs）。** 相比旧 2 desks baseline p50 下降 32%；旧 4 desks 方案（41.4% 连接失败）由 write actor pool 修复。
 
 ### 5.2 各阶段（Milestone Gap）时延
 

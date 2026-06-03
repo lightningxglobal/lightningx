@@ -227,6 +227,12 @@ pub struct AppState {
     /// off their WebSocket write half; all outgoing frames then go through
     /// the pool, keeping handler select! loops read-only.
     pub write_pool: Arc<crate::desk::write_actor::WriteActorPool>,
+    /// Read actor pool: N tokio tasks each driving M connection read loops via
+    /// FuturesUnordered. On accept, the ws_handler routes the read half here
+    /// instead of spawning a dedicated per-connection handler task. Reduces
+    /// sleeping task count from 10K to N, shrinking the tokio scheduler
+    /// ready-queue on every market-data or order-update wakeup.
+    pub read_pool: Arc<crate::desk::read_actor::ReadActorPool>,
 }
 
 pub fn router(state: AppState) -> Router {

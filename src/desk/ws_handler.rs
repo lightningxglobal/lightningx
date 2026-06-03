@@ -1,5 +1,6 @@
 use crate::account_repository::AccountRepository;
 use crate::api::AppState;
+use crate::desk::read_actor::ReadConn;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::order::{Order, Side, TimeInForce};
 use crate::order_state::{
@@ -10,11 +11,9 @@ use crate::ws_sbe;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use dashmap::DashMap;
-use fastwebsockets::{upgrade, Frame, OpCode, WebSocket};
+use fastwebsockets::{upgrade, Frame, OpCode};
 use std::time::Duration;
 use tokio::io as tio;
-use hyper::upgrade::Upgraded;
-use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -358,7 +357,29 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
     };
     tokio::spawn(async move {
         match fut.await {
-            Ok(ws) => handle_socket(ws, state).await,
+            Ok(mut socket) => {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static CONN_ID_GEN: AtomicU64 = AtomicU64::new(1);
+                let conn_id = CONN_ID_GEN.fetch_add(1, Ordering::Relaxed);
+
+                socket.set_writev(true);
+                socket.set_auto_close(false);
+                socket.set_auto_pong(false);
+
+                let (ws_read, ws_write) = socket.split(tio::split);
+                let (personal_tx, ctrl_tx) =
+                    match state.write_pool.register(ws_write, ws_personal_queue_cap()) {
+                        Some(v) => v,
+                        None => return,
+                    };
+                state.read_pool.register(ReadConn {
+                    conn_id,
+                    ws_read,
+                    state: state.clone(),
+                    personal_tx,
+                    ctrl_tx,
+                });
+            }
             Err(e) => tracing::error!("WS upgrade error: {e}"),
         }
     });
@@ -367,28 +388,8 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
 
 // ─── Socket loop ──────────────────────────────────────────────────────────────
 
-async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CONN_ID_GEN: AtomicU64 = AtomicU64::new(1);
-    let conn_id = CONN_ID_GEN.fetch_add(1, Ordering::Relaxed);
-
-    // writev=true → single writev() syscall combines WS header + payload.
-    // set_auto_pong/close false: we split the socket, so the read half can't
-    // auto-respond through the write half. Close/Ping are handled manually below.
-    socket.set_writev(true);
-    socket.set_auto_close(false);
-    socket.set_auto_pong(false);
-
-    // Split: read half stays in this task; write half moves to a write actor.
-    let (mut ws_read, ws_write) = socket.split(tio::split);
-
-    // Register write half with pool. personal_tx → user_tx registry.
-    // ctrl_tx sends WsCtrl::Pong (client-ping response) and WsCtrl::Ping
-    // (server heartbeat) to the write actor.
-    let (personal_tx, ctrl_tx) = match state.write_pool.register(ws_write, ws_personal_queue_cap()) {
-        Some(v) => v,
-        None => return, // actor registration channel full (shouldn't happen)
-    };
+pub async fn read_conn_loop(conn: ReadConn) {
+    let ReadConn { conn_id, mut ws_read, state, personal_tx, ctrl_tx } = conn;
 
     // send_fn: required by WebSocketRead::read_frame API but never called
     // because auto_close=false and auto_pong=false suppress all auto-sends.

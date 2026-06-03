@@ -1349,6 +1349,7 @@ async fn async_main() -> anyhow::Result<()> {
         persist_pub: Some(persist_pub.clone()),
         vwap_cache: vwap_cache.clone(),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
+        read_pool: Arc::new(lightning_exchange::read_actor::ReadActorPool::new()),
     };
 
     // DB worker thread removed. PR5 took every PG SQL call out of

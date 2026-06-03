@@ -43,6 +43,7 @@ pub use desk::rate_limit;
 pub use desk::snowflake;
 pub use desk::symbol_rules;
 pub use desk::user_service;
+pub use desk::read_actor;
 pub use desk::write_actor;
 pub use desk::ws_handler;
 

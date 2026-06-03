@@ -11,5 +11,6 @@ pub mod redis_store;
 pub mod snowflake;
 pub mod symbol_rules;
 pub mod user_service;
+pub mod read_actor;
 pub mod write_actor;
 pub mod ws_handler;

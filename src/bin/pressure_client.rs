@@ -919,11 +919,7 @@ fn worker_threads() -> usize {
     std::env::var("PRESSURE_WORKERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8)
-        })
+        .unwrap_or(2)
 }
 
 fn main() -> anyhow::Result<()> {

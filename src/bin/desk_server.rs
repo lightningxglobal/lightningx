@@ -944,15 +944,15 @@ fn process_db_cmd(
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     raise_nofile_limit();
-    // Default to 8 worker threads (vs num_cpus≈14 default). Even at 400K
-    // WS conns each worker only handles ~28K parked sockets; reactor
-    // wake-ups are well under 10K/s/worker. Six fewer threads = ~6 MB
-    // less stack + less scheduler context + less L1 churn. Override with
-    // TOKIO_WORKER_THREADS env when needed.
+    // A 40K run usually starts 4 desk-server processes on one host. Defaulting
+    // each process to 8 Tokio workers creates 32 scheduler threads before the
+    // Aeron spin threads even start, which preempts the matching thread. Keep
+    // the default small; override with TOKIO_WORKER_THREADS when a desk owns
+    // more cores.
     let worker_threads: usize = std::env::var("TOKIO_WORKER_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
+        .unwrap_or(2);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
@@ -1010,6 +1010,44 @@ fn raise_nofile_limit() {
             new_soft,
             limit.rlim_max
         );
+    }
+}
+
+fn env_core(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_core(name: &str, label: &str) {
+    let Some(core) = env_core(name) else {
+        return;
+    };
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        let rc = libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        );
+        if rc == 0 {
+            tracing::info!("{label} pinned to cpu {core} via {name}");
+        } else {
+            tracing::warn!(
+                "{label} failed to pin to cpu {core} via {name}: {}",
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to_core(name: &str, label: &str) {
+    if let Some(core) = env_core(name) {
+        tracing::warn!("{label} requested cpu pin {core} via {name}, but this platform does not support pthread affinity");
     }
 }
 
@@ -1150,6 +1188,7 @@ async fn async_main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("persist-send".to_string())
             .spawn(move || {
+                pin_current_thread_to_core("DESK_PERSIST_CORE", "persist-send");
                 let mut idle_us: u64 = 10;
                 loop {
                     let mut did_work = false;
@@ -1367,6 +1406,7 @@ async fn async_main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("aeron-send".to_string())
             .spawn(move || {
+                pin_current_thread_to_core("DESK_SEND_CORE", "aeron-send");
                 let mut idle_us: u64 = 0;
                 let mut metric_last = std::time::Instant::now();
                 let mut metric_drained: u64 = 0;
@@ -1557,6 +1597,7 @@ async fn async_main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("aeron-recv-public".to_string())
             .spawn(move || {
+                pin_current_thread_to_core("DESK_RECV_PUBLIC_CORE", "aeron-recv-public");
                 let mut live_market_data = LiveMarketData::default();
                 let mut settle_batch: [SettleTradeEntry; 64] = [SettleTradeEntry {
                     taker_id: 0, maker_id: 0, taker_uid: 0, maker_uid: 0,
@@ -1711,6 +1752,7 @@ async fn async_main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("aeron-recv".to_string())
             .spawn(move || {
+                pin_current_thread_to_core("DESK_RECV_CORE", "aeron-recv");
                 let mut idle_us: u64 = 0;
                 // Accumulator for CANCELLED events observed in one poll burst.
                 // PR5b: each entry carries the fully-resolved (user_id,

@@ -50,11 +50,54 @@ fn symbol_from_bytes(bytes: &[u8; 16]) -> &str {
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
+fn env_core_at(name: &str, index: usize) -> Option<usize> {
+    let value = std::env::var(name).ok()?;
+    let mut cores = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<usize>().ok());
+    cores.nth(index)
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_core(name: &str, index: usize, label: &str) {
+    let Some(core) = env_core_at(name, index) else {
+        return;
+    };
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core, &mut set);
+        let rc = libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        );
+        if rc == 0 {
+            tracing::info!("{label} pinned to cpu {core} via {name}[{index}]");
+        } else {
+            tracing::warn!(
+                "{label} failed to pin to cpu {core} via {name}[{index}]: {}",
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to_core(name: &str, index: usize, label: &str) {
+    if let Some(core) = env_core_at(name, index) {
+        tracing::warn!("{label} requested cpu pin {core} via {name}[{index}], but this platform does not support pthread affinity");
+    }
+}
+
 /// Spawn one fully-independent matching thread for a single symbol.
 ///
 /// Each thread creates its own AeronClient connection — this avoids the 3rd
 /// publication registration hanging when all symbols share one client.
 fn spawn_symbol_thread(
+    core_index: usize,
     symbol: String,
     engine: MatchingEngine,
     tracer: Option<lightning_exchange::tracer::ExchangeTracer>,
@@ -63,6 +106,7 @@ fn spawn_symbol_thread(
     std::thread::Builder::new()
         .name(format!("match-{}", symbol))
         .spawn(move || {
+            pin_current_thread_to_core("ENGINE_MATCH_CORES", core_index, "matching");
             let client = Arc::new(AeronClient::new(&aeron_dir()).expect("AeronClient"));
             let orders_stream = orders_stream_for_symbol(&symbol);
             let mut subscriber =
@@ -112,27 +156,19 @@ fn spawn_symbol_thread(
             let mut stats_dur_sum_us: u64 = 0;
             let mut stats_dur_max_us: u64 = 0;
             let mut stats_last = Instant::now();
-            // Matching is latency-critical, but defaulting to infinite spin
-            // burns a whole core per symbol thread even when idle — on shared
-            // hosts (dev macOS, multi-symbol single-machine deploys) this
-            // starves desk/pg-writer of cores. Spin for a budget, then nap
-            // briefly to release the core; arriving bursts pile in the IPC
-            // ring and get drained on the next wake.
+            // Matching is latency-critical: default to infinite spin so a
+            // warm order stream does not wait behind a sleep wake-up. Shared
+            // dev hosts can opt into bounded spinning with ENGINE_IDLE_SPINS.
             //
-            // Default budget = 8192 spins (~ tens of µs of polling); start
-            // sleep at 1µs and cap at 50µs to keep wake-up latency low. 8192
-            // is large enough that mid-burst dips don't trigger sleep, but
-            // small enough that truly idle threads quickly release the core.
-            //
-            // ENGINE_IDLE_SPINS=0 forces infinite spin (production with
-            // dedicated cores). Otherwise the value sets the spin budget.
+            // ENGINE_IDLE_SPINS=0 or unset means infinite spin. A positive
+            // value spins that many idle loops before sleeping 1-50µs.
             let idle_spin_budget: Option<u32> = match std::env::var("ENGINE_IDLE_SPINS")
                 .ok()
                 .and_then(|s| s.parse().ok())
             {
                 Some(0u32) => None,
                 Some(n) => Some(n),
-                None => Some(8192),
+                None => None,
             };
             let mut idle_iters: u32 = 0;
             let mut idle_sleep_us: u64 = 1;
@@ -744,7 +780,10 @@ async fn main() -> anyhow::Result<()> {
     // calls + unbounded mpsc sends + cache-line invalidation crushed the
     // hot path. Cheap `if let Some` guards remain on every call site so
     // turning it back on with `TRACER_ENABLED=1` requires no code changes.
-    let tracer = if std::env::var("TRACER_ENABLED").map(|v| v == "1").unwrap_or(false) {
+    let tracer = if std::env::var("TRACER_ENABLED")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         spawn_tracer(
             &aeron_dir(),
             METRICS_CHANNEL,
@@ -764,10 +803,10 @@ async fn main() -> anyhow::Result<()> {
     // ----- Spawn one independent matching thread per symbol ------------------
     // Each thread creates its own AeronClient so publications don't contend.
     let mut handles = Vec::new();
-    for symbol in &symbols {
+    for (idx, symbol) in symbols.iter().enumerate() {
         let engine = engines.remove(symbol).expect("engine missing");
         let uid_map = uid_maps.remove(symbol).unwrap_or_default();
-        let handle = spawn_symbol_thread(symbol.clone(), engine, tracer.clone(), uid_map);
+        let handle = spawn_symbol_thread(idx, symbol.clone(), engine, tracer.clone(), uid_map);
         handles.push(handle);
     }
 

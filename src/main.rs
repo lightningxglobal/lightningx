@@ -337,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
         redis: None,
         persist_pub: None,
         vwap_cache: Arc::new(dashmap::DashMap::new()),
+        write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

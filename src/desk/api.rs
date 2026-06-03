@@ -225,6 +225,11 @@ pub struct AppState {
     /// Per (user_id, base_asset) running VWAP of BUY fills. Updated by
     /// the spin thread on every BatchSettleTrade. Read by /api/positions.
     pub vwap_cache: VwapCache,
+    /// Write actor pool: N tokio tasks each driving M connections via
+    /// FuturesUnordered. Handler tasks call write_pool.register() to hand
+    /// off their WebSocket write half; all outgoing frames then go through
+    /// the pool, keeping handler select! loops read-only.
+    pub write_pool: Arc<crate::desk::write_actor::WriteActorPool>,
 }
 
 pub fn router(state: AppState) -> Router {

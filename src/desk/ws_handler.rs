@@ -9,7 +9,8 @@ use crate::user_service;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use dashmap::DashMap;
-use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket};
+use fastwebsockets::{upgrade, Frame, OpCode, WebSocket};
+use tokio::io as tio;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
@@ -357,42 +358,43 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
     static CONN_ID_GEN: AtomicU64 = AtomicU64::new(1);
     let conn_id = CONN_ID_GEN.fetch_add(1, Ordering::Relaxed);
 
-    // writev=true → single writev() syscall combines WS header + payload
-    // instead of two write() calls per frame. On loopback this halves the
-    // syscall count per outgoing frame and shaves ~50-100µs off RTT.
+    // writev=true → single writev() syscall combines WS header + payload.
+    // set_auto_pong/close false: we split the socket, so the read half can't
+    // auto-respond through the write half. Close/Ping are handled manually below.
     socket.set_writev(true);
-    socket.set_auto_close(true);
-    socket.set_auto_pong(true);
+    socket.set_auto_close(false);
+    socket.set_auto_pong(false);
+
+    // Split: read half stays in this task; write half moves to a write actor.
+    let (mut ws_read, ws_write) = socket.split(tio::split);
+
+    // Register write half with pool. personal_tx → user_tx registry.
+    // pong_tx is only used to forward Pong responses when client pings.
+    let (personal_tx, pong_tx) = match state.write_pool.register(ws_write, ws_personal_queue_cap()) {
+        Some(v) => v,
+        None => return, // actor registration channel full (shouldn't happen)
+    };
+
+    // send_fn: required by WebSocketRead::read_frame API but never called
+    // because auto_close=false and auto_pong=false suppress all auto-sends.
+    let mut noop_send =
+        |_frame: Frame<'static>| std::future::ready(Ok::<(), fastwebsockets::WebSocketError>(()));
+
     let mut session = WsSession::new();
 
-    // Personal update channel for this connection (order/balance events).
-    let (personal_tx, mut personal_rx) = mpsc::channel::<String>(ws_personal_queue_cap());
     // Market data channel: registered LAZILY with state.market_fanout when
     // the client first sends a Subscribe message. Connections that never
     // subscribe (load tests, trading-only bots) never get registered, so
-    // they impose zero fanout overhead. Eliminates the broadcast::Receiver
-    // lock contention that pushed p50 to 2s at 40K conns.
+    // they impose zero fanout overhead.
     let (market_tx, mut market_rx) = mpsc::channel::<Arc<str>>(8192);
     let mut market_registered = false;
 
     'conn: loop {
         tokio::select! {
-            // biased; → poll branches in declared order on every wake. Personal
-            // responses (order_update / balance_update) carry user-visible
-            // place-order latency; we want them flushed BEFORE we drain the
-            // next incoming frame. Without biased, tokio picks randomly →
-            // outgoing responses can wait one full select cycle.
             biased;
 
-            // Personal order/balance update for this user — TOP PRIORITY.
-            Some(msg) = personal_rx.recv() => {
-                if socket.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
-                    break 'conn;
-                }
-            }
-
-            // Incoming message from client
-            frame = socket.read_frame() => {
+            // Incoming message from client — reads drive all control flow.
+            frame = ws_read.read_frame(&mut noop_send) => {
                 match frame {
                     Ok(frame) => match frame.opcode {
                         OpCode::Text => {
@@ -400,20 +402,19 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                                 Ok(t) => t,
                                 Err(_) => continue 'conn,
                             };
-                            // Lazy register with market_fanout on first
-                            // Subscribe-like message — quick substring check
-                            // avoids a full JSON parse just to detect intent.
                             if !market_registered && text.contains("\"subscribe\"") {
                                 state.market_fanout.register(conn_id, market_tx.clone());
                                 market_registered = true;
                             }
                             if let Some(reply) = handle_client_message(
-                                text, &mut session, &state, &personal_tx
+                                text, &mut session, &state, &personal_tx,
                             ).await {
-                                if socket.write_frame(Frame::text(Payload::Owned(reply.into_bytes()))).await.is_err() {
-                                    break 'conn;
-                                }
+                                let _ = personal_tx.try_send(reply);
                             }
+                        }
+                        OpCode::Ping => {
+                            // Forward Pong via write actor channel.
+                            let _ = pong_tx.try_send(frame.payload.to_vec());
                         }
                         OpCode::Close => break 'conn,
                         _ => {}
@@ -425,9 +426,6 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
             // Market data (depth, trades, ticker, kline) — lowest priority,
             // only flows here for subscribers.
             Some(msg) = market_rx.recv() => {
-                // Only forward if this client subscribed to a matching channel.
-                // Quick prefix check on the JSON "type" field to avoid
-                // deserializing the whole payload.
                 let should_forward = if msg.contains("\"type\":\"depth\"") {
                     msg_symbol(&msg).map(|sym| {
                         session.subscribed.contains(&format!("depth.{}", sym))
@@ -453,18 +451,17 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                 };
 
                 if should_forward {
-                    if socket.write_frame(Frame::text(Payload::Owned(msg.as_bytes().to_vec()))).await.is_err() {
-                        break 'conn;
-                    }
+                    let _ = personal_tx.try_send(msg.as_ref().to_owned());
                 }
             }
         }
     }
+
+    // Dropping personal_tx + pong_tx signals write_conn_loop to exit cleanly.
+
     if market_registered {
         state.market_fanout.unregister(conn_id);
     }
-
-    // Remove personal channel on disconnect.
     if let Some(uid) = session.user_id {
         state.user_tx.unregister(uid);
     }

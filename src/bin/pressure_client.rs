@@ -643,13 +643,11 @@ async fn driver(
                     order_id_match = Some(format!(r#""order_id":{},"#, id));
                 }
                 continue;
-            }
-            else if text.contains("\"order_rejected\"") {
+            } else if text.contains("\"order_rejected\"") {
                 placed_ok = false;
                 place_us = t0.elapsed().as_micros() as u64;
                 break;
-            }
-            else if text.contains("\"order_update\"") {
+            } else if text.contains("\"order_update\"") {
                 // Match by client_order_id if present (engine→desk forward
                 // includes it), else fall back to order_id match.
                 let mine = text.contains(&coid_match)
@@ -669,8 +667,7 @@ async fn driver(
                     placed_ok = true;
                     place_us = t0.elapsed().as_micros() as u64;
                     break;
-                }
-                else if text.contains("\"status\":\"REJECTED\"") {
+                } else if text.contains("\"status\":\"REJECTED\"") {
                     placed_ok = false;
                     place_us = t0.elapsed().as_micros() as u64;
                     break;
@@ -776,8 +773,7 @@ async fn driver(
                     // Don't break — keep reading until the engine CANCELED
                     // arrives so we don't leave it queued.
                     continue;
-                }
-                else if text.contains("\"order_update\"")
+                } else if text.contains("\"order_update\"")
                     && text.contains("\"status\":\"CANCELED\"")
                     && text.contains(&id_match)
                 {
@@ -931,6 +927,9 @@ fn worker_threads() -> usize {
 }
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+    raise_nofile_limit();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
         .enable_all()
@@ -938,8 +937,57 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(async_main())
 }
 
+fn raise_nofile_limit() {
+    let target = std::env::var("NOFILE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<libc::rlim_t>().ok())
+        .unwrap_or(262_144);
+
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            warn!(
+                "getrlimit(RLIMIT_NOFILE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        if limit.rlim_cur >= target {
+            info!(
+                "RLIMIT_NOFILE already sufficient: soft={} hard={}",
+                limit.rlim_cur, limit.rlim_max
+            );
+            return;
+        }
+
+        let new_soft = target.min(limit.rlim_max);
+        let new_limit = libc::rlimit {
+            rlim_cur: new_soft,
+            rlim_max: limit.rlim_max,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new_limit) != 0 {
+            warn!(
+                "setrlimit(RLIMIT_NOFILE) failed: target={} soft={} hard={} error={}",
+                target,
+                limit.rlim_cur,
+                limit.rlim_max,
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        info!(
+            "raised RLIMIT_NOFILE: soft {} -> {} hard={}",
+            limit.rlim_cur, new_soft, limit.rlim_max
+        );
+    }
+}
+
 async fn async_main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
     let cfg = Arc::new(Config::from_env());
     info!(
         "pressure_client: users={} conns={} ops/s/conn={} duration={}s ramp={}s symbol={} price={} qty={}",

@@ -943,6 +943,7 @@ fn process_db_cmd(
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    raise_nofile_limit();
     // Default to 8 worker threads (vs num_cpus≈14 default). Even at 400K
     // WS conns each worker only handles ~28K parked sockets; reactor
     // wake-ups are well under 10K/s/worker. Six fewer threads = ~6 MB
@@ -957,6 +958,59 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async_main())
+}
+
+fn raise_nofile_limit() {
+    let target = std::env::var("NOFILE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<libc::rlim_t>().ok())
+        .unwrap_or(262_144);
+
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            tracing::warn!(
+                "getrlimit(RLIMIT_NOFILE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        if limit.rlim_cur >= target {
+            tracing::info!(
+                "RLIMIT_NOFILE already sufficient: soft={} hard={}",
+                limit.rlim_cur,
+                limit.rlim_max
+            );
+            return;
+        }
+
+        let new_soft = target.min(limit.rlim_max);
+        let new_limit = libc::rlimit {
+            rlim_cur: new_soft,
+            rlim_max: limit.rlim_max,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new_limit) != 0 {
+            tracing::warn!(
+                "setrlimit(RLIMIT_NOFILE) failed: target={} soft={} hard={} error={}",
+                target,
+                limit.rlim_cur,
+                limit.rlim_max,
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        tracing::info!(
+            "raised RLIMIT_NOFILE: soft {} -> {} hard={}",
+            limit.rlim_cur,
+            new_soft,
+            limit.rlim_max
+        );
+    }
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -1217,7 +1271,9 @@ async fn async_main() -> anyhow::Result<()> {
     let initial_id = (max_db_id as u64) + 1 + desk_id * 1_000_000_000;
     tracing::info!(
         "next_order_id initial: max_db_id={} desk_id={} initial_id={}",
-        max_db_id, desk_id, initial_id,
+        max_db_id,
+        desk_id,
+        initial_id,
     );
 
     // ── Shared state ──────────────────────────────────────────────────────────
@@ -1464,8 +1520,7 @@ async fn async_main() -> anyhow::Result<()> {
                     } else {
                         idle_us = 0;
                     }
-                    if queue_metrics && metric_last.elapsed() >= std::time::Duration::from_secs(1)
-                    {
+                    if queue_metrics && metric_last.elapsed() >= std::time::Duration::from_secs(1) {
                         let len = aeron_cmd_rx.len();
                         tracing::warn!(
                             "aeron_cmd queue: len={} max_len={} drained_per_s={}",

@@ -13,7 +13,7 @@ use lightning_exchange::{
     api::{router, AccountCache, AppState},
     db,
     order_state::{
-        db_status_from_update_kind, maker_ws_status_from_db_status, ws_status_from_update_kind,
+        db_status_from_update_kind, ws_status_from_update_kind,
         DbOrderStatus,
     },
     tracer::{
@@ -112,7 +112,8 @@ struct LiveSymbolMarketData {
 }
 
 impl LiveSymbolMarketData {
-    fn ingest(&mut self, ts_secs: i64, price: f64, qty: f64) -> (String, String, String, String) {
+    /// Returns (change, high, low, volume, kline_bucket, agg_1s, agg_5s)
+    fn ingest(&mut self, ts_secs: i64, price: f64, qty: f64) -> (f64, f64, f64, f64, LiveBucket, LiveBucket, LiveBucket) {
         self.prune_24h(ts_secs);
         self.push_24h(ts_secs, price, qty);
 
@@ -127,15 +128,7 @@ impl LiveSymbolMarketData {
         let agg_1s = update_live_bucket(&mut self.agg_1s, ts_secs, price, qty);
         let agg_5s = update_live_bucket(&mut self.agg_5s, ts_secs - ts_secs % 5, price, qty);
 
-        (
-            format!(
-                r#""last":{},"change":{},"high":{},"low":{},"volume":{}"#,
-                price, change, self.high_24h, self.low_24h, self.volume_24h,
-            ),
-            bucket_bar_json(kline),
-            bucket_agg_json("1s", agg_1s),
-            bucket_agg_json("5s", agg_5s),
-        )
+        (change, self.high_24h, self.low_24h, self.volume_24h, kline, agg_1s, agg_5s)
     }
 
     fn prune_24h(&mut self, ts_secs: i64) {
@@ -187,22 +180,35 @@ struct LiveMarketData {
 }
 
 impl LiveMarketData {
-    fn ingest(&mut self, symbol: &str, ts_micros: u64, price: f64, qty: f64) -> [String; 4] {
+    /// Returns (ticker_json_for_rest, [ticker_sbe, kline_sbe, agg1s_sbe, agg5s_sbe])
+    fn ingest(&mut self, symbol: &str, ts_micros: u64, price: f64, qty: f64) -> (String, [Vec<u8>; 4]) {
+        use lightning_exchange::ws_sbe;
         let ts_secs = (ts_micros / 1_000_000) as i64;
         let state = self.by_symbol.entry(symbol.to_string()).or_default();
-        let (ticker_fields, kline_bar, agg_1s, agg_5s) = state.ingest(ts_secs, price, qty);
-        [
-            format!(
-                r#"{{"type":"ticker","symbol":"{}",{}}}"#,
-                symbol, ticker_fields
-            ),
-            format!(
-                r#"{{"type":"kline","symbol":"{}","bar":{}}}"#,
-                symbol, kline_bar
-            ),
-            format!(r#"{{"type":"agg_trade","symbol":"{}",{}}}"#, symbol, agg_1s),
-            format!(r#"{{"type":"agg_trade","symbol":"{}",{}}}"#, symbol, agg_5s),
-        ]
+        let (change, high, low, volume, kline, agg_1s, agg_5s) = state.ingest(ts_secs, price, qty);
+
+        // Ticker JSON kept for REST endpoint (last_ticker cache).
+        let ticker_json = format!(
+            r#"{{"type":"ticker","symbol":"{}","last":{},"change":{},"high":{},"low":{},"volume":{}}}"#,
+            symbol, price, change, high, low, volume,
+        );
+
+        // SBE frames for market_fanout broadcast.
+        let interval_1m: u8 = 1;
+        let interval_1s: u8 = 0;
+        let interval_5s: u8 = 0;
+        (
+            ticker_json,
+            [
+                ws_sbe::encode_ticker(symbol, price, change, high, low, volume),
+                ws_sbe::encode_kline(symbol, interval_1m, kline.start as u64,
+                    kline.open, kline.high, kline.low, kline.close, kline.volume),
+                ws_sbe::encode_agg_trade(symbol, interval_1s, agg_1s.start as u64,
+                    agg_1s.open, agg_1s.high, agg_1s.low, agg_1s.close, agg_1s.volume, agg_1s.trade_count as u32),
+                ws_sbe::encode_agg_trade(symbol, interval_5s, agg_5s.start as u64,
+                    agg_5s.open, agg_5s.high, agg_5s.low, agg_5s.close, agg_5s.volume, agg_5s.trade_count as u32),
+            ],
+        )
     }
 }
 
@@ -223,27 +229,6 @@ fn update_live_bucket(
             next
         }
     }
-}
-
-fn bucket_bar_json(bucket: LiveBucket) -> String {
-    format!(
-        r#"{{"time":{},"open":{},"high":{},"low":{},"close":{},"volume":{}}}"#,
-        bucket.start, bucket.open, bucket.high, bucket.low, bucket.close, bucket.volume,
-    )
-}
-
-fn bucket_agg_json(interval: &str, bucket: LiveBucket) -> String {
-    format!(
-        r#""interval":"{}","time":{},"open":{},"high":{},"low":{},"close":{},"volume":{},"trade_count":{}"#,
-        interval,
-        bucket.start,
-        bucket.open,
-        bucket.high,
-        bucket.low,
-        bucket.close,
-        bucket.volume,
-        bucket.trade_count,
-    )
 }
 
 // ── DbCmd: fixed-size Copy type for rtrb spin thread → DB worker ─────────────
@@ -689,9 +674,8 @@ fn process_db_cmd(
                         }),
                     );
                     if let Some(tx) = user_tx.get(uid) {
-                        let _ = tx.try_send(format!(
-                            r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
-                            asset, bal, bal - frz, frz,
+                        let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
+                            &asset, bal, bal - frz, frz,
                         ));
                     }
                 }
@@ -746,9 +730,8 @@ fn process_db_cmd(
                     }),
                 );
                 if let Some(tx) = user_tx.get(user_id) {
-                    let _ = tx.try_send(format!(
-                        r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
-                        asset, bal, bal - frz, frz,
+                    let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
+                        &asset, bal, bal - frz, frz,
                     ));
                 }
             }
@@ -880,11 +863,8 @@ fn process_db_cmd(
             // will eventually arrive.
             for r in &resolved {
                 if let Some(tx) = user_tx.get(r.maker_uid) {
-                    // Hand-written JSON; same shape as the previous
-                    // serde_json::json! macro call.
-                    let _ = tx.try_send(format!(
-                        r#"{{"type":"order_update","order_id":{},"status":"PARTIAL_FILL","filled_qty":{},"ts":{}}}"#,
-                        r.maker_id, r.qty, ts,
+                    let _ = tx.try_send(lightning_exchange::ws_sbe::encode_order_update(
+                        r.maker_id as u64, 0, lightning_exchange::ws_sbe::WS_STATUS_PARTIAL_FILL, r.qty, r.price, ts,
                     ));
                 }
                 // Publish a TRADING-status fill update for the maker. If the
@@ -914,9 +894,8 @@ fn process_db_cmd(
                     }),
                 );
                 if let Some(tx) = user_tx.get(uid) {
-                    let _ = tx.try_send(format!(
-                        r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
-                        asset, bal, bal - frz, frz,
+                    let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
+                        &asset, bal, bal - frz, frz,
                     ));
                 }
             }
@@ -1464,13 +1443,9 @@ async fn async_main() -> anyhow::Result<()> {
                                         .map(|m| m.client_order_id.as_str())
                                         .unwrap_or("");
                                     if let Some(tx) = user_tx.get(uid as i64) {
-                                        let msg = serde_json::json!({
-                                            "type": "order_rejected",
-                                            "client_order_id": client_oid,
-                                            "reason": format!("No engine for symbol: {}", sym),
-                                        })
-                                        .to_string();
-                                        let _ = tx.try_send(msg);
+                                        let _ = tx.try_send(lightning_exchange::ws_sbe::encode_order_rejected(
+                                            0, &format!("No engine for symbol: {}", sym),
+                                        ));
                                     }
                                 }
                                 if let Some(ref t) = spin_tracer {
@@ -1635,23 +1610,20 @@ async fn async_main() -> anyhow::Result<()> {
                         let sym_end = sym.iter().position(|&b| b == 0).unwrap_or(16);
                         let symbol_str =
                             std::str::from_utf8(&sym[..sym_end]).unwrap_or("BTC_USDT");
-                        let side_str = if side == 0 { "buy" } else { "sell" };
                         let ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_micros() as u64)
                             .unwrap_or(0);
-                        let msg = format!(
-                            r#"{{"type":"trade","symbol":"{}","price":{},"qty":{},"side":"{}","ts":{}}}"#,
-                            symbol_str, price, qty, side_str, ts,
-                        );
-                        market_fanout.send_owned(msg);
+                        market_fanout.send_owned(lightning_exchange::ws_sbe::encode_trade(
+                            price, qty, side, ts, symbol_str,
+                        ));
                         last_trade_price.insert(symbol_str.to_string(), price);
                         if market_fanout.subscriber_count() != 0 {
-                            let market_msgs =
+                            let (ticker_json, sbe_msgs) =
                                 live_market_data.ingest(symbol_str, ts, price, qty);
-                            last_ticker.insert(symbol_str.to_string(), market_msgs[0].clone());
-                            for msg in market_msgs {
-                                market_fanout.send_owned(msg);
+                            last_ticker.insert(symbol_str.to_string(), ticker_json);
+                            for sbe in sbe_msgs {
+                                market_fanout.send_owned(sbe);
                             }
                         }
                         if settle_count >= 64 {
@@ -1708,21 +1680,24 @@ async fn async_main() -> anyhow::Result<()> {
                                 let mf2 = market_fanout.clone();
                                 let last_depth2 = last_depth.clone();
                                 rt_pub.spawn(async move {
-                                    let bids: Vec<[f64; 2]> = bids_raw[..nb]
+                                    let bids: Vec<(f64, f64)> = bids_raw[..nb]
                                         .iter().filter(|(_, q)| *q > 0.0)
-                                        .map(|&(p, q)| [p, q]).collect();
-                                    let asks: Vec<[f64; 2]> = asks_raw[..na]
+                                        .map(|&(p, q)| (p, q)).collect();
+                                    let asks: Vec<(f64, f64)> = asks_raw[..na]
                                         .iter().filter(|(_, q)| *q > 0.0)
-                                        .map(|&(p, q)| [p, q]).collect();
+                                        .map(|&(p, q)| (p, q)).collect();
                                     let ts = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_micros() as u64).unwrap_or(0);
+                                    // Keep last_depth as JSON for REST endpoint.
+                                    let bids_json: Vec<[f64; 2]> = bids.iter().map(|&(p, q)| [p, q]).collect();
+                                    let asks_json: Vec<[f64; 2]> = asks.iter().map(|&(p, q)| [p, q]).collect();
                                     let depth_json = serde_json::json!({
-                                        "type": "depth", "symbol": symbol,
-                                        "bids": bids, "asks": asks, "ts": ts,
+                                        "type": "depth", "symbol": &symbol,
+                                        "bids": bids_json, "asks": asks_json, "ts": ts,
                                     });
-                                    last_depth2.insert(symbol, depth_json.clone());
-                                    mf2.send_owned(depth_json.to_string());
+                                    last_depth2.insert(symbol.clone(), depth_json);
+                                    mf2.send_owned(lightning_exchange::ws_sbe::encode_depth(ts, &symbol, &bids, &asks));
                                 });
                             }
                             DeskDepthMsg::Depth50(_) | DeskDepthMsg::Level2(_) => {}
@@ -1891,16 +1866,10 @@ async fn async_main() -> anyhow::Result<()> {
                             }
                             if let Some(tx) = user_tx.get(participant_id as i64) {
                                 let ts = msg.timestamp;
-                                let upd = match ws_client_oid {
-                                    Some(coid) => format!(
-                                        r#"{{"type":"order_update","order_id":{},"status":"OPEN","filled_qty":{},"avg_price":{},"ts":{},"client_order_id":"{}"}}"#,
-                                        order_id, fill_qty, fill_price, ts, coid,
-                                    ),
-                                    None => format!(
-                                        r#"{{"type":"order_update","order_id":{},"status":"OPEN","filled_qty":{},"avg_price":{},"ts":{}}}"#,
-                                        order_id, fill_qty, fill_price, ts,
-                                    ),
-                                };
+                                let upd = lightning_exchange::ws_sbe::encode_order_update(
+                                    order_id, 0, lightning_exchange::ws_sbe::WS_STATUS_OPEN,
+                                    fill_qty, fill_price, ts,
+                                );
                                 if tx.try_send(upd).is_err() {
                                     let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n % 10_000 == 0 {
@@ -1979,11 +1948,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 });
                                 if let Some((bal, frz)) = new_vals {
                                     if let Some(tx) = user_tx.get(meta.user_id) {
-                                        // Hand-written JSON for the spin-thread WS push.
-                                        // asset is a short alphanumeric symbol (BTC, USDT, …) —
-                                        // no JSON escaping needed.
-                                        let _ = tx.try_send(format!(
-                                            r#"{{"type":"balance_update","asset":"{}","balance":{},"available":{},"frozen":{}}}"#,
+                                        let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
                                             asset, bal, bal - frz, frz,
                                         ));
                                     }
@@ -2105,26 +2070,12 @@ async fn async_main() -> anyhow::Result<()> {
                                 }
                             }
                             if let Some(tx) = maybe_tx {
-                                let ws_status = ws_status_from_update_kind(kind).as_str();
+                                let ws_status = ws_status_from_update_kind(kind);
+                                let status_byte = lightning_exchange::ws_sbe::ws_status_byte_from_str(ws_status.as_str());
                                 let ts = msg.timestamp;
-                                // Hand-written JSON — serde_json::json! macro
-                                // measures ~600ns per call; format! is ~150ns
-                                // for this fixed shape and runs at every
-                                // order_update event (≈ 400/s steady-state).
-                                // client_order_id is JSON-escape-safe here: it's
-                                // a server-generated session prefix + counter
-                                // (see make_place_msg → "{prefix}-{N}"), so no
-                                // escaping needed.
-                                let upd = match ws_client_oid.as_deref() {
-                                    Some(coid) => format!(
-                                        r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{},"client_order_id":"{}"}}"#,
-                                        order_id, ws_status, fill_qty, fill_price, ts, coid,
-                                    ),
-                                    None => format!(
-                                        r#"{{"type":"order_update","order_id":{},"status":"{}","filled_qty":{},"avg_price":{},"ts":{}}}"#,
-                                        order_id, ws_status, fill_qty, fill_price, ts,
-                                    ),
-                                };
+                                let upd = lightning_exchange::ws_sbe::encode_order_update(
+                                    order_id, 0, status_byte, fill_qty, fill_price, ts,
+                                );
                                 if tx.try_send(upd).is_err() {
                                     let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n % 10_000 == 0 {

@@ -4,6 +4,7 @@ pub mod order_update;
 pub mod persist_event;
 pub mod sbe;
 pub mod tracer;
+pub mod ws_sbe;
 
 /// Transport层抽象 - Aeron的trait定义 + Mock实现
 ///

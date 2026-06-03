@@ -44,6 +44,7 @@ use hyper::{
     Request,
 };
 use hyper_util::rt::TokioIo;
+use lightning_exchange::ws_sbe;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -624,8 +625,8 @@ async fn driver(
         // Send place_order.
         counter += 1;
         let coid = format!("p{}-{conn_idx}-{counter}", cfg.run_id);
-        let coid_match = format!(r#""client_order_id":"{}""#, coid);
-        let mut order_id_match: Option<String> = None;
+        let _coid_match = coid.as_str(); // kept for future use
+        let mut order_id_match: Option<u64> = None;
         let place_msg = format!(
             r#"{{"type":"place_order","client_order_id":"{}","symbol":"{}","side":"buy","order_type":"limit","price":{},"qty":{}}}"#,
             coid, cfg.symbol, cfg.price, cfg.qty,
@@ -671,67 +672,76 @@ async fn driver(
                 }
                 Err(_) => break, // timeout
             };
-            if frame.opcode != OpCode::Text {
+            if frame.opcode != OpCode::Binary {
                 continue;
             }
             frames_read += 1;
-            let Ok(text) = std::str::from_utf8(&frame.payload) else {
+            let buf = &frame.payload;
+            let Some(msg_type) = ws_sbe::decode_msg_type(buf) else {
                 continue;
             };
             if dbg && counter <= 5 {
-                let preview = &text[..text.len().min(140)];
-                eprintln!("[conn{conn_idx} place#{counter} read#{frames_read}] {preview}");
+                eprintln!("[conn{conn_idx} place#{counter} read#{frames_read}] msg_type={msg_type} len={}", buf.len());
             }
-            // Cheap substring checks — avoid full JSON parse hot path.
-            if text.contains("\"order_submitted\"") {
-                // Desk inline ack — capture order_id, but keep waiting for
-                // the engine `order_update` so place_us reflects e2e RTT.
-                if let Some(id) = extract_order_id(text) {
-                    current_order_id = Some(id);
-                    order_id_match = Some(format!(r#""order_id":{},"#, id));
-                }
-                continue;
-            } else if text.contains("\"order_rejected\"") {
-                placed_ok = false;
-                place_us = t0.elapsed().as_micros() as u64;
-                break;
-            } else if text.contains("\"order_update\"") {
-                // Match by client_order_id if present (engine→desk forward
-                // includes it), else fall back to order_id match.
-                let mine = text.contains(&coid_match)
-                    || order_id_match
-                        .as_ref()
-                        .map(|needle| text.contains(needle))
-                        .unwrap_or(false);
-                if !mine {
-                    // Stale order_update from a prior cycle, or somehow not
-                    // ours — drain and keep reading.
+            match msg_type {
+                ws_sbe::ORDER_SUBMITTED => {
+                    // Desk inline ack — capture order_id, but keep waiting for
+                    // the engine `order_update` so place_us reflects e2e RTT.
+                    if let Some((id, _, _)) = ws_sbe::decode_order_submitted(buf) {
+                        current_order_id = Some(id as i64);
+                        order_id_match = Some(id);
+                    }
                     continue;
                 }
-                if text.contains("\"status\":\"OPEN\"") {
-                    if current_order_id.is_none() {
-                        current_order_id = extract_order_id(text);
-                    }
-                    placed_ok = true;
-                    place_us = t0.elapsed().as_micros() as u64;
-                    break;
-                } else if text.contains("\"status\":\"REJECTED\"") {
+                ws_sbe::ORDER_REJECTED => {
                     placed_ok = false;
                     place_us = t0.elapsed().as_micros() as u64;
                     break;
                 }
-                // PARTIAL/FILLED on a resting GTC @ 5000 is unexpected for
-                // this test — record as ok and move on.
-                else if text.contains("\"status\":\"FILLED\"")
-                    || text.contains("\"status\":\"PARTIAL\"")
-                    || text.contains("\"status\":\"PARTIAL_FILL\"")
-                {
+                ws_sbe::ORDER_ACCEPTED => {
+                    // Standalone mode: ORDER_ACCEPTED is the immediate ack.
+                    if let Some((id, _)) = ws_sbe::decode_order_accepted(buf) {
+                        if current_order_id.is_none() {
+                            current_order_id = Some(id as i64);
+                        }
+                    }
                     placed_ok = true;
                     place_us = t0.elapsed().as_micros() as u64;
                     break;
                 }
+                ws_sbe::ORDER_UPDATE => {
+                    if let Some((order_id, _, status, _, _, _)) = ws_sbe::decode_order_update(buf) {
+                        // Match by order_id if we already know it, else accept any.
+                        let mine = order_id_match.map(|exp| order_id == exp).unwrap_or(true);
+                        if !mine {
+                            continue;
+                        }
+                        match status {
+                            ws_sbe::WS_STATUS_OPEN => {
+                                if current_order_id.is_none() {
+                                    current_order_id = Some(order_id as i64);
+                                }
+                                placed_ok = true;
+                                place_us = t0.elapsed().as_micros() as u64;
+                                break;
+                            }
+                            ws_sbe::WS_STATUS_REJECTED => {
+                                placed_ok = false;
+                                place_us = t0.elapsed().as_micros() as u64;
+                                break;
+                            }
+                            ws_sbe::WS_STATUS_PARTIAL_FILL | ws_sbe::WS_STATUS_FILLED => {
+                                placed_ok = true;
+                                place_us = t0.elapsed().as_micros() as u64;
+                                break;
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+                // balance_update, trade, depth, ticker, etc. — silently drained.
+                _ => {}
             }
-            // balance_update, trade, depth, ticker, etc. — silently drained.
         }
         if place_us == 0 {
             // Loop fell out via deadline without ever finding our OPEN.
@@ -794,7 +804,6 @@ async fn driver(
             let cancel_deadline = t1 + (cycle_period - wait_after_place);
             let mut cancel_ok = false;
             let mut saw_inline_ack = false;
-            let id_match = format!("\"order_id\":{id},");
             loop {
                 let now = Instant::now();
                 if now >= cancel_deadline {
@@ -810,26 +819,31 @@ async fn driver(
                     }
                     Err(_) => break,
                 };
-                if frame.opcode != OpCode::Text {
+                if frame.opcode != OpCode::Binary {
                     continue;
                 }
-                let Ok(text) = std::str::from_utf8(&frame.payload) else {
+                let buf = &frame.payload;
+                let Some(msg_type) = ws_sbe::decode_msg_type(buf) else {
                     continue;
                 };
-                if text.contains("\"cancel_submitted\"") || text.contains("\"cancel_all_ok\"") {
-                    saw_inline_ack = true;
-                    // Don't break — keep reading until the engine CANCELED
-                    // arrives so we don't leave it queued.
-                    continue;
-                } else if text.contains("\"order_update\"")
-                    && text.contains("\"status\":\"CANCELED\"")
-                    && text.contains(&id_match)
-                {
-                    cancel_ok = true;
-                    break;
+                match msg_type {
+                    ws_sbe::CANCEL_SUBMITTED | ws_sbe::CANCEL_ALL_OK | ws_sbe::BATCH_CANCEL_OK => {
+                        saw_inline_ack = true;
+                        // Don't break — keep reading until the engine CANCELED
+                        // arrives so we don't leave it queued.
+                        continue;
+                    }
+                    ws_sbe::ORDER_UPDATE => {
+                        if let Some((order_id, _, status, _, _, _)) = ws_sbe::decode_order_update(buf) {
+                            if order_id == id as u64 && status == ws_sbe::WS_STATUS_CANCELED {
+                                cancel_ok = true;
+                                break;
+                            }
+                        }
+                    }
+                    // Other order_update events, balance_update, market data — silently drained.
+                    _ => {}
                 }
-                // Other order_update events (FILLED on a fill that beat the
-                // cancel, balance_update, market data) silently drained.
             }
             // If we got the inline ack but timed out waiting for engine
             // CANCELED, still count as ok (rare — only if engine is slow).
@@ -872,21 +886,6 @@ async fn driver(
     metrics.conn_closed.fetch_add(1, Ordering::Relaxed);
 }
 
-fn extract_order_id(text: &str) -> Option<i64> {
-    // Find `"order_id":<digits>` without full JSON parse.
-    let key = "\"order_id\":";
-    let idx = text.find(key)?;
-    let rest = &text[idx + key.len()..];
-    let mut end = 0;
-    for (i, c) in rest.char_indices() {
-        if c.is_ascii_digit() || c == '-' {
-            end = i + 1;
-        } else {
-            break;
-        }
-    }
-    rest[..end].parse().ok()
-}
 
 // ── Reporter ─────────────────────────────────────────────────────────────────
 

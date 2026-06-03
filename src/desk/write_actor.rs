@@ -40,21 +40,18 @@ fn write_actor_count() -> usize {
 
 struct NewConn {
     ws_write: WsWrite,
-    text_rx: mpsc::Receiver<String>,
+    text_rx: mpsc::Receiver<Vec<u8>>,
     ctrl_rx: mpsc::Receiver<WsCtrl>,
 }
 
 async fn write_conn_loop(
     mut ws: WsWrite,
-    mut text_rx: mpsc::Receiver<String>,
+    mut text_rx: mpsc::Receiver<Vec<u8>>,
     mut ctrl_rx: mpsc::Receiver<WsCtrl>,
 ) {
     loop {
         tokio::select! {
             biased;
-            // Control frames (Pong/Ping) are low-volume but must go out
-            // quickly — heartbeat Pong within the browser's keep-alive
-            // window, server Ping before the idle timeout fires.
             ctrl = ctrl_rx.recv() => {
                 match ctrl {
                     Some(WsCtrl::Pong(p)) => {
@@ -68,18 +65,16 @@ async fn write_conn_loop(
                             break;
                         }
                     }
-                    // ctrl_tx dropped → handler exited, stop writing.
                     None => break,
                 }
             }
             msg = text_rx.recv() => {
                 match msg {
-                    Some(s) => {
-                        if ws.write_frame(Frame::text(Payload::Owned(s.into_bytes()))).await.is_err() {
+                    Some(bytes) => {
+                        if ws.write_frame(Frame::binary(Payload::Owned(bytes))).await.is_err() {
                             break;
                         }
                     }
-                    // personal_tx dropped → handler disconnected, stop writing.
                     None => break,
                 }
             }
@@ -140,8 +135,8 @@ impl WriteActorPool {
         &self,
         ws_write: WsWrite,
         text_cap: usize,
-    ) -> Option<(mpsc::Sender<String>, mpsc::Sender<WsCtrl>)> {
-        let (text_tx, text_rx) = mpsc::channel::<String>(text_cap);
+    ) -> Option<(mpsc::Sender<Vec<u8>>, mpsc::Sender<WsCtrl>)> {
+        let (text_tx, text_rx) = mpsc::channel::<Vec<u8>>(text_cap);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsCtrl>(4);
         let n = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         self.senders[n]

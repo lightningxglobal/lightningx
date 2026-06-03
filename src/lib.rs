@@ -30,6 +30,7 @@ pub use transport::aeron_transport;
 pub use transport::order_update;
 pub use transport::sbe;
 pub use transport::tracer;
+pub use transport::ws_sbe;
 
 pub use desk::account;
 pub use desk::account_repository;

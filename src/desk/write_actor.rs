@@ -7,7 +7,7 @@
 /// Scheduling benefit: at 20K connections, a burst of 20K order responses
 /// wakes 8 write actors instead of 20K handler tasks — 2500× fewer scheduler
 /// round-trips for the write path.
-use fastwebsockets::{Frame, Payload, WebSocketWrite};
+use fastwebsockets::{Frame, OpCode, Payload, WebSocketWrite};
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
@@ -17,6 +17,16 @@ use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 
 pub type WsWrite = WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>;
+
+/// Control frame sent from the handler task to the write actor.
+/// Kept separate from the text channel so control frames can't be
+/// blocked by a full text queue.
+pub enum WsCtrl {
+    /// Pong in response to a client-initiated Ping.
+    Pong(Vec<u8>),
+    /// Server-initiated heartbeat Ping (handler sends this periodically).
+    Ping,
+}
 
 fn write_actor_count() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
@@ -31,25 +41,34 @@ fn write_actor_count() -> usize {
 struct NewConn {
     ws_write: WsWrite,
     text_rx: mpsc::Receiver<String>,
-    pong_rx: mpsc::Receiver<Vec<u8>>,
+    ctrl_rx: mpsc::Receiver<WsCtrl>,
 }
 
 async fn write_conn_loop(
     mut ws: WsWrite,
     mut text_rx: mpsc::Receiver<String>,
-    mut pong_rx: mpsc::Receiver<Vec<u8>>,
+    mut ctrl_rx: mpsc::Receiver<WsCtrl>,
 ) {
     loop {
         tokio::select! {
             biased;
-            // Pong responses are rare but must go out quickly for keep-alive.
-            payload = pong_rx.recv() => {
-                match payload {
-                    Some(p) => {
+            // Control frames (Pong/Ping) are low-volume but must go out
+            // quickly — heartbeat Pong within the browser's keep-alive
+            // window, server Ping before the idle timeout fires.
+            ctrl = ctrl_rx.recv() => {
+                match ctrl {
+                    Some(WsCtrl::Pong(p)) => {
                         if ws.write_frame(Frame::pong(Payload::Owned(p))).await.is_err() {
                             break;
                         }
                     }
+                    Some(WsCtrl::Ping) => {
+                        let frame = Frame::new(true, OpCode::Ping, None, Payload::Owned(vec![]));
+                        if ws.write_frame(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    // ctrl_tx dropped → handler exited, stop writing.
                     None => break,
                 }
             }
@@ -75,7 +94,7 @@ async fn write_actor_loop(mut conn_rx: mpsc::Receiver<NewConn>) {
             msg = conn_rx.recv() => {
                 match msg {
                     Some(c) => pending.push(Box::pin(write_conn_loop(
-                        c.ws_write, c.text_rx, c.pong_rx,
+                        c.ws_write, c.text_rx, c.ctrl_rx,
                     ))),
                     None => break,
                 }
@@ -107,12 +126,13 @@ impl WriteActorPool {
         }
     }
 
-    /// Register a new connection's write half. Returns `(text_tx, pong_tx)`.
+    /// Register a new connection's write half. Returns `(text_tx, ctrl_tx)`.
     ///
     /// `text_tx` — store in `user_tx` registry; used by spin thread and
     ///   `handle_client_message` for all outgoing text frames.
-    /// `pong_tx` — kept by the handler task; used to forward Pong responses
-    ///   when the client sends a Ping frame.
+    /// `ctrl_tx` — kept by the handler task; capacity=4; used to forward
+    ///   `WsCtrl::Pong` when client pings, and to send `WsCtrl::Ping` for
+    ///   the server heartbeat.
     ///
     /// Returns `None` if the actor's registration channel is unexpectedly full
     /// (capacity 1024 — should never occur under normal connection rates).
@@ -120,18 +140,18 @@ impl WriteActorPool {
         &self,
         ws_write: WsWrite,
         text_cap: usize,
-    ) -> Option<(mpsc::Sender<String>, mpsc::Sender<Vec<u8>>)> {
+    ) -> Option<(mpsc::Sender<String>, mpsc::Sender<WsCtrl>)> {
         let (text_tx, text_rx) = mpsc::channel::<String>(text_cap);
-        let (pong_tx, pong_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsCtrl>(4);
         let n = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         self.senders[n]
             .try_send(NewConn {
                 ws_write,
                 text_rx,
-                pong_rx,
+                ctrl_rx,
             })
             .ok()?;
-        Some((text_tx, pong_tx))
+        Some((text_tx, ctrl_tx))
     }
 }
 

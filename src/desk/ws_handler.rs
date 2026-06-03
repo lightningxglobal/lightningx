@@ -10,6 +10,7 @@ use axum::extract::{Request, State};
 use axum::response::Response;
 use dashmap::DashMap;
 use fastwebsockets::{upgrade, Frame, OpCode, WebSocket};
+use std::time::Duration;
 use tokio::io as tio;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
@@ -369,8 +370,9 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
     let (mut ws_read, ws_write) = socket.split(tio::split);
 
     // Register write half with pool. personal_tx → user_tx registry.
-    // pong_tx is only used to forward Pong responses when client pings.
-    let (personal_tx, pong_tx) = match state.write_pool.register(ws_write, ws_personal_queue_cap()) {
+    // ctrl_tx sends WsCtrl::Pong (client-ping response) and WsCtrl::Ping
+    // (server heartbeat) to the write actor.
+    let (personal_tx, ctrl_tx) = match state.write_pool.register(ws_write, ws_personal_queue_cap()) {
         Some(v) => v,
         None => return, // actor registration channel full (shouldn't happen)
     };
@@ -388,6 +390,18 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
     // they impose zero fanout overhead.
     let (market_tx, mut market_rx) = mpsc::channel::<Arc<str>>(8192);
     let mut market_registered = false;
+
+    // ── Heartbeat ────────────────────────────────────────────────────────────
+    // Send a WS-level Ping every 30s; kick if no Pong received by the next
+    // interval. Jitter based on conn_id spreads 20K timers evenly across
+    // the full 30s window, preventing thundering-herd wakeups.
+    const PING_INTERVAL: Duration = Duration::from_secs(30);
+    let jitter = Duration::from_millis(conn_id % 30_000);
+    let mut ping_interval = {
+        let start = tokio::time::Instant::now() + jitter;
+        tokio::time::interval_at(start, PING_INTERVAL)
+    };
+    let mut waiting_pong = false;
 
     'conn: loop {
         tokio::select! {
@@ -414,13 +428,30 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                         }
                         OpCode::Ping => {
                             // Forward Pong via write actor channel.
-                            let _ = pong_tx.try_send(frame.payload.to_vec());
+                            let _ = ctrl_tx.try_send(crate::desk::write_actor::WsCtrl::Pong(
+                                frame.payload.to_vec(),
+                            ));
+                        }
+                        // Client's Pong in response to our heartbeat Ping.
+                        OpCode::Pong => {
+                            waiting_pong = false;
                         }
                         OpCode::Close => break 'conn,
                         _ => {}
                     }
                     Err(_) => break 'conn,
                 }
+            }
+
+            // Heartbeat tick: send Ping; kick if previous Ping was not answered.
+            _ = ping_interval.tick() => {
+                if waiting_pong {
+                    // Client missed the previous ping — consider it dead.
+                    tracing::debug!(conn_id, "heartbeat timeout, closing connection");
+                    break 'conn;
+                }
+                let _ = ctrl_tx.try_send(crate::desk::write_actor::WsCtrl::Ping);
+                waiting_pong = true;
             }
 
             // Market data (depth, trades, ticker, kline) — lowest priority,
@@ -457,7 +488,7 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
         }
     }
 
-    // Dropping personal_tx + pong_tx signals write_conn_loop to exit cleanly.
+    // Dropping personal_tx + ctrl_tx signals write_conn_loop to exit cleanly.
 
     if market_registered {
         state.market_fanout.unregister(conn_id);

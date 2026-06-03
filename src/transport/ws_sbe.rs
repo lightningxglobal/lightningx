@@ -537,6 +537,78 @@ pub fn sym8_to_str(sym: &[u8]) -> &str {
     std::str::from_utf8(&sym[..end]).unwrap_or("")
 }
 
+// ── REST decode helpers ───────────────────────────────────────────────────────
+
+/// Decode a DEPTH_MSG frame into a `serde_json::Value` for REST responses.
+/// Returns `{"symbol":..., "bids":[[p,q],...], "asks":[[p,q],...], "ts":...}`.
+pub fn decode_depth_for_rest(buf: &[u8]) -> Option<serde_json::Value> {
+    // header: type(1) + ts(8) + symbol(8) + nb(2) + na(2) + pad(4) = 25
+    if buf.len() < 25 || buf[0] != DEPTH_MSG {
+        return None;
+    }
+    let ts = u64::from_le_bytes(buf[1..9].try_into().ok()?);
+    let symbol = sym8_to_str(&buf[9..17]).to_owned();
+    let nb = u16::from_le_bytes(buf[17..19].try_into().ok()?) as usize;
+    let na = u16::from_le_bytes(buf[19..21].try_into().ok()?) as usize;
+    let expected = 25 + (nb + na) * 16;
+    if buf.len() < expected {
+        return None;
+    }
+    let mut off = 25usize;
+    let mut bids = Vec::with_capacity(nb);
+    for _ in 0..nb {
+        let p = f64::from_le_bytes(buf[off..off + 8].try_into().ok()?);
+        let q = f64::from_le_bytes(buf[off + 8..off + 16].try_into().ok()?);
+        bids.push(serde_json::json!([p, q]));
+        off += 16;
+    }
+    let mut asks = Vec::with_capacity(na);
+    for _ in 0..na {
+        let p = f64::from_le_bytes(buf[off..off + 8].try_into().ok()?);
+        let q = f64::from_le_bytes(buf[off + 8..off + 16].try_into().ok()?);
+        asks.push(serde_json::json!([p, q]));
+        off += 16;
+    }
+    Some(serde_json::json!({ "symbol": symbol, "bids": bids, "asks": asks, "ts": ts }))
+}
+
+/// Decode a TICKER_MSG frame into a `serde_json::Value` for REST responses.
+/// Returns `{"symbol":..., "last":..., "change":..., "high":..., "low":..., "volume":...}`.
+pub fn decode_ticker_for_rest(buf: &[u8]) -> Option<serde_json::Value> {
+    // type(1) + symbol(8) + last(8) + change(8) + high(8) + low(8) + volume(8) = 49
+    if buf.len() < 49 || buf[0] != TICKER_MSG {
+        return None;
+    }
+    let symbol = sym8_to_str(&buf[1..9]).to_owned();
+    let last   = f64::from_le_bytes(buf[9..17].try_into().ok()?);
+    let change = f64::from_le_bytes(buf[17..25].try_into().ok()?);
+    let high   = f64::from_le_bytes(buf[25..33].try_into().ok()?);
+    let low    = f64::from_le_bytes(buf[33..41].try_into().ok()?);
+    let volume = f64::from_le_bytes(buf[41..49].try_into().ok()?);
+    Some(serde_json::json!({ "symbol": symbol, "last": last, "change": change,
+                             "high": high, "low": low, "volume": volume }))
+}
+
+/// Return the best bid or best ask price from a DEPTH_MSG frame.
+/// `want_ask = true` → first ask price; `false` → first bid price.
+pub fn decode_best_price(buf: &[u8], want_ask: bool) -> Option<f64> {
+    if buf.len() < 25 || buf[0] != DEPTH_MSG {
+        return None;
+    }
+    let nb = u16::from_le_bytes(buf[17..19].try_into().ok()?) as usize;
+    let na = u16::from_le_bytes(buf[19..21].try_into().ok()?) as usize;
+    if want_ask {
+        // asks start after the bid levels
+        let off = 25 + nb * 16;
+        if na == 0 || buf.len() < off + 8 { return None; }
+        Some(f64::from_le_bytes(buf[off..off + 8].try_into().ok()?))
+    } else {
+        // first bid is right after the header
+        if nb == 0 || buf.len() < 33 { return None; }
+        Some(f64::from_le_bytes(buf[25..33].try_into().ok()?))
+    }
+}
+
 /// Extract the symbol string from any broadcast message frame (TRADE/DEPTH/TICKER/KLINE/AGG_TRADE).
 /// Returns None if the frame is too short or not a recognized broadcast type.
 pub fn decode_broadcast_symbol(buf: &[u8]) -> Option<String> {

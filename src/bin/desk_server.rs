@@ -180,35 +180,24 @@ struct LiveMarketData {
 }
 
 impl LiveMarketData {
-    /// Returns (ticker_json_for_rest, [ticker_sbe, kline_sbe, agg1s_sbe, agg5s_sbe])
-    fn ingest(&mut self, symbol: &str, ts_micros: u64, price: f64, qty: f64) -> (String, [Vec<u8>; 4]) {
+    /// Returns [ticker_sbe, kline_sbe, agg1s_sbe, agg5s_sbe]. All SBE — REST decodes on demand.
+    fn ingest(&mut self, symbol: &str, ts_micros: u64, price: f64, qty: f64) -> [Vec<u8>; 4] {
         use lightning_exchange::ws_sbe;
         let ts_secs = (ts_micros / 1_000_000) as i64;
         let state = self.by_symbol.entry(symbol.to_string()).or_default();
         let (change, high, low, volume, kline, agg_1s, agg_5s) = state.ingest(ts_secs, price, qty);
-
-        // Ticker JSON kept for REST endpoint (last_ticker cache).
-        let ticker_json = format!(
-            r#"{{"type":"ticker","symbol":"{}","last":{},"change":{},"high":{},"low":{},"volume":{}}}"#,
-            symbol, price, change, high, low, volume,
-        );
-
-        // SBE frames for market_fanout broadcast.
         let interval_1m: u8 = 1;
         let interval_1s: u8 = 0;
         let interval_5s: u8 = 0;
-        (
-            ticker_json,
-            [
-                ws_sbe::encode_ticker(symbol, price, change, high, low, volume),
-                ws_sbe::encode_kline(symbol, interval_1m, kline.start as u64,
-                    kline.open, kline.high, kline.low, kline.close, kline.volume),
-                ws_sbe::encode_agg_trade(symbol, interval_1s, agg_1s.start as u64,
-                    agg_1s.open, agg_1s.high, agg_1s.low, agg_1s.close, agg_1s.volume, agg_1s.trade_count as u32),
-                ws_sbe::encode_agg_trade(symbol, interval_5s, agg_5s.start as u64,
-                    agg_5s.open, agg_5s.high, agg_5s.low, agg_5s.close, agg_5s.volume, agg_5s.trade_count as u32),
-            ],
-        )
+        [
+            ws_sbe::encode_ticker(symbol, price, change, high, low, volume),
+            ws_sbe::encode_kline(symbol, interval_1m, kline.start as u64,
+                kline.open, kline.high, kline.low, kline.close, kline.volume),
+            ws_sbe::encode_agg_trade(symbol, interval_1s, agg_1s.start as u64,
+                agg_1s.open, agg_1s.high, agg_1s.low, agg_1s.close, agg_1s.volume, agg_1s.trade_count as u32),
+            ws_sbe::encode_agg_trade(symbol, interval_5s, agg_5s.start as u64,
+                agg_5s.open, agg_5s.high, agg_5s.low, agg_5s.close, agg_5s.volume, agg_5s.trade_count as u32),
+        ]
     }
 }
 
@@ -1618,12 +1607,15 @@ async fn async_main() -> anyhow::Result<()> {
                             price, qty, side, ts, symbol_str,
                         ));
                         last_trade_price.insert(symbol_str.to_string(), price);
-                        if market_fanout.subscriber_count() != 0 {
-                            let (ticker_json, sbe_msgs) =
+                        {
+                            let sbe_msgs =
                                 live_market_data.ingest(symbol_str, ts, price, qty);
-                            last_ticker.insert(symbol_str.to_string(), ticker_json);
-                            for sbe in sbe_msgs {
-                                market_fanout.send_owned(sbe);
+                            // Store ticker SBE for REST; REST decodes on demand.
+                            last_ticker.insert(symbol_str.to_string(), Arc::from(sbe_msgs[0].as_slice()));
+                            if market_fanout.subscriber_count() != 0 {
+                                for sbe in sbe_msgs {
+                                    market_fanout.send_owned(sbe);
+                                }
                             }
                         }
                         if settle_count >= 64 {
@@ -1689,15 +1681,10 @@ async fn async_main() -> anyhow::Result<()> {
                                     let ts = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_micros() as u64).unwrap_or(0);
-                                    // Keep last_depth as JSON for REST endpoint.
-                                    let bids_json: Vec<[f64; 2]> = bids.iter().map(|&(p, q)| [p, q]).collect();
-                                    let asks_json: Vec<[f64; 2]> = asks.iter().map(|&(p, q)| [p, q]).collect();
-                                    let depth_json = serde_json::json!({
-                                        "type": "depth", "symbol": &symbol,
-                                        "bids": bids_json, "asks": asks_json, "ts": ts,
-                                    });
-                                    last_depth2.insert(symbol.clone(), depth_json);
-                                    mf2.send_owned(lightning_exchange::ws_sbe::encode_depth(ts, &symbol, &bids, &asks));
+                                    // Store as SBE — REST decodes on demand, WS gets bytes directly.
+                                    let sbe = lightning_exchange::ws_sbe::encode_depth(ts, &symbol, &bids, &asks);
+                                    last_depth2.insert(symbol.clone(), Arc::from(sbe.as_slice()));
+                                    mf2.send_owned(sbe);
                                 });
                             }
                             DeskDepthMsg::Depth50(_) | DeskDepthMsg::Level2(_) => {}

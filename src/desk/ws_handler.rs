@@ -514,9 +514,9 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
 }
 
 fn best_opposing_from_depth(state: &AppState, symbol: &str, side: &str) -> Option<f64> {
-    let depth = state.last_depth.get(symbol)?;
-    let levels_key = if side == "buy" { "asks" } else { "bids" };
-    depth.get(levels_key)?.as_array()?.first()?.get(0)?.as_f64()
+    let buf = state.last_depth.get(symbol)?;
+    let want_ask = side == "buy";
+    ws_sbe::decode_best_price(&buf, want_ask)
 }
 
 // ─── Per-message handler ──────────────────────────────────────────────────────
@@ -575,39 +575,15 @@ async fn handle_client_message(
                     if let Some(engine) = engines.get(&sym) {
                         let _ = personal_tx.try_send(build_depth_sbe(engine.value(), &sym));
                     }
-                } else if let Some(depth_json) = state.last_depth.get(&sym) {
-                    // Re-encode stored JSON depth snapshot as SBE for the one-time subscribe send.
-                    let ts = unix_now();
-                    let bids: Vec<(f64, f64)> = depth_json.get("bids")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|lv| {
-                            let p = lv.get(0).and_then(|x| x.as_f64())?;
-                            let q = lv.get(1).and_then(|x| x.as_f64())?;
-                            Some((p, q))
-                        }).collect())
-                        .unwrap_or_default();
-                    let asks: Vec<(f64, f64)> = depth_json.get("asks")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|lv| {
-                            let p = lv.get(0).and_then(|x| x.as_f64())?;
-                            let q = lv.get(1).and_then(|x| x.as_f64())?;
-                            Some((p, q))
-                        }).collect())
-                        .unwrap_or_default();
-                    let _ = personal_tx.try_send(ws_sbe::encode_depth(ts, &sym, &bids, &asks));
+                } else if let Some(depth_bytes) = state.last_depth.get(&sym) {
+                    // last_depth now stores SBE bytes — clone and send directly.
+                    let _ = personal_tx.try_send(depth_bytes.to_vec());
                 }
             }
             for sym in ticker_symbols {
-                if let Some(payload) = state.last_ticker.get(&sym) {
-                    // last_ticker stores JSON strings (used by REST). Parse and re-encode as SBE.
-                    if let Ok(v) = serde_json::from_str::<Value>(payload.value()) {
-                        let last   = v.get("last").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        let change = v.get("change").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        let high   = v.get("high").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        let low    = v.get("low").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        let volume = v.get("volume").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        let _ = personal_tx.try_send(ws_sbe::encode_ticker(&sym, last, change, high, low, volume));
-                    }
+                if let Some(ticker_bytes) = state.last_ticker.get(&sym) {
+                    // last_ticker now stores SBE bytes — clone and send directly.
+                    let _ = personal_tx.try_send(ticker_bytes.to_vec());
                 }
             }
             None
@@ -2169,26 +2145,9 @@ pub fn broadcast_depth_pub(state: &AppState, symbol: &str) {
                 .market_fanout
                 .send_owned(build_depth_sbe(engine.value(), symbol));
         }
-    } else if let Some(depth_json) = state.last_depth.get(symbol) {
-        // Re-encode the cached JSON depth as SBE for the broadcast.
-        let ts = unix_now();
-        let bids: Vec<(f64, f64)> = depth_json.get("bids")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|lv| {
-                let p = lv.get(0).and_then(|x| x.as_f64())?;
-                let q = lv.get(1).and_then(|x| x.as_f64())?;
-                Some((p, q))
-            }).collect())
-            .unwrap_or_default();
-        let asks: Vec<(f64, f64)> = depth_json.get("asks")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|lv| {
-                let p = lv.get(0).and_then(|x| x.as_f64())?;
-                let q = lv.get(1).and_then(|x| x.as_f64())?;
-                Some((p, q))
-            }).collect())
-            .unwrap_or_default();
-        state.market_fanout.send_owned(ws_sbe::encode_depth(ts, symbol, &bids, &asks));
+    } else if let Some(depth_bytes) = state.last_depth.get(symbol) {
+        // last_depth stores SBE bytes — send directly.
+        state.market_fanout.send_bytes(depth_bytes.clone());
     }
 }
 

@@ -197,12 +197,11 @@ pub struct AppState {
     pub pending_meta: Arc<DashMap<u64, OrderMeta>>,
     /// Pending REST order responses: order_id → oneshot sender (desk_server mode only).
     pub pending_orders: Arc<DashMap<u64, oneshot::Sender<OrderUpdateMsg>>>,
-    /// Last known depth per symbol from Aeron push (desk_server mode only).
-    pub last_depth: Arc<DashMap<String, serde_json::Value>>,
-    /// Last broadcast ticker payload per symbol (JSON string ready to send).
-    /// Pushed to new subscribers of `ticker.{symbol}` so they don't wait
-    /// for the next periodic tick to see 24h stats.
-    pub last_ticker: Arc<DashMap<String, String>>,
+    /// Last known depth per symbol stored as SBE DEPTH_MSG bytes. REST endpoints
+    /// decode on demand; WS subscribers get the Arc<[u8]> directly.
+    pub last_depth: Arc<DashMap<String, Arc<[u8]>>>,
+    /// Last ticker per symbol as SBE TICKER_MSG bytes. REST decodes on demand.
+    pub last_ticker: Arc<DashMap<String, Arc<[u8]>>>,
     /// Last trade price per symbol — updated on every `SettleTrade`. Drives the
     /// `last` field of broadcast tickers (which used to use best bid, causing
     /// the order-book center price to lag the recent-trades feed).
@@ -864,11 +863,11 @@ async fn handle_place_order(
         let levels = eng.get_top_levels(1, engine_side == Side::Sell);
         levels.first().map(|(p, _)| rules.ticks_to_price(*p))
     } else {
-        // Aeron mode: read from spin-thread-maintained last_depth.
-        let levels_key = if req.side == "buy" { "asks" } else { "bids" };
+        // Aeron mode: read from spin-thread-maintained last_depth (SBE bytes).
+        let want_ask = req.side == "buy";
         s.last_depth
             .get(&req.symbol)
-            .and_then(|depth| depth.get(levels_key)?.as_array()?.first()?.get(0)?.as_f64())
+            .and_then(|buf| crate::ws_sbe::decode_best_price(&buf, want_ask))
     };
 
     // Compute the price that actually backs the frozen quote-asset amount.
@@ -1639,23 +1638,11 @@ async fn handle_tickers(State(s): State<AppState>) -> impl IntoResponse {
     if !s.last_ticker.is_empty() {
         let mut tickers: Vec<Value> = Vec::with_capacity(s.last_ticker.len());
         for entry in s.last_ticker.iter() {
-            // Each cached value is the WS push payload — `{"type":"ticker", "symbol":..., "last":..., ...}`.
-            // The REST response omits the "type" field; convert when serving.
-            let json: Value = match serde_json::from_str(entry.value()) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let Some(obj) = json.as_object() else {
+            // Each cached value is SBE TICKER_MSG bytes. Decode on demand for REST.
+            let Some(json) = crate::ws_sbe::decode_ticker_for_rest(entry.value()) else {
                 continue;
             };
-            let mut out = serde_json::Map::with_capacity(obj.len());
-            for (k, v) in obj.iter() {
-                if k == "type" {
-                    continue;
-                }
-                out.insert(k.clone(), v.clone());
-            }
-            tickers.push(Value::Object(out));
+            tickers.push(json);
         }
         tickers.sort_by(|a, b| {
             let ks = a.get("symbol").and_then(|v| v.as_str()).unwrap_or("");

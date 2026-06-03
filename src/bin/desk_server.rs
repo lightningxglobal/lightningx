@@ -2217,44 +2217,12 @@ async fn async_main() -> anyhow::Result<()> {
     use hyper_util::server::conn::auto::Builder as ConnBuilder;
     use tower_service::Service;
 
-    // Spawn the appropriate accept loop.
-    // On Linux: io_uring accept in a dedicated thread + SO_BUSY_POLL on each
-    // socket. Accepted connections are sent via mpsc to this tokio task.
-    // On other platforms: standard tokio epoll accept with TCP_NODELAY.
-
-    #[cfg(target_os = "linux")]
-    let mut conn_rx = {
-        let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(256);
-        let sock_addr: std::net::SocketAddr = addr_str.parse()?;
-        lightning_exchange::linux_net::spawn_io_uring_accept_loop(sock_addr, conn_tx);
-        conn_rx
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let listener = {
-        let l = TcpListener::bind(&addr_str).await?;
-        l
-    };
+    let listener = TcpListener::bind(&addr_str).await?;
 
     loop {
-        // Receive the next accepted TcpStream regardless of accept backend.
-        let (stream, peer) = {
-            #[cfg(target_os = "linux")]
-            {
-                match conn_rx.recv().await {
-                    Some(v) => v,
-                    None => break, // accept thread exited
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                // Standard tokio accept; set TCP_NODELAY manually since
-                // io_uring path does it inside tune_accepted_socket.
-                match listener.accept().await {
-                    Ok((s, p)) => { let _ = s.set_nodelay(true); (s, p) }
-                    Err(e) => { tracing::warn!("accept error: {e}"); continue; }
-                }
-            }
+        let (stream, peer) = match listener.accept().await {
+            Ok((s, p)) => { let _ = s.set_nodelay(true); (s, p) }
+            Err(e) => { tracing::warn!("accept error: {e}"); continue; }
         };
 
         let app_per_conn = app.clone();

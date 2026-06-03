@@ -9,10 +9,6 @@ pub mod transport;
 // ── 柜台子系统 (desk server + API) ───────────────────────────────────────────
 pub mod desk;
 
-// ── Linux 网络优化 (SO_BUSY_POLL + io_uring accept) ──────────────────────────
-#[cfg(target_os = "linux")]
-pub mod linux_net;
-
 // ── Flat re-exports: preserve all existing `crate::module` paths ──────────────
 pub use matching::engine;
 pub use matching::error;

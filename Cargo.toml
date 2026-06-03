@@ -101,6 +101,3 @@ path = "src/bin/pg_writer.rs"
 [[bin]]
 name = "pressure-client"
 path = "src/bin/pressure_client.rs"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring = { version = "0.5" }

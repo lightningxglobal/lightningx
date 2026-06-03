@@ -9,8 +9,7 @@ use crate::user_service;
 use axum::extract::{Request, State};
 use axum::response::Response;
 use dashmap::DashMap;
-use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket, WebSocketWrite};
-use tokio::io::WriteHalf;
+use fastwebsockets::{upgrade, Frame, OpCode, Payload, WebSocket};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
@@ -325,31 +324,6 @@ impl WsSession {
     }
 }
 
-// ─── Write-task types ─────────────────────────────────────────────────────────
-
-enum WsOut {
-    Text(String),
-    Pong(Vec<u8>),
-}
-
-// Writer task: owns the write half of the split WebSocket and drains the output
-// channel from the handler task.  Decoupled from reads so the handler task is
-// never blocked waiting for a socket write to complete.
-async fn ws_write_loop(
-    mut ws_write: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
-    mut out_rx: mpsc::Receiver<WsOut>,
-) {
-    while let Some(msg) = out_rx.recv().await {
-        let result = match msg {
-            WsOut::Text(s) => ws_write.write_frame(Frame::text(Payload::Owned(s.into_bytes()))).await,
-            WsOut::Pong(p) => ws_write.write_frame(Frame::pong(Payload::Owned(p))).await,
-        };
-        if result.is_err() {
-            break;
-        }
-    }
-}
-
 // ─── Upgrade handler ──────────────────────────────────────────────────────────
 
 pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Response {
@@ -383,50 +357,42 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
     static CONN_ID_GEN: AtomicU64 = AtomicU64::new(1);
     let conn_id = CONN_ID_GEN.fetch_add(1, Ordering::Relaxed);
 
-    // writev=true → single writev() syscall combines WS header + payload.
-    // auto_pong/auto_close disabled: we handle ping and close in our read loop
-    // so we never need to write from the read half (which would require
-    // shared access to the write half).
+    // writev=true → single writev() syscall combines WS header + payload
+    // instead of two write() calls per frame. On loopback this halves the
+    // syscall count per outgoing frame and shaves ~50-100µs off RTT.
     socket.set_writev(true);
-    socket.set_auto_close(false);
-    socket.set_auto_pong(false);
+    socket.set_auto_close(true);
+    socket.set_auto_pong(true);
     let mut session = WsSession::new();
 
+    // Personal update channel for this connection (order/balance events).
     let (personal_tx, mut personal_rx) = mpsc::channel::<String>(ws_personal_queue_cap());
-    // Market data: lazy-register on first Subscribe so pure-trading connections
-    // pay zero fanout overhead.
+    // Market data channel: registered LAZILY with state.market_fanout when
+    // the client first sends a Subscribe message. Connections that never
+    // subscribe (load tests, trading-only bots) never get registered, so
+    // they impose zero fanout overhead. Eliminates the broadcast::Receiver
+    // lock contention that pushed p50 to 2s at 40K conns.
     let (market_tx, mut market_rx) = mpsc::channel::<Arc<str>>(8192);
     let mut market_registered = false;
 
-    // Split the WebSocket into independent read and write halves.
-    // The write half runs in a dedicated task so the handler loop is never
-    // blocked waiting for a socket write to complete.  At 20K connections the
-    // handler task becomes non-blocking (all writes are channel sends),
-    // which reduces per-task latency and scheduler contention.
-    let (out_tx, out_rx) = mpsc::channel::<WsOut>(ws_personal_queue_cap());
-    let (mut ws_read, ws_write) = socket.split(tokio::io::split);
-    ws_read.set_auto_close(false);
-    ws_read.set_auto_pong(false);
-    let write_task = tokio::spawn(ws_write_loop(ws_write, out_rx));
-
-    // send_fn for ws_read.read_frame: no obligated sends (auto_pong=false,
-    // auto_close=false), so this closure is never actually called.
-    let mut no_obligated_send = |_| async { Ok::<(), std::convert::Infallible>(()) };
-
     'conn: loop {
         tokio::select! {
+            // biased; → poll branches in declared order on every wake. Personal
+            // responses (order_update / balance_update) carry user-visible
+            // place-order latency; we want them flushed BEFORE we drain the
+            // next incoming frame. Without biased, tokio picks randomly →
+            // outgoing responses can wait one full select cycle.
             biased;
 
-            // Personal order/balance update — highest priority: flush before
-            // reading the next client frame.
+            // Personal order/balance update for this user — TOP PRIORITY.
             Some(msg) = personal_rx.recv() => {
-                if out_tx.try_send(WsOut::Text(msg)).is_err() {
+                if socket.write_frame(Frame::text(Payload::Owned(msg.into_bytes()))).await.is_err() {
                     break 'conn;
                 }
             }
 
-            // Incoming frame from client.
-            frame = ws_read.read_frame::<_, std::convert::Infallible>(&mut no_obligated_send) => {
+            // Incoming message from client
+            frame = socket.read_frame() => {
                 match frame {
                     Ok(frame) => match frame.opcode {
                         OpCode::Text => {
@@ -434,6 +400,9 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                                 Ok(t) => t,
                                 Err(_) => continue 'conn,
                             };
+                            // Lazy register with market_fanout on first
+                            // Subscribe-like message — quick substring check
+                            // avoids a full JSON parse just to detect intent.
                             if !market_registered && text.contains("\"subscribe\"") {
                                 state.market_fanout.register(conn_id, market_tx.clone());
                                 market_registered = true;
@@ -441,15 +410,9 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                             if let Some(reply) = handle_client_message(
                                 text, &mut session, &state, &personal_tx
                             ).await {
-                                if out_tx.try_send(WsOut::Text(reply)).is_err() {
+                                if socket.write_frame(Frame::text(Payload::Owned(reply.into_bytes()))).await.is_err() {
                                     break 'conn;
                                 }
-                            }
-                        }
-                        OpCode::Ping => {
-                            let payload = frame.payload.to_vec();
-                            if out_tx.try_send(WsOut::Pong(payload)).is_err() {
-                                break 'conn;
                             }
                         }
                         OpCode::Close => break 'conn,
@@ -459,8 +422,12 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                 }
             }
 
-            // Market data — lowest priority, only for subscribers.
+            // Market data (depth, trades, ticker, kline) — lowest priority,
+            // only flows here for subscribers.
             Some(msg) = market_rx.recv() => {
+                // Only forward if this client subscribed to a matching channel.
+                // Quick prefix check on the JSON "type" field to avoid
+                // deserializing the whole payload.
                 let should_forward = if msg.contains("\"type\":\"depth\"") {
                     msg_symbol(&msg).map(|sym| {
                         session.subscribed.contains(&format!("depth.{}", sym))
@@ -486,21 +453,18 @@ async fn handle_socket(mut socket: WebSocket<TokioIo<Upgraded>>, state: AppState
                 };
 
                 if should_forward {
-                    if out_tx.try_send(WsOut::Text(msg.to_string())).is_err() {
+                    if socket.write_frame(Frame::text(Payload::Owned(msg.as_bytes().to_vec()))).await.is_err() {
                         break 'conn;
                     }
                 }
             }
         }
     }
-
-    // Drop out_tx so the write task sees channel closed and exits cleanly.
-    drop(out_tx);
-    write_task.await.ok();
-
     if market_registered {
         state.market_fanout.unregister(conn_id);
     }
+
+    // Remove personal channel on disconnect.
     if let Some(uid) = session.user_id {
         state.user_tx.unregister(uid);
     }

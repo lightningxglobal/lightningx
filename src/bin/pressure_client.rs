@@ -9,6 +9,7 @@
 //!   PRESSURE_DURATION_S    test duration in seconds            (default 60)
 //!   PRESSURE_RAMP_S        seconds to ramp connections up      (default 30)
 //!   PRESSURE_BASE_URL      desk-server base url                (default http://localhost:4003)
+//!   PRESSURE_USER_OFFSET   first pressure user index            (default 0)
 //!   PRESSURE_SYMBOL        symbol to trade                     (default BTC_USDT)
 //!   PRESSURE_PRICE         limit price (far from market)       (default 1.0  — won't fill)
 //!   PRESSURE_QTY           order quantity                      (default 0.0001)
@@ -94,6 +95,7 @@ struct Config {
     duration_s: u64,
     ramp_s: u64,
     base_url: String,
+    user_offset: usize,
     symbol: String,
     price: f64,
     qty: f64,
@@ -114,6 +116,7 @@ impl Config {
             duration_s: env_usize("PRESSURE_DURATION_S", 60) as u64,
             ramp_s: env_usize("PRESSURE_RAMP_S", 30) as u64,
             base_url: env_string("PRESSURE_BASE_URL", "http://localhost:4003"),
+            user_offset: env_usize("PRESSURE_USER_OFFSET", 0),
             symbol: env_string("PRESSURE_SYMBOL", "BTC_USDT"),
             // Default price 5000 × qty 0.001 = $5 notional (BTC_USDT
             // min_notional is $5). Far below market (~74k) → orders rest
@@ -431,8 +434,8 @@ fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<User
     let header = Header::default();
 
     info!(
-        "setup: loading user→id map from {path}, self-signing tokens for {} users…",
-        cfg.users
+        "setup: loading user→id map from {path}, self-signing tokens for {} users at offset {}…",
+        cfg.users, cfg.user_offset,
     );
     let started = Instant::now();
     let raw = std::fs::read_to_string(path)?;
@@ -453,10 +456,11 @@ fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<User
     }
     let mut users = Vec::with_capacity(cfg.users);
     for i in 0..cfg.users {
-        let user_id = *by_idx.get(&i).ok_or_else(|| {
-            anyhow::anyhow!("missing user idx {i} in CSV — pre-create users first")
+        let idx = cfg.user_offset + i;
+        let user_id = *by_idx.get(&idx).ok_or_else(|| {
+            anyhow::anyhow!("missing user idx {idx} in CSV — pre-create users first")
         })?;
-        let email = format!("pressure_{i}@stress.test");
+        let email = format!("pressure_{idx}@stress.test");
         let claims = Claims {
             sub: user_id,
             email,
@@ -485,7 +489,10 @@ async fn setup_users(cfg: &Config) -> anyhow::Result<Arc<Vec<UserToken>>> {
         .pool_max_idle_per_host(64)
         .build()?;
 
-    info!("setup: ensuring {} test users…", cfg.users);
+    info!(
+        "setup: ensuring {} test users at offset {}…",
+        cfg.users, cfg.user_offset
+    );
     let started = Instant::now();
     let mut users = Vec::with_capacity(cfg.users);
 
@@ -494,7 +501,7 @@ async fn setup_users(cfg: &Config) -> anyhow::Result<Arc<Vec<UserToken>>> {
     use futures::stream::{FuturesUnordered, StreamExt};
     let parallel = env_usize("PRESSURE_SETUP_PARALLEL", 32).max(1);
     let mut pending: FuturesUnordered<_> = (0..parallel.min(cfg.users))
-        .map(|i| ensure_user(&http, &cfg.base_url, i))
+        .map(|i| ensure_user(&http, &cfg.base_url, cfg.user_offset + i))
         .collect();
     let mut next_idx = parallel.min(cfg.users);
 
@@ -504,7 +511,11 @@ async fn setup_users(cfg: &Config) -> anyhow::Result<Arc<Vec<UserToken>>> {
             Err(e) => warn!("ensure_user failed: {e}"),
         }
         if next_idx < cfg.users {
-            pending.push(ensure_user(&http, &cfg.base_url, next_idx));
+            pending.push(ensure_user(
+                &http,
+                &cfg.base_url,
+                cfg.user_offset + next_idx,
+            ));
             next_idx += 1;
         }
         if users.len() % 1000 == 0 && users.len() > 0 {
@@ -986,8 +997,8 @@ fn raise_nofile_limit() {
 async fn async_main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::from_env());
     info!(
-        "pressure_client: users={} conns={} ops/s/conn={} duration={}s ramp={}s symbol={} price={} qty={}",
-        cfg.users, cfg.conns, cfg.ops_per_sec, cfg.duration_s, cfg.ramp_s,
+        "pressure_client: users={} user_offset={} conns={} ops/s/conn={} duration={}s ramp={}s symbol={} price={} qty={}",
+        cfg.users, cfg.user_offset, cfg.conns, cfg.ops_per_sec, cfg.duration_s, cfg.ramp_s,
         cfg.symbol, cfg.price, cfg.qty,
     );
 

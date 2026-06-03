@@ -10,6 +10,8 @@
 //!   PRESSURE_RAMP_S        seconds to ramp connections up      (default 30)
 //!   PRESSURE_BASE_URL      desk-server base url                (default http://localhost:4003)
 //!   PRESSURE_USER_OFFSET   first pressure user index            (default 0)
+//!   PRESSURE_SETUP_ONLY    create/load users then exit          (default false)
+//!   PRESSURE_EXPORT_USERS_CSV write user_id,idx rows after setup
 //!   PRESSURE_SYMBOL        symbol to trade                     (default BTC_USDT)
 //!   PRESSURE_PRICE         limit price (far from market)       (default 1.0  — won't fill)
 //!   PRESSURE_QTY           order quantity                      (default 0.0001)
@@ -1005,6 +1007,21 @@ async fn async_main() -> anyhow::Result<()> {
     let users = setup_users(&cfg).await.context("setup users")?;
     if users.is_empty() {
         anyhow::bail!("no users were set up — abort");
+    }
+    if let Ok(path) = std::env::var("PRESSURE_EXPORT_USERS_CSV") {
+        let mut out = String::with_capacity(users.len() * 16);
+        for (i, user) in users.iter().enumerate() {
+            let idx = cfg.user_offset + i;
+            out.push_str(&format!("{},{}\n", user.user_id, idx));
+        }
+        std::fs::write(&path, out).with_context(|| format!("write {path}"))?;
+        info!("setup: exported {} user rows to {path}", users.len());
+    }
+    if std::env::var("PRESSURE_SETUP_ONLY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+    {
+        return Ok(());
     }
 
     let metrics = Arc::new(Metrics::default());

@@ -150,6 +150,11 @@ struct Metrics {
     conn_open: AtomicUsize, // gauge
     conn_failed: AtomicU64,
     conn_closed: AtomicU64,
+    conn_fail_addr_unavailable: AtomicU64,
+    conn_fail_refused: AtomicU64,
+    conn_fail_timeout: AtomicU64,
+    conn_fail_auth: AtomicU64,
+    conn_fail_other: AtomicU64,
 
     // Order flow (cumulative counters).
     place_sent: AtomicU64,
@@ -221,6 +226,11 @@ impl Metrics {
             conn_open: self.conn_open.load(Ordering::Relaxed),
             conn_failed: self.conn_failed.load(Ordering::Relaxed),
             conn_closed: self.conn_closed.load(Ordering::Relaxed),
+            conn_fail_addr_unavailable: self.conn_fail_addr_unavailable.load(Ordering::Relaxed),
+            conn_fail_refused: self.conn_fail_refused.load(Ordering::Relaxed),
+            conn_fail_timeout: self.conn_fail_timeout.load(Ordering::Relaxed),
+            conn_fail_auth: self.conn_fail_auth.load(Ordering::Relaxed),
+            conn_fail_other: self.conn_fail_other.load(Ordering::Relaxed),
             place_sent: self.place_sent.load(Ordering::Relaxed),
             place_ok: self.place_ok.load(Ordering::Relaxed),
             place_fail: self.place_fail.load(Ordering::Relaxed),
@@ -243,6 +253,11 @@ struct MetricsSnap {
     conn_open: usize,
     conn_failed: u64,
     conn_closed: u64,
+    conn_fail_addr_unavailable: u64,
+    conn_fail_refused: u64,
+    conn_fail_timeout: u64,
+    conn_fail_auth: u64,
+    conn_fail_other: u64,
     place_sent: u64,
     place_ok: u64,
     place_fail: u64,
@@ -264,6 +279,25 @@ fn record_max(slot: &AtomicU64, v: u64) {
             Ok(_) => break,
             Err(actual) => cur = actual,
         }
+    }
+}
+
+fn record_conn_error(metrics: &Metrics, err: &anyhow::Error) {
+    metrics.conn_failed.fetch_add(1, Ordering::Relaxed);
+    let text = err.to_string();
+    if text.contains("Can't assign requested address")
+        || text.contains("Cannot assign requested address")
+        || text.contains("EADDRNOTAVAIL")
+    {
+        metrics
+            .conn_fail_addr_unavailable
+            .fetch_add(1, Ordering::Relaxed);
+    } else if text.contains("Connection refused") || text.contains("ECONNREFUSED") {
+        metrics.conn_fail_refused.fetch_add(1, Ordering::Relaxed);
+    } else if text.contains("timed out") || text.contains("deadline") || text.contains("timeout") {
+        metrics.conn_fail_timeout.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.conn_fail_other.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -554,7 +588,7 @@ async fn driver(
     let mut ws = match ws_connect_plain_from(&ws_url, bind_ip).await {
         Ok(w) => w,
         Err(e) => {
-            metrics.conn_failed.fetch_add(1, Ordering::Relaxed);
+            record_conn_error(&metrics, &e);
             tracing::debug!("conn {conn_idx} failed: {e}");
             return;
         }
@@ -573,6 +607,7 @@ async fn driver(
     {
         metrics.conn_open.fetch_sub(1, Ordering::Relaxed);
         metrics.conn_failed.fetch_add(1, Ordering::Relaxed);
+        metrics.conn_fail_auth.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -1083,6 +1118,16 @@ async fn async_main() -> anyhow::Result<()> {
         "  conn attempted/open/failed/closed:  {} / {} / {} / {}",
         cur.conn_attempted, cur.conn_open, cur.conn_failed, cur.conn_closed
     );
+    if cur.conn_failed > 0 {
+        println!(
+            "  conn failed breakdown:             addr_unavail={} refused={} timeout={} auth={} other={}",
+            cur.conn_fail_addr_unavailable,
+            cur.conn_fail_refused,
+            cur.conn_fail_timeout,
+            cur.conn_fail_auth,
+            cur.conn_fail_other
+        );
+    }
     let place_pct = if cur.place_sent > 0 {
         100.0 * cur.place_ok as f64 / cur.place_sent as f64
     } else {

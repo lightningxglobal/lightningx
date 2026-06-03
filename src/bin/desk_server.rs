@@ -953,8 +953,16 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(2);
+    // event_interval: how many task polls between I/O driver checks (default 61).
+    // Lower values reduce WS frame wake latency at the cost of more epoll syscalls.
+    // 7 is a practical balance; set to 1 for minimum latency on a dedicated server.
+    let event_interval: u32 = std::env::var("TOKIO_EVENT_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
+        .event_interval(event_interval)
         .enable_all()
         .build()?;
     runtime.block_on(async_main())

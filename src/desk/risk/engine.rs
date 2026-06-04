@@ -102,6 +102,12 @@ impl RiskEngine {
         };
 
         // Compute new position state without holding shard locks.
+        let old_unrealized_pnl = self
+            .positions
+            .get(&key)
+            .map(|p| p.unrealized_pnl)
+            .unwrap_or(0);
+
         let (new_pos, released_used_margin, realized_pnl_cents) = {
             let existing = self.positions.get(&key);
             compute_position_update(
@@ -117,6 +123,8 @@ impl RiskEngine {
                 maintenance_rate_bps,
             )
         };
+        let new_unrealized_pnl = new_pos.as_ref().map(|p| p.unrealized_pnl).unwrap_or(0);
+        let unrealized_pnl_delta = new_unrealized_pnl - old_unrealized_pnl;
 
         // Apply position update.
         match new_pos {
@@ -192,6 +200,7 @@ impl RiskEngine {
                 // Opening: move order_margin → used_margin.
                 acct.used_margin += fill_margin_cents;
             }
+            acct.unrealized_pnl += unrealized_pnl_delta;
             acct.equity = acct.available_margin
                 + acct.order_margin
                 + acct.used_margin
@@ -238,8 +247,8 @@ impl RiskEngine {
     // Phase 3: mark price + incremental unrealized PnL + risk tick
     // -------------------------------------------------------------------------
 
-    /// Update the EWMA mark price for a symbol and recompute unrealized PnL
-    /// for all users with open positions.  Called from the WS Aeron spin thread
+    /// Update the EWMA mark price for a symbol and incrementally adjust unrealized PnL
+    /// for users with open positions.  Called from the WS Aeron public receive thread
     /// every time a depth snapshot arrives (~10ms cadence).
     ///
     /// EWMA: mark = 0.1 × new_price + 0.9 × old_mark  (α=0.1)
@@ -269,32 +278,24 @@ impl RiskEngine {
 
         for uid in user_ids {
             let key = (uid, symbol);
-            // Update mark price on this position.
-            {
+            let upnl_delta = {
                 let Some(mut pos) = self.positions.get_mut(&key) else {
                     continue;
                 };
+                let old_upnl = pos.unrealized_pnl;
+                let new_upnl = calc::calc_unrealized_pnl_cents(
+                    pos.side,
+                    pos.qty_lots,
+                    pos.entry_price_ticks,
+                    mark_ticks,
+                    notional_scale,
+                );
                 pos.mark_price_ticks = mark_ticks;
-            }
-            // Sum unrealized PnL across all open positions for this user so
-            // multi-symbol accounts accumulate correctly instead of overwriting.
-            let total_upnl: i64 = self
-                .positions
-                .iter()
-                .filter(|e| e.key().0 == uid)
-                .map(|e| {
-                    let p = e.value();
-                    calc::calc_unrealized_pnl_cents(
-                        p.side,
-                        p.qty_lots,
-                        p.entry_price_ticks,
-                        p.mark_price_ticks,
-                        notional_scale,
-                    )
-                })
-                .sum();
+                pos.unrealized_pnl = new_upnl;
+                new_upnl - old_upnl
+            };
             if let Some(mut acct) = self.accounts.get_mut(&uid) {
-                acct.unrealized_pnl = total_upnl;
+                acct.unrealized_pnl += upnl_delta;
                 acct.equity = acct.available_margin
                     + acct.order_margin
                     + acct.used_margin
@@ -439,6 +440,7 @@ fn compute_position_update(
                 qty_lots: fill_qty_lots,
                 entry_price_ticks: fill_price_ticks,
                 mark_price_ticks: fill_price_ticks,
+                unrealized_pnl: 0,
                 initial_margin: fill_margin_cents,
                 maintenance_margin: maint,
                 liquidation_price_ticks: liq,
@@ -463,6 +465,7 @@ fn compute_position_update(
         updated.qty_lots = new_qty;
         updated.initial_margin += fill_margin_cents;
         refresh_risk_fields(&mut updated, notional_scale, maintenance_rate_bps);
+        refresh_unrealized_pnl(&mut updated, notional_scale);
         return (Some(updated), 0, 0);
     }
 
@@ -502,6 +505,7 @@ fn compute_position_update(
                 qty_lots: remaining_qty,
                 entry_price_ticks: fill_price_ticks,
                 mark_price_ticks: fill_price_ticks,
+                unrealized_pnl: 0,
                 initial_margin: flip_margin,
                 maintenance_margin: maint,
                 liquidation_price_ticks: liq,
@@ -523,6 +527,7 @@ fn compute_position_update(
         updated.qty_lots = pos.qty_lots - close_qty;
         updated.initial_margin = pos.initial_margin - released_margin;
         refresh_risk_fields(&mut updated, notional_scale, maintenance_rate_bps);
+        refresh_unrealized_pnl(&mut updated, notional_scale);
         (Some(updated), released_margin, realized_pnl as i64)
     }
 }
@@ -542,6 +547,16 @@ fn refresh_risk_fields(pos: &mut PositionRiskState, notional_scale: i64, mainten
         calc::calc_bankruptcy_price_ticks(pos.entry_price_ticks, pos.leverage, pos.side);
 }
 
+fn refresh_unrealized_pnl(pos: &mut PositionRiskState, notional_scale: i64) {
+    pos.unrealized_pnl = calc::calc_unrealized_pnl_cents(
+        pos.side,
+        pos.qty_lots,
+        pos.entry_price_ticks,
+        pos.mark_price_ticks,
+        notional_scale,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +571,13 @@ mod tests {
     fn btc_sym() -> [u8; 16] {
         let mut s = [0u8; 16];
         s[..7].copy_from_slice(b"BTC_USD");
+        s[7] = b'T';
+        s
+    }
+
+    fn eth_sym() -> [u8; 16] {
+        let mut s = [0u8; 16];
+        s[..7].copy_from_slice(b"ETH_USD");
         s[7] = b'T';
         s
     }
@@ -801,6 +823,35 @@ mod tests {
         // equity = available(450k - nothing since open moved to used) + used(50k) + upnl(1k) + order(0)
         // At open: available = 500_000 - 50_000 = 450_000, used = 50_000
         assert_eq!(acct.equity, 450_000 + 50_000 + 1_000);
+    }
+
+    #[test]
+    fn update_mark_price_accumulates_multi_symbol_upnl_incrementally() {
+        let (engine, uid) = make_engine_with_account(1_000_000);
+
+        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        let eth_price = 300_000i64;
+        let eth_qty = 100_000i64;
+        let eth_margin = 3_000i64;
+        engine.check_and_reserve_margin(uid, eth_margin).unwrap();
+        engine.on_fill(uid, eth_sym(), 0, eth_price, eth_qty, eth_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        engine.update_mark_price(btc_sym(), 5_100_000, NOTIONAL_SCALE);
+        engine.update_mark_price(eth_sym(), 310_000, NOTIONAL_SCALE);
+
+        let btc_pos = engine.positions.get(&(uid, btc_sym())).unwrap();
+        let btc_upnl = btc_pos.unrealized_pnl;
+        drop(btc_pos);
+        let eth_pos = engine.positions.get(&(uid, eth_sym())).unwrap();
+        let eth_upnl = eth_pos.unrealized_pnl;
+        drop(eth_pos);
+
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.unrealized_pnl, btc_upnl + eth_upnl);
+        assert_eq!(btc_upnl, 1_000);
+        assert_eq!(eth_upnl, 100);
     }
 
     #[test]

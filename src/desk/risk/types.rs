@@ -56,6 +56,7 @@ pub struct PositionRiskState {
     pub qty_lots: i64,
     pub entry_price_ticks: i64,
     pub mark_price_ticks: i64,
+    pub unrealized_pnl: i64,
     pub initial_margin: i64,
     pub maintenance_margin: i64,
     pub liquidation_price_ticks: i64,

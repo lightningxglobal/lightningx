@@ -624,17 +624,15 @@ async fn driver(
 
         // Send place_order.
         counter += 1;
-        let coid = format!("p{}-{conn_idx}-{counter}", cfg.run_id);
-        let _coid_match = coid.as_str(); // kept for future use
+        let coid: u64 = (conn_idx as u64).wrapping_mul(1_000_000_000).wrapping_add(counter);
         let mut order_id_match: Option<u64> = None;
-        let place_msg = format!(
-            r#"{{"type":"place_order","client_order_id":"{}","symbol":"{}","side":"buy","order_type":"limit","price":{},"qty":{}}}"#,
-            coid, cfg.symbol, cfg.price, cfg.qty,
-        );
+        let side: u8 = 0; // Buy
+        let tif: u8 = 0;  // GTC
+        let place_buf = ws_sbe::encode_client_place_order(coid, &cfg.symbol, side, tif, cfg.price, cfg.qty);
         let t0 = Instant::now();
         metrics.place_sent.fetch_add(1, Ordering::Relaxed);
         if ws
-            .write_frame(Frame::text(Payload::Owned(place_msg.into_bytes())))
+            .write_frame(Frame::binary(Payload::Owned(place_buf.to_vec())))
             .await
             .is_err()
         {
@@ -782,11 +780,11 @@ async fn driver(
 
         // Cancel.
         if let Some(id) = current_order_id.take() {
-            let cancel_msg = format!(r#"{{"type":"cancel_order","order_id":{}}}"#, id);
+            let cancel_buf = ws_sbe::encode_client_cancel_order(id);
             let t1 = Instant::now();
             metrics.cancel_sent.fetch_add(1, Ordering::Relaxed);
             if ws
-                .write_frame(Frame::text(Payload::Owned(cancel_msg.into_bytes())))
+                .write_frame(Frame::binary(Payload::Owned(cancel_buf.to_vec())))
                 .await
                 .is_err()
             {

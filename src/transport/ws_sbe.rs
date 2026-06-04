@@ -609,6 +609,75 @@ pub fn decode_best_price(buf: &[u8], want_ask: bool) -> Option<f64> {
     }
 }
 
+// ── Client→Server binary message types (50+) ────────────────────────────────
+// Text frames (JSON) remain supported for auth/subscribe/etc.
+// Binary frames use these msg_type values for hot-path trading commands.
+
+pub const CLIENT_PLACE_ORDER: u8 = 50;
+pub const CLIENT_CANCEL_ORDER: u8 = 51;
+pub const CLIENT_PING: u8 = 52;
+
+/// Encode a client PlaceOrder binary frame (37 bytes).
+/// Layout: [msg_type:1][coid:u64][symbol:u8×8][side:u8][tif:u8][_pad:u16][price:f64][qty:f64]
+/// side: 0=Buy, 1=Sell
+/// tif:  0=GTC, 1=IOC, 2=FOK, 3=PostOnly
+#[inline]
+pub fn encode_client_place_order(
+    coid: u64,
+    symbol: &str,
+    side: u8,
+    tif: u8,
+    price: f64,
+    qty: f64,
+) -> [u8; 37] {
+    let mut buf = [0u8; 37];
+    buf[0] = CLIENT_PLACE_ORDER;
+    buf[1..9].copy_from_slice(&coid.to_le_bytes());
+    let sym = pack8(symbol);
+    buf[9..17].copy_from_slice(&sym);
+    buf[17] = side;
+    buf[18] = tif;
+    // buf[19..21] = pad (already zero)
+    buf[21..29].copy_from_slice(&price.to_le_bytes());
+    buf[29..37].copy_from_slice(&qty.to_le_bytes());
+    buf
+}
+
+/// Decode a client PlaceOrder binary frame.
+/// Returns (coid, symbol_bytes[8], side, tif, price, qty) or None if malformed.
+#[inline]
+pub fn decode_client_place_order(buf: &[u8]) -> Option<(u64, [u8; 8], u8, u8, f64, f64)> {
+    if buf.len() < 37 || buf[0] != CLIENT_PLACE_ORDER {
+        return None;
+    }
+    let coid = u64::from_le_bytes(buf[1..9].try_into().ok()?);
+    let sym: [u8; 8] = buf[9..17].try_into().ok()?;
+    let side = buf[17];
+    let tif = buf[18];
+    let price = f64::from_le_bytes(buf[21..29].try_into().ok()?);
+    let qty = f64::from_le_bytes(buf[29..37].try_into().ok()?);
+    Some((coid, sym, side, tif, price, qty))
+}
+
+/// Encode a client CancelOrder binary frame (9 bytes).
+/// Layout: [msg_type:1][order_id:i64]
+#[inline]
+pub fn encode_client_cancel_order(order_id: i64) -> [u8; 9] {
+    let mut buf = [0u8; 9];
+    buf[0] = CLIENT_CANCEL_ORDER;
+    buf[1..9].copy_from_slice(&order_id.to_le_bytes());
+    buf
+}
+
+/// Decode a client CancelOrder binary frame. Returns order_id or None if malformed.
+#[inline]
+pub fn decode_client_cancel_order(buf: &[u8]) -> Option<i64> {
+    if buf.len() < 9 || buf[0] != CLIENT_CANCEL_ORDER {
+        return None;
+    }
+    Some(i64::from_le_bytes(buf[1..9].try_into().ok()?))
+}
+
 /// Extract the symbol string from any broadcast message frame (TRADE/DEPTH/TICKER/KLINE/AGG_TRADE).
 /// Returns None if the frame is too short or not a recognized broadcast type.
 pub fn decode_broadcast_symbol(buf: &[u8]) -> Option<String> {

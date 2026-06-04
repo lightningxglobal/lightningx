@@ -256,6 +256,45 @@ impl ClientMsg {
             _ => None,
         }
     }
+
+    fn parse_binary(bytes: &[u8]) -> Option<Self> {
+        let msg_type = *bytes.first()?;
+        match msg_type {
+            ws_sbe::CLIENT_PLACE_ORDER => {
+                let (coid, sym, side_byte, tif_byte, price_raw, qty) =
+                    ws_sbe::decode_client_place_order(bytes)?;
+                let symbol = ws_sbe::sym8_to_str(&sym).to_owned();
+                let side = match side_byte {
+                    0 => "buy",
+                    1 => "sell",
+                    _ => return None,
+                }.to_owned();
+                let (order_type, time_in_force) = match tif_byte {
+                    0 => ("limit".to_owned(), None),
+                    1 => ("ioc".to_owned(), None),
+                    2 => ("fok".to_owned(), None),
+                    3 => ("post_only".to_owned(), None),
+                    _ => return None,
+                };
+                let price = if price_raw == 0.0 { None } else { Some(price_raw) };
+                Some(ClientMsg::PlaceOrder {
+                    client_order_id: coid.to_string(),
+                    symbol,
+                    side,
+                    order_type,
+                    time_in_force,
+                    price,
+                    qty,
+                })
+            }
+            ws_sbe::CLIENT_CANCEL_ORDER => {
+                let order_id = ws_sbe::decode_client_cancel_order(bytes)?;
+                Some(ClientMsg::CancelOrder { order_id })
+            }
+            ws_sbe::CLIENT_PING => Some(ClientMsg::Ping),
+            _ => None,
+        }
+    }
 }
 
 fn parse_place_order_fast(text: &str) -> Option<ClientMsg> {
@@ -432,9 +471,16 @@ pub async fn read_conn_loop(
                                 Ok(t) => t,
                                 Err(_) => continue 'conn,
                             };
+                            let msg = match ClientMsg::parse(text) {
+                                Some(m) => m,
+                                None => {
+                                    let _ = personal_tx.try_send((ws_sbe::encode_error("Invalid message format"), 0));
+                                    continue 'conn;
+                                }
+                            };
                             let was_subscribed = !session.subscribed.is_empty();
                             if let Some(reply) = handle_client_message(
-                                text, &mut session, &state, &personal_tx,
+                                msg, &mut session, &state, &personal_tx,
                             ).await {
                                 let _ = personal_tx.try_send((reply, 0));
                             }
@@ -450,6 +496,17 @@ pub async fn read_conn_loop(
                                 actor_sub_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 state.market_fanout.decrement_subscriber();
                                 market_registered = false;
+                            }
+                        }
+                        OpCode::Binary => {
+                            let msg = match ClientMsg::parse_binary(&frame.payload) {
+                                Some(m) => m,
+                                None => continue 'conn,
+                            };
+                            if let Some(reply) = handle_client_message(
+                                msg, &mut session, &state, &personal_tx,
+                            ).await {
+                                let _ = personal_tx.try_send((reply, 0));
                             }
                         }
                         OpCode::Ping => {
@@ -505,18 +562,11 @@ fn best_opposing_from_depth(state: &AppState, symbol: &str, side: &str) -> Optio
 // ─── Per-message handler ──────────────────────────────────────────────────────
 
 async fn handle_client_message(
-    text: &str,
+    msg: ClientMsg,
     session: &mut WsSession,
     state: &AppState,
     personal_tx: &mpsc::Sender<(Vec<u8>, u64)>,
 ) -> Option<Vec<u8>> {
-    let msg: ClientMsg = match ClientMsg::parse(text) {
-        Some(m) => m,
-        None => {
-            return Some(ws_sbe::encode_error("Invalid message format"))
-        }
-    };
-
     match msg {
         ClientMsg::Auth { token } => match user_service::verify_token(&token) {
             Ok(claims) => {

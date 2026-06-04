@@ -281,6 +281,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/test-funds", post(handle_test_funds))
         .route("/api/robot-funds", post(handle_robot_funds))
         .route("/api/seed-demo", post(handle_seed_demo))
+        // Debug endpoint: only active when TEST_ENDPOINTS=1 env var is set.
+        // Forces mark price for a symbol — used by integration tests to drive
+        // liquidations without relying on live market data.
+        .route("/api/debug/mark-price", post(handle_debug_mark_price))
         .with_state(state)
 }
 
@@ -2244,4 +2248,101 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
         Json(json!({"status": "seeded", "orders_placed": placed, "demo_user_id": demo_user_id})),
     )
         .into_response()
+}
+
+// ─── Debug: Force mark price (TEST_ENDPOINTS=1 only) ─────────────────────────
+
+#[derive(Deserialize)]
+struct DebugMarkPriceReq {
+    symbol: String,
+    price: f64,
+}
+
+/// Force-set the mark price for a symbol and re-run the risk tick.
+/// Only active when the `TEST_ENDPOINTS=1` environment variable is set.
+/// Returns 403 otherwise.  Used by integration tests to trigger liquidations
+/// without a live market data feed.
+async fn handle_debug_mark_price(
+    State(s): State<AppState>,
+    Json(req): Json<DebugMarkPriceReq>,
+) -> impl IntoResponse {
+    if std::env::var("TEST_ENDPOINTS").as_deref() != Ok("1") {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "TEST_ENDPOINTS not enabled"}))).into_response();
+    }
+
+    let rules = crate::symbol_rules::SymbolRules::for_symbol(&req.symbol);
+    let price_ticks = (req.price / rules.price_tick).round() as i64;
+
+    let mut sym_bytes = [0u8; 16];
+    let b = req.symbol.as_bytes();
+    sym_bytes[..b.len().min(16)].copy_from_slice(&b[..b.len().min(16)]);
+
+    // Bypass EWMA by inserting directly into mark_prices, then call
+    // update_mark_price once so unrealized PnL and equity are recomputed.
+    s.risk_engine.mark_prices.insert(sym_bytes, price_ticks);
+    s.risk_engine.update_mark_price(sym_bytes, price_ticks, rules.notional_scale);
+
+    let events = s.risk_engine.run_risk_tick();
+    let liq_count = events.len();
+
+    // Dispatch liquidation events to the priority ring (same as the 10ms task).
+    for evt in events {
+        use crate::transport::{AeronCmd, OrderMeta, pack_str16};
+        use crate::sbe::NewOrderRequest as SbeNewOrder;
+        use std::sync::atomic::Ordering;
+        use crate::desk::risk::PositionSide;
+
+        if evt.liq_price_ticks == 0 { continue; }
+
+        if let Some(mut acct) = s.risk_engine.accounts.get_mut(&evt.user_id) {
+            acct.status = crate::desk::risk::RiskStatus::Liquidating;
+        }
+        let Some(ref cmd_tx) = s.liq_cmd_tx else { continue; };
+
+        let sym_str_end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+        let sym_str = std::str::from_utf8(&evt.symbol[..sym_str_end]).unwrap_or("BTC_USDT");
+        let liq_rules = crate::symbol_rules::SymbolRules::for_symbol(sym_str);
+
+        let liq_side: u8 = if evt.side == PositionSide::Long { 1 } else { 0 };
+        let order_id = s.next_order_id.fetch_add(1, Ordering::Relaxed);
+
+        let sbe_req = SbeNewOrder {
+            client_order_id: order_id,
+            participant_id: evt.user_id as u64,
+            price_ticks: evt.liq_price_ticks,
+            quantity_lots: evt.qty_lots,
+            side: liq_side,
+            time_in_force: 1,
+            _pad: [0; 14],
+            symbol: evt.symbol,
+        };
+        let mark_ticks = s.risk_engine.mark_prices.get(&evt.symbol).map(|v| *v).unwrap_or(0);
+        let notional = if mark_ticks > 0 {
+            crate::desk::risk::calc::calc_notional_cents(mark_ticks, evt.qty_lots, liq_rules.notional_scale)
+        } else { 0 };
+        let margin_cents = crate::desk::risk::calc::calc_initial_margin_cents(notional, liq_rules.default_leverage);
+        let order_type = if liq_side == 0 { "liq-buy" } else { "liq-sell" };
+        s.pending_meta.insert(order_id, OrderMeta {
+            user_id: evt.user_id,
+            symbol: evt.symbol,
+            side: liq_side,
+            order_type: pack_str16(order_type),
+            price: None,
+            qty: liq_rules.lots_to_quantity(evt.qty_lots),
+            client_order_id: format!("liq-{}", order_id),
+            freeze_price: 0.0,
+            initial_margin_cents: margin_cents,
+            liq_price_ticks: evt.liq_price_ticks,
+        });
+        if cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
+            s.pending_meta.remove(&order_id);
+        }
+    }
+
+    (StatusCode::OK, Json(json!({
+        "symbol": req.symbol,
+        "price": req.price,
+        "price_ticks": price_ticks,
+        "liquidations_triggered": liq_count,
+    }))).into_response()
 }

@@ -19,6 +19,7 @@ use lightning_exchange::{
     tracer::{
         spawn_tracer, DESK_INSTANCE_ID, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV,
         MS_CMD_RING_POPPED, MS_USER_TX_SENT, MS_WS_UPDATE_SEND,
+        MS_LIQ_TICK_EMIT, MS_LIQ_ORDER_SENT, MS_LIQ_FILL_RECV,
     },
     transport::persist_event::{
         pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload,
@@ -2212,6 +2213,11 @@ async fn async_main() -> anyhow::Result<()> {
                                     // Liquidation orders have no reserved order_margin (the close
                                     // side has no margin requirement). Pass 0 so on_fill does not
                                     // deduct from order_margin that was never reserved.
+                                    if meta.liq_price_ticks != 0 {
+                                        if let Some(ref t) = spin_tracer {
+                                            t.record(MS_LIQ_FILL_RECV, order_id);
+                                        }
+                                    }
                                     let fill_margin = if meta.liq_price_ticks != 0 {
                                         0
                                     } else {
@@ -2300,12 +2306,18 @@ async fn async_main() -> anyhow::Result<()> {
         let next_order_id_tick = state.next_order_id.clone();
         let pending_meta_tick = state.pending_meta.clone();
         let liq_cmd_tick = state.liq_cmd_tx.clone();
+        let tracer_liq = state.tracer.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let to_liquidate = risk_engine_tick.run_risk_tick();
+                for evt in &to_liquidate {
+                    if let Some(ref t) = tracer_liq {
+                        t.record_sym(MS_LIQ_TICK_EMIT, evt.user_id as u64, &evt.symbol);
+                    }
+                }
                 for evt in to_liquidate {
                     use lightning_exchange::desk::risk::PositionSide;
                     use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
@@ -2376,6 +2388,9 @@ async fn async_main() -> anyhow::Result<()> {
                         pending_meta_tick.remove(&order_id);
                         tracing::warn!(user_id = evt.user_id, "liquidation order dropped: ring full");
                     } else {
+                        if let Some(ref t) = tracer_liq {
+                            t.record_sym(MS_LIQ_ORDER_SENT, order_id, &evt.symbol);
+                        }
                         tracing::warn!(
                             user_id = evt.user_id,
                             order_id,

@@ -40,6 +40,12 @@ pub const MS_AERON_ORDER_SEND: i32  = (8_i32 << 16) | 28; // OnAeronOrderSend
 pub const MS_AERON_UPDATE_RECV: i32 = (8_i32 << 16) | 32; // OnAeronUpdateRecv
 pub const MS_WS_UPDATE_SEND: i32    = (8_i32 << 16) | 33; // OnWsUpdateSend
 pub const MS_USER_TX_SENT: i32      = (8_i32 << 16) | 36; // OnUserTxSent
+
+// Liquidation path milestones (reuse DeskServer site=8, ordinal 50-52):
+pub const MS_LIQ_TICK_EMIT: i32    = (8_i32 << 16) | 50; // run_risk_tick emits LiquidationEvent
+pub const MS_LIQ_ORDER_SENT: i32   = (8_i32 << 16) | 51; // liq order pushed to priority ring
+pub const MS_LIQ_FILL_RECV: i32    = (8_i32 << 16) | 52; // liq fill received by on_fill
+
 // pub const MS_AERON_ORDER_RECV: i32  = (9_i32 << 16) | 29; // Engine × OnAeronOrderRecv
 // pub const MS_MATCHING_DONE: i32     = (9_i32 << 16) | 30; // Engine × OnMatchingDone
 // pub const MS_AERON_UPDATE_SEND: i32 = (9_i32 << 16) | 31; // Engine × OnAeronUpdateSend

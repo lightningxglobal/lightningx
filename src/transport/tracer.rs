@@ -156,31 +156,30 @@ fn wait_for_pub(client: &AeronClient, channel: &str, stream_id: i32) -> Option<P
 
 fn drain_loop(mut rx: UnboundedReceiver<(i32, u64, i64, [u8; 16])>, client: &AeronClient, pub_: &Publisher, instance_id: i32) {
     let mut buf = [0u8; 600];
-    let mut idle = 0u32;
+    let mut idle_us = 0u64;
     loop {
+        let mut did_work = false;
         while let Ok((milestone_id, order_id, ts_ns, sym)) = rx.try_recv() {
             let n = serialize_checkpoint(&mut buf, instance_id, milestone_id, order_id, ts_ns, &sym);
-            // Zero-copy claim: write directly into Aeron's term-log buffer
-            // instead of staging in `buf` then memcpy via `send()`.
-            // The `serialize_checkpoint` already wrote into `buf` above so we
-            // still copy from it — to get a true second-memcpy elimination we
-            // would have to refactor `serialize_checkpoint` to take the claim
-            // buffer directly. For now this just removes the send()'s internal
-            // claim+memcpy round-trip.
             if let Ok(mut claim) = pub_.try_claim(n) {
                 claim.as_mut_slice().copy_from_slice(&buf[..n]);
                 let _ = claim.commit();
             }
-            idle = 0;
+            did_work = true;
         }
-        // Aeron client times out if do_work() is not called within ~10 seconds.
-        // Call it every ~1 ms of idle time (every 1000 spin iterations) to keep
-        // the publication alive without burning CPU when traffic is low.
-        idle += 1;
-        if idle % 1_000 == 0 {
-            client.do_work();
+        // Always keep Aeron client alive; do_work() is cheap when idle.
+        client.do_work();
+        if did_work {
+            idle_us = 0;
+        } else {
+            // Timestamps are captured at the call site, not here, so a short
+            // sleep does not inflate the measured latency.  Exponential backoff
+            // up to 5 ms keeps the thread from stealing CPU from hot-path spin
+            // threads (Aeron send/recv), which was the main cause of tracer
+            // overhead at 40K+ connections.
+            idle_us = (idle_us * 2 + 100).min(5_000);
+            std::thread::sleep(std::time::Duration::from_micros(idle_us));
         }
-        std::hint::spin_loop();
     }
 }
 

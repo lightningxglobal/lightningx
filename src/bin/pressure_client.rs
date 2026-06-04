@@ -617,6 +617,15 @@ async fn driver(
     let mut counter: u64 = 0;
     let mut current_order_id: Option<i64> = None;
 
+    // Pre-convert price/qty to integer ticks/lots once per connection.
+    let sym_rules = lightning_exchange::symbol_rules::SymbolRules::for_symbol(&cfg.symbol);
+    let price_ticks: i64 = sym_rules.price_to_ticks(cfg.price).unwrap_or_else(|_| {
+        (cfg.price / sym_rules.price_tick).round() as i64
+    });
+    let quantity_lots: i64 = sym_rules.quantity_to_lots(cfg.qty).unwrap_or_else(|_| {
+        (cfg.qty / sym_rules.quantity_step).round() as i64
+    });
+
     loop {
         if Instant::now() >= deadline {
             break;
@@ -628,7 +637,7 @@ async fn driver(
         let mut order_id_match: Option<u64> = None;
         let side: u8 = 0; // Buy
         let tif: u8 = 0;  // GTC
-        let place_buf = ws_sbe::encode_client_place_order(coid, &cfg.symbol, side, tif, cfg.price, cfg.qty);
+        let place_buf = ws_sbe::encode_client_place_order(coid, &cfg.symbol, side, tif, price_ticks, quantity_lots);
         let t0 = Instant::now();
         metrics.place_sent.fetch_add(1, Ordering::Relaxed);
         if ws

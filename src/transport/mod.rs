@@ -399,12 +399,11 @@ mod tests {
         let mut subscriber = MockOrderSubscriber::new();
         assert!(subscriber.is_connected());
 
-        let price = 100.5;
         let req = NewOrderRequest {
             client_order_id: 1,
             participant_id: 456,
-            price,
-            quantity: 10.0,
+            price_ticks: 10_050,    // 100.5 at tick=0.01
+            quantity_lots: 10_000_000, // 10.0 at step=1e-6
             side: 0,
             time_in_force: 0,
             _pad: [0; 14],

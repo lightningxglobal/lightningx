@@ -896,8 +896,8 @@ mod tests {
         let req = NewOrderRequest {
             client_order_id: 42,
             participant_id: 7,
-            price: 101.25,
-            quantity: 3.5,
+            price_ticks: 10_125,  // 101.25 at tick=0.01
+            quantity_lots: 3_500_000,  // 3.5 at step=1e-6
             side: 0,
             time_in_force: 0,
             _pad: [0; 14],

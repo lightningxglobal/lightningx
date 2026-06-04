@@ -755,7 +755,7 @@ async fn handle_place_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let _fixed_shape = match crate::symbol_rules::normalize_order_shape(
+    let fixed_shape = match crate::symbol_rules::normalize_order_shape(
         &req.symbol,
         &req.order_type,
         req.price,
@@ -1231,8 +1231,8 @@ async fn handle_place_order(
         let sbe_req = SbeNewOrder {
             client_order_id: db_order_id as u64,
             participant_id: user_id as u64,
-            price: req.price.unwrap_or(0.0),
-            quantity: req.quantity,
+            price_ticks: fixed_shape.price_ticks.unwrap_or(0),
+            quantity_lots: fixed_shape.quantity_lots,
             side: side_byte,
             time_in_force: tif_byte,
             _pad: [0; 14],

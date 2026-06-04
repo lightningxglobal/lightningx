@@ -48,8 +48,8 @@ impl SbeHeader {
 pub struct NewOrderRequest {
     pub client_order_id: u64,
     pub participant_id: u64,
-    pub price: f64,
-    pub quantity: f64,
+    pub price_ticks: i64,    // integer price in symbol tick units; 0 = market order
+    pub quantity_lots: i64,  // integer quantity in symbol lot units
     pub side: u8,          // 0=Buy, 1=Sell
     pub time_in_force: u8, // 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
     pub _pad: [u8; 14],
@@ -349,11 +349,13 @@ mod tests {
 
     #[test]
     fn test_new_order_encode_decode() {
+        // BTC_USDT: price_tick=0.01, qty_step=1e-6
+        // price=100.50 → 10050 ticks; qty=50.000000 → 50_000_000 lots
         let req = NewOrderRequest {
             client_order_id: 123,
             participant_id: 456,
-            price: 100.5,
-            quantity: 50.0,
+            price_ticks: 10_050,
+            quantity_lots: 50_000_000,
             side: 0,          // Buy
             time_in_force: 0, // GTC
             _pad: [0; 14],
@@ -417,8 +419,8 @@ mod tests {
         let req = NewOrderRequest {
             client_order_id: 123,
             participant_id: 456,
-            price: 100.5,
-            quantity: 50.0,
+            price_ticks: 10_050,
+            quantity_lots: 50_000_000,
             side: 0,
             time_in_force: 0,
             _pad: [0; 14],

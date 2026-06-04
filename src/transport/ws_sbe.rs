@@ -618,7 +618,9 @@ pub const CLIENT_CANCEL_ORDER: u8 = 51;
 pub const CLIENT_PING: u8 = 52;
 
 /// Encode a client PlaceOrder binary frame (37 bytes).
-/// Layout: [msg_type:1][coid:u64][symbol:u8×8][side:u8][tif:u8][_pad:u16][price:f64][qty:f64]
+/// Layout: [msg_type:1][coid:u64][symbol:u8×8][side:u8][tif:u8][_pad:u16][price_ticks:i64][quantity_lots:i64]
+/// price_ticks: integer price in symbol tick units; 0 = market order
+/// quantity_lots: integer quantity in symbol lot units
 /// side: 0=Buy, 1=Sell
 /// tif:  0=GTC, 1=IOC, 2=FOK, 3=PostOnly
 #[inline]
@@ -627,8 +629,8 @@ pub fn encode_client_place_order(
     symbol: &str,
     side: u8,
     tif: u8,
-    price: f64,
-    qty: f64,
+    price_ticks: i64,
+    quantity_lots: i64,
 ) -> [u8; 37] {
     let mut buf = [0u8; 37];
     buf[0] = CLIENT_PLACE_ORDER;
@@ -638,15 +640,15 @@ pub fn encode_client_place_order(
     buf[17] = side;
     buf[18] = tif;
     // buf[19..21] = pad (already zero)
-    buf[21..29].copy_from_slice(&price.to_le_bytes());
-    buf[29..37].copy_from_slice(&qty.to_le_bytes());
+    buf[21..29].copy_from_slice(&price_ticks.to_le_bytes());
+    buf[29..37].copy_from_slice(&quantity_lots.to_le_bytes());
     buf
 }
 
 /// Decode a client PlaceOrder binary frame.
-/// Returns (coid, symbol_bytes[8], side, tif, price, qty) or None if malformed.
+/// Returns (coid, symbol_bytes[8], side, tif, price_ticks, quantity_lots) or None if malformed.
 #[inline]
-pub fn decode_client_place_order(buf: &[u8]) -> Option<(u64, [u8; 8], u8, u8, f64, f64)> {
+pub fn decode_client_place_order(buf: &[u8]) -> Option<(u64, [u8; 8], u8, u8, i64, i64)> {
     if buf.len() < 37 || buf[0] != CLIENT_PLACE_ORDER {
         return None;
     }
@@ -654,9 +656,9 @@ pub fn decode_client_place_order(buf: &[u8]) -> Option<(u64, [u8; 8], u8, u8, f6
     let sym: [u8; 8] = buf[9..17].try_into().ok()?;
     let side = buf[17];
     let tif = buf[18];
-    let price = f64::from_le_bytes(buf[21..29].try_into().ok()?);
-    let qty = f64::from_le_bytes(buf[29..37].try_into().ok()?);
-    Some((coid, sym, side, tif, price, qty))
+    let price_ticks = i64::from_le_bytes(buf[21..29].try_into().ok()?);
+    let quantity_lots = i64::from_le_bytes(buf[29..37].try_into().ok()?);
+    Some((coid, sym, side, tif, price_ticks, quantity_lots))
 }
 
 /// Encode a client CancelOrder binary frame (9 bytes).
@@ -676,6 +678,45 @@ pub fn decode_client_cancel_order(buf: &[u8]) -> Option<i64> {
         return None;
     }
     Some(i64::from_le_bytes(buf[1..9].try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_place_order_integer_roundtrip() {
+        // BTC_USDT: price=65000.00 → 6_500_000 ticks (tick=0.01)
+        //           qty=0.001     → 1_000 lots     (step=1e-6)
+        let price_ticks: i64 = 6_500_000;
+        let quantity_lots: i64 = 1_000;
+        let buf = encode_client_place_order(42, "BTC_USDT", 0, 0, price_ticks, quantity_lots);
+        assert_eq!(buf.len(), 37);
+        assert_eq!(buf[0], CLIENT_PLACE_ORDER);
+        let (coid, sym, side, tif, pt, ql) = decode_client_place_order(&buf).unwrap();
+        assert_eq!(coid, 42);
+        assert_eq!(sym8_to_str(&sym), "BTC_USDT");
+        assert_eq!(side, 0);
+        assert_eq!(tif, 0);
+        assert_eq!(pt, price_ticks);
+        assert_eq!(ql, quantity_lots);
+    }
+
+    #[test]
+    fn client_place_order_market_has_zero_ticks() {
+        // Market order: price_ticks=0
+        let buf = encode_client_place_order(99, "ETH_USDT", 1, 1, 0, 500);
+        let (_, _, _, tif, pt, ql) = decode_client_place_order(&buf).unwrap();
+        assert_eq!(tif, 1); // IOC
+        assert_eq!(pt, 0);  // market order
+        assert_eq!(ql, 500);
+    }
+
+    #[test]
+    fn client_place_order_rejects_short_buffer() {
+        let buf = [CLIENT_PLACE_ORDER; 10]; // too short
+        assert!(decode_client_place_order(&buf).is_none());
+    }
 }
 
 /// Extract the symbol string from any broadcast message frame (TRADE/DEPTH/TICKER/KLINE/AGG_TRADE).

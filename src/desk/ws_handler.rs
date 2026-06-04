@@ -261,7 +261,7 @@ impl ClientMsg {
         let msg_type = *bytes.first()?;
         match msg_type {
             ws_sbe::CLIENT_PLACE_ORDER => {
-                let (coid, sym, side_byte, tif_byte, price_raw, qty) =
+                let (coid, sym, side_byte, tif_byte, price_ticks, quantity_lots) =
                     ws_sbe::decode_client_place_order(bytes)?;
                 let symbol = ws_sbe::sym8_to_str(&sym).to_owned();
                 let side = match side_byte {
@@ -276,7 +276,11 @@ impl ClientMsg {
                     3 => ("post_only".to_owned(), None),
                     _ => return None,
                 };
-                let price = if price_raw == 0.0 { None } else { Some(price_raw) };
+                // Convert ticks/lots back to f64 so the shared PlaceOrder handler
+                // can validate + route. The round-trip is lossless for tick-aligned values.
+                let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
+                let price = if price_ticks == 0 { None } else { Some(rules.ticks_to_price(price_ticks)) };
+                let qty = rules.lots_to_quantity(quantity_lots);
                 Some(ClientMsg::PlaceOrder {
                     client_order_id: coid.to_string(),
                     symbol,
@@ -655,7 +659,7 @@ async fn handle_client_message(
             // bottleneck at 400K conns (609 sqlx pool slow-acquire warnings,
             // place avg 6 s).
 
-            let _fixed_shape = match crate::symbol_rules::normalize_order_shape(
+            let fixed_shape = match crate::symbol_rules::normalize_order_shape(
                 &symbol,
                 &order_type,
                 price,
@@ -807,8 +811,8 @@ async fn handle_client_message(
                 let sbe_req = SbeNewOrder {
                     client_order_id: order_id,
                     participant_id: user_id as u64,
-                    price: price.unwrap_or(0.0),
-                    quantity: qty,
+                    price_ticks: fixed_shape.price_ticks.unwrap_or(0),
+                    quantity_lots: fixed_shape.quantity_lots,
                     side: side_byte,
                     time_in_force: tif_byte,
                     _pad: [0; 14],
@@ -1567,6 +1571,10 @@ async fn handle_client_message(
                         TimeInForce::PostOnly => 3,
                     };
 
+                    let batch_fixed_shape = match crate::symbol_rules::normalize_order_shape(&symbol, &order_type, price, qty) {
+                        Ok(shape) => shape,
+                        Err(reason) => rej!(reason),
+                    };
                     let meta = OrderMeta {
                         user_id,
                         symbol: sym_bytes,
@@ -1580,8 +1588,8 @@ async fn handle_client_message(
                     let sbe_req = SbeNewOrder {
                         client_order_id: order_id,
                         participant_id: user_id as u64,
-                        price: price.unwrap_or(0.0),
-                        quantity: qty,
+                        price_ticks: batch_fixed_shape.price_ticks.unwrap_or(0),
+                        quantity_lots: batch_fixed_shape.quantity_lots,
                         side: side_byte,
                         time_in_force: tif_byte,
                         _pad: [0; 14],

@@ -1415,13 +1415,14 @@ async fn async_main() -> anyhow::Result<()> {
                                 let sym = std::str::from_utf8(&req.symbol)
                                     .unwrap_or("")
                                     .trim_end_matches('\0');
-                                let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
+                                let sym_rules = lightning_exchange::symbol_rules::SymbolRules::for_symbol(sym);
+                                let prelim_freeze = if req.side == 0 { sym_rules.ticks_to_price(req.price_ticks) } else { 0.0 };
                                 remember_runtime_order(
                                     &order_meta_cache,
                                     req.client_order_id,
                                     req.participant_id as i64,
                                     prelim_freeze,
-                                    req.quantity,
+                                    sym_rules.lots_to_quantity(req.quantity_lots),
                                     req.side,
                                     req.symbol,
                                 );
@@ -1504,13 +1505,14 @@ async fn async_main() -> anyhow::Result<()> {
                                     let sym = std::str::from_utf8(&req.symbol)
                                         .unwrap_or("")
                                         .trim_end_matches('\0');
-                                    let prelim_freeze = if req.side == 0 { req.price } else { 0.0 };
+                                    let sym_rules = lightning_exchange::symbol_rules::SymbolRules::for_symbol(sym);
+                                    let prelim_freeze = if req.side == 0 { sym_rules.ticks_to_price(req.price_ticks) } else { 0.0 };
                                     remember_runtime_order(
                                         &order_meta_cache,
                                         req.client_order_id,
                                         req.participant_id as i64,
                                         prelim_freeze,
-                                        req.quantity,
+                                        sym_rules.lots_to_quantity(req.quantity_lots),
                                         req.side,
                                         req.symbol,
                                     );

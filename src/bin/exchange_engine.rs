@@ -222,37 +222,23 @@ fn spawn_symbol_thread(
                                 3 => TimeInForce::PostOnly,
                                 _ => TimeInForce::GTC,
                             };
-                            let quantity_lots = match rules.quantity_to_lots(req.quantity) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
-                                        req.client_order_id,
-                                        req.participant_id,
-                                        2,
-                                        ts,
-                                    ));
-                                    continue;
-                                }
-                            };
-                            let order = if req.price == 0.0 {
+                            let quantity_lots = req.quantity_lots;
+                            if quantity_lots <= 0 {
+                                let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
+                                    req.client_order_id,
+                                    req.participant_id,
+                                    2,
+                                    ts,
+                                ));
+                                continue;
+                            }
+                            let order = if req.price_ticks == 0 {
                                 Order::new_market(req.client_order_id, side, quantity_lots, ts)
                             } else {
-                                let price_ticks = match rules.price_to_ticks(req.price) {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
-                                            req.client_order_id,
-                                            req.participant_id,
-                                            2,
-                                            ts,
-                                        ));
-                                        continue;
-                                    }
-                                };
                                 Order::new(
                                     req.client_order_id,
                                     side,
-                                    price_ticks,
+                                    req.price_ticks,
                                     quantity_lots,
                                     tif,
                                     ts,
@@ -295,8 +281,9 @@ fn spawn_symbol_thread(
                                         .fills
                                         .last()
                                         .map(|f| rules.ticks_to_price(f.1))
-                                        .unwrap_or(req.price);
+                                        .unwrap_or_else(|| rules.ticks_to_price(req.price_ticks));
                                     let filled_qty = rules.lots_to_quantity(result.filled_lots);
+                                    let total_qty = rules.lots_to_quantity(req.quantity_lots);
                                     let update = match result.status {
                                         OrderStatus::Accepted => {
                                             uid_map.insert(result.order_id, req.participant_id);
@@ -328,7 +315,7 @@ fn spawn_symbol_thread(
                                                 req.participant_id,
                                                 last_price,
                                                 filled_qty,
-                                                req.quantity - filled_qty,
+                                                total_qty - filled_qty,
                                                 ts,
                                             )
                                         }
@@ -338,7 +325,7 @@ fn spawn_symbol_thread(
                                                 result.order_id,
                                                 req.client_order_id,
                                                 req.participant_id,
-                                                req.quantity - filled_qty,
+                                                total_qty - filled_qty,
                                                 ts,
                                             )
                                         }

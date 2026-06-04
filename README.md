@@ -106,24 +106,55 @@ npm run dev          # http://localhost:5173
 
 Connect to `wss://<host>/ws`.
 
-### Subscribe to market data (no auth required)
+**Wire format is asymmetric:**
+- **Client → Server**: JSON text frames
+- **Server → Client**: SBE binary frames — every frame begins with a 1-byte `msg_type`, followed by a fixed-layout payload (all integers little-endian)
+
+### Client → Server (JSON text)
 
 ```json
+// Subscribe to market data (no auth required)
 { "type": "subscribe", "channels": ["depth.BTC_USDT", "trades.BTC_USDT", "ticker.BTC_USDT"] }
-```
 
-### Authenticate
-
-```json
+// Authenticate
 { "type": "auth", "token": "<JWT>" }
-```
 
-### Place / cancel orders (requires auth)
-
-```json
+// Place a limit order (requires auth)
 { "type": "place_order", "symbol": "BTC_USDT", "side": "buy", "order_type": "limit", "price": 65000, "quantity": 0.01, "client_order_id": "my-id-1" }
+
+// Cancel an order
 { "type": "cancel_order", "order_id": 12345, "client_order_id": "my-id-1" }
 ```
+
+### Server → Client (SBE binary)
+
+All frames: `[msg_type: u8][payload...]`. See `src/transport/ws_sbe.rs` for exact byte layouts.
+
+**Unicast (sent to the requesting client only):**
+
+| `msg_type` | Name | Key fields |
+|---|---|---|
+| 1 | `AUTH_OK` | `user_id: i64` |
+| 2 | `AUTH_ERROR` | `reason: str` |
+| 3 | `ORDER_ACCEPTED` | `order_id: u64`, `client_order_id: u64` |
+| 4 | `ORDER_REJECTED` | `client_order_id: u64`, `reason: str` |
+| 5 | `ORDER_SUBMITTED` | `order_id: u64`, `client_order_id: u64`, `ts: u64` |
+| 6 | `ORDER_UPDATE` | `order_id`, `status: u8`, `filled_qty: f64`, `price: f64` |
+| 7 | `CANCEL_SUBMITTED` | `order_id: u64`, `ts: u64` |
+| 8 | `BALANCE_UPDATE` | `asset: [u8;8]`, `available: f64`, `frozen: f64` |
+| 9 | `POSITION_UPDATE` | `symbol: [u8;8]`, `qty: f64`, `avg_price: f64` |
+| 13 | `ERROR_MSG` | `message: str` |
+
+**Broadcast (pushed to all subscribers of the relevant channel):**
+
+| `msg_type` | Name | Key fields |
+|---|---|---|
+| 20 | `TRADE` | `price: f64`, `qty: f64`, `side: u8`, `ts: u64`, `symbol: [u8;8]` |
+| 21 | `DEPTH` | `symbol: [u8;8]`, N bid/ask levels (`price: f64`, `qty: f64`) |
+| 22 | `TICKER` | `symbol: [u8;8]`, `open/high/low/close/vol: f64`, `ts: u64` |
+| 23 | `KLINE` | interval, OHLCV, `ts: u64` |
+
+`ORDER_UPDATE` status byte: `0=OPEN  1=PARTIAL_FILL  2=FILLED  3=CANCELED  4=REJECTED`
 
 ---
 

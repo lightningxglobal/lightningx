@@ -4,7 +4,7 @@
 
 # LightningX Exchange
 
-A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with **5 µs median end-to-end latency**.
+A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with **48 µs median server-internal latency at 40K concurrent connections**.
 
 Live demo with very limited resources and a very very simple market making bot: **https://www.lightningx.global**
 
@@ -14,7 +14,7 @@ Live demo with very limited resources and a very very simple market making bot: 
 
 ![LightningX end-to-end latency on M4 Mac](lightningx-latency-m4.jpg)
 
-*Internal processing latency: server receives WS frame → Aeron IPC → matching engine → Aeron IPC → result queued for sending. Measured via beacon tracing on an M4 MacBook Pro. **p50 = 5 µs · p90 = 9 µs · p99 = 15 µs.** Network latency (Internet RTT) is not included and dominates user-perceived latency in practice.*
+*Internal processing latency: server receives WS frame → Aeron IPC → matching engine → Aeron IPC → result queued for sending. Measured via beacon tracing on an M4 MacBook Pro at **40K concurrent WebSocket connections (4 desks × 10K)**. **p50 = 48 µs · p90 = 853 µs.** Network latency (Internet RTT) is not included and dominates user-perceived latency in practice.*
 
 ---
 
@@ -200,11 +200,11 @@ all buffers are pre-allocated (`SmallVec`, arena SkipList, rtrb ring buffers).
 
 ### Internal Processing Latency
 
-Measured from the moment the server receives a WS frame to the moment the result is queued for sending back — **excluding network transit in both directions**. Captured via beacon / HDR histogram tracing on an Apple M4 MacBook Pro.
+Measured from the moment the server receives a WS frame to the moment the result is queued for sending back — **excluding network transit in both directions**. Captured via beacon / HDR histogram tracing on an Apple M4 MacBook Pro at 40K concurrent WebSocket connections (4 desks × 10K, `DESK_SPIN=true`, `TRACER_ENABLED=1`).
 
-| Metric | P50 | P90 | P99 |
-|---|---|---|---|
-| **Internal processing** | **5 µs** | **9 µs** | **15 µs** |
+| Metric | P50 | P90 |
+|---|---|---|
+| **Internal processing (40K conns)** | **48 µs** | **853 µs** |
 
 > Internet RTT (20–200 ms typical) is not included. User-perceived latency is dominated by network, not by exchange processing.
 

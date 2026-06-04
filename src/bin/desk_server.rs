@@ -343,6 +343,9 @@ struct OrderRuntimeMeta {
     /// 0 = buy, 1 = sell — same encoding as SbeNewOrder.side.
     side: u8,
     symbol: [u8; 16],
+    /// Non-zero for forced-liquidation orders. Passed to RiskEngine::on_fill
+    /// so the user is settled at this price; spread → insurance fund.
+    liq_price_ticks: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -364,6 +367,7 @@ fn remember_runtime_order(
             filled: 0.0,
             side,
             symbol,
+            liq_price_ticks: 0,
         },
     );
 }
@@ -1129,6 +1133,7 @@ async fn async_main() -> anyhow::Result<()> {
                     filled,
                     side: side_byte,
                     symbol: sym_bytes,
+                    liq_price_ticks: 0,
                 },
             );
         }
@@ -1267,6 +1272,14 @@ async fn async_main() -> anyhow::Result<()> {
     // Clone for DB worker so it can cancel orders when fund freeze fails post-ACCEPTED.
     let db_worker_aeron_tx = aeron_cmd_tx.clone();
 
+    // Priority ring for system-generated liquidation orders.
+    // Small (1024) — the risk tick fires at most a handful of liquidation orders per 10 ms.
+    // Drained by the spin thread BEFORE aeron_cmd_rx so liq orders always go first.
+    let liq_cmd_ring: std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>> =
+        std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(1024));
+    let liq_cmd_tx = liq_cmd_ring.clone();
+    let liq_cmd_rx = liq_cmd_ring;
+
     // ── Sync next_order_id from DB so WS atomic IDs don't collide ─────────────
     // Each desk-server has its own AtomicU64 counter — without DESK_ID
     // offsetting, two desks both starting from MAX(id)+1 hand out the
@@ -1351,6 +1364,7 @@ async fn async_main() -> anyhow::Result<()> {
         user_tx: Arc::new(lightning_exchange::api::UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(initial_id)),
         aeron_cmd_tx: Some(aeron_cmd_tx),
+        liq_cmd_tx: Some(liq_cmd_tx),
         pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
         last_depth: Arc::new(DashMap::new()),
@@ -1388,6 +1402,7 @@ async fn async_main() -> anyhow::Result<()> {
     // 350 K parked conns). Future shard experiment lives in git history.
     {
         let aeron_cmd_rx = aeron_cmd_rx.clone();
+        let liq_cmd_rx = liq_cmd_rx.clone();
         let mut order_pubs = order_pubs;
         let order_meta_cache = open_order_meta.clone();
         let pending_meta = state.pending_meta.clone();
@@ -1408,6 +1423,47 @@ async fn async_main() -> anyhow::Result<()> {
                     let mut did_work = false;
                     if queue_metrics {
                         metric_max_len = metric_max_len.max(aeron_cmd_rx.len());
+                    }
+                    // Priority: drain liquidation orders before normal orders.
+                    while let Some(cmd) = liq_cmd_rx.pop() {
+                        did_work = true;
+                        match cmd {
+                            AeronCmd::NewOrder(req) => {
+                                // Copy packed fields to locals before any reference (packed struct).
+                                let order_id: u64 = req.client_order_id;
+                                let participant_id: u64 = req.participant_id;
+                                let quantity_lots: i64 = req.quantity_lots;
+                                let side: u8 = req.side;
+                                let symbol: [u8; 16] = req.symbol;
+                                let sym = std::str::from_utf8(&symbol)
+                                    .unwrap_or("")
+                                    .trim_end_matches('\0');
+                                let sym_rules = lightning_exchange::symbol_rules::SymbolRules::for_symbol(sym);
+                                // Retrieve liq_price_ticks from pending_meta (set by tick task).
+                                let liq_ticks = pending_meta
+                                    .get(&order_id)
+                                    .map(|m| m.liq_price_ticks)
+                                    .unwrap_or(0);
+                                remember_runtime_order(
+                                    &order_meta_cache,
+                                    order_id,
+                                    participant_id as i64,
+                                    0.0, // liq orders: no quote-asset freeze
+                                    sym_rules.lots_to_quantity(quantity_lots),
+                                    side,
+                                    symbol,
+                                );
+                                if liq_ticks != 0 {
+                                    if let Some(mut m) = order_meta_cache.get_mut(&order_id) {
+                                        m.liq_price_ticks = liq_ticks;
+                                    }
+                                }
+                                if let Some(pub_) = order_pubs.get_mut(sym) {
+                                    let _ = pub_.publish_new_order(&req);
+                                }
+                            }
+                            _ => {} // liquidation ring carries only NewOrder
+                        }
                     }
                     while let Some(cmd) = aeron_cmd_rx.pop() {
                         did_work = true;
@@ -2221,7 +2277,7 @@ async fn async_main() -> anyhow::Result<()> {
         let risk_engine_tick = state.risk_engine.clone();
         let next_order_id_tick = state.next_order_id.clone();
         let pending_meta_tick = state.pending_meta.clone();
-        let aeron_cmd_tick = state.aeron_cmd_tx.clone();
+        let liq_cmd_tick = state.liq_cmd_tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2239,7 +2295,7 @@ async fn async_main() -> anyhow::Result<()> {
                         acct.status = lightning_exchange::desk::risk::RiskStatus::Liquidating;
                     }
 
-                    let Some(ref cmd_tx) = aeron_cmd_tick else { continue; };
+                    let Some(ref cmd_tx) = liq_cmd_tick else { continue; };
 
                     let sym_str_end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
                     let sym_str = std::str::from_utf8(&evt.symbol[..sym_str_end]).unwrap_or("BTC_USDT");

@@ -195,6 +195,10 @@ pub struct AppState {
     /// stream cannot OOM the process — when push returns Err(value),
     /// the WS handler must reject the client with "system busy".
     pub aeron_cmd_tx: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>>>,
+    /// Priority ring for system-generated liquidation orders.
+    /// The spin thread drains this BEFORE aeron_cmd_tx so forced-liquidation
+    /// orders are always submitted to the matching engine ahead of normal flow.
+    pub liq_cmd_tx: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>>>,
     /// Pending order metadata stored by WS fast path until Aeron event loop handles DB+freeze.
     pub pending_meta: Arc<DashMap<u64, OrderMeta>>,
     /// Pending REST order responses: order_id → oneshot sender (desk_server mode only).

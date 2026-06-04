@@ -53,8 +53,11 @@ async fn read_actor_loop(
     mut conn_rx: mpsc::Receiver<ReadConn>,
     mut market_rx: mpsc::Receiver<Arc<[u8]>>,
 ) {
-    // Registry of all connections currently managed by this actor.
     let actor_conns: Arc<DashMap<u64, ConnMarketInfo>> = Arc::new(DashMap::new());
+    // How many connections in this actor are subscribed to market data.
+    // Checked before DashMap iteration — stays O(1) when nobody subscribes
+    // (e.g. trading-only bots or load-test connections).
+    let actor_sub_count = Arc::new(AtomicUsize::new(0));
     let mut pending: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
 
     loop {
@@ -68,27 +71,33 @@ async fn read_actor_loop(
                             wants_market: c.wants_market.clone(),
                         });
                         let conns = actor_conns.clone();
+                        let sub_cnt = actor_sub_count.clone();
                         pending.push(Box::pin(
-                            crate::desk::ws_handler::read_conn_loop(c, conns)
+                            crate::desk::ws_handler::read_conn_loop(c, conns, sub_cnt)
                         ));
                     }
                     None => break,
                 }
             }
 
-            // Market data arrives from MarketFanout (8 actors, not 100K conns).
-            // Actor distributes sequentially — no FuturesUnordered wakeup per conn.
+            // Connection reads — non-biased so tokio fairly interleaves with
+            // the market data arm. biased; caused the actor to spin without
+            // yielding the tokio worker, starving write actors.
+            Some(_) = pending.next(), if !pending.is_empty() => {}
+
+            // Market data from MarketFanout. actor_sub_count is 0 for connections
+            // that never subscribed (trading bots, pressure tests) so this arm
+            // is O(1) — one atomic load + branch — in that common case.
             Some(msg) = market_rx.recv() => {
-                for entry in actor_conns.iter() {
-                    let info = entry.value();
-                    if info.wants_market.load(Ordering::Relaxed) {
-                        let _ = info.personal_tx.try_send(msg.as_ref().to_owned());
+                if actor_sub_count.load(Ordering::Relaxed) > 0 {
+                    for entry in actor_conns.iter() {
+                        let info = entry.value();
+                        if info.wants_market.load(Ordering::Relaxed) {
+                            let _ = info.personal_tx.try_send(msg.as_ref().to_owned());
+                        }
                     }
                 }
             }
-
-            // One of the managed connection read-loops made progress.
-            Some(_) = pending.next(), if !pending.is_empty() => {}
         }
     }
     while pending.next().await.is_some() {}

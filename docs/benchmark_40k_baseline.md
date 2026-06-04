@@ -286,13 +286,13 @@ select! {
 | 委托成功率 | **~74%** |
 | Place p50 | 数百 ms（Aeron 延迟上升，spin 关闭后 recv 延迟从 1 µs → ~1 ms） |
 
-#### 100K 综合结论
+#### 100K 综合结论（B2 实现前，历史对照）
 
 | 组合 | 核心占用 | 委托成功率 | 结论 |
 |------|---------|-----------|------|
-| 3 desks，spin=true | 10 线程/14 核 | 60% | 勉强，latency 不稳 |
-| 5 desks，spin=false | 10 线程/14 核 | 74% | 最佳（本机） |
-| 8 desks，spin=true | 16+ 线程/14 核 | 22–32% | 不可用 |
+| 3 desks，spin=true | 10 线程/14 核 | 60% | B2 实现后提升至 91%（见 9.5 节） |
+| 5 desks，spin=false | 10 线程/14 核 | 74% | B2 实现后降至 ~54%（行情非瓶颈，SPIN=false 延迟主导） |
+| 8 desks，spin=true | 16+ 线程/14 核 | 22–32% | 不可用（spin 线程超核心数） |
 | **生产目标** | 32+ 核 Linux | **~100%** | 需迁至多核服务器 |
 
 **根本瓶颈**：每个 desk-server 有 1 个 Aeron recv spin 线程（不可关闭，否则 Aeron 延迟上升 1000×）。3+ desks 时 spin 线程 + tokio workers 超过 14 核物理上限。
@@ -315,6 +315,51 @@ select! {
 | **委托成功率** | **100%** |
 | **Place p50** | **~178 µs** |
 | **Place p99** | **~7.7 ms** |
+
+### 9.5 Actor 级行情分发（B2）压测结果（2026-06-04）
+
+架构变更：`MarketFanout` 100K per-conn sender → 8 actor sender（wakeup 100K → 8）；`actor_sub_count` 原子计数跳过无订阅者的 DashMap 遍历。
+
+#### 40K / 4 desks / SPIN=true（B2 最终版）
+
+| 指标 | 结果 | 说明 |
+|------|------|------|
+| 连接成功率 | **100%** | — |
+| 委托成功率 | **100%** | — |
+| Place p50 | **~200–216 µs** | 与历史 ~178 µs 在噪声范围内持平 |
+| Place p99 | **~7.7 ms** | — |
+
+**结论**：40K 轻负载下行情分发从未是瓶颈，B2 对该场景无明显影响。
+
+#### 100K / 5 desks / SPIN=false（B2 最终版）
+
+| 指标 | 结果 |
+|------|------|
+| 连接成功率 | ~96% |
+| 委托成功率 | **~53–54%** |
+| Place OK p50 | ~660 µs |
+| Cancel OK p50 | — |
+
+注：`biased;` 版本（中间状态）使成功率降至 53%；去除 `biased;` 后恢复 54%，但仍不及原无 B2 版本的 74%。原因：`SPIN=false` 时 Aeron 延迟本身已成限制，B2 行情 wakeup 优化效益不显著。
+
+#### 100K / 3 desks / SPIN=true（B2 最终版，惊喜结果）
+
+| 指标 | 结果 |
+|------|------|
+| 连接成功率 | **100%** |
+| 委托成功率 | **~91.2–91.3%** |
+| Place OK p50 | ~550–570 µs |
+| Cancel OK p50 | ~1,000–1,068 µs |
+
+**与历史 3desk/SPIN=true 对比**：原 ReadActorPool 版记录为 60% 成功率，B2 后达到 91%。显著改善原因：B2 将 100K FuturesUnordered wakeup 减为 8，降低行情广播对 tokio worker 的冲击，使 write actor 获得更多 CPU 时间写 socket 帧。
+
+#### B2 100K 配置横向对比
+
+| 组合 | 连接成功率 | 委托成功率 | Place OK p50 |
+|------|-----------|-----------|--------------|
+| 3 desks, SPIN=true | **100%** | **91%** | ~560 µs |
+| 5 desks, SPIN=false | ~96% | ~54% | ~660 µs |
+| **推荐（macOS 14核）** | **3 desks, SPIN=true** | — | — |
 
 ---
 
@@ -355,12 +400,15 @@ Aeron recv-spin 线程和 engine 撮合线程是 busy-loop，必须独占核心�
 - 延迟更低（内核态批量提交，减少系统调用次数）
 - 代价：重写 ws_handler.rs 的 IO 层，改动较大
 
-**B2：Read Actor Pool 深度优化（现有架构延伸）**
+**B2：actor 级行情分发（已实现，commit 0a6f16e + 后续修订）**
 
-当前 `ReadActorPool` 已将 read 半部合并到 8 个 FuturesUnordered task，但 `write_conn_loop` 中仍有每连接 `mpsc::Receiver::recv()` 在单独的 future 内等待。进一步优化：
-- 将 market 行情推送从每连接 mpsc 改为共享 `ArcSwap<Arc<str>>`（读时 load，写时 swap），消除每连接 market_rx 等待
-- 减少 FuturesUnordered 内的 pending future 数量，降低 poll overhead
-- 预期：单 desk 连接上限从 20K 推至 40–50K，2 desks 即可支撑 100K
+`MarketFanout` 从持有 N 个 per-connection sender 改为持有 8 个 actor-level sender：
+- 每次行情广播从 N × `try_send` → 8 × `try_send`（wakeup 从 N 降为 8）
+- actor 内部顺序分发给 M/8 个连接，无额外 FuturesUnordered wakeup
+- `actor_sub_count: Arc<AtomicUsize>` 优化：无人订阅时跳过 DashMap 迭代，O(N) → O(1)（压测连接不订阅行情的常见场景）
+- 注意：select! 需保持非 biased 模式；biased 会导致 actor 不释放 tokio worker，饿死 write actor → 100K 超时率上升
+
+测试结果见 9.5 节。在 macOS 14 核上 B2 对 40K 影响可忽略（行情不是瓶颈），100K/3desk/SPIN=true 成功率从 60% → **91%**（显著改善）。
 
 ---
 

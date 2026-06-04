@@ -394,6 +394,7 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
 pub async fn read_conn_loop(
     conn: ReadConn,
     actor_conns: Arc<ActorConnMap<u64, ConnMarketInfo>>,
+    actor_sub_count: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let ReadConn { conn_id, mut ws_read, state, personal_tx, ctrl_tx, wants_market } = conn;
 
@@ -438,6 +439,7 @@ pub async fn read_conn_loop(
                             };
                             if !market_registered && text.contains("\"subscribe\"") {
                                 wants_market.store(true, std::sync::atomic::Ordering::Relaxed);
+                                actor_sub_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 state.market_fanout.increment_subscriber();
                                 market_registered = true;
                             }
@@ -483,6 +485,7 @@ pub async fn read_conn_loop(
     // Remove from actor's market registry so the actor stops sending to this conn.
     actor_conns.remove(&conn_id);
     if market_registered {
+        actor_sub_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         state.market_fanout.decrement_subscriber();
     }
     if let Some(uid) = session.user_id {

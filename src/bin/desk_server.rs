@@ -1928,6 +1928,13 @@ async fn async_main() -> anyhow::Result<()> {
                                     meta_ref.side,
                                     meta_ref.symbol,
                                 );
+                                // remember_runtime_order always zeros liq_price_ticks;
+                                // restore it so on_fill settles the user at the correct price.
+                                if meta_ref.liq_price_ticks != 0 {
+                                    if let Some(mut entry) = order_meta_cache.get_mut(&order_id) {
+                                        entry.liq_price_ticks = meta_ref.liq_price_ticks;
+                                    }
+                                }
                             }
                         }
                         // client_order_id is only available on the first event (ACCEPTED).
@@ -2028,6 +2035,15 @@ async fn async_main() -> anyhow::Result<()> {
                                 };
                                 if meta.initial_margin_cents > 0 {
                                     risk_engine.release_order_margin(meta.user_id, meta.initial_margin_cents);
+                                }
+                                // If this was a liquidation order that got rejected,
+                                // unblock the account so run_risk_tick can retry.
+                                if meta.liq_price_ticks != 0 {
+                                    if let Some(mut acct) = risk_engine.accounts.get_mut(&meta.user_id) {
+                                        if acct.status == lightning_exchange::desk::risk::RiskStatus::Liquidating {
+                                            acct.status = lightning_exchange::desk::risk::RiskStatus::LiquidationPending;
+                                        }
+                                    }
                                 }
                                 let new_vals = account_cache.get_mut(&meta.user_id).and_then(|mut e| {
                                     let kv = e.get_mut(asset)?;
@@ -2193,10 +2209,16 @@ async fn async_main() -> anyhow::Result<()> {
                                         lightning_exchange::desk::risk::calc::calc_notional_cents(
                                             fp_ticks, fq_lots, rules.notional_scale,
                                         );
-                                    let fill_margin =
+                                    // Liquidation orders have no reserved order_margin (the close
+                                    // side has no margin requirement). Pass 0 so on_fill does not
+                                    // deduct from order_margin that was never reserved.
+                                    let fill_margin = if meta.liq_price_ticks != 0 {
+                                        0
+                                    } else {
                                         lightning_exchange::desk::risk::calc::calc_initial_margin_cents(
                                             notional, rules.default_leverage,
-                                        );
+                                        )
+                                    };
                                     risk_engine.on_fill(
                                         meta.user_id,
                                         meta.symbol,
@@ -2289,6 +2311,14 @@ async fn async_main() -> anyhow::Result<()> {
                     use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
                     use lightning_exchange::sbe::NewOrderRequest as SbeNewOrder;
                     use std::sync::atomic::Ordering;
+
+                    // Guard: zero liq_price_ticks means position data is stale — skip
+                    // rather than sending a zero-price order that would be rejected and
+                    // leave the account permanently stuck in Liquidating.
+                    if evt.liq_price_ticks == 0 {
+                        tracing::warn!(user_id = evt.user_id, "liquidation skipped: zero liq_price_ticks");
+                        continue;
+                    }
 
                     // Mark account as Liquidating immediately so no new orders can be placed.
                     if let Some(mut acct) = risk_engine_tick.accounts.get_mut(&evt.user_id) {

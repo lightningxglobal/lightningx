@@ -138,7 +138,9 @@ impl RiskEngine {
                 // sell close (long liq): fill > liq → (fill - liq) * qty / scale > 0
                 // buy  close (short liq): liq > fill → (liq - fill) * qty / scale > 0
                 let sign: i64 = if order_side == 1 { 1 } else { -1 }; // sell=+1, buy=-1
-                (fill_price_ticks - liq_price_ticks) * sign * fill_qty_lots / notional_scale
+                ((fill_price_ticks - liq_price_ticks) as i128 * sign as i128
+                    * fill_qty_lots as i128
+                    / notional_scale as i128) as i64
             } else {
                 let is_liquidating = self
                     .accounts
@@ -161,20 +163,30 @@ impl RiskEngine {
 
         // Apply account update: move fill_margin from order_margin → used_margin (opening),
         // or release used_margin and credit realized PnL (closing).
+        //
+        // Flip case: closed old position AND opened a new one on the opposite side.
+        // The flip's new_pos.side == fill_side (e.g. closed long via sell → new Short pos).
+        // For a simple partial close, new_pos.side is still the old side → flip_margin = 0.
+        let flip_margin = match &new_pos {
+            Some(p) if p.side == fill_side => p.initial_margin,
+            _ => 0,
+        };
         if let Some(mut acct) = self.accounts.get_mut(&user_id) {
             acct.order_margin = (acct.order_margin - fill_margin_cents).max(0);
             if released_used_margin > 0 {
-                // Closing: release position's used_margin and credit realized PnL.
-                // fill_margin_cents was reserved for the close order and is also returned.
+                // Closing (or closing+flipping): release old position's used_margin and credit pnl.
                 acct.used_margin = (acct.used_margin - released_used_margin).max(0);
+                // For flip: flip_margin portion stays in used_margin, not available.
+                acct.used_margin += flip_margin;
                 acct.available_margin = (acct.available_margin
                     + fill_margin_cents
                     + released_used_margin
-                    + realized_pnl_cents)
+                    + realized_pnl_cents
+                    - flip_margin)
                     .max(0);
-                // Flip account back to Normal after the forced close completes.
+                // After forced liquidation close, let run_risk_tick re-evaluate status.
                 if acct.status == RiskStatus::Liquidating {
-                    acct.status = RiskStatus::Liquidated;
+                    acct.status = RiskStatus::Normal;
                 }
             } else {
                 // Opening: move order_margin → used_margin.
@@ -257,23 +269,32 @@ impl RiskEngine {
 
         for uid in user_ids {
             let key = (uid, symbol);
-            // Update mark price on the position and compute unrealized PnL.
-            let upnl = {
+            // Update mark price on this position.
+            {
                 let Some(mut pos) = self.positions.get_mut(&key) else {
                     continue;
                 };
                 pos.mark_price_ticks = mark_ticks;
-                calc::calc_unrealized_pnl_cents(
-                    pos.side,
-                    pos.qty_lots,
-                    pos.entry_price_ticks,
-                    mark_ticks,
-                    notional_scale,
-                )
-            };
-            // Update account unrealized PnL and equity.
+            }
+            // Sum unrealized PnL across all open positions for this user so
+            // multi-symbol accounts accumulate correctly instead of overwriting.
+            let total_upnl: i64 = self
+                .positions
+                .iter()
+                .filter(|e| e.key().0 == uid)
+                .map(|e| {
+                    let p = e.value();
+                    calc::calc_unrealized_pnl_cents(
+                        p.side,
+                        p.qty_lots,
+                        p.entry_price_ticks,
+                        p.mark_price_ticks,
+                        notional_scale,
+                    )
+                })
+                .sum();
             if let Some(mut acct) = self.accounts.get_mut(&uid) {
-                acct.unrealized_pnl = upnl;
+                acct.unrealized_pnl = total_upnl;
                 acct.equity = acct.available_margin
                     + acct.order_margin
                     + acct.used_margin
@@ -358,9 +379,13 @@ impl RiskEngine {
         };
 
         // Pass 3: apply status updates one at a time (no iter_mut).
+        // Compare-and-swap: only update if status hasn't been changed by on_fill
+        // (e.g. Liquidating set by the tick task) between Pass 1 and Pass 3.
         for u in &updates {
             if let Some(mut acct) = self.accounts.get_mut(&u.user_id) {
-                acct.status = u.new_status;
+                if acct.status == u.old_status {
+                    acct.status = u.new_status;
+                }
             }
         }
 
@@ -896,9 +921,10 @@ mod tests {
         let close_price_ticks = 5_100_000i64;
         engine.on_fill(uid, btc_sym(), 1, close_price_ticks, QTY_LOTS, 0, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
-        // Account should be Liquidated.
+        // After the forced close, on_fill resets status to Normal so run_risk_tick
+        // can re-evaluate on the next tick (H3 fix: Liquidated was a terminal sink).
         let acct = engine.accounts.get(&uid).unwrap();
-        assert_eq!(acct.status, RiskStatus::Liquidated);
+        assert_eq!(acct.status, RiskStatus::Normal);
 
         // Insurance fund should have gained the realized pnl:
         //   pnl = (5_100_000 − 5_000_000) × 100_000 / 1_000_000 = 10_000 cents
@@ -938,13 +964,9 @@ mod tests {
         engine.on_fill(uid, btc_sym(), 1, fill_ticks, qty_lots, 0, SCALE, 10, 50, liq_ticks);
 
         // Account settled at liq_price ($49,000), not fill price ($49,800).
-        // user_pnl = (49,000 − 50,000) × 100,000 / 1,000,000 = −100 * 1_000_000 / 1_000_000?
-        // Actually: (liq_ticks − entry_ticks) × qty_lots / SCALE
-        //         = (4_900_000 − 5_000_000) × 100_000 / 1_000_000 = −100_000 × 100_000 / 1_000_000
-        //         = −10_000_000_000 / 1_000_000 = −10_000 cents = −$100
-        // available = 0 (order_margin=50_000 returned) + 50_000 (used_margin) + (−10_000) pnl = 40_000 cents
+        // After forced close, status → Normal so run_risk_tick can re-evaluate (H3 fix).
         let acct = engine.accounts.get(&uid).unwrap();
-        assert_eq!(acct.status, RiskStatus::Liquidated);
+        assert_eq!(acct.status, RiskStatus::Normal);
 
         // Exchange revenue = (fill − liq) × qty / scale (sell close, sign=+1)
         //   = (4_980_000 − 4_900_000) × 100_000 / 1_000_000

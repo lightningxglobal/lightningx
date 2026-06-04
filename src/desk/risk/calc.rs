@@ -5,6 +5,7 @@ pub fn calc_notional_cents(price_ticks: i64, qty_lots: i64, notional_scale: i64)
 }
 
 pub fn calc_initial_margin_cents(notional_cents: i64, leverage: u8) -> i64 {
+    if leverage == 0 { return 0; }
     notional_cents / leverage as i64
 }
 
@@ -18,6 +19,7 @@ pub fn calc_liquidation_price_ticks(
     maintenance_rate_bps: i64,
     side: PositionSide,
 ) -> i64 {
+    if leverage == 0 { return 0; }
     let lev = leverage as i128;
     let entry = entry_ticks as i128;
     let rate = maintenance_rate_bps as i128;

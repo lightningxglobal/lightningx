@@ -8,6 +8,7 @@ AERON_DIR="${AERON_DIR:-/tmp/aeron}"
 TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_40k.csv}"
 TOTAL_CONNS="${TOTAL_CONNS:-40000}"
 DESK_COUNT="${DESK_COUNT:-4}"
+TRACER_ENABLED="${TRACER_ENABLED:-0}"
 CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
 LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
 
@@ -37,7 +38,7 @@ fi
 
 mkdir -p "$LOG_DIR"
 echo "logs: $LOG_DIR"
-echo "shape: ${TOTAL_CONNS} conns across ${DESK_COUNT} desk-server processes"
+echo "shape: ${TOTAL_CONNS} conns across ${DESK_COUNT} desk-server processes  TRACER_ENABLED=${TRACER_ENABLED}"
 
 pids=()
 cleanup() {
@@ -57,12 +58,14 @@ sleep 2
 
 for ((i = 0; i < DESK_COUNT; i++)); do
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning TRACER_ENABLED=0 DESK_SPIN=true DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
+    RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" DESK_SPIN=true \
+    DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
     TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}" NOFILE_LIMIT=262144 \
     "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
   pids+=("$!")
 done
-sleep 5
+# Give desk-servers extra time when tracer is on so they can register the scenario with beacon.
+sleep "${DESK_WARMUP_S:-5}"
 
 base_conns=$((TOTAL_CONNS / DESK_COUNT))
 extra_conns=$((TOTAL_CONNS % DESK_COUNT))
@@ -103,8 +106,74 @@ done
 
 wait "${pids[@]:$((DESK_COUNT + 1))}" || true
 
+echo
+echo "===== ${TOTAL_CONNS} CLIENT-SIDE LATENCY (${DESK_COUNT} desk) ====="
 for ((i = 0; i < DESK_COUNT; i++)); do
   echo
-  echo "===== pressure-$i -> ${PORTS[$i]} ====="
+  echo "----- pressure-$i -> ${PORTS[$i]} -----"
   sed -n '/final summary/,$p' "$LOG_DIR/pressure-$i.log"
 done
+
+# ── Beacon query (only when TRACER_ENABLED=1) ──────────────────────────────────
+if [[ "$TRACER_ENABLED" == "1" ]]; then
+  echo
+  echo "── waiting 15s for beacon flush to VictoriaMetrics ──"
+  sleep 15
+  echo
+  echo "===== SERVER-INTERNAL LATENCY (beacon: OnWsOrderRecv → OnWsResponseSent) ====="
+  python3 - <<'PYEOF'
+import urllib.request, json, urllib.parse, sys
+
+BASE = "http://localhost:8428"
+
+def qrange(promql):
+    url = f"{BASE}/api/v1/query_range?query={urllib.parse.quote(promql)}&start=now-30m&end=now&step=10s"
+    with urllib.request.urlopen(url) as r:
+        return json.load(r)
+
+scenario = 'ExchangeOrderFlow'
+from_ms  = 'ExchangeDeskServer.OnWsOrderRecv'
+to_ms    = 'ExchangeDeskServer.OnWsResponseSent'
+
+for pct in ['p50', 'p90', 'p99', 'p999', 'max']:
+    q = f'latency_us{{percentile="{pct}",scenario="{scenario}",from_milestone="{from_ms}",to_milestone="{to_ms}"}}'
+    try:
+        d = qrange(q)
+    except Exception as e:
+        print(f"  {pct}: query error: {e}")
+        continue
+    results = d.get('data', {}).get('result', [])
+    main = [r for r in results if 'outlier_category' not in r['metric'] and r['metric'].get('group') == '*_*_*_*']
+    if main:
+        vals = [float(v) for _, v in main[0].get('values', []) if float(v) > 0]
+        if vals:
+            print(f"  {pct:6s}: avg={sum(vals)/len(vals):>8.1f} µs   peak={max(vals):>8.1f} µs")
+        else:
+            print(f"  {pct:6s}: (no data in window)")
+    else:
+        print(f"  {pct:6s}: (no series)")
+
+q = f'latency_avg_us{{scenario="{scenario}",from_milestone="{from_ms}",to_milestone="{to_ms}"}}'
+try:
+    d = qrange(q)
+    results = d.get('data', {}).get('result', [])
+    main = [r for r in results if 'outlier_category' not in r['metric'] and r['metric'].get('group') == '*_*_*_*']
+    if main:
+        vals = [float(v) for _, v in main[0].get('values', []) if float(v) > 0]
+        if vals:
+            print(f"  {'avg':6s}: {sum(vals)/len(vals):>8.1f} µs")
+except Exception:
+    pass
+
+q = f'latency_count{{scenario="{scenario}",from_milestone="{from_ms}",to_milestone="{to_ms}"}}'
+try:
+    d = qrange(q)
+    results = d.get('data', {}).get('result', [])
+    main = [r for r in results if 'outlier_category' not in r['metric'] and r['metric'].get('group') == '*_*_*_*']
+    if main:
+        total = sum(float(v) for _, v in main[0].get('values', []))
+        print(f"  {'count':6s}: {total:.0f} traces")
+except Exception:
+    pass
+PYEOF
+fi

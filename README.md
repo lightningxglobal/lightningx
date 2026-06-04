@@ -4,7 +4,7 @@
 
 # LightningX Exchange
 
-A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with **48 µs median server-internal latency at 40K concurrent connections**.
+A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with **20 µs median server-internal latency at 40K concurrent connections**.
 
 Live demo with very limited resources and a very very simple market making bot: **https://www.lightningx.global**
 
@@ -14,7 +14,7 @@ Live demo with very limited resources and a very very simple market making bot: 
 
 ![LightningX end-to-end latency on M4 Mac](lightningx-latency-m4.jpg)
 
-*Internal processing latency: server receives WS frame → Aeron IPC → matching engine → Aeron IPC → result queued for sending. Measured via beacon tracing on an M4 MacBook Pro at **40K concurrent WebSocket connections (4 desks × 10K)**. **p50 = 48 µs · p90 = 853 µs.** Network latency (Internet RTT) is not included and dominates user-perceived latency in practice.*
+*Internal processing latency: server receives WS frame → Aeron IPC → matching engine → Aeron IPC → result queued for sending. Measured via beacon tracing on an M4 MacBook Pro (14-core) at **40K concurrent WebSocket connections (4 desks × 10K)**. **p50 = 20 µs · p90 = 74 µs.** Network latency (Internet RTT) is not included and dominates user-perceived latency in practice. Further gains are expected on Linux with dedicated core pinning.*
 
 ---
 
@@ -202,9 +202,9 @@ all buffers are pre-allocated (`SmallVec`, arena SkipList, rtrb ring buffers).
 
 Measured from the moment the server receives a WS frame to the moment the result is queued for sending back — **excluding network transit in both directions**. Captured via beacon / HDR histogram tracing on an Apple M4 MacBook Pro at 40K concurrent WebSocket connections (4 desks × 10K, `DESK_SPIN=true`, `TRACER_ENABLED=1`).
 
-| Metric | P50 | P90 |
-|---|---|---|
-| **Internal processing (40K conns)** | **48 µs** | **853 µs** |
+| Metric | P50 | P90 | P99 |
+|---|---|---|---|
+| **Internal processing (40K conns, M4 14-core)** | **20 µs** | **74 µs** | **709 µs** |
 
 > Internet RTT (20–200 ms typical) is not included. User-perceived latency is dominated by network, not by exchange processing.
 
@@ -227,12 +227,12 @@ Measured with `pressure-client` placing limit orders at 0.2 ops/s per connection
 
 | Connections | Desks | Conn success | Order success | Place OK p50 |
 |---|---|---|---|---|
-| **40K** | 4 × 10K | **100%** | **100%** | **~178 µs** |
-| **100K** | 3 × 33K | ~95–100% | ~77–91%† | **~325–560 µs** |
+| **40K** | 4 × 10K | **100%** | **100%** | **~170 µs** |
+| **100K** | 2 × 50K | ~93% | ~90%† | **~788 µs** |
 
-† 100K order success rate varies run-to-run (77–91%) because the machine operates near its CPU ceiling: 3 Aeron recv spin threads + 6 tokio workers + 1 engine thread ≈ 10 threads competing for 14 physical cores. p90 widens to ~30–84 ms and p99 reaches the 1 s timeout cap for some orders.
+† 100K tested on macOS M4 Pro 14-core with 2 desks (`DESK_SPIN=false`). Order success rate reaches ~90% near the CPU ceiling: 2 Aeron recv spin threads + tokio workers + 1 engine thread compete for 14 physical cores. p90 widens to ~6.6 ms. On **32+ core Linux** with `sched_setaffinity` pinning each spin thread to a dedicated core, 100K at 100% success and p99 < 10 ms is achievable — Linux gains are expected to be significantly larger.
 
-**On 32+ core Linux** with `sched_setaffinity` pinning each spin thread to a dedicated core, 100K at 100% success and p99 < 10 ms is achievable with the current architecture. See `docs/benchmark_40k_baseline.md` for full results.
+See `docs/benchmark_40k_baseline.md` for full results.
 
 ---
 

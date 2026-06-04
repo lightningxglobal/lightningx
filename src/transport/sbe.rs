@@ -151,10 +151,7 @@ static_assertions::const_assert_eq!(std::mem::size_of::<TradeNotification>(), 64
 
 pub fn encode_header(template_id: u16, block_length: u16) -> [u8; 8] {
     let header = SbeHeader::new(template_id, block_length);
-    unsafe {
-        let ptr = &header as *const SbeHeader as *const [u8; 8];
-        *ptr
-    }
+    unsafe { std::mem::transmute::<SbeHeader, [u8; 8]>(header) }
 }
 
 pub fn encode_new_order(msg: &NewOrderRequest, buf: &mut [u8]) -> Result<usize, ()> {

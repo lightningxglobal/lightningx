@@ -149,6 +149,23 @@ impl RiskEngine {
         } else if let Some(mut idx) = self.symbol_position_index.get_mut(&symbol) {
             idx.retain(|&id| id != user_id);
         }
+
+        // Recompute account-level maintenance_margin as sum of all open positions.
+        self.recompute_account_maintenance(user_id);
+    }
+
+    /// Recomputes `account.maintenance_margin` as the sum of all open positions'
+    /// maintenance_margin.  Must be called after any position change.
+    fn recompute_account_maintenance(&self, user_id: i64) {
+        let total: i64 = self
+            .positions
+            .iter()
+            .filter(|e| e.key().0 == user_id)
+            .map(|e| e.value().maintenance_margin)
+            .sum();
+        if let Some(mut acct) = self.accounts.get_mut(&user_id) {
+            acct.maintenance_margin = total;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -694,23 +711,27 @@ mod tests {
     }
 
     #[test]
+    fn account_maintenance_margin_aggregated_from_positions() {
+        let (engine, uid) = setup_with_reserved(500_000);
+        // notional = 5_000_000 * 100_000 / 1_000_000 = 500_000 cents
+        // maintenance_margin = 500_000 * 50 / 10_000 = 2_500 cents
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.maintenance_margin, 2_500);
+    }
+
+    #[test]
     fn risk_tick_triggers_liquidation_pending_when_equity_below_maintenance() {
         let (engine, uid) = make_engine_with_account(500_000);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
         engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
 
         // Maintenance margin at open = 500_000 * 50 / 10_000 = 2_500 cents ($25).
-        // Force equity below maintenance by injecting a large unrealized loss.
+        // Force equity below maintenance via unrealized PnL.
+        // equity = available(450_000) + used(50_000) + upnl = 2_499 → upnl = -497_501
         if let Some(mut acct) = engine.accounts.get_mut(&uid) {
-            // equity = used_margin(50_000) + available(450_000) + upnl(-500_000) = 0
-            // Set unrealized_pnl to make equity = maintenance - 1 = 2_499
-            // equity = 500_000 + upnl = 2_499 → upnl = -497_501
             acct.unrealized_pnl = -497_501;
             acct.equity = acct.available_margin + acct.order_margin + acct.used_margin + acct.unrealized_pnl;
-        }
-        // Maintenance margin on account must also be set (normally done by fill).
-        if let Some(mut acct) = engine.accounts.get_mut(&uid) {
-            acct.maintenance_margin = 2_500;
         }
 
         let events = engine.run_risk_tick();

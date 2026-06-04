@@ -855,6 +855,7 @@ async fn handle_client_message(
                         client_order_id: client_order_id.clone(),
                         freeze_price: freeze_price_val,
                         initial_margin_cents,
+                        liq_price_ticks: 0,
                     },
                 );
 
@@ -1631,6 +1632,7 @@ async fn handle_client_message(
                         client_order_id: coid.clone(),
                         freeze_price: freeze_price_val,
                         initial_margin_cents: batch_initial_margin_cents,
+                        liq_price_ticks: 0,
                     };
                     let sbe_req = SbeNewOrder {
                         client_order_id: order_id,

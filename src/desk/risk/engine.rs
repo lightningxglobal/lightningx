@@ -80,6 +80,7 @@ impl RiskEngine {
         notional_scale: i64,
         leverage: u8,
         maintenance_rate_bps: i64,
+        liq_price_ticks: i64, // non-zero for forced-liquidation: user settled here, spread → insurance fund
     ) {
         if fill_qty_lots <= 0 {
             return;
@@ -92,6 +93,14 @@ impl RiskEngine {
         };
         let key = (user_id, symbol);
 
+        // For liquidation orders, the user is settled at liq_price_ticks (not the actual
+        // fill price). The spread between fill and liq price is exchange revenue.
+        let settlement_price_ticks = if liq_price_ticks != 0 {
+            liq_price_ticks
+        } else {
+            fill_price_ticks
+        };
+
         // Compute new position state without holding shard locks.
         let (new_pos, released_used_margin, realized_pnl_cents) = {
             let existing = self.positions.get(&key);
@@ -100,7 +109,7 @@ impl RiskEngine {
                 user_id,
                 symbol,
                 fill_side,
-                fill_price_ticks,
+                settlement_price_ticks,
                 fill_qty_lots,
                 fill_margin_cents,
                 notional_scale,
@@ -119,36 +128,28 @@ impl RiskEngine {
             }
         }
 
-        // Compute insurance fund delta for liquidation closes.
-        // When the account is Liquidating, any difference between realized_pnl and
-        // the expected bankruptcy pnl flows to/from the insurance fund.
+        // Insurance fund accounting for liquidation closes.
+        // When liq_price_ticks is set: exchange revenue = |fill - liq| × qty / scale.
+        // When the account is Liquidating without liq_price: fund absorbs the full realized_pnl
+        // (legacy path, should not occur in normal operation).
         let insurance_delta: i64 = if released_used_margin > 0 {
-            let is_liquidating = self
-                .accounts
-                .get(&user_id)
-                .map(|a| a.status == RiskStatus::Liquidating)
-                .unwrap_or(false);
-            if is_liquidating {
-                // Bankruptcy pnl = (bankruptcy_price - entry_price) * close_qty / scale.
-                // We recover this from the closed position's bankruptcy_price_ticks.
-                // new_pos==None means full close (flip is opening a new position, not a liq close).
-                let bkrpt_pnl = new_pos.as_ref().map_or_else(
-                    || {
-                        // Full close: all of the position was closed.
-                        // Bankruptcy pnl = (bkrpt_price - entry) * qty / scale.
-                        // We can read from the OLD position state (before positions.insert/remove).
-                        // The position was previously held in the compute call; we lack a direct reference.
-                        // Use fill_price as proxy: delta is realized_pnl minus what bankruptcy would yield.
-                        // This is an approximation — a full implementation would pass bankruptcy_price_ticks
-                        // from compute_position_update.  For Phase 6, log the event and let the
-                        // insurance fund absorb the full realized pnl on bankruptcy closes.
-                        0i64 // TODO: pass bkrpt_price_ticks from compute_position_update in Phase 6+
-                    },
-                    |_| 0i64, // partial close or flip — no fund adjustment
-                );
-                realized_pnl_cents - bkrpt_pnl
+            if liq_price_ticks != 0 {
+                // Exchange pockets the spread between actual fill and liquidation price.
+                // sell close (long liq): fill > liq → (fill - liq) * qty / scale > 0
+                // buy  close (short liq): liq > fill → (liq - fill) * qty / scale > 0
+                let sign: i64 = if order_side == 1 { 1 } else { -1 }; // sell=+1, buy=-1
+                (fill_price_ticks - liq_price_ticks) * sign * fill_qty_lots / notional_scale
             } else {
-                0
+                let is_liquidating = self
+                    .accounts
+                    .get(&user_id)
+                    .map(|a| a.status == RiskStatus::Liquidating)
+                    .unwrap_or(false);
+                if is_liquidating {
+                    realized_pnl_cents
+                } else {
+                    0
+                }
             }
         } else {
             0
@@ -351,6 +352,7 @@ impl RiskEngine {
                     symbol: e.key().1,
                     side: e.value().side,
                     qty_lots: e.value().qty_lots,
+                    liq_price_ticks: e.value().liquidation_price_ticks,
                 })
                 .collect()
         };
@@ -626,7 +628,7 @@ mod tests {
     #[test]
     fn on_fill_opens_long_position() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.qty_lots, QTY_LOTS);
@@ -642,7 +644,7 @@ mod tests {
     #[test]
     fn on_fill_opens_short_position() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.side, PositionSide::Short);
@@ -653,12 +655,12 @@ mod tests {
     fn on_fill_adds_to_existing_long_vwap() {
         let (engine, uid) = make_engine_with_account(500_000);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Second fill at $55,000 for same qty
         let price2 = 5_500_000i64;
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, price2, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, price2, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.qty_lots, QTY_LOTS * 2);
@@ -672,12 +674,12 @@ mod tests {
         let (engine, uid) = make_engine_with_account(500_000);
         // Open long at $50,000
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Close at $55,000: profit = ($55,000 - $50,000) * 0.1 BTC = $500 = 50_000 cents
         let close_price = 5_500_000i64;
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, close_price, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 1, close_price, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Position should be gone
         assert!(engine.positions.get(&(uid, btc_sym())).is_none());
@@ -696,13 +698,13 @@ mod tests {
     fn on_fill_partial_close_reduces_position() {
         let (engine, uid) = make_engine_with_account(500_000);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Close half at $50,000 (no PnL)
         let half_qty = QTY_LOTS / 2;
         let half_margin = MARGIN_CENTS / 2;
         engine.check_and_reserve_margin(uid, half_margin).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, half_qty, half_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, half_qty, half_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.qty_lots, half_qty);
@@ -716,7 +718,7 @@ mod tests {
     #[test]
     fn on_fill_symbol_position_index_maintained() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Should be in index
         let idx = engine.symbol_position_index.get(&btc_sym()).unwrap();
@@ -725,7 +727,7 @@ mod tests {
 
         // Close: index entry removed
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         let idx = engine.symbol_position_index.get(&btc_sym());
         assert!(idx.map(|v| !v.contains(&uid)).unwrap_or(true));
@@ -734,7 +736,7 @@ mod tests {
     #[test]
     fn on_fill_liquidation_price_set_on_open() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         // liq_price_long = entry * (10*10000 - 10000 + 50) / (10*10000) = 5_000_000 * 90050 / 100000 = 4_502_500
         assert_eq!(pos.liquidation_price_ticks, 4_502_500);
@@ -747,7 +749,7 @@ mod tests {
     fn update_mark_price_sets_ewma_and_upnl() {
         let (engine, uid) = setup_with_reserved(500_000);
         // Open long: 0.1 BTC at $50,000, margin $500
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Mark price jumps to $51,000 (price_ticks = 5_100_000).
         // First update: EWMA = (5_100_000 + 9 * 5_000_000) / 10 = 5_010_000
@@ -767,7 +769,7 @@ mod tests {
     #[test]
     fn update_mark_price_ignores_zero() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         engine.update_mark_price(btc_sym(), 0, NOTIONAL_SCALE);
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.mark_price_ticks, PRICE_TICKS); // unchanged
@@ -776,7 +778,7 @@ mod tests {
     #[test]
     fn risk_tick_normal_when_margin_healthy() {
         let (engine, uid) = setup_with_reserved(500_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         let events = engine.run_risk_tick();
         assert!(events.is_empty());
         let acct = engine.accounts.get(&uid).unwrap();
@@ -788,7 +790,7 @@ mod tests {
         let (engine, uid) = setup_with_reserved(500_000);
         // notional = 5_000_000 * 100_000 / 1_000_000 = 500_000 cents
         // maintenance_margin = 500_000 * 50 / 10_000 = 2_500 cents
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.maintenance_margin, 2_500);
     }
@@ -797,7 +799,7 @@ mod tests {
     fn risk_tick_triggers_liquidation_pending_when_equity_below_maintenance() {
         let (engine, uid) = make_engine_with_account(500_000);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Maintenance margin at open = 500_000 * 50 / 10_000 = 2_500 cents ($25).
         // Force equity below maintenance via unrealized PnL.
@@ -828,7 +830,7 @@ mod tests {
     fn integration_mark_price_triggers_liquidation() {
         let (engine, uid) = make_engine_with_account(52_600);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         // After open: available=2_600, used=50_000, maintenance=2_500
         // mark converges to $44,000: after ~18 calls equity drops below maintenance.
         // Each call: mark = (4_400_000 + 9 * old) / 10  (EWMA α=0.1)
@@ -858,7 +860,7 @@ mod tests {
     #[test]
     fn integration_healthy_account_no_liquidation_events() {
         let (engine, uid) = setup_with_reserved(1_000_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Mark price moves +1% — well within margin.
         engine.update_mark_price(btc_sym(), PRICE_TICKS + 50_000, NOTIONAL_SCALE);
@@ -882,7 +884,7 @@ mod tests {
     fn insurance_fund_gains_on_profitable_liquidation_close() {
         let (engine, uid) = setup_with_reserved(500_000);
         // Open long at $50,000; margin = 50_000 cents
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Simulate the account being set to Liquidating (done by the tick task).
         if let Some(mut acct) = engine.accounts.get_mut(&uid) {
@@ -892,7 +894,7 @@ mod tests {
         // System close at $51,000 (profit $100 = 10_000 cents).
         // No margin was pre-reserved (system bypass), so fill_margin_cents = 0.
         let close_price_ticks = 5_100_000i64;
-        engine.on_fill(uid, btc_sym(), 1, close_price_ticks, QTY_LOTS, 0, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 1, close_price_ticks, QTY_LOTS, 0, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Account should be Liquidated.
         let acct = engine.accounts.get(&uid).unwrap();
@@ -904,15 +906,61 @@ mod tests {
         assert_eq!(engine.insurance_fund(), 10_000);
     }
 
+    /// When liq_price_ticks is set, the spread between actual fill and liq_price
+    /// flows to the insurance fund.  The user is settled at liq_price (worse for them).
+    ///
+    /// Example (long liq, sell close):
+    ///   entry = $50,000  liq_price = $49,000  actual fill = $49,800
+    ///   User pnl  = (49,000 − 50,000) × 0.1 / 1 = −$100  → loss of 10_000 cents
+    ///   Exchange  = (49,800 − 49,000) × 0.1  = $80  → 8_000 cents to insurance fund
+    #[test]
+    fn liq_price_spread_flows_to_insurance_fund() {
+        const SCALE: i64 = 1_000_000; // BTC: price_ticks/tick * lots / 1_000_000 = cents
+        let (engine, uid) = setup_with_reserved(2_000_000); // $20,000 initial balance
+
+        // Open long BTC at $50,000 (entry_price_ticks = 5_000_000, qty = 0.1 BTC = 100_000 lots)
+        let entry_ticks = 5_000_000i64; // $50,000 at $0.01/tick
+        let qty_lots = 100_000i64;       // 0.1 BTC at 1e-6 lot size
+        let open_notional = entry_ticks * qty_lots / SCALE; // = 500_000 cents = $5,000
+        let open_margin = open_notional / 10; // 10x → 50_000 cents = $500
+        engine.check_and_reserve_margin(uid, open_margin).unwrap();
+        engine.on_fill(uid, btc_sym(), 0, entry_ticks, qty_lots, open_margin, SCALE, 10, 50, 0);
+
+        // Risk tick decides to liquidate; liq_price = $49,000 (below mark, more aggressive)
+        let liq_ticks = 4_900_000i64; // $49,000
+        // Actual market fill comes in at $49,800 (better for the buyer / worse for liq engine)
+        let fill_ticks = 4_980_000i64; // $49,800
+        if let Some(mut acct) = engine.accounts.get_mut(&uid) {
+            acct.status = RiskStatus::Liquidating;
+        }
+
+        // System close: sell order at liq_price (IOC limit), fills at $49,800.
+        engine.on_fill(uid, btc_sym(), 1, fill_ticks, qty_lots, 0, SCALE, 10, 50, liq_ticks);
+
+        // Account settled at liq_price ($49,000), not fill price ($49,800).
+        // user_pnl = (49,000 − 50,000) × 100,000 / 1,000,000 = −100 * 1_000_000 / 1_000_000?
+        // Actually: (liq_ticks − entry_ticks) × qty_lots / SCALE
+        //         = (4_900_000 − 5_000_000) × 100_000 / 1_000_000 = −100_000 × 100_000 / 1_000_000
+        //         = −10_000_000_000 / 1_000_000 = −10_000 cents = −$100
+        // available = 0 (order_margin=50_000 returned) + 50_000 (used_margin) + (−10_000) pnl = 40_000 cents
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.status, RiskStatus::Liquidated);
+
+        // Exchange revenue = (fill − liq) × qty / scale (sell close, sign=+1)
+        //   = (4_980_000 − 4_900_000) × 100_000 / 1_000_000
+        //   = 80_000 × 100_000 / 1_000_000 = 8_000_000_000 / 1_000_000 = 8_000 cents = $80
+        assert_eq!(engine.insurance_fund(), 8_000);
+    }
+
     /// For non-Liquidating closes, insurance fund is not touched.
     #[test]
     fn insurance_fund_unchanged_on_normal_close() {
         let (engine, uid) = setup_with_reserved(500_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         // Normal user close at same price (no PnL, account stays Normal).
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
 
         assert_eq!(engine.insurance_fund(), 0);
     }

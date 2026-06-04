@@ -1257,6 +1257,7 @@ async fn handle_place_order(
                 client_order_id: req.client_order_id.clone().unwrap_or_default(),
                 freeze_price,
                 initial_margin_cents: 0,
+                liq_price_ticks: 0,
             },
         );
 

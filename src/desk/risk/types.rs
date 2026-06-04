@@ -70,4 +70,7 @@ pub struct LiquidationEvent {
     pub symbol: [u8; 16],
     pub side: PositionSide,
     pub qty_lots: i64,
+    /// The price at which the user is settled (from PositionRiskState::liquidation_price_ticks).
+    /// Exchange revenue = |actual_fill_price - liq_price| * qty / notional_scale.
+    pub liq_price_ticks: i64,
 }

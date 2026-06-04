@@ -2151,6 +2151,7 @@ async fn async_main() -> anyhow::Result<()> {
                                         rules.notional_scale,
                                         rules.default_leverage,
                                         rules.maintenance_rate_bps,
+                                        meta.liq_price_ticks,
                                     );
                                 }
                             }
@@ -2248,11 +2249,13 @@ async fn async_main() -> anyhow::Result<()> {
                     let liq_side: u8 = if evt.side == PositionSide::Long { 1 } else { 0 };
                     let order_id = next_order_id_tick.fetch_add(1, Ordering::Relaxed);
 
-                    // Market order: price_ticks=0, time_in_force=1 (IOC).
+                    // Liquidation order is a limit IOC at the liquidation price.
+                    // This is deliberately aggressive (well into the book), so it
+                    // fills at market while the user is settled at liq_price_ticks.
                     let sbe_req = SbeNewOrder {
                         client_order_id: order_id,
                         participant_id: evt.user_id as u64,
-                        price_ticks: 0,
+                        price_ticks: evt.liq_price_ticks,
                         quantity_lots: evt.qty_lots,
                         side: liq_side,
                         time_in_force: 1, // IOC
@@ -2267,8 +2270,9 @@ async fn async_main() -> anyhow::Result<()> {
                     } else { 0 };
                     let margin_cents = lightning_exchange::desk::risk::calc::calc_initial_margin_cents(notional, rules.default_leverage);
 
-                    // Register metadata so on_fill can close the position correctly.
-                    let order_type = if liq_side == 0 { "market-buy" } else { "market-sell" };
+                    // Register metadata so on_fill can settle user at liq_price_ticks
+                    // and credit the spread to the insurance fund.
+                    let order_type = if liq_side == 0 { "liq-buy" } else { "liq-sell" };
                     pending_meta_tick.insert(order_id, OrderMeta {
                         user_id: evt.user_id,
                         symbol: evt.symbol,
@@ -2279,6 +2283,7 @@ async fn async_main() -> anyhow::Result<()> {
                         client_order_id: format!("liq-{}", order_id),
                         freeze_price: 0.0,
                         initial_margin_cents: margin_cents,
+                        liq_price_ticks: evt.liq_price_ticks,
                     });
 
                     if cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {

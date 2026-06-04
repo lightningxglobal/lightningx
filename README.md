@@ -220,6 +220,21 @@ Stage-by-stage breakdown (steady-state, last-observed values):
 
 The matching step contributes only ~1 µs end-to-end; the dominant cost is the two Aeron IPC round-trips and tokio scheduler wake-ups at each WS boundary.
 
+### WebSocket Scalability (desk-server, macOS M4 Pro 14-core)
+
+Measured with `pressure-client` placing limit orders at 0.2 ops/s per connection over a 30 s steady-state window after a 60 s ramp. All connections share a single `BTC_USDT` symbol; market data broadcast enabled.
+
+| Connections | Desks | Conn success | Order success | Place OK p50 |
+|---|---|---|---|---|
+| **40K** | 4 × 10K | **100%** | **100%** | **~178 µs** |
+| **100K** | 3 × 33K | ~95–100% | ~77–91%† | **~325–560 µs** |
+
+† 100K order success rate varies run-to-run (77–91%) because the machine operates near its CPU ceiling: 3 Aeron recv spin threads + 6 tokio workers + 1 engine thread ≈ 10 threads competing for 14 physical cores. p90 widens to ~30–84 ms and p99 reaches the 1 s timeout cap for some orders.
+
+**On 32+ core Linux** with `sched_setaffinity` pinning each spin thread to a dedicated core, 100K at 100% success and p99 < 10 ms is achievable with the current architecture. See `docs/benchmark_40k_baseline.md` for full results.
+
+---
+
 ### What Makes It Fast
 
 | Technique | Effect |

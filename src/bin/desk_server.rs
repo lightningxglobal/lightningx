@@ -2215,10 +2215,12 @@ async fn async_main() -> anyhow::Result<()> {
             })?;
     }
 
-    // ── 10ms risk tick: mark-to-market account status check ─────────────────
+    // ── 10ms risk tick: mark-to-market account status check + liquidation ────
     {
         let risk_engine_tick = state.risk_engine.clone();
-        let user_tx_tick = state.user_tx.clone();
+        let next_order_id_tick = state.next_order_id.clone();
+        let pending_meta_tick = state.pending_meta.clone();
+        let aeron_cmd_tick = state.aeron_cmd_tx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2226,15 +2228,71 @@ async fn async_main() -> anyhow::Result<()> {
                 interval.tick().await;
                 let to_liquidate = risk_engine_tick.run_risk_tick();
                 for evt in to_liquidate {
-                    // Phase 5 will route this to the liquidation engine.
-                    // For now just log it so we know when liquidation is triggered.
-                    tracing::warn!(
-                        user_id = evt.user_id,
-                        side = ?evt.side,
-                        qty_lots = evt.qty_lots,
-                        "LiquidationPending — position queued for forced close"
-                    );
-                    let _ = (user_tx_tick.clone(), evt); // silence unused warning
+                    use lightning_exchange::desk::risk::PositionSide;
+                    use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
+                    use lightning_exchange::sbe::NewOrderRequest as SbeNewOrder;
+                    use std::sync::atomic::Ordering;
+
+                    // Mark account as Liquidating immediately so no new orders can be placed.
+                    if let Some(mut acct) = risk_engine_tick.accounts.get_mut(&evt.user_id) {
+                        acct.status = lightning_exchange::desk::risk::RiskStatus::Liquidating;
+                    }
+
+                    let Some(ref cmd_tx) = aeron_cmd_tick else { continue; };
+
+                    let sym_str_end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                    let sym_str = std::str::from_utf8(&evt.symbol[..sym_str_end]).unwrap_or("BTC_USDT");
+                    let rules = lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(sym_str);
+
+                    // Liquidation side is opposite to position side.
+                    let liq_side: u8 = if evt.side == PositionSide::Long { 1 } else { 0 };
+                    let order_id = next_order_id_tick.fetch_add(1, Ordering::Relaxed);
+
+                    // Market order: price_ticks=0, time_in_force=1 (IOC).
+                    let sbe_req = SbeNewOrder {
+                        client_order_id: order_id,
+                        participant_id: evt.user_id as u64,
+                        price_ticks: 0,
+                        quantity_lots: evt.qty_lots,
+                        side: liq_side,
+                        time_in_force: 1, // IOC
+                        _pad: [0; 14],
+                        symbol: evt.symbol,
+                    };
+
+                    // Notional and margin for fill accounting on the close.
+                    let mark_ticks = risk_engine_tick.mark_prices.get(&evt.symbol).map(|v| *v).unwrap_or(0);
+                    let notional = if mark_ticks > 0 {
+                        lightning_exchange::desk::risk::calc::calc_notional_cents(mark_ticks, evt.qty_lots, rules.notional_scale)
+                    } else { 0 };
+                    let margin_cents = lightning_exchange::desk::risk::calc::calc_initial_margin_cents(notional, rules.default_leverage);
+
+                    // Register metadata so on_fill can close the position correctly.
+                    let order_type = if liq_side == 0 { "market-buy" } else { "market-sell" };
+                    pending_meta_tick.insert(order_id, OrderMeta {
+                        user_id: evt.user_id,
+                        symbol: evt.symbol,
+                        side: liq_side,
+                        order_type: pack_str16(order_type),
+                        price: None,
+                        qty: rules.lots_to_quantity(evt.qty_lots),
+                        client_order_id: format!("liq-{}", order_id),
+                        freeze_price: 0.0,
+                        initial_margin_cents: margin_cents,
+                    });
+
+                    if cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
+                        pending_meta_tick.remove(&order_id);
+                        tracing::warn!(user_id = evt.user_id, "liquidation order dropped: ring full");
+                    } else {
+                        tracing::warn!(
+                            user_id = evt.user_id,
+                            order_id,
+                            qty_lots = evt.qty_lots,
+                            sym = sym_str,
+                            "liquidation order sent"
+                        );
+                    }
                 }
             }
         });

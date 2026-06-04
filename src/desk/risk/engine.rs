@@ -230,63 +230,83 @@ impl RiskEngine {
 
     /// Called every ~10ms from a dedicated timer task.  Scans all accounts,
     /// updates RiskStatus, and returns a vec of positions that need liquidation.
+    ///
+    /// Two-pass design to avoid nested DashMap shard lock acquisition:
+    ///   Pass 1 (accounts.iter — shared read): compute new statuses, collect UIDs
+    ///            that transition to LiquidationPending.
+    ///   Pass 2 (positions.iter — shared read): collect LiquidationEvents for those UIDs.
+    ///   Pass 3 (accounts.get_mut — per-key write): apply status updates.
     pub fn run_risk_tick(&self) -> Vec<super::types::LiquidationEvent> {
-        let mut to_liquidate = Vec::new();
+        use super::types::RiskStatus;
 
-        for mut entry in self.accounts.iter_mut() {
-            let acct = entry.value_mut();
-            // Skip already-terminal states.
-            if matches!(
-                acct.status,
-                super::types::RiskStatus::Liquidating
-                    | super::types::RiskStatus::Liquidated
-                    | super::types::RiskStatus::Bankruptcy
-            ) {
-                continue;
-            }
+        // Pass 1: read all accounts, compute new status for each.
+        struct Update {
+            user_id: i64,
+            old_status: RiskStatus,
+            new_status: RiskStatus,
+        }
 
-            // Equity uses mark-to-market value (updated by update_mark_price).
-            let equity = acct.equity;
-            let used_margin = acct.used_margin;
-            let maintenance_margin = acct.maintenance_margin;
+        let updates: Vec<Update> = self
+            .accounts
+            .iter()
+            .filter_map(|entry| {
+                let acct = entry.value();
+                if matches!(
+                    acct.status,
+                    RiskStatus::Liquidating | RiskStatus::Liquidated | RiskStatus::Bankruptcy
+                ) {
+                    return None;
+                }
+                let equity = acct.equity;
+                let used_margin = acct.used_margin;
+                let maintenance_margin = acct.maintenance_margin;
 
-            let new_status = if used_margin == 0 {
-                super::types::RiskStatus::Normal
-            } else if equity <= 0 {
-                super::types::RiskStatus::Bankruptcy
-            } else if equity <= maintenance_margin {
-                super::types::RiskStatus::LiquidationPending
-            } else {
-                // margin_ratio = equity / used_margin (in basis points, × 10_000)
-                let margin_ratio_bps = equity * 10_000 / used_margin;
-                // margin_call if margin_ratio < 75 bps (0.75%) above maintenance
-                // For simplicity: warn at equity < 1.5 × maintenance_margin
-                if equity * 2 < 3 * maintenance_margin {
-                    super::types::RiskStatus::MarginCall
+                let new_status = if used_margin == 0 {
+                    RiskStatus::Normal
+                } else if equity <= 0 {
+                    RiskStatus::Bankruptcy
+                } else if equity <= maintenance_margin {
+                    RiskStatus::LiquidationPending
+                } else if equity * 2 < 3 * maintenance_margin {
+                    RiskStatus::MarginCall
                 } else {
-                    let _ = margin_ratio_bps; // suppress warning
-                    super::types::RiskStatus::Normal
-                }
-            };
+                    RiskStatus::Normal
+                };
 
-            if new_status == super::types::RiskStatus::LiquidationPending
-                && acct.status != super::types::RiskStatus::LiquidationPending
-            {
-                // Collect positions for liquidation.
-                let uid = acct.user_id;
-                for pos_entry in self.positions.iter() {
-                    if pos_entry.key().0 == uid {
-                        to_liquidate.push(super::types::LiquidationEvent {
-                            user_id: uid,
-                            symbol: pos_entry.key().1,
-                            side: pos_entry.value().side,
-                            qty_lots: pos_entry.value().qty_lots,
-                        });
-                    }
-                }
+                Some(Update { user_id: acct.user_id, old_status: acct.status, new_status })
+            })
+            .collect();
+
+        // Pass 2: scan positions for UIDs newly entering LiquidationPending.
+        let liq_uids: Vec<i64> = updates
+            .iter()
+            .filter(|u| {
+                u.new_status == RiskStatus::LiquidationPending
+                    && u.old_status != RiskStatus::LiquidationPending
+            })
+            .map(|u| u.user_id)
+            .collect();
+
+        let to_liquidate: Vec<super::types::LiquidationEvent> = if liq_uids.is_empty() {
+            Vec::new()
+        } else {
+            self.positions
+                .iter()
+                .filter(|e| liq_uids.contains(&e.key().0))
+                .map(|e| super::types::LiquidationEvent {
+                    user_id: e.key().0,
+                    symbol: e.key().1,
+                    side: e.value().side,
+                    qty_lots: e.value().qty_lots,
+                })
+                .collect()
+        };
+
+        // Pass 3: apply status updates one at a time (no iter_mut).
+        for u in &updates {
+            if let Some(mut acct) = self.accounts.get_mut(&u.user_id) {
+                acct.status = u.new_status;
             }
-
-            acct.status = new_status;
         }
 
         to_liquidate
@@ -740,5 +760,61 @@ mod tests {
 
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.status, RiskStatus::LiquidationPending);
+    }
+
+    // ── Integration: full mark-price → liquidation pipeline ──────────────────
+
+    /// Full pipeline: update_mark_price drives equity below maintenance → run_risk_tick
+    /// emits LiquidationEvent → second tick emits nothing (no duplicate events).
+    ///
+    /// Uses a tight account so a ~10% EWMA-smoothed price drop triggers liquidation:
+    ///   balance=52_600 cents, margin=50_000, available=2_600, maintenance=2_500
+    ///   After 20 calls to update_mark_price($44,000):
+    ///     mark converges toward 44_000 ticks; equity drops below maintenance (2_500).
+    #[test]
+    fn integration_mark_price_triggers_liquidation() {
+        let (engine, uid) = make_engine_with_account(52_600);
+        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        // After open: available=2_600, used=50_000, maintenance=2_500
+        // mark converges to $44,000: after ~18 calls equity drops below maintenance.
+        // Each call: mark = (4_400_000 + 9 * old) / 10  (EWMA α=0.1)
+
+        let mut triggered = false;
+        for _ in 0..30 {
+            engine.update_mark_price(btc_sym(), 4_400_000, NOTIONAL_SCALE);
+            let acct = engine.accounts.get(&uid).unwrap();
+            if acct.equity <= acct.maintenance_margin {
+                triggered = true;
+                break;
+            }
+        }
+        assert!(triggered, "equity should drop below maintenance after repeated mark price updates");
+
+        let events = engine.run_risk_tick();
+        assert_eq!(events.len(), 1, "should emit one liquidation event");
+        assert_eq!(events[0].user_id, uid);
+        assert_eq!(events[0].qty_lots, QTY_LOTS);
+
+        // Second tick: already LiquidationPending — no repeat events.
+        let events2 = engine.run_risk_tick();
+        assert!(events2.is_empty(), "no duplicate liquidation events");
+    }
+
+    /// With healthy equity, run_risk_tick emits nothing and account stays Normal.
+    #[test]
+    fn integration_healthy_account_no_liquidation_events() {
+        let (engine, uid) = setup_with_reserved(1_000_000);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+
+        // Mark price moves +1% — well within margin.
+        engine.update_mark_price(btc_sym(), PRICE_TICKS + 50_000, NOTIONAL_SCALE);
+
+        for _ in 0..5 {
+            let events = engine.run_risk_tick();
+            assert!(events.is_empty());
+        }
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.status, RiskStatus::Normal);
     }
 }

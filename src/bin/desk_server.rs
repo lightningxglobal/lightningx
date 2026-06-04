@@ -2104,6 +2104,42 @@ async fn async_main() -> anyhow::Result<()> {
                             }
                         }
 
+                        // Phase 2: update position state on every fill.
+                        if kind == order_update_kind::FILLED
+                            || kind == order_update_kind::PARTIAL_FILL
+                        {
+                            if let Some(meta) = runtime_meta(&order_meta_cache, order_id) {
+                                let sym_end =
+                                    meta.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                                let sym_str = std::str::from_utf8(&meta.symbol[..sym_end])
+                                    .unwrap_or("BTC_USDT");
+                                let rules = lightning_exchange::symbol_rules::SymbolRules::for_symbol(sym_str);
+                                let fp_ticks = (fill_price / rules.price_tick).round() as i64;
+                                let fq_lots = rules.quantity_to_lots(fill_qty).unwrap_or(0);
+                                if fq_lots > 0 {
+                                    let notional =
+                                        lightning_exchange::desk::risk::calc::calc_notional_cents(
+                                            fp_ticks, fq_lots, rules.notional_scale,
+                                        );
+                                    let fill_margin =
+                                        lightning_exchange::desk::risk::calc::calc_initial_margin_cents(
+                                            notional, rules.default_leverage,
+                                        );
+                                    risk_engine.on_fill(
+                                        meta.user_id,
+                                        meta.symbol,
+                                        meta.side,
+                                        fp_ticks,
+                                        fq_lots,
+                                        fill_margin,
+                                        rules.notional_scale,
+                                        rules.default_leverage,
+                                        rules.maintenance_rate_bps,
+                                    );
+                                }
+                            }
+                        }
+
                         if kind == order_update_kind::FILLED
                             || kind == order_update_kind::CANCELLED
                             || kind == order_update_kind::REJECTED

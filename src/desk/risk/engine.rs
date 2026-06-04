@@ -303,27 +303,37 @@ impl RiskEngine {
         }
     }
 
-    /// Called every ~10ms from a dedicated timer task.  Scans all accounts,
+    /// Called every ~10ms from a dedicated timer task.  Scans open-position users,
     /// updates RiskStatus, and returns a vec of positions that need liquidation.
     ///
     /// Two-pass design to avoid nested DashMap shard lock acquisition:
-    ///   Pass 1 (accounts.iter — shared read): compute new statuses, collect UIDs
+    ///   Pass 1 (positions.iter + accounts.get): compute new statuses for users with exposure
     ///            that transition to LiquidationPending.
     ///   Pass 2 (positions.iter — shared read): collect LiquidationEvents for those UIDs.
     ///   Pass 3 (accounts.get_mut — per-key write): apply status updates.
     pub fn run_risk_tick(&self) -> Vec<super::types::LiquidationEvent> {
         use super::types::RiskStatus;
 
-        // Pass 1: read all accounts, compute new status for each.
+        // Only accounts with open positions can breach maintenance margin.
+        // Scanning every cached account every 10ms regresses 40K/100K WS tests even
+        // when the test only places resting orders and no position exists.
+        let mut risk_user_ids: Vec<i64> = self.positions.iter().map(|e| e.key().0).collect();
+        if risk_user_ids.is_empty() {
+            return Vec::new();
+        }
+        risk_user_ids.sort_unstable();
+        risk_user_ids.dedup();
+
+        // Pass 1: read exposed accounts, compute new status for each.
         struct Update {
             user_id: i64,
             old_status: RiskStatus,
             new_status: RiskStatus,
         }
 
-        let updates: Vec<Update> = self
-            .accounts
+        let updates: Vec<Update> = risk_user_ids
             .iter()
+            .filter_map(|user_id| self.accounts.get(user_id))
             .filter_map(|entry| {
                 let acct = entry.value();
                 if matches!(
@@ -365,9 +375,11 @@ impl RiskEngine {
         let to_liquidate: Vec<super::types::LiquidationEvent> = if liq_uids.is_empty() {
             Vec::new()
         } else {
+            let mut liq_uids = liq_uids;
+            liq_uids.sort_unstable();
             self.positions
                 .iter()
-                .filter(|e| liq_uids.contains(&e.key().0))
+                .filter(|e| liq_uids.binary_search(&e.key().0).is_ok())
                 .map(|e| super::types::LiquidationEvent {
                     user_id: e.key().0,
                     symbol: e.key().1,
@@ -808,6 +820,25 @@ mod tests {
         assert!(events.is_empty());
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.status, RiskStatus::Normal);
+    }
+
+    #[test]
+    fn risk_tick_ignores_accounts_without_positions() {
+        let engine = RiskEngine::new();
+        for user_id in 1..=1_000 {
+            engine.initialize_account(user_id, 100_000);
+            if let Some(mut acct) = engine.accounts.get_mut(&user_id) {
+                acct.equity = 0;
+                acct.maintenance_margin = 1;
+            }
+        }
+
+        let events = engine.run_risk_tick();
+        assert!(events.is_empty());
+        assert!(engine
+            .accounts
+            .iter()
+            .all(|acct| acct.status == RiskStatus::Normal));
     }
 
     #[test]

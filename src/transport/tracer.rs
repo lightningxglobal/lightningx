@@ -262,8 +262,8 @@ fn publish_scenario(pub_: &Publisher, instance_id: i32) {
     buf[p] = name.len() as u8; p += 1;
     buf[p..p + name.len()].copy_from_slice(name); p += name.len();
 
-    // 2 milestones: server receives order frame (IN) and server sends response (OUT).
-    buf[p] = 2u8; p += 1;
+    // 6 milestones: full hot-path breakdown.
+    buf[p] = 6u8; p += 1;
 
     macro_rules! milestone {
         ($sid:expr, $sname:expr, $aid:expr, $aname:expr) => {{
@@ -279,31 +279,21 @@ fn publish_scenario(pub_: &Publisher, instance_id: i32) {
     }
 
     milestone!(8i16, b"ExchangeDeskServer", 27i16, b"OnWsOrderRecv");
+    milestone!(8i16, b"ExchangeDeskServer", 35i16, b"OnCmdRingPopped");
+    milestone!(8i16, b"ExchangeDeskServer", 28i16, b"OnAeronOrderSend");
+    milestone!(8i16, b"ExchangeDeskServer", 32i16, b"OnAeronUpdateRecv");
+    milestone!(8i16, b"ExchangeDeskServer", 36i16, b"OnUserTxSent");
     milestone!(8i16, b"ExchangeDeskServer", 37i16, b"OnWsResponseSent");
-    // Intermediate milestones kept for future reference (restore count above to re-enable):
-    // milestone!(8i16, b"ExchangeDeskServer", 34i16, b"OnCmdRingPushed");
-    // milestone!(8i16, b"ExchangeDeskServer", 35i16, b"OnCmdRingPopped");
-    // milestone!(8i16, b"ExchangeDeskServer", 28i16, b"OnAeronOrderSend");
-    // milestone!(9i16, b"ExchangeEngine",     29i16, b"OnAeronOrderRecv");
-    // milestone!(9i16, b"ExchangeEngine",     30i16, b"OnMatchingDone");
-    // milestone!(9i16, b"ExchangeEngine",     31i16, b"OnAeronUpdateSend");
-    // milestone!(8i16, b"ExchangeDeskServer", 32i16, b"OnAeronUpdateRecv");
-    // milestone!(8i16, b"ExchangeDeskServer", 33i16, b"OnWsUpdateSend");
-    // milestone!(8i16, b"ExchangeDeskServer", 36i16, b"OnUserTxSent");
 
-    // 1 gap: full server processing time (WS frame received → response written to socket)
-    buf[p] = 1u8; p += 1;
+    // 6 gaps: full breakdown — each segment of the hot path
+    buf[p] = 6u8; p += 1;
     for (from, to) in [
-        (MS_WS_ORDER_RECV, MS_WS_RESPONSE_SENT), // server processing: recv frame → write_frame()
-        // Restore below + update count above for fine-grained breakdown:
-        // (MS_WS_ORDER_RECV,    MS_CMD_RING_PUSHED),
-        // (MS_CMD_RING_PUSHED,  MS_CMD_RING_POPPED),
-        // (MS_CMD_RING_POPPED,  MS_AERON_ORDER_SEND),
-        // (MS_AERON_ORDER_SEND, MS_AERON_ORDER_RECV),
-        // (MS_AERON_ORDER_RECV, MS_MATCHING_DONE),
-        // (MS_MATCHING_DONE,    MS_AERON_UPDATE_SEND),
-        // (MS_AERON_UPDATE_SEND, MS_AERON_UPDATE_RECV),
-        // (MS_WS_ORDER_RECV,    MS_WS_RESPONSE_SENT),
+        (MS_WS_ORDER_RECV,    MS_CMD_RING_POPPED),   // gap1: tokio handler → spin thread (cmd ring wait)
+        (MS_CMD_RING_POPPED,  MS_AERON_ORDER_SEND),  // gap2: spin thread pre-Aeron work + risk check
+        (MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV), // gap3: Aeron round-trip + engine match
+        (MS_AERON_UPDATE_RECV, MS_USER_TX_SENT),     // gap4: spin thread dispatch to user_tx
+        (MS_USER_TX_SENT,     MS_WS_RESPONSE_SENT),  // gap5: write actor wakeup + socket write
+        (MS_WS_ORDER_RECV,    MS_WS_RESPONSE_SENT),  // gap6: total E2E server-internal
     ] {
         buf[p..p + 4].copy_from_slice(&from.to_le_bytes()); p += 4;
         buf[p..p + 4].copy_from_slice(&to.to_le_bytes()); p += 4;

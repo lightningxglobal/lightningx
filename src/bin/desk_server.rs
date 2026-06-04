@@ -1036,6 +1036,9 @@ async fn async_main() -> anyhow::Result<()> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
     let port = std::env::var("DESK_PORT").unwrap_or_else(|_| "4003".to_string());
+    let public_market_data_enabled = std::env::var("DESK_PUBLIC_MARKET_DATA")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     tracing::info!("Connecting to database…");
     let pool = db::create_pool(&database_url).await?;
@@ -1215,17 +1218,23 @@ async fn async_main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("DeskOrderUpdateSubscriber: {}", e))?;
 
-    let mut trade_sub = DeskTradeSubscriber::new(client.clone(), &trade_channel(), TRADE_STREAM)
-        .map_err(|e| anyhow::anyhow!("DeskTradeSubscriber: {}", e))?;
-
-    let mut depth_sub = DeskDepthSubscriber::new(
-        client.clone(),
-        &depth_channel(),
-        DEPTH_STREAM,
-        DEPTH50_STREAM,
-        LEVEL2_STREAM,
-    )
-    .map_err(|e| anyhow::anyhow!("DeskDepthSubscriber: {}", e))?;
+    let public_market_data_subs = if public_market_data_enabled {
+        Some((
+            DeskTradeSubscriber::new(client.clone(), &trade_channel(), TRADE_STREAM)
+                .map_err(|e| anyhow::anyhow!("DeskTradeSubscriber: {}", e))?,
+            DeskDepthSubscriber::new(
+                client.clone(),
+                &depth_channel(),
+                DEPTH_STREAM,
+                DEPTH50_STREAM,
+                LEVEL2_STREAM,
+            )
+            .map_err(|e| anyhow::anyhow!("DeskDepthSubscriber: {}", e))?,
+        ))
+    } else {
+        tracing::info!("desk-server public market-data path disabled; use market-data-gateway");
+        None
+    };
 
     tracing::info!("Aeron subscribers and publisher created");
 
@@ -1362,6 +1371,7 @@ async fn async_main() -> anyhow::Result<()> {
         db: Arc::new(pool),
         engines: None,
         market_fanout: market_fanout.clone(),
+        public_market_data_enabled,
         user_tx: Arc::new(lightning_exchange::api::UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(initial_id)),
         aeron_cmd_tx: Some(aeron_cmd_tx),
@@ -1631,7 +1641,7 @@ async fn async_main() -> anyhow::Result<()> {
     // while private order acks need <1ms. Running them on the SAME thread
     // means processing a 256-msg depth burst stalls OrderUpdate routing
     // and pumps Aeron-outbound transit from <100µs to ~300µs.
-    {
+    if let Some((mut trade_sub, mut depth_sub)) = public_market_data_subs {
         let market_fanout = state.market_fanout.clone();
         let account_cache_pub = account_cache.clone();
         let user_tx_pub = state.user_tx.clone();

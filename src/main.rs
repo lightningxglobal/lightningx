@@ -326,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         db: Arc::new(pool),
         engines: Some(Arc::new(engines)),
         market_fanout,
+        public_market_data_enabled: true,
         user_tx: Arc::new(UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
         aeron_cmd_tx: None,

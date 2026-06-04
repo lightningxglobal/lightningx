@@ -181,6 +181,9 @@ pub struct AppState {
     /// (lazy — connections that never subscribe pay zero broadcast cost).
     /// Replaces tokio::sync::broadcast which lock-contended at 40K+ subs.
     pub market_fanout: Arc<MarketFanout>,
+    /// Whether this process accepts public market-data subscriptions.
+    /// desk-server defaults this off; market-data-gateway owns live public data.
+    pub public_market_data_enabled: bool,
     /// Per-user personal update channel (order fills, balance changes).
     /// Lock-free slab indexed by user_id. See UserTxRegistry for why we
     /// replaced `DashMap<i64, _>` (broke down at 400K subscribers).

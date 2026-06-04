@@ -75,6 +75,10 @@ name = "lightning-data"
 path = "src/bin/data_server.rs"
 
 [[bin]]
+name = "market-data-gateway"
+path = "src/bin/market_data_gateway.rs"
+
+[[bin]]
 name = "market-maker"
 path = "src/bin/market_maker.rs"
 

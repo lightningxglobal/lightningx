@@ -593,6 +593,9 @@ async fn handle_client_message(
         }
 
         ClientMsg::Subscribe { channels } => {
+            if !state.public_market_data_enabled {
+                return Some(ws_sbe::encode_error("Public market data is served by market-data-gateway"));
+            }
             // Collect depth + ticker symbols before moving `channels` into the
             // subscribed set, so we can push an immediate snapshot for each.
             let depth_symbols: Vec<String> = channels

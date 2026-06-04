@@ -26,18 +26,35 @@ Browser / API client
     ▼
 nginx  (TLS termination, reverse proxy)
     │
-    ├─ /api/*  ──►  desk-server  (axum, HTTP + WebSocket)
-    └─ /ws     ──►      │
-                        │  Aeron IPC (lock-free ring buffer)
-                        ▼
-               exchange-engine  (matching engine, one thread per symbol)
-                  SkipList order book · SBE binary messages
-                        │
-                        ├─ order_update  ──►  desk-server  ──►  WebSocket push
-                        ├─ depth / trades ──►  desk-server  ──►  WebSocket broadcast
-                        └─ metrics  ──►  beacon  ──►  VictoriaMetrics
-                                                                     │
-                        PostgreSQL  ◄──  desk-server (persistence)  Grafana
+    ├─ private /api + /ws  ──►  desk-server  (counter/private gateway)
+    ├─ public  /ws         ──►  market-data-gateway
+    └─ slow REST /api      ──►  lightning-data
+                            │
+                            │  Aeron IPC (lock-free ring buffer)
+                            ▼
+                   exchange-engine  (matching engine, one thread per symbol)
+                      SkipList order book · SBE binary messages
+                            │
+                            ├─ order_update  ──►  desk-server  ──►  private WS push
+                            ├─ depth / trades ──►  market-data-gateway  ──►  public WS broadcast
+                            └─ metrics  ──►  beacon  ──►  VictoriaMetrics
+                                                                         │
+                            PostgreSQL  ◄──  writers / lightning-data  Grafana
+```
+
+`desk-server` is intentionally private-only by default. Set `DESK_PUBLIC_MARKET_DATA=1`
+only for legacy local runs that still need public market-data subscriptions on the desk
+process.
+
+```
+Browser / API client
+    │  private order flow
+    ▼
+desk-server
+    │
+    │  Aeron IPC (lock-free ring buffer)
+    ▼
+exchange-engine
 ```
 
 **Key design choices:**
@@ -57,9 +74,11 @@ nginx  (TLS termination, reverse proxy)
 | Binary | Description |
 |---|---|
 | `exchange-engine` | Matching engine: one spin-loop thread per symbol, restores resting orders from DB on startup |
-| `desk-server` | WebSocket + REST gateway: auth, order routing, real-time pushes, balance management |
+| `desk-server` | Private counter gateway: auth, order routing, private order/account pushes, balance/risk state |
+| `market-data-gateway` | Public live market-data WebSocket: trades, depth, ticker, kline, aggregate trade fanout |
+| `lightning-data` | Slow/cold REST data service: historical tickers, klines, trades, orders, accounts, positions from PostgreSQL |
 | `market-maker` | Mirrors Binance top-20 depth into LightningX via diff-based order management |
-| `kline` | Aggregates trades from Aeron into OHLCV candles and persists to PostgreSQL |
+| `kline-service` | Aggregates trades from Aeron into OHLCV candles and persists to PostgreSQL |
 | `trade-bot` | Demo user that places random orders to keep the book active |
 | `beacon` | Reads HDR histogram latency traces from the engine, pushes `latency_us` metrics to VictoriaMetrics |
 
@@ -85,6 +104,13 @@ Prerequisites: Rust stable, PostgreSQL on `localhost:5432`, Aeron media driver r
 # Run database migrations and start desk-server
 DATABASE_URL=postgres://user:password@localhost:5432/mydb \
 cargo run --bin desk-server
+
+# Public live market data WebSocket, default port 4010
+cargo run --bin market-data-gateway
+
+# Slow/cold REST data service, default port 4002
+DATABASE_URL=postgres://user:password@localhost:5432/mydb \
+cargo run --bin lightning-data
 
 # In a separate terminal — start the matching engine
 DATABASE_URL=postgres://user:password@localhost:5432/mydb \

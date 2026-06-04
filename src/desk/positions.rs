@@ -145,6 +145,28 @@ pub async fn position_for_user_asset(
     })
 }
 
+/// Slow/cold REST path used by `lightning-data`.
+/// Reads non-USDT account rows from PostgreSQL and builds positions from PG history.
+pub async fn all_positions_for_user(pool: &PgPool, user_id: i64) -> Vec<Position> {
+    let assets: Vec<String> = sqlx::query_scalar(
+        "SELECT asset FROM accounts
+         WHERE user_id = $1 AND asset <> 'USDT' AND balance > 0
+         ORDER BY asset",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut out = Vec::with_capacity(assets.len());
+    for asset in assets {
+        if let Some(pos) = position_for_user_asset(pool, user_id, &asset).await {
+            out.push(pos);
+        }
+    }
+    out
+}
+
 /// Pre-built WS `position_update` JSON for one (user, base asset). Returns
 /// None when the user has no account row for that asset.
 pub async fn position_update_msg(pool: &PgPool, user_id: i64, asset: &str) -> Option<String> {

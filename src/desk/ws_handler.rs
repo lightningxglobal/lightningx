@@ -369,7 +369,7 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
 
                 let (ws_read, ws_write) = socket.split(tio::split);
                 let (personal_tx, ctrl_tx) =
-                    match state.write_pool.register(ws_write, ws_personal_queue_cap()) {
+                    match state.write_pool.register(ws_write, ws_personal_queue_cap(), state.tracer.clone()) {
                         Some(v) => v,
                         None => return,
                     };
@@ -436,7 +436,7 @@ pub async fn read_conn_loop(
                             if let Some(reply) = handle_client_message(
                                 text, &mut session, &state, &personal_tx,
                             ).await {
-                                let _ = personal_tx.try_send(reply);
+                                let _ = personal_tx.try_send((reply, 0));
                             }
                             if let Ok(mut subs) = subscriptions.write() {
                                 *subs = session.subscribed.clone();
@@ -508,7 +508,7 @@ async fn handle_client_message(
     text: &str,
     session: &mut WsSession,
     state: &AppState,
-    personal_tx: &mpsc::Sender<Vec<u8>>,
+    personal_tx: &mpsc::Sender<(Vec<u8>, u64)>,
 ) -> Option<Vec<u8>> {
     let msg: ClientMsg = match ClientMsg::parse(text) {
         Some(m) => m,
@@ -556,17 +556,17 @@ async fn handle_client_message(
                 // In standalone mode: push from engine. In Aeron mode: push from last_depth cache.
                 if let Some(engines) = &state.engines {
                     if let Some(engine) = engines.get(&sym) {
-                        let _ = personal_tx.try_send(build_depth_sbe(engine.value(), &sym));
+                        let _ = personal_tx.try_send((build_depth_sbe(engine.value(), &sym), 0));
                     }
                 } else if let Some(depth_bytes) = state.last_depth.get(&sym) {
                     // last_depth now stores SBE bytes — clone and send directly.
-                    let _ = personal_tx.try_send(depth_bytes.to_vec());
+                    let _ = personal_tx.try_send((depth_bytes.to_vec(), 0));
                 }
             }
             for sym in ticker_symbols {
                 if let Some(ticker_bytes) = state.last_ticker.get(&sym) {
                     // last_ticker now stores SBE bytes — clone and send directly.
-                    let _ = personal_tx.try_send(ticker_bytes.to_vec());
+                    let _ = personal_tx.try_send((ticker_bytes.to_vec(), 0));
                 }
             }
             None
@@ -686,7 +686,7 @@ async fn handle_client_message(
             // in the Aeron event loop after the engine confirms ACCEPTED.
             if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
-                use crate::tracer::{MS_CMD_RING_PUSHED, MS_WS_ORDER_RECV};
+                use crate::tracer::MS_WS_ORDER_RECV;
                 use crate::transport::{pack_str16, AeronCmd, OrderMeta};
 
                 // PERF DIAG (off by default): sample ~1/256 PlaceOrders per-section timing.
@@ -729,9 +729,9 @@ async fn handle_client_message(
                     if let Some(user_assets) = state.account_cache.get(&user_id) {
                         if let Some(&(bal, frz)) = user_assets.get(freeze_asset) {
                             if let Some(tx) = state.user_tx.get(user_id) {
-                                let _ = tx.try_send(ws_sbe::encode_balance_update(
+                                let _ = tx.try_send((ws_sbe::encode_balance_update(
                                     freeze_asset, bal, bal - frz, frz,
-                                ));
+                                ), 0));
                             }
                         }
                     }
@@ -793,9 +793,9 @@ async fn handle_client_message(
                     );
                     return Some(ws_sbe::encode_order_rejected(0, "system busy"));
                 }
-                if let Some(ref t) = state.tracer {
-                    t.record_sym(MS_CMD_RING_PUSHED, order_id, &sym_bytes);
-                }
+                // if let Some(ref t) = state.tracer {
+                //     t.record_sym(MS_CMD_RING_PUSHED, order_id, &sym_bytes);
+                // }
                 let t_post_aeron = t0.map(|_| std::time::Instant::now());
 
                 let reply = if ws_inline_order_submitted_enabled() {
@@ -934,9 +934,9 @@ async fn handle_client_message(
                             .or_insert_with(std::collections::HashMap::new)
                             .insert(frozen_asset.to_string(), (bal, frz));
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send(ws_sbe::encode_balance_update(
+                            let _ = tx.try_send((ws_sbe::encode_balance_update(
                                 frozen_asset, bal, bal - frz, frz,
-                            ));
+                            ), 0));
                         }
                     }
                     Ok(_) => {} // no-op freeze (zero amount)
@@ -1068,9 +1068,9 @@ async fn handle_client_message(
                             for asset in [m_debit, m_credit] {
                                 if let Ok(acc) = repo.get_account(maker_id, asset).await {
                                     if let Some(tx) = state.user_tx.get(maker_id) {
-                                        let _ = tx.try_send(ws_sbe::encode_balance_update(
+                                        let _ = tx.try_send((ws_sbe::encode_balance_update(
                                             asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                                        ));
+                                        ), 0));
                                     }
                                 }
                             }
@@ -1082,9 +1082,9 @@ async fn handle_client_message(
                             .await
                             {
                                 if let Some(tx) = state.user_tx.get(maker_id) {
-                                    let _ = tx.try_send(ws_sbe::encode_position_update(
+                                    let _ = tx.try_send((ws_sbe::encode_position_update(
                                         base_asset, pos.quantity, pos.entry_price,
-                                    ));
+                                    ), 0));
                                 }
                             }
                         }
@@ -1111,9 +1111,9 @@ async fn handle_client_message(
                         let ws_maker_status = maker_ws_status_from_db_status(new_status.as_str());
                         let status_byte = ws_status_to_byte(ws_maker_status);
                         if let Some(tx) = state.user_tx.get(maker_id) {
-                            let _ = tx.try_send(ws_sbe::encode_order_update(
+                            let _ = tx.try_send((ws_sbe::encode_order_update(
                                 maker_order_id as u64, 0, status_byte, new_filled, fp, ts,
-                            ));
+                            ), 0));
                         }
                     }
 
@@ -1172,9 +1172,9 @@ async fn handle_client_message(
                 // Push order_update + balance_update to this user's personal channel.
                 let ws_status_byte = ws_status_to_byte(ws_status_from_engine(result.status, filled_qty > 0.0));
                 if let Some(tx) = state.user_tx.get(user_id) {
-                    let _ = tx.try_send(ws_sbe::encode_order_update(
+                    let _ = tx.try_send((ws_sbe::encode_order_update(
                         db_order_id as u64, 0, ws_status_byte, total_filled, fill_price, ts,
-                    ));
+                    ), 0));
                 }
 
                 // Send balance_update so frontend can refresh balances.
@@ -1186,9 +1186,9 @@ async fn handle_client_message(
                 for asset in [debit_asset, credit_asset] {
                     if let Ok(acc) = repo.get_account(user_id, asset).await {
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send(ws_sbe::encode_balance_update(
+                            let _ = tx.try_send((ws_sbe::encode_balance_update(
                                 asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                            ));
+                            ), 0));
                         }
                     }
                 }
@@ -1198,9 +1198,9 @@ async fn handle_client_message(
                     state.db.as_ref(), user_id, base_asset,
                 ).await {
                     if let Some(tx) = state.user_tx.get(user_id) {
-                        let _ = tx.try_send(ws_sbe::encode_position_update(
+                        let _ = tx.try_send((ws_sbe::encode_position_update(
                             base_asset, pos.quantity, pos.entry_price,
-                        ));
+                        ), 0));
                     }
                 }
             } else if result.status == OrderStatus::Accepted {
@@ -1208,9 +1208,9 @@ async fn handle_client_message(
                 // until it fills or the user cancels — releasing here would
                 // double-spend when the maker fills later.
                 if let Some(tx) = state.user_tx.get(user_id) {
-                    let _ = tx.try_send(ws_sbe::encode_order_update(
+                    let _ = tx.try_send((ws_sbe::encode_order_update(
                         db_order_id as u64, 0, ws_sbe::WS_STATUS_OPEN, 0.0, 0.0, ts,
-                    ));
+                    ), 0));
                 }
                 // New resting order changes the book — push depth so the
                 // frontend reflects it without waiting for the 2s tick.
@@ -1230,18 +1230,18 @@ async fn handle_client_message(
 
                 // Notify user the order is CANCELED so frontend can drop it from openOrders.
                 if let Some(tx) = state.user_tx.get(user_id) {
-                    let _ = tx.try_send(ws_sbe::encode_order_update(
+                    let _ = tx.try_send((ws_sbe::encode_order_update(
                         db_order_id as u64, 0, ws_sbe::WS_STATUS_CANCELED, 0.0, 0.0, ts,
-                    ));
+                    ), 0));
                 }
 
                 // Refresh frontend balance for the released asset (frozen → available).
                 if rel_amount > 0.0 {
                     if let Ok(acc) = repo.get_account(user_id, rel_asset).await {
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send(ws_sbe::encode_balance_update(
+                            let _ = tx.try_send((ws_sbe::encode_balance_update(
                                 rel_asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                            ));
+                            ), 0));
                         }
                     }
                 }
@@ -1383,9 +1383,9 @@ async fn handle_client_message(
             ] {
                 if let Ok(acc) = repo.get_account(user_id, asset).await {
                     if let Some(tx) = state.user_tx.get(user_id) {
-                        let _ = tx.try_send(ws_sbe::encode_balance_update(
+                        let _ = tx.try_send((ws_sbe::encode_balance_update(
                             &acc.asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                        ));
+                        ), 0));
                     }
                 }
             }
@@ -1559,9 +1559,9 @@ async fn handle_client_message(
                         if let Some(user_assets) = state.account_cache.get(&user_id) {
                             if let Some(&(bal, frz)) = user_assets.get(v.freeze_asset.as_str()) {
                                 if let Some(tx) = state.user_tx.get(user_id) {
-                                    let _ = tx.try_send(ws_sbe::encode_balance_update(
+                                    let _ = tx.try_send((ws_sbe::encode_balance_update(
                                         &v.freeze_asset, bal, bal - frz, frz,
-                                    ));
+                                    ), 0));
                                 }
                             }
                         }
@@ -1771,9 +1771,9 @@ async fn handle_client_message(
                             .or_insert_with(std::collections::HashMap::new)
                             .insert(frozen_asset.to_string(), (bal, frz));
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send(ws_sbe::encode_balance_update(
+                            let _ = tx.try_send((ws_sbe::encode_balance_update(
                                 frozen_asset, bal, bal - frz, frz,
-                            ));
+                            ), 0));
                         }
                     }
                     Ok(_) => {}
@@ -1855,7 +1855,7 @@ async fn batch_cancel_by_ids(
     user_id: i64,
     order_ids: &[i64],
     state: &AppState,
-    personal_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    personal_tx: &tokio::sync::mpsc::Sender<(Vec<u8>, u64)>,
 ) -> usize {
     if order_ids.is_empty() {
         return 0;
@@ -1950,9 +1950,9 @@ async fn batch_cancel_by_ids(
             let _ = repo.release_frozen(user_id, base_asset, remaining).await;
         }
 
-        let _ = personal_tx.try_send(ws_sbe::encode_order_update(
+        let _ = personal_tx.try_send((ws_sbe::encode_order_update(
             order.id as u64, 0, ws_sbe::WS_STATUS_CANCELED, order.filled, 0.0, ts,
-        ));
+        ), 0));
     }
 
     count
@@ -1966,7 +1966,7 @@ async fn bulk_cancel(
     user_id: i64,
     symbol: Option<&str>,
     state: &AppState,
-    personal_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    personal_tx: &tokio::sync::mpsc::Sender<(Vec<u8>, u64)>,
 ) -> usize {
     #[derive(sqlx::FromRow)]
     struct OpenOrder {
@@ -2063,9 +2063,9 @@ async fn bulk_cancel(
         }
 
         // Push order_update to the caller's personal channel.
-        let _ = personal_tx.try_send(ws_sbe::encode_order_update(
+        let _ = personal_tx.try_send((ws_sbe::encode_order_update(
             order.id as u64, 0, ws_sbe::WS_STATUS_CANCELED, order.filled, 0.0, ts,
-        ));
+        ), 0));
     }
 
     count

@@ -25,8 +25,8 @@ pub type WsRead = WebSocketRead<ReadHalf<TokioIo<Upgraded>>>;
 
 /// Per-connection market data state held in the actor's local registry.
 pub struct ConnMarketInfo {
-    /// Forward path to the write actor for this connection.
-    pub personal_tx: mpsc::Sender<Vec<u8>>,
+    /// Forward path to the write actor. Tuple (payload, order_id); market data uses order_id=0.
+    pub personal_tx: mpsc::Sender<(Vec<u8>, u64)>,
     /// Exact channel names this connection subscribed to, e.g. `depth.BTC_USDT`.
     pub subscriptions: Arc<RwLock<HashSet<String>>>,
 }
@@ -35,7 +35,7 @@ pub struct ReadConn {
     pub conn_id: u64,
     pub ws_read: WsRead,
     pub state: crate::desk::api::AppState,
-    pub personal_tx: mpsc::Sender<Vec<u8>>,
+    pub personal_tx: mpsc::Sender<(Vec<u8>, u64)>,
     pub ctrl_tx: mpsc::Sender<WsCtrl>,
     /// Shared subscription set — ws_handler mutates it; actor reads it before fanout.
     pub subscriptions: Arc<RwLock<HashSet<String>>>,
@@ -101,7 +101,7 @@ async fn read_actor_loop(
                                 .map(|subs| subs.contains(&channel))
                                 .unwrap_or(false);
                             if should_send {
-                                let _ = info.personal_tx.try_send(msg.as_ref().to_owned());
+                                let _ = info.personal_tx.try_send((msg.as_ref().to_owned(), 0));
                             }
                         }
                     }

@@ -7,6 +7,8 @@
 /// Scheduling benefit: at 20K connections, a burst of 20K order responses
 /// wakes 8 write actors instead of 20K handler tasks — 2500× fewer scheduler
 /// round-trips for the write path.
+use crate::transport::tracer::{ExchangeTracer, MS_WS_RESPONSE_SENT};
+use std::sync::Arc;
 use fastwebsockets::{Frame, OpCode, Payload, WebSocketWrite};
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use hyper::upgrade::Upgraded;
@@ -40,14 +42,18 @@ fn write_actor_count() -> usize {
 
 struct NewConn {
     ws_write: WsWrite,
-    text_rx: mpsc::Receiver<Vec<u8>>,
+    // (payload, order_id): order_id != 0 triggers MS_WS_RESPONSE_SENT beacon record.
+    // Market data pushes and non-order responses use order_id = 0.
+    text_rx: mpsc::Receiver<(Vec<u8>, u64)>,
     ctrl_rx: mpsc::Receiver<WsCtrl>,
+    tracer: Option<Arc<ExchangeTracer>>,
 }
 
 async fn write_conn_loop(
     mut ws: WsWrite,
-    mut text_rx: mpsc::Receiver<Vec<u8>>,
+    mut text_rx: mpsc::Receiver<(Vec<u8>, u64)>,
     mut ctrl_rx: mpsc::Receiver<WsCtrl>,
+    tracer: Option<Arc<ExchangeTracer>>,
 ) {
     loop {
         tokio::select! {
@@ -70,9 +76,16 @@ async fn write_conn_loop(
             }
             msg = text_rx.recv() => {
                 match msg {
-                    Some(bytes) => {
+                    Some((bytes, order_id)) => {
                         if ws.write_frame(Frame::binary(Payload::Owned(bytes))).await.is_err() {
                             break;
+                        }
+                        // OUT milestone: write_frame() returned — response is in the kernel
+                        // send buffer. order_id=0 means no tracing (market data / auth etc.).
+                        if order_id != 0 {
+                            if let Some(ref t) = tracer {
+                                t.record(MS_WS_RESPONSE_SENT, order_id);
+                            }
                         }
                     }
                     None => break,
@@ -89,12 +102,11 @@ async fn write_actor_loop(mut conn_rx: mpsc::Receiver<NewConn>) {
             msg = conn_rx.recv() => {
                 match msg {
                     Some(c) => pending.push(Box::pin(write_conn_loop(
-                        c.ws_write, c.text_rx, c.ctrl_rx,
+                        c.ws_write, c.text_rx, c.ctrl_rx, c.tracer,
                     ))),
                     None => break,
                 }
             }
-            // Only arm this branch when there are active connections.
             Some(_) = pending.next(), if !pending.is_empty() => {}
         }
     }
@@ -135,8 +147,9 @@ impl WriteActorPool {
         &self,
         ws_write: WsWrite,
         text_cap: usize,
-    ) -> Option<(mpsc::Sender<Vec<u8>>, mpsc::Sender<WsCtrl>)> {
-        let (text_tx, text_rx) = mpsc::channel::<Vec<u8>>(text_cap);
+        tracer: Option<Arc<ExchangeTracer>>,
+    ) -> Option<(mpsc::Sender<(Vec<u8>, u64)>, mpsc::Sender<WsCtrl>)> {
+        let (text_tx, text_rx) = mpsc::channel::<(Vec<u8>, u64)>(text_cap);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsCtrl>(4);
         let n = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         self.senders[n]
@@ -144,6 +157,7 @@ impl WriteActorPool {
                 ws_write,
                 text_rx,
                 ctrl_rx,
+                tracer,
             })
             .ok()?;
         Some((text_tx, ctrl_tx))

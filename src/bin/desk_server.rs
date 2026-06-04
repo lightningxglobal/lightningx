@@ -663,9 +663,9 @@ fn process_db_cmd(
                         }),
                     );
                     if let Some(tx) = user_tx.get(uid) {
-                        let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
+                        let _ = tx.try_send((lightning_exchange::ws_sbe::encode_balance_update(
                             &asset, bal, bal - frz, frz,
-                        ));
+                        ), 0));
                     }
                 }
             }
@@ -719,9 +719,9 @@ fn process_db_cmd(
                     }),
                 );
                 if let Some(tx) = user_tx.get(user_id) {
-                    let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
+                    let _ = tx.try_send((lightning_exchange::ws_sbe::encode_balance_update(
                         &asset, bal, bal - frz, frz,
-                    ));
+                    ), 0));
                 }
             }
         }
@@ -852,9 +852,9 @@ fn process_db_cmd(
             // will eventually arrive.
             for r in &resolved {
                 if let Some(tx) = user_tx.get(r.maker_uid) {
-                    let _ = tx.try_send(lightning_exchange::ws_sbe::encode_order_update(
+                    let _ = tx.try_send((lightning_exchange::ws_sbe::encode_order_update(
                         r.maker_id as u64, 0, lightning_exchange::ws_sbe::WS_STATUS_PARTIAL_FILL, r.qty, r.price, ts,
-                    ));
+                    ), 0));
                 }
                 // Publish a TRADING-status fill update for the maker. If the
                 // order fully filled, the spin thread will subsequently
@@ -883,9 +883,9 @@ fn process_db_cmd(
                     }),
                 );
                 if let Some(tx) = user_tx.get(uid) {
-                    let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
+                    let _ = tx.try_send((lightning_exchange::ws_sbe::encode_balance_update(
                         &asset, bal, bal - frz, frz,
-                    ));
+                    ), 0));
                 }
             }
 
@@ -1437,9 +1437,9 @@ async fn async_main() -> anyhow::Result<()> {
                                         .map(|m| m.client_order_id.as_str())
                                         .unwrap_or("");
                                     if let Some(tx) = user_tx.get(uid as i64) {
-                                        let _ = tx.try_send(lightning_exchange::ws_sbe::encode_order_rejected(
+                                        let _ = tx.try_send((lightning_exchange::ws_sbe::encode_order_rejected(
                                             0, &format!("No engine for symbol: {}", sym),
-                                        ));
+                                        ), 0));
                                     }
                                 }
                                 if let Some(ref t) = spin_tracer {
@@ -1862,7 +1862,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     order_id, 0, lightning_exchange::ws_sbe::WS_STATUS_OPEN,
                                     fill_qty, fill_price, ts,
                                 );
-                                if tx.try_send(upd).is_err() {
+                                if tx.try_send((upd, client_order_id)).is_err() {
                                     let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n % 10_000 == 0 {
                                         tracing::warn!("personal channel full — order_update dropped (total: {n})");
@@ -1940,9 +1940,9 @@ async fn async_main() -> anyhow::Result<()> {
                                 });
                                 if let Some((bal, frz)) = new_vals {
                                     if let Some(tx) = user_tx.get(meta.user_id) {
-                                        let _ = tx.try_send(lightning_exchange::ws_sbe::encode_balance_update(
+                                        let _ = tx.try_send((lightning_exchange::ws_sbe::encode_balance_update(
                                             asset, bal, bal - frz, frz,
-                                        ));
+                                        ), 0));
                                     }
                                 }
                             } else if kind == order_update_kind::CANCELLED {
@@ -2068,7 +2068,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 let upd = lightning_exchange::ws_sbe::encode_order_update(
                                     order_id, 0, status_byte, fill_qty, fill_price, ts,
                                 );
-                                if tx.try_send(upd).is_err() {
+                                if tx.try_send((upd, 0)).is_err() {
                                     let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n % 10_000 == 0 {
                                         tracing::warn!("personal channel full — order_update dropped (total: {n})");

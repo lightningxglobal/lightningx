@@ -112,7 +112,7 @@ impl MarketFanout {
 /// Memory: 1 048 576 cells × 16 B ≈ 16 MB upfront. Cheap relative to the
 /// gain.
 pub struct UserTxRegistry {
-    slots: Box<[arc_swap::ArcSwapOption<mpsc::Sender<Vec<u8>>>]>,
+    slots: Box<[arc_swap::ArcSwapOption<mpsc::Sender<(Vec<u8>, u64)>>]>,
 }
 
 const USER_TX_CAPACITY: usize = 1 << 20; // 1 048 576
@@ -138,7 +138,7 @@ impl UserTxRegistry {
         }
     }
 
-    pub fn register(&self, user_id: i64, sender: mpsc::Sender<Vec<u8>>) {
+    pub fn register(&self, user_id: i64, sender: mpsc::Sender<(Vec<u8>, u64)>) {
         if let Some(idx) = self.idx(user_id) {
             self.slots[idx].store(Some(Arc::new(sender)));
         }
@@ -153,7 +153,7 @@ impl UserTxRegistry {
     /// Returns an `Arc<mpsc::Sender>` ready for `try_send`. The Arc clone
     /// makes the call safe against concurrent unregister mid-send.
     #[inline]
-    pub fn get(&self, user_id: i64) -> Option<Arc<mpsc::Sender<Vec<u8>>>> {
+    pub fn get(&self, user_id: i64) -> Option<Arc<mpsc::Sender<(Vec<u8>, u64)>>> {
         let idx = self.idx(user_id)?;
         self.slots[idx].load_full()
     }
@@ -1152,17 +1152,17 @@ async fn handle_place_order(
                 let repo2 = AccountRepository::new(s.db.as_ref());
                 if let Ok(accounts) = repo2.get_all_accounts(uid).await {
                     for acc in accounts {
-                        let _ = tx.send(crate::ws_sbe::encode_balance_update(
+                        let _ = tx.send((crate::ws_sbe::encode_balance_update(
                             &acc.asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                        )).await;
+                        ), 0)).await;
                     }
                 }
                 if let Some(pos) =
                     crate::positions::position_for_user_asset(s.db.as_ref(), uid, base_asset).await
                 {
-                    let _ = tx.send(crate::ws_sbe::encode_position_update(
+                    let _ = tx.send((crate::ws_sbe::encode_position_update(
                         base_asset, pos.quantity, pos.entry_price,
-                    )).await;
+                    ), 0)).await;
                 }
             }
         }
@@ -1197,9 +1197,9 @@ async fn handle_place_order(
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0);
             let status_byte = crate::ws_sbe::ws_status_byte_from_str(ws_status.as_str());
-            let _ = tx.send(crate::ws_sbe::encode_order_update(
+            let _ = tx.send((crate::ws_sbe::encode_order_update(
                 db_order_id as u64, 0, status_byte, filled_qty, 0.0, ts,
-            )).await;
+            ), 0)).await;
         }
 
         return match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
@@ -1477,9 +1477,9 @@ async fn handle_cancel_order(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
-        let _ = tx.send(crate::ws_sbe::encode_order_update(
+        let _ = tx.send((crate::ws_sbe::encode_order_update(
             order_id as u64, 0, crate::ws_sbe::WS_STATUS_CANCELED, 0.0, 0.0, ts,
-        )).await;
+        ), 0)).await;
     }
 
     (StatusCode::OK, Json(json!({"cancelled": order_id}))).into_response()
@@ -1621,9 +1621,9 @@ async fn handle_cancel_all_orders(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0);
-            let _ = tx.send(crate::ws_sbe::encode_order_update(
+            let _ = tx.send((crate::ws_sbe::encode_order_update(
                 row.id as u64, 0, crate::ws_sbe::WS_STATUS_CANCELED, 0.0, 0.0, ts,
-            )).await;
+            ), 0)).await;
         }
     }
 

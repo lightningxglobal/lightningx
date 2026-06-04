@@ -17,10 +17,7 @@ use lightning_exchange::{
     order::{Order, Side, TimeInForce},
     sbe::TradeNotification,
     symbol_rules::SymbolRules,
-    tracer::{
-        spawn_tracer, ENGINE_INSTANCE_ID, MS_AERON_ORDER_RECV, MS_AERON_UPDATE_SEND,
-        MS_MATCHING_DONE,
-    },
+    tracer::{spawn_tracer, ENGINE_INSTANCE_ID},
     transport::{
         InboundMsg, MarketDataPublisher, OrderSubscriber, OrderUpdateMsg, OrderUpdatePublisher,
         TradePublisher,
@@ -213,9 +210,9 @@ fn spawn_symbol_thread(
                                 ));
                                 continue;
                             }
-                            if let Some(ref t) = tracer {
-                                t.record_sym(MS_AERON_ORDER_RECV, req.client_order_id, &req.symbol);
-                            }
+                            // if let Some(ref t) = tracer {
+                            //     t.record_sym(MS_AERON_ORDER_RECV, req.client_order_id, &req.symbol);
+                            // }
                             let ts = now_ns();
                             let side = if req.side == 0 { Side::Buy } else { Side::Sell };
                             let tif = match req.time_in_force {
@@ -265,35 +262,35 @@ fn spawn_symbol_thread(
                             match engine.place_order(order) {
                                 Err(e) => {
                                     tracing::warn!("[{}] place_order failed: {:?}", symbol, e);
-                                    if let Some(ref t) = tracer {
-                                        t.record_sym(
-                                            MS_MATCHING_DONE,
-                                            req.client_order_id,
-                                            &req.symbol,
-                                        );
-                                    }
+                                    // if let Some(ref t) = tracer {
+                                    //     t.record_sym(
+                                    //         MS_MATCHING_DONE,
+                                    //         req.client_order_id,
+                                    //         &req.symbol,
+                                    //     );
+                                    // }
                                     let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
                                         req.client_order_id,
                                         req.participant_id,
                                         2,
                                         ts,
                                     ));
-                                    if let Some(ref t) = tracer {
-                                        t.record_sym(
-                                            MS_AERON_UPDATE_SEND,
-                                            req.client_order_id,
-                                            &req.symbol,
-                                        );
-                                    }
+                                    // if let Some(ref t) = tracer {
+                                    //     t.record_sym(
+                                    //         MS_AERON_UPDATE_SEND,
+                                    //         req.client_order_id,
+                                    //         &req.symbol,
+                                    //     );
+                                    // }
                                 }
                                 Ok(result) => {
-                                    if let Some(ref t) = tracer {
-                                        t.record_sym(
-                                            MS_MATCHING_DONE,
-                                            req.client_order_id,
-                                            &req.symbol,
-                                        );
-                                    }
+                                    // if let Some(ref t) = tracer {
+                                    //     t.record_sym(
+                                    //         MS_MATCHING_DONE,
+                                    //         req.client_order_id,
+                                    //         &req.symbol,
+                                    //     );
+                                    // }
                                     let last_price = result
                                         .fills
                                         .last()
@@ -373,13 +370,13 @@ fn spawn_symbol_thread(
                                         let _ = trade_pub.publish(&trade);
                                     }
                                     let _ = ou_pub.publish(&update);
-                                    if let Some(ref t) = tracer {
-                                        t.record_sym(
-                                            MS_AERON_UPDATE_SEND,
-                                            req.client_order_id,
-                                            &req.symbol,
-                                        );
-                                    }
+                                    // if let Some(ref t) = tracer {
+                                    //     t.record_sym(
+                                    //         MS_AERON_UPDATE_SEND,
+                                    //         req.client_order_id,
+                                    //         &req.symbol,
+                                    //     );
+                                    // }
                                 }
                             }
                         }

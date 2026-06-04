@@ -8,6 +8,7 @@ pub mod pg_store;
 pub mod positions;
 pub mod rate_limit;
 pub mod redis_store;
+pub mod risk;
 pub mod snowflake;
 pub mod symbol_rules;
 pub mod user_service;

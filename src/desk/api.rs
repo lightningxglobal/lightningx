@@ -235,6 +235,8 @@ pub struct AppState {
     /// sleeping task count from 10K to N, shrinking the tokio scheduler
     /// ready-queue on every market-data or order-update wakeup.
     pub read_pool: Arc<crate::desk::read_actor::ReadActorPool>,
+    /// Margin risk engine: per-account margin state, order reservation.
+    pub risk_engine: Arc<crate::desk::risk::RiskEngine>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1254,6 +1256,7 @@ async fn handle_place_order(
                 qty: req.quantity,
                 client_order_id: req.client_order_id.clone().unwrap_or_default(),
                 freeze_price,
+                initial_margin_cents: 0,
             },
         );
 

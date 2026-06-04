@@ -5,6 +5,14 @@ pub struct SymbolRules {
     pub price_tick: f64,
     pub quantity_step: f64,
     pub min_notional: f64,
+    /// notional_cents = price_ticks * qty_lots / notional_scale
+    pub notional_scale: i64,
+    /// Default leverage for this symbol
+    pub default_leverage: u8,
+    /// Maintenance margin rate in basis points (50 = 0.5%)
+    pub maintenance_rate_bps: i64,
+    /// Margin call threshold in basis points (75 = 0.75%)
+    pub margin_call_rate_bps: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,21 +63,37 @@ impl SymbolRules {
                 price_tick: 0.01,
                 quantity_step: 0.000001,
                 min_notional: 5.0,
+                notional_scale: 1_000_000,
+                default_leverage: 10,
+                maintenance_rate_bps: 50,
+                margin_call_rate_bps: 75,
             },
             "ETH_USDT" => Self {
                 price_tick: 0.01,
                 quantity_step: 0.0001,
                 min_notional: 5.0,
+                notional_scale: 10_000,
+                default_leverage: 10,
+                maintenance_rate_bps: 50,
+                margin_call_rate_bps: 75,
             },
             "SOL_USDT" => Self {
                 price_tick: 0.001,
                 quantity_step: 0.001,
                 min_notional: 5.0,
+                notional_scale: 10_000,
+                default_leverage: 10,
+                maintenance_rate_bps: 50,
+                margin_call_rate_bps: 75,
             },
             _ => Self {
                 price_tick: 0.01,
                 quantity_step: 0.000001,
                 min_notional: 1.0,
+                notional_scale: 1_000_000,
+                default_leverage: 10,
+                maintenance_rate_bps: 50,
+                margin_call_rate_bps: 75,
             },
         }
     }

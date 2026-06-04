@@ -765,19 +765,43 @@ async fn handle_client_message(
                     return Some(ws_sbe::encode_order_rejected(0, &format!("No engine for symbol: {}", symbol)));
                 }
 
-                let (freeze_asset, freeze_amount): (&str, f64) = if side == "buy" {
-                    let amount = freeze_price_val * qty;
-                    if amount <= 0.0 {
+                // Futures margin model: freeze initial_margin (notional / leverage) in USDT.
+                let effective_price_ticks = if fixed_shape.price_ticks.unwrap_or(0) > 0 {
+                    fixed_shape.price_ticks.unwrap()
+                } else {
+                    if freeze_price_val <= 0.0 {
                         return Some(ws_sbe::encode_order_rejected(0, "Unable to determine buy reservation price"));
                     }
-                    (quote_asset, amount)
-                } else {
-                    (base_asset, qty)
+                    (freeze_price_val / rules.price_tick).round() as i64
                 };
+
+                let initial_margin_cents = if effective_price_ticks > 0 {
+                    let notional_cents = crate::desk::risk::calc::calc_notional_cents(
+                        effective_price_ticks,
+                        fixed_shape.quantity_lots,
+                        rules.notional_scale,
+                    );
+                    crate::desk::risk::calc::calc_initial_margin_cents(notional_cents, rules.default_leverage)
+                } else {
+                    0
+                };
+
+                if initial_margin_cents <= 0 {
+                    return Some(ws_sbe::encode_order_rejected(0, "Unable to determine margin requirement"));
+                }
+
                 let t_pre_freeze = t0.map(|_| std::time::Instant::now());
-                if !try_freeze_cache(&state.account_cache, user_id, freeze_asset, freeze_amount) {
+                if let Err(reason) = state.risk_engine.check_and_reserve_margin(user_id, initial_margin_cents) {
+                    return Some(ws_sbe::encode_order_rejected(0, reason));
+                }
+
+                let margin_usdt = initial_margin_cents as f64 / 100.0;
+                if !try_freeze_cache(&state.account_cache, user_id, quote_asset, margin_usdt) {
+                    state.risk_engine.release_order_margin(user_id, initial_margin_cents);
                     return Some(ws_sbe::encode_order_rejected(0, "Insufficient balance"));
                 }
+                let (freeze_asset, freeze_amount): (&str, f64) = (quote_asset, margin_usdt);
+
                 let t_post_freeze = t0.map(|_| std::time::Instant::now());
                 if push_bal {
                     if let Some(user_assets) = state.account_cache.get(&user_id) {
@@ -830,6 +854,7 @@ async fn handle_client_message(
                         qty,
                         client_order_id: client_order_id.clone(),
                         freeze_price: freeze_price_val,
+                        initial_margin_cents,
                     },
                 );
 
@@ -839,6 +864,7 @@ async fn handle_client_message(
                 if queue_too_deep || aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
                     // ArrayQueue full — apply backpressure to the client.
                     state.pending_meta.remove(&order_id);
+                    state.risk_engine.release_order_margin(user_id, initial_margin_cents);
                     release_cache_frozen(
                         &state.account_cache,
                         user_id,
@@ -1472,6 +1498,7 @@ async fn handle_client_message(
                     order_id: u64,
                     freeze_asset: String,
                     freeze_amount: f64,
+                    initial_margin_cents: i64,
                     sbe_req: SbeNewOrder,
                     meta: OrderMeta,  // used for pending_meta.insert on freeze success
                 }
@@ -1540,7 +1567,8 @@ async fn handle_client_message(
                         rej!(format!("No engine for symbol: {}", symbol));
                     }
 
-                    let (base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                    let (_base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                    let batch_rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
 
                     let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
                     let freeze_price_val: f64 = if side == "buy" {
@@ -1549,15 +1577,37 @@ async fn handle_client_message(
                         0.0
                     };
 
-                    let (freeze_asset, freeze_amount) = if side == "buy" {
-                        let amount = freeze_price_val * qty;
-                        if amount <= 0.0 {
+                    let batch_fixed_shape = match crate::symbol_rules::normalize_order_shape(&symbol, &order_type, price, qty) {
+                        Ok(shape) => shape,
+                        Err(reason) => rej!(reason),
+                    };
+
+                    // Futures margin model: freeze initial_margin in USDT for all orders.
+                    let batch_price_ticks = if batch_fixed_shape.price_ticks.unwrap_or(0) > 0 {
+                        batch_fixed_shape.price_ticks.unwrap()
+                    } else {
+                        if freeze_price_val <= 0.0 {
                             rej!("Unable to determine buy reservation price");
                         }
-                        (quote_asset.to_owned(), amount)
-                    } else {
-                        (base_asset.to_owned(), qty)
+                        (freeze_price_val / batch_rules.price_tick).round() as i64
                     };
+
+                    let batch_initial_margin_cents = if batch_price_ticks > 0 {
+                        let n = crate::desk::risk::calc::calc_notional_cents(
+                            batch_price_ticks,
+                            batch_fixed_shape.quantity_lots,
+                            batch_rules.notional_scale,
+                        );
+                        crate::desk::risk::calc::calc_initial_margin_cents(n, batch_rules.default_leverage)
+                    } else {
+                        0
+                    };
+
+                    if batch_initial_margin_cents <= 0 {
+                        rej!("Unable to determine margin requirement");
+                    }
+
+                    let margin_usdt = batch_initial_margin_cents as f64 / 100.0;
 
                     let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
                     let mut sym_bytes = [0u8; 16];
@@ -1571,10 +1621,6 @@ async fn handle_client_message(
                         TimeInForce::PostOnly => 3,
                     };
 
-                    let batch_fixed_shape = match crate::symbol_rules::normalize_order_shape(&symbol, &order_type, price, qty) {
-                        Ok(shape) => shape,
-                        Err(reason) => rej!(reason),
-                    };
                     let meta = OrderMeta {
                         user_id,
                         symbol: sym_bytes,
@@ -1584,6 +1630,7 @@ async fn handle_client_message(
                         qty,
                         client_order_id: coid.clone(),
                         freeze_price: freeze_price_val,
+                        initial_margin_cents: batch_initial_margin_cents,
                     };
                     let sbe_req = SbeNewOrder {
                         client_order_id: order_id,
@@ -1597,8 +1644,9 @@ async fn handle_client_message(
                     };
                     validated.push(V {
                         order_id,
-                        freeze_asset,
-                        freeze_amount,
+                        freeze_asset: quote_asset.to_owned(),
+                        freeze_amount: margin_usdt,
+                        initial_margin_cents: batch_initial_margin_cents,
                         sbe_req,
                         meta,
                     });
@@ -1608,7 +1656,10 @@ async fn handle_client_message(
                 let mut aeron_batch: smallvec::SmallVec<[SbeNewOrder; 32]> =
                     smallvec::SmallVec::new();
                 for v in validated {
-                    if try_freeze_cache(
+                    let margin_reserved = state.risk_engine
+                        .check_and_reserve_margin(user_id, v.initial_margin_cents)
+                        .is_ok();
+                    if margin_reserved && try_freeze_cache(
                         &state.account_cache,
                         user_id,
                         &v.freeze_asset,
@@ -1628,6 +1679,9 @@ async fn handle_client_message(
                         state.pending_meta.insert(v.order_id, v.meta);
                         aeron_batch.push(v.sbe_req);
                     } else {
+                        if margin_reserved {
+                            state.risk_engine.release_order_margin(user_id, v.initial_margin_cents);
+                        }
                         sbe_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED));
                     }
                 }

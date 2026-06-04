@@ -1334,6 +1334,16 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
+    let risk_engine = lightning_exchange::desk::risk::RiskEngine::new();
+    for entry in account_cache.iter() {
+        let user_id = *entry.key();
+        let usdt_cents = entry.value().get("USDT")
+            .map(|&(bal, _)| (bal * 100.0).round() as i64)
+            .unwrap_or(0);
+        risk_engine.initialize_account(user_id, usdt_cents);
+    }
+    tracing::info!("Risk engine initialized ({} accounts)", risk_engine.accounts.len());
+
     let state = AppState {
         db: Arc::new(pool),
         engines: None,
@@ -1354,6 +1364,7 @@ async fn async_main() -> anyhow::Result<()> {
         vwap_cache: vwap_cache.clone(),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
         read_pool,
+        risk_engine: risk_engine.clone(),
     };
 
     // DB worker thread removed. PR5 took every PG SQL call out of
@@ -1726,6 +1737,7 @@ async fn async_main() -> anyhow::Result<()> {
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
         let order_meta_cache = open_order_meta;
+        let risk_engine = state.risk_engine.clone();
 
         std::thread::Builder::new()
             .name("aeron-recv".to_string())
@@ -1927,14 +1939,24 @@ async fn async_main() -> anyhow::Result<()> {
                             // and trades has no FK to orders so settle is unaffected.
                             if kind == order_update_kind::REJECTED {
                                 // Freeze was in-memory only (hot path never hit DB).
-                                // Revert the cache and notify; no DB write needed.
+                                // Revert account_cache and risk_engine; no DB write needed.
                                 let symbol = unpack_str16(&meta.symbol).unwrap_or("BTC_USDT");
-                                let (base, quote) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
-                                let (asset, rel_amount) = if meta.side == 0 {
-                                    (quote, meta.freeze_price * meta.qty)
+                                let (_, quote) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                                let rel_amount = if meta.initial_margin_cents > 0 {
+                                    meta.initial_margin_cents as f64 / 100.0
+                                } else if meta.side == 0 {
+                                    meta.freeze_price * meta.qty
                                 } else {
-                                    (base, meta.qty)
+                                    meta.qty
                                 };
+                                let asset = if meta.side == 0 || meta.initial_margin_cents > 0 {
+                                    quote
+                                } else {
+                                    symbol.split_once('_').map(|(b, _)| b).unwrap_or("BTC")
+                                };
+                                if meta.initial_margin_cents > 0 {
+                                    risk_engine.release_order_margin(meta.user_id, meta.initial_margin_cents);
+                                }
                                 let new_vals = account_cache.get_mut(&meta.user_id).and_then(|mut e| {
                                     let kv = e.get_mut(asset)?;
                                     kv.1 = (kv.1 - rel_amount).max(0.0);
@@ -1948,6 +1970,9 @@ async fn async_main() -> anyhow::Result<()> {
                                     }
                                 }
                             } else if kind == order_update_kind::CANCELLED {
+                                if meta.initial_margin_cents > 0 {
+                                    risk_engine.release_order_margin(meta.user_id, meta.initial_margin_cents);
+                                }
                                 process_db_cmd(DbCmd::ReleaseReservation {
                                     user_id: meta.user_id,
                                     symbol: meta.symbol,

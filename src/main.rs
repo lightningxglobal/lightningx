@@ -342,6 +342,7 @@ async fn main() -> anyhow::Result<()> {
         vwap_cache: Arc::new(dashmap::DashMap::new()),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
         read_pool,
+        risk_engine: lightning_exchange::desk::risk::RiskEngine::new(),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

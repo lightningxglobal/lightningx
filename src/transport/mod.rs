@@ -39,6 +39,7 @@ pub struct OrderMeta {
     pub qty: f64,
     pub client_order_id: String,
     pub freeze_price: f64,
+    pub initial_margin_cents: i64,
 }
 
 #[inline]

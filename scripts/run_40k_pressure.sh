@@ -57,7 +57,7 @@ sleep 2
 
 for ((i = 0; i < DESK_COUNT; i++)); do
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning TRACER_ENABLED=0 DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
+    RUST_LOG=warning TRACER_ENABLED=0 DESK_SPIN=true DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
     TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}" NOFILE_LIMIT=262144 \
     "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
   pids+=("$!")

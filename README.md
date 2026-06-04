@@ -14,7 +14,7 @@ Live demo with very limited resources and a very very simple market making bot: 
 
 ![LightningX end-to-end latency on M4 Mac](lightningx-latency-m4.jpg)
 
-*Exchange-layer round-trip (WS receive → Aeron IPC → matching engine → Aeron IPC → WS send-ready) measured via beacon tracing on an M4 MacBook Pro. **p50 = 5 µs · p90 = 9 µs · p99 = 15 µs.***
+*Internal processing latency: server receives WS frame → Aeron IPC → matching engine → Aeron IPC → result queued for sending. Measured via beacon tracing on an M4 MacBook Pro. **p50 = 5 µs · p90 = 9 µs · p99 = 15 µs.** Network latency (Internet RTT) is not included and dominates user-perceived latency in practice.*
 
 ---
 
@@ -198,27 +198,28 @@ Latency is measured from `place_order()` call to result return, including order 
 price matching, and market data snapshot generation. No allocations on the hot path —
 all buffers are pre-allocated (`SmallVec`, arena SkipList, rtrb ring buffers).
 
-### Full System End-to-End Latency
+### Internal Processing Latency
 
-Round-trip path: **WS receive → Aeron IPC → matching engine → Aeron IPC → WS send-ready**  
-Measured via beacon / HDR histogram tracing on an Apple M4 MacBook Pro.
+Measured from the moment the server receives a WS frame to the moment the result is queued for sending back — **excluding network transit in both directions**. Captured via beacon / HDR histogram tracing on an Apple M4 MacBook Pro.
 
 | Metric | P50 | P90 | P99 |
 |---|---|---|---|
-| **Full RTT** | **5 µs** | **9 µs** | **15 µs** |
+| **Internal processing** | **5 µs** | **9 µs** | **15 µs** |
 
-Stage-by-stage breakdown (steady-state, last-observed values):
+> Internet RTT (20–200 ms typical) is not included. User-perceived latency is dominated by network, not by exchange processing.
+
+Stage-by-stage breakdown (steady-state):
 
 | Stage | P50 | P90 |
 |---|---|---|
-| WS receive → Aeron publish | 2 µs | 4 µs |
+| WS frame decode → Aeron publish | 2 µs | 4 µs |
 | Aeron IPC transit (desk → engine) | < 1 µs | 1 µs |
 | Engine matching | 1 µs | 3 µs |
 | Result publish (engine → Aeron) | 1 µs | 3 µs |
 | Aeron IPC transit (engine → desk) | < 1 µs | 1 µs |
-| Desk processing (Aeron recv → WS ready) | 2 µs | 4 µs |
+| Desk recv → result queued for sending | 2 µs | 4 µs |
 
-The matching step contributes only ~1 µs end-to-end; the dominant cost is the two Aeron IPC round-trips and tokio scheduler wake-ups at each WS boundary.
+The matching step is ~1 µs; the remaining cost is the two Aeron IPC hops and WS frame handling at each end.
 
 ### WebSocket Scalability (desk-server, macOS M4 Pro 14-core)
 

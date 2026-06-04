@@ -132,6 +132,9 @@ impl RiskEngine {
                 + acct.unrealized_pnl;
         }
 
+        // Seed mark_prices with entry price the first time any position opens.
+        self.mark_prices.entry(symbol).or_insert(fill_price_ticks);
+
         // Maintain symbol_position_index for Phase 3 mark-price scan.
         let has_open = self
             .positions
@@ -146,6 +149,130 @@ impl RiskEngine {
         } else if let Some(mut idx) = self.symbol_position_index.get_mut(&symbol) {
             idx.retain(|&id| id != user_id);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 3: mark price + incremental unrealized PnL + risk tick
+    // -------------------------------------------------------------------------
+
+    /// Update the EWMA mark price for a symbol and recompute unrealized PnL
+    /// for all users with open positions.  Called from the WS Aeron spin thread
+    /// every time a depth snapshot arrives (~10ms cadence).
+    ///
+    /// EWMA: mark = 0.1 × new_price + 0.9 × old_mark  (α=0.1)
+    pub fn update_mark_price(&self, symbol: [u8; 16], new_price_ticks: i64, notional_scale: i64) {
+        if new_price_ticks <= 0 {
+            return;
+        }
+
+        // Compute the new EWMA mark price.
+        let mark_ticks = {
+            let old = self
+                .mark_prices
+                .get(&symbol)
+                .map(|v| *v)
+                .unwrap_or(new_price_ticks);
+            // α=0.1 in integer: (1*new + 9*old) / 10
+            (new_price_ticks + 9 * old) / 10
+        };
+        self.mark_prices.insert(symbol, mark_ticks);
+
+        // Update unrealized PnL for every user with a position in this symbol.
+        let user_ids: Vec<i64> = self
+            .symbol_position_index
+            .get(&symbol)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+
+        for uid in user_ids {
+            let key = (uid, symbol);
+            // Update mark price on the position and compute unrealized PnL.
+            let upnl = {
+                let Some(mut pos) = self.positions.get_mut(&key) else {
+                    continue;
+                };
+                pos.mark_price_ticks = mark_ticks;
+                calc::calc_unrealized_pnl_cents(
+                    pos.side,
+                    pos.qty_lots,
+                    pos.entry_price_ticks,
+                    mark_ticks,
+                    notional_scale,
+                )
+            };
+            // Update account unrealized PnL and equity.
+            if let Some(mut acct) = self.accounts.get_mut(&uid) {
+                acct.unrealized_pnl = upnl;
+                acct.equity = acct.available_margin
+                    + acct.order_margin
+                    + acct.used_margin
+                    + acct.unrealized_pnl;
+            }
+        }
+    }
+
+    /// Called every ~10ms from a dedicated timer task.  Scans all accounts,
+    /// updates RiskStatus, and returns a vec of positions that need liquidation.
+    pub fn run_risk_tick(&self) -> Vec<super::types::LiquidationEvent> {
+        let mut to_liquidate = Vec::new();
+
+        for mut entry in self.accounts.iter_mut() {
+            let acct = entry.value_mut();
+            // Skip already-terminal states.
+            if matches!(
+                acct.status,
+                super::types::RiskStatus::Liquidating
+                    | super::types::RiskStatus::Liquidated
+                    | super::types::RiskStatus::Bankruptcy
+            ) {
+                continue;
+            }
+
+            // Equity uses mark-to-market value (updated by update_mark_price).
+            let equity = acct.equity;
+            let used_margin = acct.used_margin;
+            let maintenance_margin = acct.maintenance_margin;
+
+            let new_status = if used_margin == 0 {
+                super::types::RiskStatus::Normal
+            } else if equity <= 0 {
+                super::types::RiskStatus::Bankruptcy
+            } else if equity <= maintenance_margin {
+                super::types::RiskStatus::LiquidationPending
+            } else {
+                // margin_ratio = equity / used_margin (in basis points, × 10_000)
+                let margin_ratio_bps = equity * 10_000 / used_margin;
+                // margin_call if margin_ratio < 75 bps (0.75%) above maintenance
+                // For simplicity: warn at equity < 1.5 × maintenance_margin
+                if equity * 2 < 3 * maintenance_margin {
+                    super::types::RiskStatus::MarginCall
+                } else {
+                    let _ = margin_ratio_bps; // suppress warning
+                    super::types::RiskStatus::Normal
+                }
+            };
+
+            if new_status == super::types::RiskStatus::LiquidationPending
+                && acct.status != super::types::RiskStatus::LiquidationPending
+            {
+                // Collect positions for liquidation.
+                let uid = acct.user_id;
+                for pos_entry in self.positions.iter() {
+                    if pos_entry.key().0 == uid {
+                        to_liquidate.push(super::types::LiquidationEvent {
+                            user_id: uid,
+                            symbol: pos_entry.key().1,
+                            side: pos_entry.value().side,
+                            qty_lots: pos_entry.value().qty_lots,
+                        });
+                    }
+                }
+            }
+
+            acct.status = new_status;
+        }
+
+        to_liquidate
     }
 }
 
@@ -522,5 +649,75 @@ mod tests {
         // liq_price_long = entry * (10*10000 - 10000 + 50) / (10*10000) = 5_000_000 * 90050 / 100000 = 4_502_500
         assert_eq!(pos.liquidation_price_ticks, 4_502_500);
         assert_eq!(pos.bankruptcy_price_ticks, 4_500_000);
+    }
+
+    // ── Phase 3: mark price + unrealized PnL + risk tick ─────────────────────
+
+    #[test]
+    fn update_mark_price_sets_ewma_and_upnl() {
+        let (engine, uid) = setup_with_reserved(500_000);
+        // Open long: 0.1 BTC at $50,000, margin $500
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+
+        // Mark price jumps to $51,000 (price_ticks = 5_100_000).
+        // First update: EWMA = (5_100_000 + 9 * 5_000_000) / 10 = 5_010_000
+        engine.update_mark_price(btc_sym(), 5_100_000, NOTIONAL_SCALE);
+
+        let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
+        assert_eq!(pos.mark_price_ticks, 5_010_000);
+
+        // unrealized_pnl = (5_010_000 - 5_000_000) * 100_000 / 1_000_000 = 1_000 cents = $10
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.unrealized_pnl, 1_000);
+        // equity = available(450k - nothing since open moved to used) + used(50k) + upnl(1k) + order(0)
+        // At open: available = 500_000 - 50_000 = 450_000, used = 50_000
+        assert_eq!(acct.equity, 450_000 + 50_000 + 1_000);
+    }
+
+    #[test]
+    fn update_mark_price_ignores_zero() {
+        let (engine, uid) = setup_with_reserved(200_000);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        engine.update_mark_price(btc_sym(), 0, NOTIONAL_SCALE);
+        let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
+        assert_eq!(pos.mark_price_ticks, PRICE_TICKS); // unchanged
+    }
+
+    #[test]
+    fn risk_tick_normal_when_margin_healthy() {
+        let (engine, uid) = setup_with_reserved(500_000);
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        let events = engine.run_risk_tick();
+        assert!(events.is_empty());
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.status, RiskStatus::Normal);
+    }
+
+    #[test]
+    fn risk_tick_triggers_liquidation_pending_when_equity_below_maintenance() {
+        let (engine, uid) = make_engine_with_account(500_000);
+        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+
+        // Maintenance margin at open = 500_000 * 50 / 10_000 = 2_500 cents ($25).
+        // Force equity below maintenance by injecting a large unrealized loss.
+        if let Some(mut acct) = engine.accounts.get_mut(&uid) {
+            // equity = used_margin(50_000) + available(450_000) + upnl(-500_000) = 0
+            // Set unrealized_pnl to make equity = maintenance - 1 = 2_499
+            // equity = 500_000 + upnl = 2_499 → upnl = -497_501
+            acct.unrealized_pnl = -497_501;
+            acct.equity = acct.available_margin + acct.order_margin + acct.used_margin + acct.unrealized_pnl;
+        }
+        // Maintenance margin on account must also be set (normally done by fill).
+        if let Some(mut acct) = engine.accounts.get_mut(&uid) {
+            acct.maintenance_margin = 2_500;
+        }
+
+        let events = engine.run_risk_tick();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].user_id, uid);
+
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.status, RiskStatus::LiquidationPending);
     }
 }

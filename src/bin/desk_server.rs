@@ -1585,6 +1585,7 @@ async fn async_main() -> anyhow::Result<()> {
         let vwap_cache_pub = vwap_cache.clone();
         let rt_pub = tokio::runtime::Handle::current();
         let order_meta_cache_pub = open_order_meta.clone();
+        let risk_engine_pub = state.risk_engine.clone();
         std::thread::Builder::new()
             .name("aeron-recv-public".to_string())
             .spawn(move || {
@@ -1687,6 +1688,21 @@ async fn async_main() -> anyhow::Result<()> {
                                     "BTC_USDT".to_string()
                                 } else { symbol };
                                 if nb == 0 || na == 0 { continue; }
+
+                                // Update EWMA mark price from mid = (best_bid + best_ask) / 2.
+                                {
+                                    let sym_key = evt.symbol;
+                                    let best_bid = bids_raw[..nb].iter().map(|(p, _)| *p).fold(f64::NEG_INFINITY, f64::max);
+                                    let best_ask = asks_raw[..na].iter().map(|(p, _)| *p).fold(f64::INFINITY, f64::min);
+                                    if best_bid > 0.0 && best_ask < f64::INFINITY {
+                                        let sym_str_end = sym_key.iter().position(|&b| b == 0).unwrap_or(16);
+                                        let sym_str = std::str::from_utf8(&sym_key[..sym_str_end]).unwrap_or("");
+                                        let rules = lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(sym_str);
+                                        let mid_ticks = ((best_bid + best_ask) / 2.0 / rules.price_tick).round() as i64;
+                                        risk_engine_pub.update_mark_price(sym_key, mid_ticks, rules.notional_scale);
+                                    }
+                                }
+
                                 let mf2 = market_fanout.clone();
                                 let last_depth2 = last_depth.clone();
                                 rt_pub.spawn(async move {
@@ -2197,6 +2213,31 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 }
             })?;
+    }
+
+    // ── 10ms risk tick: mark-to-market account status check ─────────────────
+    {
+        let risk_engine_tick = state.risk_engine.clone();
+        let user_tx_tick = state.user_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let to_liquidate = risk_engine_tick.run_risk_tick();
+                for evt in to_liquidate {
+                    // Phase 5 will route this to the liquidation engine.
+                    // For now just log it so we know when liquidation is triggered.
+                    tracing::warn!(
+                        user_id = evt.user_id,
+                        side = ?evt.side,
+                        qty_lots = evt.qty_lots,
+                        "LiquidationPending — position queued for forced close"
+                    );
+                    let _ = (user_tx_tick.clone(), evt); // silence unused warning
+                }
+            }
+        });
     }
 
     // ── Periodic depth broadcaster ───────────────────────────────────────────

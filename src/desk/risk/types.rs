@@ -62,3 +62,12 @@ pub struct PositionRiskState {
     pub bankruptcy_price_ticks: i64,
     pub leverage: u8,
 }
+
+/// Emitted by run_risk_tick() when a position should be liquidated.
+#[derive(Debug, Clone)]
+pub struct LiquidationEvent {
+    pub user_id: i64,
+    pub symbol: [u8; 16],
+    pub side: PositionSide,
+    pub qty_lots: i64,
+}

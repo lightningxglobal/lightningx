@@ -3,4 +3,4 @@ pub mod engine;
 pub mod types;
 
 pub use engine::RiskEngine;
-pub use types::{AccountRiskState, PositionRiskState, PositionSide, RiskStatus};
+pub use types::{AccountRiskState, LiquidationEvent, PositionRiskState, PositionSide, RiskStatus};

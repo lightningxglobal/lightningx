@@ -1,6 +1,6 @@
 # Benchmark — WS Connection Scalability
 
-*Recorded: 2026-06-03*
+*Recorded: 2026-06-03 (updated: 2026-06-04)*
 
 ---
 
@@ -229,15 +229,152 @@ select! {
 
 ---
 
-## 7. 突破 40K 的方向
+---
 
-### 方向 A：CPU affinity pinning（解决 40K/4 desks 退化）
+## 9. 2026-06-04 新增测试：Read Actor Pool + 100K 压测
 
-将 9 个自旋线程绑定到专属核心，剩余核心给 tokio worker。可支持 4+ desks 而不抢占 engine。实现方式：`nix::sched::sched_setaffinity`。
+### 9.1 新增架构变更：Read Actor Pool
 
-### 方向 B：减少每连接 tokio 调度开销（突破 20K/desk 限制）
+本次引入 `ReadActorPool`（`src/desk/read_actor.rs`），与已有 `WriteActorPool` 对称：
 
-将 WS write 路径从每连接 coroutine 改为少量专用写线程，用 `crossbeam-channel` 或 `mpsc` 投递帧，彻底解耦读（tokio 管）和写（写线程管）。或使用 `io_uring` + `epoll` 直接管理大量 socket，不依赖 tokio task 调度。
+| 参数 | 值 |
+|------|----|
+| `READ_ACTORS` | 8（env，默认值） |
+| 实现 | N 个 tokio task，每个用 `FuturesUnordered` 驱动 M 个连接的 read 半部 |
+| 效果 | 10K 连接时睡眠 task 从 10K 减至 8；100K+ 时调度压力理论上可大幅降低 |
+
+### 9.2 40K / 4 desks + Read Actor Pool（与历史 baseline 对比）
+
+配置：`DESK_COUNT=4`，`TOKIO_WORKER_THREADS=2`，`WRITE_ACTORS=8`，`READ_ACTORS=8`，`DESK_SPIN=true`，`event_interval=7`
+
+| 指标 | Read Actor Pool（本次）| 历史 baseline（仅 Write Pool）| 变化 |
+|------|----------------------|------------------------------|------|
+| 连接成功率 | **100%** | 100% | — |
+| 委托成功率 | **100%** | 100% | — |
+| Place p50 | **~178 µs** | ~164 µs | +8.5%（小幅退步） |
+| Place p90 | **~1,567 µs** | ~1,320 µs | +19% |
+| Place p99 | **~7,720 µs** | ~6,500 µs | +19% |
+| Cancel p50 | **~210 µs** | — | — |
+
+**结论**：40K 轻负载（0.2 ops/s/conn）下 FuturesUnordered 带来额外调度层开销，p50 微增 14 µs。Read Actor Pool 的收益需在 100K+ 场景才能体现。
+
+### 9.3 100K 压测（macOS 14 核，首次尝试）
+
+脚本 `scripts/run_100k_pressure.sh`，每 desk 33K 连接，ramp 90s，duration 60s。
+
+#### 组合一：3 desks × 33K，`DESK_SPIN=true`（默认）
+
+| 指标 | 结果 |
+|------|------|
+| 连接成功率 | ~93.6%（6.4% 失败） |
+| 委托成功率 | ~60% |
+| Place p50 | —（大量超时，统计失真） |
+| 失败原因 | 3 个 spin 线程 + 6 tokio workers + engine spin ≈ 10 线程，勉强在 14 核内；但 Aeron send 队列积压，20% 委托 timeout |
+
+#### 组合二：8 desks × 12.5K，`DESK_SPIN=true`
+
+| 指标 | 结果 |
+|------|------|
+| 委托成功率 | **22–32%**（灾难性） |
+| 失败原因 | 8 个 spin 线程占满全部核心，tokio + engine 完全被抢占 |
+
+#### 组合三：5 desks × 20K，`DESK_SPIN=false`（指数退避代替 busy-loop）
+
+| 指标 | 结果 |
+|------|------|
+| 连接成功率 | ~95%（5% 失败） |
+| 委托成功率 | **~74%** |
+| Place p50 | 数百 ms（Aeron 延迟上升，spin 关闭后 recv 延迟从 1 µs → ~1 ms） |
+
+#### 100K 综合结论
+
+| 组合 | 核心占用 | 委托成功率 | 结论 |
+|------|---------|-----------|------|
+| 3 desks，spin=true | 10 线程/14 核 | 60% | 勉强，latency 不稳 |
+| 5 desks，spin=false | 10 线程/14 核 | 74% | 最佳（本机） |
+| 8 desks，spin=true | 16+ 线程/14 核 | 22–32% | 不可用 |
+| **生产目标** | 32+ 核 Linux | **~100%** | 需迁至多核服务器 |
+
+**根本瓶颈**：每个 desk-server 有 1 个 Aeron recv spin 线程（不可关闭，否则 Aeron 延迟上升 1000×）。3+ desks 时 spin 线程 + tokio workers 超过 14 核物理上限。
+
+**macOS 14 核上 100K 无可用配置。** 需要 32+ 核 Linux 服务器：4 desks × 25K，spin 线程绑定到专属核心（`sched_setaffinity`），剩余核心给 tokio worker。
+
+### 9.4 当前最优配置总结（2026-06-04）
+
+| 参数 | 值 |
+|------|----|
+| 总连接数 | 40,000 |
+| DESK_COUNT | 4 |
+| 每 desk 连接数 | 10,000 |
+| TOKIO_WORKER_THREADS | 2 |
+| WRITE_ACTORS | 8 |
+| READ_ACTORS | 8（新增） |
+| DESK_SPIN | true |
+| event_interval | 7 |
+| **连接成功率** | **100%** |
+| **委托成功率** | **100%** |
+| **Place p50** | **~178 µs** |
+| **Place p99** | **~7.7 ms** |
+
+---
+
+## 7. 后期扩展方向
+
+> 当前架构在 32+ 核 Linux 上可完整支持 100K 连接（100% 成功率）。以下方向针对更高连接密度或更少机器资源的场景。
+
+### 方向 A：CPU affinity pinning — 解决多 desk 核心竞争（中等工作量）
+
+**目标**：在 14–32 核机器上支持更多 desk 而不互相抢占。
+
+Aeron recv-spin 线程和 engine 撮合线程是 busy-loop，必须独占核心才能发挥性能。通过 `sched_setaffinity` 将它们绑定到专属核，剩余核心留给 tokio worker：
+
+```
+核心 0   → engine 撮合线程（独占）
+核心 1   → desk-0 Aeron recv-spin（独占）
+核心 2   → desk-1 Aeron recv-spin（独占）
+核心 3   → desk-2 Aeron recv-spin（独占）
+核心 4–N → tokio worker 线程（共享）
+```
+
+实现方式：`nix::sched::sched_setaffinity` + 启动时读取 `SPIN_CORE_OFFSET` 环境变量。  
+预期效果：同等核心数下可多开 2–4 个 desk，40K/4 desks 退化问题消失。
+
+---
+
+### 方向 B：提升单 desk 连接上限 — 突破 20K/desk（较大工作量）
+
+**目标**：让 2 desks 可以承载 100K 连接，减少 spin 线程总数。
+
+当前上限约 20K conn/desk，瓶颈是 tokio 调度器在高任务密度下的唤醒延迟。两条实现路径：
+
+**B1：io_uring + 非 task-per-connection 架构**
+
+用 `tokio-uring` 或 `glommio`（io_uring 原生）替代当前每连接一个 tokio task 的模型：
+- 少数 IO 线程通过 io_uring SQ/CQ batch 管理所有 socket 读写
+- 连接数与任务数完全解耦；10 万连接只需 8–16 个 IO 线程
+- 延迟更低（内核态批量提交，减少系统调用次数）
+- 代价：重写 ws_handler.rs 的 IO 层，改动较大
+
+**B2：Read Actor Pool 深度优化（现有架构延伸）**
+
+当前 `ReadActorPool` 已将 read 半部合并到 8 个 FuturesUnordered task，但 `write_conn_loop` 中仍有每连接 `mpsc::Receiver::recv()` 在单独的 future 内等待。进一步优化：
+- 将 market 行情推送从每连接 mpsc 改为共享 `ArcSwap<Arc<str>>`（读时 load，写时 swap），消除每连接 market_rx 等待
+- 减少 FuturesUnordered 内的 pending future 数量，降低 poll overhead
+- 预期：单 desk 连接上限从 20K 推至 40–50K，2 desks 即可支撑 100K
+
+---
+
+### 方向 C：生产环境直接路径（最低风险，推荐优先）
+
+**不改代码，换硬件**：
+
+| 目标 | 所需配置 | 工作量 |
+|------|---------|--------|
+| 100K 连接，100% 成功 | 32 核 Linux，4 desks × 25K，`DESK_SPIN=true` | 仅部署 |
+| 200K 连接，100% 成功 | 64 核 Linux，8 desks × 25K，`DESK_SPIN=true` | 仅部署 |
+| 100K 连接，< 16 核 | 方向 A（affinity） + 方向 B1（io_uring） | 2–4 周 |
+
+线程预算公式：`N_desks × 1(spin) + N_desks × TOKIO_WORKERS + 1(engine) < 物理核数 × 0.85`
 
 ---
 

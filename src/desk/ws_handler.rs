@@ -1,6 +1,7 @@
 use crate::account_repository::AccountRepository;
 use crate::api::AppState;
-use crate::desk::read_actor::ReadConn;
+use crate::desk::read_actor::{ConnMarketInfo, ReadConn};
+use dashmap::DashMap as ActorConnMap;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::order::{Order, Side, TimeInForce};
 use crate::order_state::{
@@ -372,12 +373,14 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
                         Some(v) => v,
                         None => return,
                     };
+                let wants_market = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 state.read_pool.register(ReadConn {
                     conn_id,
                     ws_read,
                     state: state.clone(),
                     personal_tx,
                     ctrl_tx,
+                    wants_market,
                 });
             }
             Err(e) => tracing::error!("WS upgrade error: {e}"),
@@ -388,8 +391,11 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
 
 // ─── Socket loop ──────────────────────────────────────────────────────────────
 
-pub async fn read_conn_loop(conn: ReadConn) {
-    let ReadConn { conn_id, mut ws_read, state, personal_tx, ctrl_tx } = conn;
+pub async fn read_conn_loop(
+    conn: ReadConn,
+    actor_conns: Arc<ActorConnMap<u64, ConnMarketInfo>>,
+) {
+    let ReadConn { conn_id, mut ws_read, state, personal_tx, ctrl_tx, wants_market } = conn;
 
     // send_fn: required by WebSocketRead::read_frame API but never called
     // because auto_close=false and auto_pong=false suppress all auto-sends.
@@ -398,11 +404,11 @@ pub async fn read_conn_loop(conn: ReadConn) {
 
     let mut session = WsSession::new();
 
-    // Market data channel: registered LAZILY with state.market_fanout when
-    // the client first sends a Subscribe message. Connections that never
-    // subscribe (load tests, trading-only bots) never get registered, so
-    // they impose zero fanout overhead.
-    let (market_tx, mut market_rx) = mpsc::channel::<Arc<[u8]>>(8192);
+    // Market data is now distributed at the actor level: the read actor
+    // receives one message from MarketFanout and fans it out to connections
+    // with wants_market=true. We only need to flip the flag here and
+    // update the global subscriber count so the broadcaster can skip work
+    // when nobody is listening.
     let mut market_registered = false;
 
     // ── Heartbeat ────────────────────────────────────────────────────────────
@@ -431,7 +437,8 @@ pub async fn read_conn_loop(conn: ReadConn) {
                                 Err(_) => continue 'conn,
                             };
                             if !market_registered && text.contains("\"subscribe\"") {
-                                state.market_fanout.register(conn_id, market_tx.clone());
+                                wants_market.store(true, std::sync::atomic::Ordering::Relaxed);
+                                state.market_fanout.increment_subscriber();
                                 market_registered = true;
                             }
                             if let Some(reply) = handle_client_message(
@@ -468,46 +475,15 @@ pub async fn read_conn_loop(conn: ReadConn) {
                 waiting_pong = true;
             }
 
-            // Market data (depth, trades, ticker, kline) — lowest priority,
-            // only flows here for subscribers.
-            Some(msg) = market_rx.recv() => {
-                // SBE binary: first byte is message type. Extract symbol from
-                // fixed offset to route without full decode.
-                let should_forward = if let Some(msg_type) = msg.first().copied() {
-                    let sym_opt = ws_sbe::decode_broadcast_symbol(&msg);
-                    match msg_type {
-                        ws_sbe::DEPTH_MSG => sym_opt.map(|sym| {
-                            session.subscribed.contains(&format!("depth.{}", sym))
-                        }).unwrap_or(false),
-                        ws_sbe::TRADE_MSG => sym_opt.map(|sym| {
-                            session.subscribed.contains(&format!("trades.{}", sym))
-                        }).unwrap_or(false),
-                        ws_sbe::TICKER_MSG => sym_opt.map(|sym| {
-                            session.subscribed.contains(&format!("ticker.{}", sym))
-                        }).unwrap_or(false),
-                        ws_sbe::KLINE_MSG => sym_opt.map(|sym| {
-                            session.subscribed.contains(&format!("kline.{}", sym))
-                        }).unwrap_or(false),
-                        ws_sbe::AGG_TRADE_MSG => sym_opt.map(|sym| {
-                            session.subscribed.contains(&format!("agg_trades.{}", sym))
-                        }).unwrap_or(false),
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
-
-                if should_forward {
-                    let _ = personal_tx.try_send(msg.as_ref().to_owned());
-                }
-            }
         }
     }
 
     // Dropping personal_tx + ctrl_tx signals write_conn_loop to exit cleanly.
 
+    // Remove from actor's market registry so the actor stops sending to this conn.
+    actor_conns.remove(&conn_id);
     if market_registered {
-        state.market_fanout.unregister(conn_id);
+        state.market_fanout.decrement_subscriber();
     }
     if let Some(uid) = session.user_id {
         state.user_tx.unregister(uid);

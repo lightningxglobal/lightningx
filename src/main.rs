@@ -317,7 +317,10 @@ async fn main() -> anyhow::Result<()> {
 
     seed_demo_if_empty(&pool).await;
 
-    let market_fanout = Arc::new(lightning_exchange::api::MarketFanout::new());
+    let read_pool = Arc::new(lightning_exchange::read_actor::ReadActorPool::new());
+    let market_fanout = Arc::new(lightning_exchange::api::MarketFanout::new_with_actors(
+        read_pool.market_senders(),
+    ));
 
     let state = AppState {
         db: Arc::new(pool),
@@ -338,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
         persist_pub: None,
         vwap_cache: Arc::new(dashmap::DashMap::new()),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
-        read_pool: Arc::new(lightning_exchange::read_actor::ReadActorPool::new()),
+        read_pool,
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

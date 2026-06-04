@@ -1292,7 +1292,11 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     // ── Shared state ──────────────────────────────────────────────────────────
-    let market_fanout = std::sync::Arc::new(lightning_exchange::api::MarketFanout::new());
+    // read_pool must be created first: its market_senders() initialise MarketFanout.
+    let read_pool = std::sync::Arc::new(lightning_exchange::read_actor::ReadActorPool::new());
+    let market_fanout = std::sync::Arc::new(
+        lightning_exchange::api::MarketFanout::new_with_actors(read_pool.market_senders()),
+    );
 
     let valid_symbols: std::collections::HashSet<String> = order_pubs.keys().cloned().collect();
 
@@ -1349,7 +1353,7 @@ async fn async_main() -> anyhow::Result<()> {
         persist_pub: Some(persist_pub.clone()),
         vwap_cache: vwap_cache.clone(),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
-        read_pool: Arc::new(lightning_exchange::read_actor::ReadActorPool::new()),
+        read_pool,
     };
 
     // DB worker thread removed. PR5 took every PG SQL call out of

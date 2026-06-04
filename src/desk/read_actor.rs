@@ -1,23 +1,33 @@
 /// Read actor pool: N tasks each driving M connections via FuturesUnordered.
 ///
-/// Mirrors write_actor.rs for the read side. Instead of 10K handler tasks
-/// sleeping in select! loops, we have N read actors each driving up to
-/// 10K/N connection read loops concurrently from a single sleeping task.
+/// Market data distribution is lifted to the actor level: instead of each
+/// connection's future waiting on a per-connection `market_rx` channel (100K
+/// wakeups per broadcast), each actor receives one message from a shared
+/// `market_rx` and fans it out to its slice of connections sequentially.
 ///
-/// Scheduling benefit: a market data broadcast that wakes 10K connections
-/// wakes N read actor tasks (not 10K handler tasks) — the tokio scheduler
-/// ready-queue shrinks from 10K entries to N per event.
+/// Scheduling benefit:
+///   Before: 100K market broadcasts → 100K FuturesUnordered wakeups
+///   After:  100K market broadcasts → 8 actor wakeups + 8 × (100K/8) sequential try_send
 use crate::desk::write_actor::WsCtrl;
+use dashmap::DashMap;
 use fastwebsockets::WebSocketRead;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::io::ReadHalf;
 use tokio::sync::mpsc;
 
 pub type WsRead = WebSocketRead<ReadHalf<TokioIo<Upgraded>>>;
+
+/// Per-connection market data state held in the actor's local registry.
+pub struct ConnMarketInfo {
+    /// Forward path to the write actor for this connection.
+    pub personal_tx: mpsc::Sender<Vec<u8>>,
+    /// Flipped to true when the client sends a Subscribe message.
+    pub wants_market: Arc<AtomicBool>,
+}
 
 pub struct ReadConn {
     pub conn_id: u64,
@@ -25,6 +35,8 @@ pub struct ReadConn {
     pub state: crate::desk::api::AppState,
     pub personal_tx: mpsc::Sender<Vec<u8>>,
     pub ctrl_tx: mpsc::Sender<WsCtrl>,
+    /// Shared flag — ws_handler sets true on subscribe; actor checks before sending.
+    pub wants_market: Arc<AtomicBool>,
 }
 
 fn read_actor_count() -> usize {
@@ -37,18 +49,45 @@ fn read_actor_count() -> usize {
     })
 }
 
-async fn read_actor_loop(mut conn_rx: mpsc::Receiver<ReadConn>) {
+async fn read_actor_loop(
+    mut conn_rx: mpsc::Receiver<ReadConn>,
+    mut market_rx: mpsc::Receiver<Arc<[u8]>>,
+) {
+    // Registry of all connections currently managed by this actor.
+    let actor_conns: Arc<DashMap<u64, ConnMarketInfo>> = Arc::new(DashMap::new());
     let mut pending: FuturesUnordered<BoxFuture<'static, ()>> = FuturesUnordered::new();
+
     loop {
         tokio::select! {
+            // New connection arrives from ws_handler.
             msg = conn_rx.recv() => {
                 match msg {
-                    Some(c) => pending.push(Box::pin(
-                        crate::desk::ws_handler::read_conn_loop(c)
-                    )),
+                    Some(c) => {
+                        actor_conns.insert(c.conn_id, ConnMarketInfo {
+                            personal_tx: c.personal_tx.clone(),
+                            wants_market: c.wants_market.clone(),
+                        });
+                        let conns = actor_conns.clone();
+                        pending.push(Box::pin(
+                            crate::desk::ws_handler::read_conn_loop(c, conns)
+                        ));
+                    }
                     None => break,
                 }
             }
+
+            // Market data arrives from MarketFanout (8 actors, not 100K conns).
+            // Actor distributes sequentially — no FuturesUnordered wakeup per conn.
+            Some(msg) = market_rx.recv() => {
+                for entry in actor_conns.iter() {
+                    let info = entry.value();
+                    if info.wants_market.load(Ordering::Relaxed) {
+                        let _ = info.personal_tx.try_send(msg.as_ref().to_owned());
+                    }
+                }
+            }
+
+            // One of the managed connection read-loops made progress.
             Some(_) = pending.next(), if !pending.is_empty() => {}
         }
     }
@@ -58,21 +97,32 @@ async fn read_actor_loop(mut conn_rx: mpsc::Receiver<ReadConn>) {
 pub struct ReadActorPool {
     senders: Vec<mpsc::Sender<ReadConn>>,
     next: AtomicUsize,
+    /// Market senders — one per actor. Handed to MarketFanout at startup.
+    market_txs: Vec<mpsc::Sender<Arc<[u8]>>>,
 }
 
 impl ReadActorPool {
     pub fn new() -> Self {
         let n = read_actor_count();
         let mut senders = Vec::with_capacity(n);
+        let mut market_txs = Vec::with_capacity(n);
         for _ in 0..n {
             let (tx, rx) = mpsc::channel::<ReadConn>(1024);
-            tokio::spawn(read_actor_loop(rx));
+            let (mtx, mrx) = mpsc::channel::<Arc<[u8]>>(128);
+            tokio::spawn(read_actor_loop(rx, mrx));
             senders.push(tx);
+            market_txs.push(mtx);
         }
         Self {
             senders,
             next: AtomicUsize::new(0),
+            market_txs,
         }
+    }
+
+    /// Returns the market data senders to hand to `MarketFanout::new_with_actors`.
+    pub fn market_senders(&self) -> Vec<mpsc::Sender<Arc<[u8]>>> {
+        self.market_txs.clone()
     }
 
     pub fn register(&self, conn: ReadConn) {

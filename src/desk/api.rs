@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -59,43 +59,45 @@ pub type RedisConn = redis::aio::MultiplexedConnection;
 /// Subscribers register LAZILY — only when the client sends a
 /// `ClientMsg::Subscribe`. Connections that never subscribe (load tests,
 /// trading-only bots) impose zero broadcast overhead.
+/// Market data fanout: one channel per read actor (8) instead of one per
+/// connection (100K). `send_bytes` costs 8 try_sends regardless of connection
+/// count; each read actor distributes to its slice of connections internally.
 pub struct MarketFanout {
-    /// (conn_id, sender). conn_id is a process-local atomic counter
-    /// generated when the WS handler starts.
-    subscribers: DashMap<u64, mpsc::Sender<Arc<[u8]>>>,
+    /// One sender per read actor. Capacity = 128 messages per actor.
+    actor_txs: Vec<mpsc::Sender<Arc<[u8]>>>,
+    /// Count of connections that have subscribed to market data. Used as an
+    /// early-exit guard in the broadcaster to skip encoding when nobody listens.
+    sub_count: AtomicUsize,
 }
 
 impl MarketFanout {
-    pub fn new() -> Self {
+    pub fn new_with_actors(actor_txs: Vec<mpsc::Sender<Arc<[u8]>>>) -> Self {
         Self {
-            subscribers: DashMap::with_capacity(1024),
+            actor_txs,
+            sub_count: AtomicUsize::new(0),
         }
     }
-    pub fn register(&self, conn_id: u64, tx: mpsc::Sender<Arc<[u8]>>) {
-        self.subscribers.insert(conn_id, tx);
+    /// Called when a connection subscribes to market data.
+    pub fn increment_subscriber(&self) {
+        self.sub_count.fetch_add(1, Ordering::Relaxed);
     }
-    pub fn unregister(&self, conn_id: u64) {
-        self.subscribers.remove(&conn_id);
+    /// Called when a subscribed connection unsubscribes or closes.
+    pub fn decrement_subscriber(&self) {
+        self.sub_count.fetch_sub(1, Ordering::Relaxed);
     }
     pub fn subscriber_count(&self) -> usize {
-        self.subscribers.len()
+        self.sub_count.load(Ordering::Relaxed)
     }
-    /// Fan a pre-encoded binary frame out to every registered subscriber.
+    /// Fan a pre-encoded binary frame out to all read actors.
+    /// Each actor distributes to its subscribed connections.
     pub fn send_bytes(&self, msg: Arc<[u8]>) {
-        for entry in self.subscribers.iter() {
-            let _ = entry.value().try_send(msg.clone());
+        for tx in &self.actor_txs {
+            let _ = tx.try_send(msg.clone());
         }
     }
     /// Convenience: take ownership of a Vec<u8> and dispatch.
     pub fn send_owned(&self, msg: Vec<u8>) {
-        let arc: Arc<[u8]> = Arc::from(msg);
-        self.send_bytes(arc);
-    }
-}
-
-impl Default for MarketFanout {
-    fn default() -> Self {
-        Self::new()
+        self.send_bytes(Arc::from(msg));
     }
 }
 

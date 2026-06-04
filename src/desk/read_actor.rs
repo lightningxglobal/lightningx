@@ -9,13 +9,15 @@
 ///   Before: 100K market broadcasts → 100K FuturesUnordered wakeups
 ///   After:  100K market broadcasts → 8 actor wakeups + 8 × (100K/8) sequential try_send
 use crate::desk::write_actor::WsCtrl;
+use crate::ws_sbe;
 use dashmap::DashMap;
 use fastwebsockets::WebSocketRead;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::io::ReadHalf;
 use tokio::sync::mpsc;
 
@@ -25,8 +27,8 @@ pub type WsRead = WebSocketRead<ReadHalf<TokioIo<Upgraded>>>;
 pub struct ConnMarketInfo {
     /// Forward path to the write actor for this connection.
     pub personal_tx: mpsc::Sender<Vec<u8>>,
-    /// Flipped to true when the client sends a Subscribe message.
-    pub wants_market: Arc<AtomicBool>,
+    /// Exact channel names this connection subscribed to, e.g. `depth.BTC_USDT`.
+    pub subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
 pub struct ReadConn {
@@ -35,8 +37,8 @@ pub struct ReadConn {
     pub state: crate::desk::api::AppState,
     pub personal_tx: mpsc::Sender<Vec<u8>>,
     pub ctrl_tx: mpsc::Sender<WsCtrl>,
-    /// Shared flag — ws_handler sets true on subscribe; actor checks before sending.
-    pub wants_market: Arc<AtomicBool>,
+    /// Shared subscription set — ws_handler mutates it; actor reads it before fanout.
+    pub subscriptions: Arc<RwLock<HashSet<String>>>,
 }
 
 fn read_actor_count() -> usize {
@@ -68,7 +70,7 @@ async fn read_actor_loop(
                     Some(c) => {
                         actor_conns.insert(c.conn_id, ConnMarketInfo {
                             personal_tx: c.personal_tx.clone(),
-                            wants_market: c.wants_market.clone(),
+                            subscriptions: c.subscriptions.clone(),
                         });
                         let conns = actor_conns.clone();
                         let sub_cnt = actor_sub_count.clone();
@@ -90,10 +92,17 @@ async fn read_actor_loop(
             // is O(1) — one atomic load + branch — in that common case.
             Some(msg) = market_rx.recv() => {
                 if actor_sub_count.load(Ordering::Relaxed) > 0 {
-                    for entry in actor_conns.iter() {
-                        let info = entry.value();
-                        if info.wants_market.load(Ordering::Relaxed) {
-                            let _ = info.personal_tx.try_send(msg.as_ref().to_owned());
+                    if let Some(channel) = market_channel(&msg) {
+                        for entry in actor_conns.iter() {
+                            let info = entry.value();
+                            let should_send = info
+                                .subscriptions
+                                .read()
+                                .map(|subs| subs.contains(&channel))
+                                .unwrap_or(false);
+                            if should_send {
+                                let _ = info.personal_tx.try_send(msg.as_ref().to_owned());
+                            }
                         }
                     }
                 }
@@ -101,6 +110,47 @@ async fn read_actor_loop(
         }
     }
     while pending.next().await.is_some() {}
+}
+
+fn market_channel(msg: &[u8]) -> Option<String> {
+    let prefix = match msg.first().copied()? {
+        ws_sbe::DEPTH_MSG => "depth",
+        ws_sbe::TRADE_MSG => "trades",
+        ws_sbe::TICKER_MSG => "ticker",
+        ws_sbe::KLINE_MSG => "kline",
+        ws_sbe::AGG_TRADE_MSG => "agg_trades",
+        _ => return None,
+    };
+    let symbol = ws_sbe::decode_broadcast_symbol(msg)?;
+    Some(format!("{prefix}.{symbol}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::market_channel;
+    use crate::ws_sbe;
+
+    #[test]
+    fn market_channel_maps_broadcast_frames_to_subscription_names() {
+        assert_eq!(
+            market_channel(&ws_sbe::encode_ticker("BTC_USDT", 1.0, 0.0, 1.0, 1.0, 10.0)),
+            Some("ticker.BTC_USDT".to_string())
+        );
+        assert_eq!(
+            market_channel(&ws_sbe::encode_depth(
+                123,
+                "ETH_USDT",
+                &[(1.0, 2.0)],
+                &[(3.0, 4.0)]
+            )),
+            Some("depth.ETH_USDT".to_string())
+        );
+        assert_eq!(
+            market_channel(&ws_sbe::encode_trade(1.0, 2.0, 0, 123, "SOL_USDT")),
+            Some("trades.SOL_USDT".to_string())
+        );
+        assert_eq!(market_channel(&[0]), None);
+    }
 }
 
 pub struct ReadActorPool {

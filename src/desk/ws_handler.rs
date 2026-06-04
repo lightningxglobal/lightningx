@@ -18,7 +18,7 @@ use tokio::io as tio;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -373,14 +373,14 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
                         Some(v) => v,
                         None => return,
                     };
-                let wants_market = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let subscriptions = Arc::new(RwLock::new(HashSet::new()));
                 state.read_pool.register(ReadConn {
                     conn_id,
                     ws_read,
                     state: state.clone(),
                     personal_tx,
                     ctrl_tx,
-                    wants_market,
+                    subscriptions,
                 });
             }
             Err(e) => tracing::error!("WS upgrade error: {e}"),
@@ -396,7 +396,7 @@ pub async fn read_conn_loop(
     actor_conns: Arc<ActorConnMap<u64, ConnMarketInfo>>,
     actor_sub_count: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    let ReadConn { conn_id, mut ws_read, state, personal_tx, ctrl_tx, wants_market } = conn;
+    let ReadConn { conn_id, mut ws_read, state, personal_tx, ctrl_tx, subscriptions } = conn;
 
     // send_fn: required by WebSocketRead::read_frame API but never called
     // because auto_close=false and auto_pong=false suppress all auto-sends.
@@ -405,11 +405,6 @@ pub async fn read_conn_loop(
 
     let mut session = WsSession::new();
 
-    // Market data is now distributed at the actor level: the read actor
-    // receives one message from MarketFanout and fans it out to connections
-    // with wants_market=true. We only need to flip the flag here and
-    // update the global subscriber count so the broadcaster can skip work
-    // when nobody is listening.
     let mut market_registered = false;
 
     // ── Heartbeat ────────────────────────────────────────────────────────────
@@ -437,16 +432,24 @@ pub async fn read_conn_loop(
                                 Ok(t) => t,
                                 Err(_) => continue 'conn,
                             };
-                            if !market_registered && text.contains("\"subscribe\"") {
-                                wants_market.store(true, std::sync::atomic::Ordering::Relaxed);
-                                actor_sub_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                state.market_fanout.increment_subscriber();
-                                market_registered = true;
-                            }
+                            let was_subscribed = !session.subscribed.is_empty();
                             if let Some(reply) = handle_client_message(
                                 text, &mut session, &state, &personal_tx,
                             ).await {
                                 let _ = personal_tx.try_send(reply);
+                            }
+                            if let Ok(mut subs) = subscriptions.write() {
+                                *subs = session.subscribed.clone();
+                            }
+                            let now_subscribed = !session.subscribed.is_empty();
+                            if !was_subscribed && now_subscribed {
+                                actor_sub_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                state.market_fanout.increment_subscriber();
+                                market_registered = true;
+                            } else if was_subscribed && !now_subscribed {
+                                actor_sub_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                state.market_fanout.decrement_subscriber();
+                                market_registered = false;
                             }
                         }
                         OpCode::Ping => {

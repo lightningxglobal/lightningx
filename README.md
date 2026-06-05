@@ -4,7 +4,7 @@
 
 # LightningX Exchange
 
-A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with **20 µs median server-internal latency at 40K concurrent connections**.
+A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core, and the production WebSocket hot path uses **SBE binary messages end-to-end** for private order flow. In the latest 40K-connection local pressure run, accepted-order p50 was **172–176 µs**.
 
 Live demo with very limited resources and a very very simple market making bot: **https://www.lightningx.global**
 
@@ -65,6 +65,7 @@ exchange-engine
 | Transport | Aeron IPC | Zero-copy ring buffer, sub-microsecond publish latency |
 | Encoding | SBE (Simple Binary Encoding) | Fixed-size, no allocation, 16–72 bytes per message |
 | API server | axum + tokio | Async, zero-cost WS fan-out to thousands of clients |
+| Counter sharding | `user_id % 16` owner shard | Each desk owns private state for a deterministic user shard |
 | Market data | diff-based Binance mirror | Only cancel/place changed price levels, ~20× less traffic |
 
 ---
@@ -74,7 +75,7 @@ exchange-engine
 | Binary | Description |
 |---|---|
 | `exchange-engine` | Matching engine: one spin-loop thread per symbol, restores resting orders from DB on startup |
-| `desk-server` | Private counter gateway: auth, order routing, private order/account pushes, balance/risk state |
+| `desk-server` | Private counter gateway: auth, owner-sharded order routing, private order/account pushes, balance/risk state |
 | `market-data-gateway` | Public live market-data WebSocket: trades, depth, ticker, kline, aggregate trade fanout |
 | `lightning-data` | Slow/cold REST data service: historical tickers, klines, trades, orders, accounts, positions from PostgreSQL |
 | `market-maker` | Mirrors Binance top-20 depth into LightningX via diff-based order management |
@@ -132,25 +133,21 @@ npm run dev          # http://localhost:5173
 
 Connect to `wss://<host>/ws`.
 
-**Wire format is asymmetric:**
-- **Client → Server**: JSON text frames
-- **Server → Client**: SBE binary frames — every frame begins with a 1-byte `msg_type`, followed by a fixed-layout payload (all integers little-endian)
+**Production private order flow is SBE binary both ways.** Every binary WebSocket frame begins with a 1-byte `msg_type`, followed by a fixed-layout little-endian payload. Legacy JSON/text parsing may still exist for compatibility and non-hot-path local tools, but production clients should use the binary frames below.
 
-### Client → Server (JSON text)
+Public market data is served by `market-data-gateway`, not by `desk-server`.
 
-```json
-// Subscribe to market data (no auth required)
-{ "type": "subscribe", "channels": ["depth.BTC_USDT", "trades.BTC_USDT", "ticker.BTC_USDT"] }
+### Client → Server (SBE binary)
 
-// Authenticate
-{ "type": "auth", "token": "<JWT>" }
+See `src/transport/ws_sbe.rs` for exact layouts and helpers.
 
-// Place a limit order (requires auth)
-{ "type": "place_order", "symbol": "BTC_USDT", "side": "buy", "order_type": "limit", "price": 65000, "quantity": 0.01, "client_order_id": "my-id-1" }
+| `msg_type` | Name | Size | Key fields |
+|---|---|---:|---|
+| 50 | `CLIENT_PLACE_ORDER` | 37 B | `client_order_id: u64`, `symbol: [u8;8]`, `side: u8`, `tif: u8`, `price_ticks: i64`, `quantity_lots: i64` |
+| 51 | `CLIENT_CANCEL_ORDER` | 9 B | `order_id: i64` |
+| 52 | `CLIENT_PING` | 1 B | none |
 
-// Cancel an order
-{ "type": "cancel_order", "order_id": 12345, "client_order_id": "my-id-1" }
-```
+`side`: `0=Buy`, `1=Sell`. `tif`: `0=GTC`, `1=IOC`, `2=FOK`, `3=PostOnly`. `price_ticks=0` means market/IOC-style execution.
 
 ### Server → Client (SBE binary)
 
@@ -171,7 +168,7 @@ All frames: `[msg_type: u8][payload...]`. See `src/transport/ws_sbe.rs` for exac
 | 9 | `POSITION_UPDATE` | `symbol: [u8;8]`, `qty: f64`, `avg_price: f64` |
 | 13 | `ERROR_MSG` | `message: str` |
 
-**Broadcast (pushed to all subscribers of the relevant channel):**
+**Public market-data broadcast (`market-data-gateway`):**
 
 | `msg_type` | Name | Key fields |
 |---|---|---|
@@ -179,6 +176,7 @@ All frames: `[msg_type: u8][payload...]`. See `src/transport/ws_sbe.rs` for exac
 | 21 | `DEPTH` | `symbol: [u8;8]`, N bid/ask levels (`price: f64`, `qty: f64`) |
 | 22 | `TICKER` | `symbol: [u8;8]`, `open/high/low/close/vol: f64`, `ts: u64` |
 | 23 | `KLINE` | interval, OHLCV, `ts: u64` |
+| 24 | `AGG_TRADE` | interval aggregate trade bucket |
 
 `ORDER_UPDATE` status byte: `0=OPEN  1=PARTIAL_FILL  2=FILLED  3=CANCELED  4=REJECTED`
 
@@ -194,7 +192,7 @@ All frames: `[msg_type: u8][payload...]`. See `src/transport/ws_sbe.rs` for exac
 | GET | `/api/orders` | JWT | Open and past orders |
 | POST | `/api/orders` | JWT | Place order |
 | DELETE | `/api/orders/:id` | JWT | Cancel order |
-| GET | `/api/trades` | — | Recent trades |
+| GET | `/api/trades` | JWT | User trades |
 | GET | `/api/tickers` | — | 24h ticker stats |
 
 ---
@@ -249,16 +247,17 @@ The matching step is ~1 µs; the remaining cost is the two Aeron IPC hops and WS
 
 ### WebSocket Scalability (desk-server, macOS M4 Pro 14-core)
 
-Measured with `pressure-client` placing limit orders at 0.2 ops/s per connection over a 30 s steady-state window after a 60 s ramp. All connections share a single `BTC_USDT` symbol; market data broadcast enabled.
+Measured with `pressure-client` using SBE binary private order frames. Runs are local macOS pressure tests, so the 100K result is mostly a scheduler/WS-queue capacity signal, not a matching-engine limit.
 
-| Connections | Desks | Conn success | Order success | Place OK p50 |
-|---|---|---|---|---|
-| **40K** | 4 × 10K | **100%** | **100%** | **~170 µs** |
-| **100K** | 2 × 50K | ~93% | ~90%† | **~788 µs** |
+| Connections | Desks | Conn success | Place success | Place OK p50 | Place OK p90 | Place OK p99 |
+|---|---|---:|---:|---:|---:|---:|
+| **40K** | 4 × 10K | **100%** | **100%** | **172–176 µs** | **1345–1387 µs** | **8.9–9.1 ms** |
+| **100K** | 3 × ~33K | ~94.7% | ~73–74% | **360–368 µs** | **161–178 ms** | 1 s cap |
 
-† 100K tested on macOS M4 Pro 14-core with 2 desks (`DESK_SPIN=false`). Order success rate reaches ~90% near the CPU ceiling: 2 Aeron recv spin threads + tokio workers + 1 engine thread compete for 14 physical cores. p90 widens to ~6.6 ms. On **32+ core Linux** with `sched_setaffinity` pinning each spin thread to a dedicated core, 100K at 100% success and p99 < 10 ms is achievable — Linux gains are expected to be significantly larger.
+40K latest run: `/tmp/lightning-40000-4desk-20260605-142427`.
+100K latest run: `/tmp/lightning-100000-3desk-20260605-184213`.
 
-See `docs/benchmark_40k_baseline.md` for full results.
+At 100K on this 14-core Mac, accepted-order p50 remains below 600 µs, but success rate and tail latency collapse once the WS/command queues saturate. The matching step itself stays ~1 µs; production 100K targets require Linux core isolation/pinning and enough desk shards to keep each counter below its queueing knee.
 
 ---
 

@@ -23,7 +23,7 @@
 | Aeron Media Driver | C++ build，IPC term buffer = 256 MB (`-Daeron.ipc.term.buffer.length=268435456`) |
 | PostgreSQL | 16.9（Docker，aarch64） |
 | Redis | localhost:6379 |
-| VictoriaMetrics | localhost:8428（beacon sidecar 写入延迟指标） |
+| VictoriaMetrics | localhost:8428（beacon 写入延迟指标） |
 
 ---
 
@@ -48,7 +48,7 @@ exchange-engine
 ```
 
 - `ENGINE_IDLE_SPINS=0`：空闲时退让，不无限自旋占满 CPU。
-- `TRACER_ENABLED=1`：启用 beacon sidecar 埋点，向 VictoriaMetrics 写入各 milestone 时延。
+- `TRACER_ENABLED=1`：启用 beacon 埋点，向 VictoriaMetrics 写入各 milestone 时延。
 
 ### desk-server（每实例）
 

@@ -793,7 +793,11 @@ async fn handle_client_message(
                     return Some(ws_sbe::encode_order_rejected(0, "Unable to determine margin requirement"));
                 }
 
-                let t_pre_freeze = t0.map(|_| std::time::Instant::now());
+                let t_pre_freeze = if t0.is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 if let Err(reason) = state.risk_engine.check_and_reserve_margin(user_id, initial_margin_cents) {
                     return Some(ws_sbe::encode_order_rejected(0, reason));
                 }
@@ -805,7 +809,11 @@ async fn handle_client_message(
                 }
                 let (freeze_asset, freeze_amount): (&str, f64) = (quote_asset, margin_usdt);
 
-                let t_post_freeze = t0.map(|_| std::time::Instant::now());
+                let t_post_freeze = if t0.is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 if push_bal {
                     if let Some(user_assets) = state.account_cache.get(&user_id) {
                         if let Some(&(bal, frz)) = user_assets.get(freeze_asset) {
@@ -817,7 +825,11 @@ async fn handle_client_message(
                         }
                     }
                 }
-                let t_post_balupd = t0.map(|_| std::time::Instant::now());
+                let t_post_balupd = if t0.is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
 
                 let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
                 // Build sym_bytes first so the tracer checkpoint carries the symbol.
@@ -881,7 +893,11 @@ async fn handle_client_message(
                 // if let Some(ref t) = state.tracer {
                 //     t.record_sym(MS_CMD_RING_PUSHED, order_id, &sym_bytes);
                 // }
-                let t_post_aeron = t0.map(|_| std::time::Instant::now());
+                let t_post_aeron = if t0.is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
 
                 let reply = if ws_inline_order_submitted_enabled() {
                     Some(ws_sbe::encode_order_submitted(order_id, order_id, unix_now()))

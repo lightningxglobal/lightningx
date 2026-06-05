@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod sbe_encoding_tests {
-    use crate::sbe::{self, TradeNotification, TEMPLATE_ORDER_UPDATE, TEMPLATE_TRADE_NOTIFICATION};
+    use crate::sbe::{
+        self, CancelOrderRequest, NewOrderRequest, TradeNotification, TEMPLATE_ORDER_UPDATE,
+        TEMPLATE_TRADE_NOTIFICATION,
+    };
     use crate::transport::OrderUpdateMsg;
 
     // Test OrderUpdateMsg SBE encoding (with header)
@@ -199,8 +202,53 @@ mod sbe_encoding_tests {
     // Test that message sizes are correct
     #[test]
     fn test_message_struct_sizes() {
+        assert_eq!(std::mem::size_of::<NewOrderRequest>(), 64);
+        assert_eq!(std::mem::size_of::<CancelOrderRequest>(), 24);
         assert_eq!(std::mem::size_of::<OrderUpdateMsg>(), 64);
         assert_eq!(std::mem::size_of::<TradeNotification>(), 64);
+    }
+
+    #[test]
+    fn test_order_request_response_stream_layout() {
+        assert_eq!(std::mem::offset_of!(NewOrderRequest, response_stream_id), 34);
+        assert_eq!(std::mem::offset_of!(NewOrderRequest, _pad), 38);
+        assert_eq!(std::mem::offset_of!(NewOrderRequest, symbol), 48);
+        assert_eq!(std::mem::offset_of!(CancelOrderRequest, response_stream_id), 16);
+        assert_eq!(std::mem::offset_of!(CancelOrderRequest, _pad), 20);
+
+        let new_req = NewOrderRequest {
+            client_order_id: 1,
+            participant_id: 2,
+            price_ticks: 3,
+            quantity_lots: 4,
+            side: 0,
+            time_in_force: 1,
+            response_stream_id: 203,
+            _pad: [0; 10],
+            symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
+        };
+        let new_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &new_req as *const NewOrderRequest as *const u8,
+                std::mem::size_of::<NewOrderRequest>(),
+            )
+        };
+        assert_eq!(i32::from_le_bytes(new_bytes[34..38].try_into().unwrap()), 203);
+        assert_eq!(&new_bytes[48..64], b"BTC_USDT\0\0\0\0\0\0\0\0");
+
+        let cancel_req = CancelOrderRequest {
+            order_id: 1,
+            participant_id: 2,
+            response_stream_id: 204,
+            _pad: [0; 4],
+        };
+        let cancel_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &cancel_req as *const CancelOrderRequest as *const u8,
+                std::mem::size_of::<CancelOrderRequest>(),
+            )
+        };
+        assert_eq!(i32::from_le_bytes(cancel_bytes[16..20].try_into().unwrap()), 204);
     }
 
     // Test full round-trip: create -> encode -> decode -> verify

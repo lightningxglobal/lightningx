@@ -2,14 +2,15 @@ use aeron_wrapper::AeronClient;
 use dashmap::DashMap;
 use lightning_exchange::{
     aeron_channels::{
-        aeron_dir, depth_channel, order_update_channel, order_update_stream_for_desk,
-        orders_channel, orders_stream_for_symbol, trade_channel, DEPTH50_STREAM, DEPTH_STREAM,
-        LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM, PERSIST_CHANNEL, PERSIST_STREAM,
-        TRADE_STREAM,
+        aeron_dir, counter_forward_channel, counter_forward_cmd_stream_for_desk,
+        counter_forward_resp_stream_for_desk, depth_channel, order_update_channel,
+        order_update_stream_for_desk, orders_channel, orders_stream_for_symbol, trade_channel,
+        DEPTH50_STREAM, DEPTH_STREAM, LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM,
+        PERSIST_CHANNEL, PERSIST_STREAM, TRADE_STREAM,
     },
     aeron_transport::{
-        DeskDepthSubscriber, DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber,
-        PersistPublisher,
+        CounterForwardPublisher, CounterForwardSubscriber, DeskDepthSubscriber,
+        DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber, PersistPublisher,
     },
     api::{router, AccountCache, AppState},
     db,
@@ -26,6 +27,9 @@ use lightning_exchange::{
     transport::persist_event::{
         pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload,
         OrderUpsertPayload, PersistFrame, TradeInsertPayload,
+    },
+    transport::counter_forward::{
+        CounterForwardMsg, CounterForwardOrderMeta, CounterForwardWsFrame,
     },
     transport::{unpack_str16, AeronCmd},
     ws_handler::market_data_broadcaster,
@@ -409,6 +413,57 @@ fn remove_runtime_order(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64, c
     cache.remove(&order_id);
     if order_id != client_id {
         cache.remove(&client_id);
+    }
+}
+
+fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64) -> bool {
+    if amount <= 0.0 {
+        return true;
+    }
+    let Some(mut entry) = cache.get_mut(&user_id) else {
+        return false;
+    };
+    let Some(kv) = entry.get_mut(asset) else {
+        return false;
+    };
+    if kv.0 - kv.1 >= amount {
+        kv.1 += amount;
+        true
+    } else {
+        false
+    }
+}
+
+fn release_cache_frozen(cache: &AccountCache, user_id: i64, asset: &str, amount: f64) {
+    if amount <= 0.0 {
+        return;
+    }
+    if let Some(mut entry) = cache.get_mut(&user_id) {
+        if let Some(kv) = entry.get_mut(asset) {
+            kv.1 = (kv.1 - amount).max(0.0);
+        }
+    }
+}
+
+fn order_meta_from_forward(meta: CounterForwardOrderMeta) -> lightning_exchange::transport::OrderMeta {
+    let symbol = meta.symbol;
+    let side = meta.side;
+    let order_type = meta.order_type;
+    let price = meta.price;
+    let qty = meta.qty;
+    let freeze_price = meta.freeze_price;
+    let initial_margin_cents = meta.initial_margin_cents;
+    lightning_exchange::transport::OrderMeta {
+        user_id: meta.user_id,
+        symbol,
+        side,
+        order_type,
+        price: if price > 0.0 { Some(price) } else { None },
+        qty,
+        client_order_id: meta.client_order_id_string(),
+        freeze_price,
+        initial_margin_cents,
+        liq_price_ticks: 0,
     }
 }
 
@@ -1115,6 +1170,8 @@ async fn async_main() -> anyhow::Result<()> {
 
     let open_order_meta: std::sync::Arc<DashMap<u64, OrderRuntimeMeta>> =
         std::sync::Arc::new(DashMap::new());
+    let forwarded_order_origin: std::sync::Arc<DashMap<u64, u16>> =
+        std::sync::Arc::new(DashMap::new());
     {
         // Preload all open orders into the runtime meta cache so cancel/fill
         // paths can resolve user_id + freeze_price + qty + side without a PG
@@ -1212,7 +1269,7 @@ async fn async_main() -> anyhow::Result<()> {
     // matching threads never share a stream and there is zero HOL blocking between symbols.
     let symbols_env =
         std::env::var("SYMBOLS").unwrap_or_else(|_| "ETH_USDT,BTC_USDT,SOL_USDT".to_string());
-    let mut order_pubs: std::collections::HashMap<String, DeskOrderPublisher> = symbols_env
+    let order_pubs: std::collections::HashMap<String, DeskOrderPublisher> = symbols_env
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1230,6 +1287,19 @@ async fn async_main() -> anyhow::Result<()> {
         response_stream_id,
     )
     .map_err(|e| anyhow::anyhow!("DeskOrderUpdateSubscriber: {}", e))?;
+
+    let mut counter_forward_cmd_sub = CounterForwardSubscriber::new(
+        client.clone(),
+        &counter_forward_channel(),
+        counter_forward_cmd_stream_for_desk(desk_id as u16),
+    )
+    .map_err(|e| anyhow::anyhow!("CounterForward cmd subscriber: {}", e))?;
+    let mut counter_forward_resp_sub = CounterForwardSubscriber::new(
+        client.clone(),
+        &counter_forward_channel(),
+        counter_forward_resp_stream_for_desk(desk_id as u16),
+    )
+    .map_err(|e| anyhow::anyhow!("CounterForward resp subscriber: {}", e))?;
 
     let public_market_data_subs = if public_market_data_enabled {
         Some((
@@ -1302,6 +1372,16 @@ async fn async_main() -> anyhow::Result<()> {
         std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(1024));
     let liq_cmd_tx = liq_cmd_ring.clone();
     let liq_cmd_rx = liq_cmd_ring;
+
+    let counter_forward_cap: usize = std::env::var("COUNTER_FORWARD_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(65_536);
+    let counter_forward_ring: std::sync::Arc<
+        crossbeam_queue::ArrayQueue<lightning_exchange::transport::counter_forward::CounterForwardMsg>,
+    > = std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(counter_forward_cap));
+    let counter_forward_tx = counter_forward_ring.clone();
+    let counter_forward_rx = counter_forward_ring;
 
     // ── Sync next_order_id from DB so WS atomic IDs don't collide ─────────────
     // Each desk-server has its own AtomicU64 counter — without DESK_ID
@@ -1386,6 +1466,7 @@ async fn async_main() -> anyhow::Result<()> {
         user_tx: Arc::new(lightning_exchange::api::UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(initial_id)),
         aeron_cmd_tx: Some(aeron_cmd_tx),
+        counter_forward_tx: Some(counter_forward_tx),
         liq_cmd_tx: Some(liq_cmd_tx),
         pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),
@@ -1427,8 +1508,13 @@ async fn async_main() -> anyhow::Result<()> {
         let liq_cmd_rx = liq_cmd_rx.clone();
         let mut order_pubs = order_pubs;
         let order_meta_cache = open_order_meta.clone();
+        let forward_origin_send = forwarded_order_origin.clone();
         let pending_meta = state.pending_meta.clone();
         let user_tx = state.user_tx.clone();
+        let account_cache_send = account_cache.clone();
+        let risk_engine_send = state.risk_engine.clone();
+        let counter_forward_client = client.clone();
+        let counter_forward_channel_send = counter_forward_channel();
         let spin_tracer = tracer.clone();
         let queue_metrics = std::env::var("DESK_QUEUE_METRICS")
             .map(|v| v == "1")
@@ -1441,8 +1527,35 @@ async fn async_main() -> anyhow::Result<()> {
                 let mut metric_last = std::time::Instant::now();
                 let mut metric_drained: u64 = 0;
                 let mut metric_max_len: usize = 0;
+                let mut counter_forward_cmd_pubs: HashMap<u16, CounterForwardPublisher> =
+                    (0..lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT)
+                        .map(|desk| {
+                            let stream = counter_forward_cmd_stream_for_desk(desk);
+                            let pub_ = CounterForwardPublisher::new(
+                                counter_forward_client.clone(),
+                                &counter_forward_channel_send,
+                                stream,
+                            )
+                            .unwrap_or_else(|e| panic!("CounterForward cmd publisher({desk}): {e}"));
+                            (desk, pub_)
+                        })
+                        .collect();
+                let mut counter_forward_resp_pubs: HashMap<u16, CounterForwardPublisher> =
+                    (0..lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT)
+                        .map(|desk| {
+                            let stream = counter_forward_resp_stream_for_desk(desk);
+                            let pub_ = CounterForwardPublisher::new(
+                                counter_forward_client.clone(),
+                                &counter_forward_channel_send,
+                                stream,
+                            )
+                            .unwrap_or_else(|e| panic!("CounterForward resp publisher({desk}): {e}"));
+                            (desk, pub_)
+                        })
+                        .collect();
                 loop {
                     let mut did_work = false;
+                    counter_forward_cmd_sub.do_work();
                     if queue_metrics {
                         metric_max_len = metric_max_len.max(aeron_cmd_rx.len());
                     }
@@ -1486,6 +1599,115 @@ async fn async_main() -> anyhow::Result<()> {
                                 }
                             }
                             _ => {} // liquidation ring carries only NewOrder
+                        }
+                    }
+                    while let Some(msg) = counter_forward_rx.pop() {
+                        did_work = true;
+                        match msg {
+                            CounterForwardMsg::NewOrder(fwd) => {
+                                let req = fwd.req;
+                                let user_id = req.participant_id as i64;
+                                let owner = lightning_exchange::desk::counter_shard::owner_shard_for_user_id(user_id);
+                                if let Some(pub_) = counter_forward_cmd_pubs.get_mut(&owner) {
+                                    let _ = pub_.publish_new_order(&fwd);
+                                }
+                            }
+                            CounterForwardMsg::Cancel(fwd) => {
+                                let req = fwd.req;
+                                let user_id = req.participant_id as i64;
+                                let owner = lightning_exchange::desk::counter_shard::owner_shard_for_user_id(user_id);
+                                if let Some(pub_) = counter_forward_cmd_pubs.get_mut(&owner) {
+                                    let _ = pub_.publish_cancel(&fwd);
+                                }
+                            }
+                            CounterForwardMsg::WsFrame(_) => {}
+                        }
+                    }
+                    while let Some(msg) = counter_forward_cmd_sub.poll() {
+                        did_work = true;
+                        match msg {
+                            CounterForwardMsg::NewOrder(fwd) => {
+                                let ingress_desk_id = fwd.ingress_desk_id;
+                                let req = fwd.req;
+                                let meta = fwd.meta;
+                                let order_id = req.client_order_id;
+                                let user_id = req.participant_id as i64;
+                                let symbol = req.symbol;
+                                let sym = std::str::from_utf8(&symbol)
+                                    .unwrap_or("")
+                                    .trim_end_matches('\0');
+                                let (_, quote_asset) = sym.split_once('_').unwrap_or(("BTC", "USDT"));
+                                let initial_margin_cents = meta.initial_margin_cents;
+                                let margin_usdt = initial_margin_cents as f64 / 100.0;
+                                let mut reject = |reason: &str| {
+                                    if let Some(frame) = CounterForwardWsFrame::new(
+                                        user_id,
+                                        order_id,
+                                        &lightning_exchange::ws_sbe::encode_order_rejected(0, reason),
+                                    ) {
+                                        if let Some(pub_) = counter_forward_resp_pubs.get_mut(&ingress_desk_id) {
+                                            let _ = pub_.publish_ws_frame(&frame);
+                                        }
+                                    }
+                                };
+
+                                if let Err(reason) = risk_engine_send.check_and_reserve_margin(user_id, initial_margin_cents) {
+                                    reject(reason);
+                                    continue;
+                                }
+                                if !try_freeze_cache(&account_cache_send, user_id, quote_asset, margin_usdt) {
+                                    risk_engine_send.release_order_margin(user_id, initial_margin_cents);
+                                    reject("Insufficient balance");
+                                    continue;
+                                }
+                                remember_runtime_order(
+                                    &order_meta_cache,
+                                    order_id,
+                                    user_id,
+                                    meta.freeze_price,
+                                    meta.qty,
+                                    req.side,
+                                    symbol,
+                                    initial_margin_cents,
+                                );
+                                pending_meta.insert(order_id, order_meta_from_forward(meta));
+                                forward_origin_send.insert(order_id, ingress_desk_id);
+                                if let Some(pub_) = order_pubs.get_mut(sym) {
+                                    let _ = pub_.publish_new_order(&req);
+                                } else {
+                                    pending_meta.remove(&order_id);
+                                    forward_origin_send.remove(&order_id);
+                                    remove_runtime_order(&order_meta_cache, order_id, order_id);
+                                    risk_engine_send.release_order_margin(user_id, initial_margin_cents);
+                                    release_cache_frozen(&account_cache_send, user_id, quote_asset, margin_usdt);
+                                    reject(&format!("No engine for symbol: {}", sym));
+                                }
+                            }
+                            CounterForwardMsg::Cancel(fwd) => {
+                                let req = fwd.req;
+                                let symbol_bytes =
+                                    runtime_meta(&order_meta_cache, req.order_id).map(|m| m.symbol);
+                                let routed = if let Some(sym_bytes) = symbol_bytes {
+                                    let sym_end =
+                                        sym_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+                                    let sym =
+                                        std::str::from_utf8(&sym_bytes[..sym_end]).unwrap_or("");
+                                    if let Some(pub_) = order_pubs.get_mut(sym) {
+                                        let _ = pub_.publish_cancel(&req);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if !routed {
+                                    for pub_ in order_pubs.values_mut() {
+                                        let _ = pub_.publish_cancel(&req);
+                                    }
+                                }
+                            }
+                            CounterForwardMsg::WsFrame(_) => {}
                         }
                     }
                     while let Some(cmd) = aeron_cmd_rx.pop() {
@@ -1816,6 +2038,9 @@ async fn async_main() -> anyhow::Result<()> {
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
         let order_meta_cache = open_order_meta;
+        let forward_origin_recv = forwarded_order_origin.clone();
+        let counter_forward_client_recv = client.clone();
+        let counter_forward_channel_recv = counter_forward_channel();
         let risk_engine = state.risk_engine.clone();
 
         std::thread::Builder::new()
@@ -1823,6 +2048,19 @@ async fn async_main() -> anyhow::Result<()> {
             .spawn(move || {
                 pin_current_thread_to_core("DESK_RECV_CORE", "aeron-recv");
                 let mut idle_us: u64 = 0;
+                let mut counter_forward_resp_pubs: HashMap<u16, CounterForwardPublisher> =
+                    (0..lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT)
+                        .map(|desk| {
+                            let stream = counter_forward_resp_stream_for_desk(desk);
+                            let pub_ = CounterForwardPublisher::new(
+                                counter_forward_client_recv.clone(),
+                                &counter_forward_channel_recv,
+                                stream,
+                            )
+                            .unwrap_or_else(|e| panic!("CounterForward resp publisher({desk}): {e}"));
+                            (desk, pub_)
+                        })
+                        .collect();
                 // Accumulator for CANCELLED events observed in one poll burst.
                 // PR5b: each entry carries the fully-resolved (user_id,
                 // asset, release_amount), looked up via OrderRuntimeMeta
@@ -1857,8 +2095,19 @@ async fn async_main() -> anyhow::Result<()> {
                     let mut did_work = false;
 
                     order_update_sub.do_work();
+                    counter_forward_resp_sub.do_work();
                     // trade/depth poll moved to aeron-recv-public to keep this
                     // thread laser-focused on private order updates.
+
+                    while let Some(msg) = counter_forward_resp_sub.poll() {
+                        did_work = true;
+                        if let CounterForwardMsg::WsFrame(frame) = msg {
+                            let user_id = frame.user_id;
+                            if let Some(tx) = user_tx.get(user_id) {
+                                let _ = tx.try_send((frame.payload().to_vec(), frame.order_id));
+                            }
+                        }
+                    }
 
                     // Process order updates — complete pending REST/WS requests.
                     while let Some(msg) = order_update_sub.poll() {
@@ -1889,7 +2138,10 @@ async fn async_main() -> anyhow::Result<()> {
                         };
                         let owned = user_tx.get(participant_id as i64).is_some()
                             || pending_orders.contains_key(&lookup_id_for_pending)
-                            || pending_meta.contains_key(&lookup_id_for_pending);
+                            || pending_meta.contains_key(&lookup_id_for_pending)
+                            || pending_meta.contains_key(&client_order_id)
+                            || forward_origin_recv.contains_key(&lookup_id_for_pending)
+                            || forward_origin_recv.contains_key(&client_order_id);
                         if !owned {
                             continue;
                         }
@@ -1913,6 +2165,9 @@ async fn async_main() -> anyhow::Result<()> {
                                 client_order_id,
                                 order_id,
                             );
+                            if let Some((_, ingress)) = forward_origin_recv.remove(&client_order_id) {
+                                forward_origin_recv.insert(order_id, ingress);
+                            }
                         }
                         let ws_meta = pending_meta.remove(&lookup_id).map(|(_, m)| m);
                         if let Some(meta_ref) = ws_meta.as_ref() {
@@ -1952,12 +2207,25 @@ async fn async_main() -> anyhow::Result<()> {
                         // WS notification on the recv spin thread.
                         if kind == order_update_kind::ACCEPTED {
                             // if let Some(ref t) = spin_tracer { t.record(MS_WS_UPDATE_SEND, client_order_id); }
+                            let ts = msg.timestamp;
+                            let upd = lightning_exchange::ws_sbe::encode_order_update(
+                                order_id, 0, lightning_exchange::ws_sbe::WS_STATUS_OPEN,
+                                fill_qty, fill_price, ts,
+                            );
+                            if let Some(ingress) = forward_origin_recv
+                                .get(&order_id)
+                                .map(|e| *e.value())
+                                .or_else(|| forward_origin_recv.get(&client_order_id).map(|e| *e.value()))
+                            {
+                                if let Some(frame) =
+                                    CounterForwardWsFrame::new(participant_id as i64, order_id, &upd)
+                                {
+                                    if let Some(pub_) = counter_forward_resp_pubs.get_mut(&ingress) {
+                                        let _ = pub_.publish_ws_frame(&frame);
+                                    }
+                                }
+                            }
                             if let Some(tx) = user_tx.get(participant_id as i64) {
-                                let ts = msg.timestamp;
-                                let upd = lightning_exchange::ws_sbe::encode_order_update(
-                                    order_id, 0, lightning_exchange::ws_sbe::WS_STATUS_OPEN,
-                                    fill_qty, fill_price, ts,
-                                );
                                 if tx.try_send((upd, client_order_id)).is_err() {
                                     let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n % 10_000 == 0 {
@@ -2188,10 +2456,41 @@ async fn async_main() -> anyhow::Result<()> {
                                 let upd = lightning_exchange::ws_sbe::encode_order_update(
                                     order_id, 0, status_byte, fill_qty, fill_price, ts,
                                 );
+                                if let Some(ingress) = forward_origin_recv
+                                    .get(&order_id)
+                                    .map(|e| *e.value())
+                                    .or_else(|| forward_origin_recv.get(&client_order_id).map(|e| *e.value()))
+                                {
+                                    if let Some(frame) =
+                                        CounterForwardWsFrame::new(user_id, order_id, &upd)
+                                    {
+                                        if let Some(pub_) = counter_forward_resp_pubs.get_mut(&ingress) {
+                                            let _ = pub_.publish_ws_frame(&frame);
+                                        }
+                                    }
+                                }
                                 if tx.try_send((upd, 0)).is_err() {
                                     let n = full_channels.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n % 10_000 == 0 {
                                         tracing::warn!("personal channel full — order_update dropped (total: {n})");
+                                    }
+                                }
+                            } else if let Some(ingress) = forward_origin_recv
+                                .get(&order_id)
+                                .map(|e| *e.value())
+                                .or_else(|| forward_origin_recv.get(&client_order_id).map(|e| *e.value()))
+                            {
+                                let ws_status = ws_status_from_update_kind(kind);
+                                let status_byte = lightning_exchange::ws_sbe::ws_status_byte_from_str(ws_status.as_str());
+                                let ts = msg.timestamp;
+                                let upd = lightning_exchange::ws_sbe::encode_order_update(
+                                    order_id, 0, status_byte, fill_qty, fill_price, ts,
+                                );
+                                if let Some(frame) =
+                                    CounterForwardWsFrame::new(user_id, order_id, &upd)
+                                {
+                                    if let Some(pub_) = counter_forward_resp_pubs.get_mut(&ingress) {
+                                        let _ = pub_.publish_ws_frame(&frame);
                                     }
                                 }
                             }
@@ -2249,6 +2548,8 @@ async fn async_main() -> anyhow::Result<()> {
                             || kind == order_update_kind::CANCELLED
                             || kind == order_update_kind::REJECTED
                         {
+                            forward_origin_recv.remove(&order_id);
+                            forward_origin_recv.remove(&client_order_id);
                             remove_runtime_order(&order_meta_cache, order_id, client_order_id);
                         }
                     }

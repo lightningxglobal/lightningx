@@ -15,6 +15,10 @@ use crate::transport::{
     InboundMsg, MarketDataPublisher, OrderSubscriber, OrderUpdateMsg, OrderUpdatePublisher,
     TradePublisher, TransportError,
 };
+use crate::transport::counter_forward::{
+    CounterForwardCancel, CounterForwardMsg, CounterForwardNewOrder, CounterForwardWsFrame,
+    COUNTER_FORWARD_KIND_CANCEL, COUNTER_FORWARD_KIND_NEW_ORDER, COUNTER_FORWARD_KIND_WS_FRAME,
+};
 
 use aeron_wrapper::{AeronClient, Error as AeronError, NoopLifecycle, PollCallback, Pub};
 use parking_lot::Mutex;
@@ -36,6 +40,7 @@ const TRADE_RING: usize = 5_000_000;
 // 5M entries × 12.9 KB × 3 rings ≈ 193 GB — was causing 10 GB RSS.
 // 1024 is plenty: at 100 snapshots/s the public recv drains faster than they arrive.
 const DEPTH_RING: usize = 1_024;
+const COUNTER_FORWARD_RING: usize = 65_536;
 
 /// Zero-copy publish: retry `try_claim` on back-pressure, then run the
 /// writer directly into Aeron's term-log buffer (saves the staging-array
@@ -373,6 +378,159 @@ impl MarketDataPublisher for AeronMarketDataPublisher {
 pub struct DeskOrderPublisher {
     client: Arc<AeronClient>,
     publisher: aeron_wrapper::Publisher,
+}
+
+// ============================================================================
+// 柜台 ↔ 柜台 - 转发 wrong-owner 私有请求/响应
+// ============================================================================
+
+pub struct CounterForwardPublisher {
+    client: Arc<AeronClient>,
+    publisher: aeron_wrapper::Publisher,
+}
+
+impl CounterForwardPublisher {
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
+        let publisher = client
+            .add_publication(channel, stream_id)
+            .map_err(|e| format!("Failed to add counter-forward publication: {:?}", e))?;
+        tracing::info!("✓ CounterForwardPublisher created on stream {}", stream_id);
+        Ok(Self { client, publisher })
+    }
+
+    pub fn do_work(&mut self) {
+        self.client.do_work();
+    }
+
+    pub fn publish_new_order(&mut self, msg: &CounterForwardNewOrder) -> Result<(), TransportError> {
+        publish_pod(&mut self.publisher, msg)
+    }
+
+    pub fn publish_cancel(&mut self, msg: &CounterForwardCancel) -> Result<(), TransportError> {
+        publish_pod(&mut self.publisher, msg)
+    }
+
+    pub fn publish_ws_frame(&mut self, msg: &CounterForwardWsFrame) -> Result<(), TransportError> {
+        publish_pod(&mut self.publisher, msg)
+    }
+}
+
+#[inline]
+fn publish_pod<T: Copy>(
+    publisher: &mut aeron_wrapper::Publisher,
+    msg: &T,
+) -> Result<(), TransportError> {
+    let len = std::mem::size_of::<T>();
+    publish_with_retry_claim(publisher, len, |buf| unsafe {
+        std::ptr::copy_nonoverlapping(msg as *const T as *const u8, buf.as_mut_ptr(), len);
+    })
+}
+
+struct CounterForwardCallback {
+    tx: Producer<CounterForwardMsg>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl PollCallback for CounterForwardCallback {
+    fn on_data(&mut self, data: &[u8]) {
+        let Some(kind) = data.first().copied() else {
+            return;
+        };
+        let msg = match kind {
+            COUNTER_FORWARD_KIND_NEW_ORDER
+                if data.len() >= std::mem::size_of::<CounterForwardNewOrder>() =>
+            {
+                unsafe {
+                    Some(CounterForwardMsg::NewOrder(std::ptr::read_unaligned(
+                        data.as_ptr() as *const CounterForwardNewOrder,
+                    )))
+                }
+            }
+            COUNTER_FORWARD_KIND_CANCEL
+                if data.len() >= std::mem::size_of::<CounterForwardCancel>() =>
+            {
+                unsafe {
+                    Some(CounterForwardMsg::Cancel(std::ptr::read_unaligned(
+                        data.as_ptr() as *const CounterForwardCancel,
+                    )))
+                }
+            }
+            COUNTER_FORWARD_KIND_WS_FRAME
+                if data.len() >= std::mem::size_of::<CounterForwardWsFrame>() =>
+            {
+                unsafe {
+                    Some(CounterForwardMsg::WsFrame(std::ptr::read_unaligned(
+                        data.as_ptr() as *const CounterForwardWsFrame,
+                    )))
+                }
+            }
+            _ => None,
+        };
+        if let Some(msg) = msg {
+            if let Err(rtrb::PushError::Full(_)) = self.tx.push(msg) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub struct CounterForwardSubscriber {
+    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<CounterForwardCallback>>>>,
+    rx: Consumer<CounterForwardMsg>,
+    dropped: Arc<AtomicU64>,
+    last_reported_dropped: u64,
+    client: Arc<AeronClient>,
+}
+
+impl CounterForwardSubscriber {
+    pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
+        let (tx, rx) = RingBuffer::<CounterForwardMsg>::new(COUNTER_FORWARD_RING);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let subscriber = client
+            .add_subscription(
+                channel,
+                stream_id,
+                10_000,
+                CounterForwardCallback {
+                    tx,
+                    dropped: dropped.clone(),
+                },
+                NoopLifecycle,
+            )
+            .map_err(|e| format!("Failed to subscribe to counter-forward: {:?}", e))?;
+        tracing::info!("✓ CounterForwardSubscriber created on stream {}", stream_id);
+        Ok(Self {
+            subscriber: Arc::new(Mutex::new(subscriber)),
+            rx,
+            dropped,
+            last_reported_dropped: 0,
+            client,
+        })
+    }
+
+    pub fn do_work(&mut self) {
+        self.client.do_work();
+    }
+
+    pub fn poll(&mut self) -> Option<CounterForwardMsg> {
+        {
+            let mut sub = self.subscriber.lock();
+            let _ = sub.poll();
+        }
+        let current_dropped = self.dropped.load(Ordering::Relaxed);
+        if current_dropped != self.last_reported_dropped {
+            tracing::warn!(
+                "Aeron counter-forward ring full: {} messages dropped (total)",
+                current_dropped
+            );
+            self.last_reported_dropped = current_dropped;
+        }
+        self.rx.pop().ok()
+    }
+
+    pub fn dropped_messages(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl DeskOrderPublisher {

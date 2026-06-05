@@ -332,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
         user_tx: Arc::new(UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
         aeron_cmd_tx: None,
+        counter_forward_tx: None,
         liq_cmd_tx: None,
         pending_meta: Arc::new(DashMap::new()),
         pending_orders: Arc::new(DashMap::new()),

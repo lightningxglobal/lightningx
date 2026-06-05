@@ -8,6 +8,13 @@ pub const COUNTER_FORWARD_KIND_WS_FRAME: u8 = 3;
 pub const COUNTER_FORWARD_MAX_CLIENT_ID: usize = 32;
 pub const COUNTER_FORWARD_MAX_WS_FRAME: usize = 512;
 
+#[derive(Clone, Copy)]
+pub enum CounterForwardMsg {
+    NewOrder(CounterForwardNewOrder),
+    Cancel(CounterForwardCancel),
+    WsFrame(CounterForwardWsFrame),
+}
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct CounterForwardOrderMeta {
@@ -202,5 +209,54 @@ mod tests {
         assert_eq!(frame.payload(), payload);
         assert_eq!({ frame.user_id }, 7);
         assert_eq!({ frame.order_id }, 9);
+    }
+
+    #[test]
+    fn forwarded_new_order_keeps_ingress_and_owner_response_stream() {
+        let owner_desk = 2;
+        let req = NewOrderRequest {
+            client_order_id: 99,
+            participant_id: 42,
+            price_ticks: 123,
+            quantity_lots: 456,
+            side: 0,
+            time_in_force: 0,
+            response_stream_id: crate::aeron_channels::order_update_stream_for_desk(owner_desk),
+            _pad: [0; 10],
+            symbol: sym16("SOL_USDT"),
+        };
+        let meta = CounterForwardOrderMeta::new(
+            42,
+            sym16("SOL_USDT"),
+            0,
+            "limit",
+            Some(12.3),
+            4.56,
+            12.3,
+            123,
+            "c-99",
+        );
+        let frame = CounterForwardNewOrder::new(1, req, meta);
+        assert_eq!({ frame.kind }, COUNTER_FORWARD_KIND_NEW_ORDER);
+        assert_eq!({ frame.ingress_desk_id }, 1);
+        assert_eq!({ frame.req.response_stream_id }, crate::aeron_channels::order_update_stream_for_desk(owner_desk));
+        assert_eq!({ frame.meta.user_id }, 42);
+        assert_eq!(frame.meta.client_order_id_string(), "c-99");
+    }
+
+    #[test]
+    fn forwarded_cancel_keeps_ingress_and_response_stream() {
+        let owner_desk = 3;
+        let req = CancelOrderRequest {
+            order_id: 77,
+            participant_id: 43,
+            response_stream_id: crate::aeron_channels::order_update_stream_for_desk(owner_desk),
+            _pad: [0; 4],
+        };
+        let frame = CounterForwardCancel::new(0, req);
+        assert_eq!({ frame.kind }, COUNTER_FORWARD_KIND_CANCEL);
+        assert_eq!({ frame.ingress_desk_id }, 0);
+        assert_eq!({ frame.req.order_id }, 77);
+        assert_eq!({ frame.req.response_stream_id }, crate::aeron_channels::order_update_stream_for_desk(owner_desk));
     }
 }

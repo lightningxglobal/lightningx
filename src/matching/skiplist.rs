@@ -106,12 +106,12 @@ impl SkipList {
         // 从最高层向下遍历
         for i in (0..=self.level).rev() {
             loop {
-                let fwd = (*current).forward[i];
+                let fwd = unsafe { (*current).forward[i] };
                 if fwd.is_null() {
                     break;
                 }
 
-                let fwd_price = (*fwd).price_ticks;
+                let fwd_price = unsafe { (*fwd).price_ticks };
 
                 // 如果目标价格已经在下一个节点，停止
                 if fwd_price == price {

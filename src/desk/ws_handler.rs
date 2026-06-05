@@ -1,5 +1,6 @@
 use crate::account_repository::AccountRepository;
 use crate::api::AppState;
+use crate::desk::counter_shard::owner_shard_for_user_id;
 use crate::desk::read_actor::{ConnMarketInfo, ReadConn};
 use dashmap::DashMap as ActorConnMap;
 use crate::engine::{MatchingEngine, OrderStatus};
@@ -21,6 +22,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use crate::transport::counter_forward::{
+    CounterForwardCancel, CounterForwardMsg, CounterForwardNewOrder, CounterForwardOrderMeta,
+};
 
 fn try_freeze_cache(
     cache: &crate::api::AccountCache,
@@ -587,12 +591,6 @@ async fn handle_client_message(
     match msg {
         ClientMsg::Auth { token } => match user_service::verify_token(&token) {
             Ok(claims) => {
-                if !is_user_owned_by_this_desk(state, claims.sub) {
-                    return Some(ws_sbe::encode_auth_error(&wrong_counter_shard_message(
-                        claims.sub,
-                        state.desk_id,
-                    )));
-                }
                 session.user_id = Some(claims.sub);
                 state.user_tx.register(claims.sub, personal_tx.clone());
                 Some(ws_sbe::encode_auth_ok(claims.sub))
@@ -603,12 +601,6 @@ async fn handle_client_message(
         ClientMsg::ApiKeyAuth { api_key } => {
             match user_service::verify_api_key(&state.db, &api_key).await {
                 Ok(user_id) => {
-                    if !is_user_owned_by_this_desk(state, user_id) {
-                        return Some(ws_sbe::encode_auth_error(&wrong_counter_shard_message(
-                            user_id,
-                            state.desk_id,
-                        )));
-                    }
                     session.user_id = Some(user_id);
                     state.user_tx.register(user_id, personal_tx.clone());
                     Some(ws_sbe::encode_auth_ok(user_id))
@@ -676,12 +668,7 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_order_rejected(0, "Not authenticated")),
             };
-            if !is_user_owned_by_this_desk(state, user_id) {
-                return Some(ws_sbe::encode_order_rejected(
-                    0,
-                    &wrong_counter_shard_message(user_id, state.desk_id),
-                ));
-            }
+            let is_local_owner = is_user_owned_by_this_desk(state, user_id);
 
             // Client is responsible for ensuring client_order_id uniqueness
             // — no server-side idempotency check. The DB UNIQUE constraint
@@ -822,6 +809,65 @@ async fn handle_client_message(
 
                 if initial_margin_cents <= 0 {
                     return Some(ws_sbe::encode_order_rejected(0, "Unable to determine margin requirement"));
+                }
+
+                if !is_local_owner {
+                    let Some(counter_forward_tx) = &state.counter_forward_tx else {
+                        return Some(ws_sbe::encode_order_rejected(
+                            0,
+                            &wrong_counter_shard_message(user_id, state.desk_id),
+                        ));
+                    };
+                    let owner_desk_id = owner_shard_for_user_id(user_id);
+                    let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
+                    let mut sym_bytes = [0u8; 16];
+                    let sb = symbol.as_bytes();
+                    sym_bytes[..sb.len().min(16)].copy_from_slice(&sb[..sb.len().min(16)]);
+                    if let Some(ref t) = state.tracer {
+                        t.record_sym(MS_WS_ORDER_RECV, order_id, &sym_bytes);
+                    }
+                    let side_byte: u8 = if engine_side == Side::Buy { 0 } else { 1 };
+                    let tif_byte: u8 = match tif {
+                        TimeInForce::GTC => 0,
+                        TimeInForce::IOC => 1,
+                        TimeInForce::FOK => 2,
+                        TimeInForce::PostOnly => 3,
+                    };
+                    let sbe_req = SbeNewOrder {
+                        client_order_id: order_id,
+                        participant_id: user_id as u64,
+                        price_ticks: fixed_shape.price_ticks.unwrap_or(0),
+                        quantity_lots: fixed_shape.quantity_lots,
+                        side: side_byte,
+                        time_in_force: tif_byte,
+                        response_stream_id: crate::aeron_channels::order_update_stream_for_desk(owner_desk_id),
+                        _pad: [0; 10],
+                        symbol: sym_bytes,
+                    };
+                    let meta = CounterForwardOrderMeta::new(
+                        user_id,
+                        sym_bytes,
+                        side_byte,
+                        &order_type,
+                        price,
+                        qty,
+                        freeze_price_val,
+                        initial_margin_cents,
+                        &client_order_id,
+                    );
+                    let msg = CounterForwardMsg::NewOrder(CounterForwardNewOrder::new(
+                        state.desk_id,
+                        sbe_req,
+                        meta,
+                    ));
+                    if counter_forward_tx.push(msg).is_err() {
+                        return Some(ws_sbe::encode_order_rejected(0, "system busy"));
+                    }
+                    return if ws_inline_order_submitted_enabled() {
+                        Some(ws_sbe::encode_order_submitted(order_id, order_id, unix_now()))
+                    } else {
+                        None
+                    };
                 }
 
                 let t_pre_freeze = if t0.is_some() {
@@ -1427,12 +1473,7 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
-            if !is_user_owned_by_this_desk(state, user_id) {
-                return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
-                    user_id,
-                    state.desk_id,
-                )));
-            }
+            let is_local_owner = is_user_owned_by_this_desk(state, user_id);
 
             // ── Aeron fast path: forward cancel immediately, no DB on the hot
             // path. Fund release + PG DELETE happen when engine's CANCELED
@@ -1442,6 +1483,29 @@ async fn handle_client_message(
             // engine doesn't need the metadata to cancel.
             if state.engines.is_none() {
                 if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
+                    if !is_local_owner {
+                        let Some(counter_forward_tx) = &state.counter_forward_tx else {
+                            return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
+                                user_id,
+                                state.desk_id,
+                            )));
+                        };
+                        let owner_desk_id = owner_shard_for_user_id(user_id);
+                        let cancel_req = crate::sbe::CancelOrderRequest {
+                            order_id: order_id as u64,
+                            participant_id: user_id as u64,
+                            response_stream_id: crate::aeron_channels::order_update_stream_for_desk(owner_desk_id),
+                            _pad: [0; 4],
+                        };
+                        let msg = CounterForwardMsg::Cancel(CounterForwardCancel::new(
+                            state.desk_id,
+                            cancel_req,
+                        ));
+                        if counter_forward_tx.push(msg).is_err() {
+                            return Some(ws_sbe::encode_error("system busy"));
+                        }
+                        return Some(ws_sbe::encode_cancel_submitted(order_id as u64, unix_now()));
+                    }
                     let cancel_req = crate::sbe::CancelOrderRequest {
                         order_id: order_id as u64,
                         participant_id: user_id as u64,
@@ -1460,6 +1524,12 @@ async fn handle_client_message(
 
             // ── Standalone path: still needs the SELECT + freeze release
             // because there's no spin thread to do it. Kept inline below.
+            if !is_local_owner {
+                return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
+                    user_id,
+                    state.desk_id,
+                )));
+            }
             let order_row = sqlx::query(
                 "SELECT symbol, side, price, quantity, filled FROM orders
                  WHERE id = $1 AND user_id = $2 AND status IN ('PENDING','TRADING')",

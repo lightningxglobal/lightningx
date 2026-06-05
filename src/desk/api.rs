@@ -204,6 +204,13 @@ pub struct AppState {
     /// stream cannot OOM the process — when push returns Err(value),
     /// the WS handler must reject the client with "system busy".
     pub aeron_cmd_tx: Option<std::sync::Arc<crossbeam_queue::ArrayQueue<AeronCmd>>>,
+    /// Wrong-owner WS order/cancel forwarding queue. Drained by the Aeron
+    /// send-spin thread and published to the owning counter desk.
+    pub counter_forward_tx: Option<
+        std::sync::Arc<
+            crossbeam_queue::ArrayQueue<crate::transport::counter_forward::CounterForwardMsg>,
+        >,
+    >,
     /// Priority ring for system-generated liquidation orders.
     /// The spin thread drains this BEFORE aeron_cmd_tx so forced-liquidation
     /// orders are always submitted to the matching engine ahead of normal flow.

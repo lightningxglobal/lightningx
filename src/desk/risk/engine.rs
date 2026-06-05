@@ -345,6 +345,11 @@ impl RiskEngine {
         if risk_user_ids.is_empty() {
             return Vec::new();
         }
+        // Keep sort+dedup for the current pressure-test shape. Benchmarked in
+        // benches/risk_dedup_bench.rs on 2026-06-05: with 40K users and 1-2
+        // positions/user, sort+dedup is ~7-9x faster than HashSet. HashSet only
+        // wins in high-duplicate shapes such as 10K users x 4 symbols. Revisit
+        // if the typical account position fanout grows beyond ~3 positions/user.
         risk_user_ids.sort_unstable();
         risk_user_ids.dedup();
 

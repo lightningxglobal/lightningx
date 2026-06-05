@@ -2,9 +2,9 @@ use aeron_wrapper::AeronClient;
 use lightning_exchange::{
     account_repository::AccountRepository,
     aeron_channels::{
-        aeron_dir, depth_channel, order_update_channel, order_update_stream_for_desk,
-        orders_channel, orders_stream_for_symbol, trade_channel, DEPTH50_STREAM, DEPTH_STREAM,
-        LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM, ORDER_UPDATE_STREAM_BASE, TRADE_STREAM,
+        DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM,
+        ORDER_UPDATE_STREAM_BASE, TRADE_STREAM, aeron_dir, depth_channel, order_update_channel,
+        order_update_stream_for_desk, orders_channel, orders_stream_for_symbol, trade_channel,
     },
     aeron_transport::{
         AeronMarketDataPublisher, AeronOrderSubscriber, AeronOrderUpdatePublisher,
@@ -17,7 +17,7 @@ use lightning_exchange::{
     order::{Order, Side, TimeInForce},
     sbe::TradeNotification,
     symbol_rules::SymbolRules,
-    tracer::{spawn_tracer, ENGINE_INSTANCE_ID},
+    tracer::{ENGINE_INSTANCE_ID, spawn_tracer},
     transport::{
         InboundMsg, MarketDataPublisher, OrderSubscriber, OrderUpdateMsg, OrderUpdatePublisher,
         TradePublisher,
@@ -112,7 +112,9 @@ fn pin_current_thread_to_core(name: &str, index: usize, label: &str) {
 #[cfg(not(target_os = "linux"))]
 fn pin_current_thread_to_core(name: &str, index: usize, label: &str) {
     if let Some(core) = env_core_at(name, index) {
-        tracing::warn!("{label} requested cpu pin {core} via {name}[{index}], but this platform does not support pthread affinity");
+        tracing::warn!(
+            "{label} requested cpu pin {core} via {name}[{index}], but this platform does not support pthread affinity"
+        );
     }
 }
 
@@ -548,6 +550,7 @@ fn spawn_symbol_thread(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    lightning_exchange::util::install_panic_hook();
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
@@ -670,16 +673,10 @@ async fn main() -> anyhow::Result<()> {
         );
         if let Some(eng) = engines.get_mut(&db_order.symbol) {
             if eng.add_to_book(order).is_ok() {
-                uid_maps
-                    .entry(db_order.symbol.clone())
-                    .or_default()
-                    .insert(
-                        db_order.id as u64,
-                        (
-                            db_order.user_id as u64,
-                            order_update_stream_for_desk(0),
-                        ),
-                    );
+                uid_maps.entry(db_order.symbol.clone()).or_default().insert(
+                    db_order.id as u64,
+                    (db_order.user_id as u64, order_update_stream_for_desk(0)),
+                );
                 restored += 1;
             }
         }
@@ -716,7 +713,9 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(f64::MAX);
             tracing::warn!(
                 "Crossed book for {} (bid={} >= ask={}) — cancelling all open orders and rebuilding",
-                sym, best_bid, best_ask
+                sym,
+                best_bid,
+                best_ask
             );
 
             #[allow(clippy::type_complexity)]

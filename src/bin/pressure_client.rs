@@ -36,18 +36,18 @@
 //!   stdout. Final summary at the end.
 
 use anyhow::Context;
-use fastwebsockets::{handshake, Frame, OpCode, Payload, WebSocket};
+use fastwebsockets::{Frame, OpCode, Payload, WebSocket, handshake};
 use http_body_util::Empty;
 use hyper::{
+    Request,
     body::Bytes,
     header::{CONNECTION, UPGRADE},
-    Request,
 };
 use hyper_util::rt::TokioIo;
 use lightning_exchange::ws_sbe;
-use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
@@ -373,7 +373,7 @@ async fn ws_connect_plain_from(
             Ok(_) => {
                 return Err(anyhow::anyhow!(
                     "bind_ip only supports v4 destinations; got {host}"
-                ))
+                ));
             }
             Err(_) => {
                 let addrs = tokio::net::lookup_host(format!("{host}:{port}")).await?;
@@ -462,7 +462,7 @@ async fn ensure_user(
 /// entirely. Drops setup for 400K users from ~10 min (bcrypt-bound) to
 /// ~10 s (local HMAC-SHA256 signing).
 fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<UserToken>>> {
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
     #[derive(Serialize)]
     struct Claims {
@@ -504,9 +504,7 @@ fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<User
     let mut users = Vec::with_capacity(cfg.users);
     let selected: Vec<(usize, i64)> = if let Some(owner_shard) = cfg.owner_shard {
         rows.into_iter()
-            .filter(|(_, uid)| {
-                (*uid as u64 % cfg.owner_shard_count as u64) as u16 == owner_shard
-            })
+            .filter(|(_, uid)| (*uid as u64 % cfg.owner_shard_count as u64) as u16 == owner_shard)
             .skip(cfg.user_offset)
             .take(cfg.users)
             .collect()
@@ -649,12 +647,12 @@ async fn driver(
 
     // Pre-convert price/qty to integer ticks/lots once per connection.
     let sym_rules = lightning_exchange::symbol_rules::SymbolRules::for_symbol(&cfg.symbol);
-    let price_ticks: i64 = sym_rules.price_to_ticks(cfg.price).unwrap_or_else(|_| {
-        (cfg.price / sym_rules.price_tick).round() as i64
-    });
-    let quantity_lots: i64 = sym_rules.quantity_to_lots(cfg.qty).unwrap_or_else(|_| {
-        (cfg.qty / sym_rules.quantity_step).round() as i64
-    });
+    let price_ticks: i64 = sym_rules
+        .price_to_ticks(cfg.price)
+        .unwrap_or_else(|_| (cfg.price / sym_rules.price_tick).round() as i64);
+    let quantity_lots: i64 = sym_rules
+        .quantity_to_lots(cfg.qty)
+        .unwrap_or_else(|_| (cfg.qty / sym_rules.quantity_step).round() as i64);
 
     loop {
         if Instant::now() >= deadline {
@@ -663,11 +661,20 @@ async fn driver(
 
         // Send place_order.
         counter += 1;
-        let coid: u64 = (conn_idx as u64).wrapping_mul(1_000_000_000).wrapping_add(counter);
+        let coid: u64 = (conn_idx as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(counter);
         let mut order_id_match: Option<u64> = None;
         let side: u8 = 0; // Buy
-        let tif: u8 = 0;  // GTC
-        let place_buf = ws_sbe::encode_client_place_order(coid, &cfg.symbol, side, tif, price_ticks, quantity_lots);
+        let tif: u8 = 0; // GTC
+        let place_buf = ws_sbe::encode_client_place_order(
+            coid,
+            &cfg.symbol,
+            side,
+            tif,
+            price_ticks,
+            quantity_lots,
+        );
         let t0 = Instant::now();
         metrics.place_sent.fetch_add(1, Ordering::Relaxed);
         if ws
@@ -718,7 +725,10 @@ async fn driver(
                 continue;
             };
             if dbg && counter <= 5 {
-                eprintln!("[conn{conn_idx} place#{counter} read#{frames_read}] msg_type={msg_type} len={}", buf.len());
+                eprintln!(
+                    "[conn{conn_idx} place#{counter} read#{frames_read}] msg_type={msg_type} len={}",
+                    buf.len()
+                );
             }
             match msg_type {
                 ws_sbe::ORDER_SUBMITTED => {
@@ -871,7 +881,9 @@ async fn driver(
                         continue;
                     }
                     ws_sbe::ORDER_UPDATE => {
-                        if let Some((order_id, _, status, _, _, _)) = ws_sbe::decode_order_update(buf) {
+                        if let Some((order_id, _, status, _, _, _)) =
+                            ws_sbe::decode_order_update(buf)
+                        {
                             if order_id == id as u64 && status == ws_sbe::WS_STATUS_CANCELED {
                                 cancel_ok = true;
                                 break;
@@ -922,7 +934,6 @@ async fn driver(
     metrics.conn_open.fetch_sub(1, Ordering::Relaxed);
     metrics.conn_closed.fetch_add(1, Ordering::Relaxed);
 }
-
 
 // ── Reporter ─────────────────────────────────────────────────────────────────
 
@@ -1008,6 +1019,7 @@ fn worker_threads() -> usize {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    lightning_exchange::util::install_panic_hook();
     raise_nofile_limit();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1071,8 +1083,15 @@ async fn async_main() -> anyhow::Result<()> {
     let cfg = Arc::new(Config::from_env());
     info!(
         "pressure_client: users={} user_offset={} conns={} ops/s/conn={} duration={}s ramp={}s symbol={} price={} qty={}",
-        cfg.users, cfg.user_offset, cfg.conns, cfg.ops_per_sec, cfg.duration_s, cfg.ramp_s,
-        cfg.symbol, cfg.price, cfg.qty,
+        cfg.users,
+        cfg.user_offset,
+        cfg.conns,
+        cfg.ops_per_sec,
+        cfg.duration_s,
+        cfg.ramp_s,
+        cfg.symbol,
+        cfg.price,
+        cfg.qty,
     );
 
     let users = setup_users(&cfg).await.context("setup users")?;

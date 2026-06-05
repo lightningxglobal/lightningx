@@ -8,6 +8,7 @@ pub mod transport;
 
 // ── 柜台子系统 (desk server + API) ───────────────────────────────────────────
 pub mod desk;
+pub mod util;
 
 // ── Flat re-exports: preserve all existing `crate::module` paths ──────────────
 pub use matching::engine;
@@ -41,10 +42,10 @@ pub use desk::models;
 pub use desk::order_state;
 pub use desk::positions;
 pub use desk::rate_limit;
+pub use desk::read_actor;
 pub use desk::snowflake;
 pub use desk::symbol_rules;
 pub use desk::user_service;
-pub use desk::read_actor;
 pub use desk::write_actor;
 pub use desk::ws_handler;
 
@@ -67,15 +68,15 @@ pub use market_data::{
 };
 pub use order::{Order, Side, TimeInForce};
 pub use order_state::{
-    db_status_from_engine, db_status_from_update_kind, maker_ws_status_from_db_status,
-    ws_status_from_engine, ws_status_from_update_kind, DbOrderStatus, WsOrderStatus,
-    HISTORY_DB_STATUSES, OPEN_DB_STATUSES,
+    DbOrderStatus, HISTORY_DB_STATUSES, OPEN_DB_STATUSES, WsOrderStatus, db_status_from_engine,
+    db_status_from_update_kind, maker_ws_status_from_db_status, ws_status_from_engine,
+    ws_status_from_update_kind,
 };
 pub use rate_limit::{RateLimitPolicy, RateLimiter};
 pub use snapshot::{DepthSnapshot, PriceLevel};
 pub use snowflake::SnowflakeIdGenerator;
 pub use symbol_rules::{
-    normalize_order_shape, validate_order_shape, FixedOrderInput, FixedOrderShape, SymbolRules,
+    FixedOrderInput, FixedOrderShape, SymbolRules, normalize_order_shape, validate_order_shape,
 };
 pub use trade::Trade;
 

@@ -1,18 +1,18 @@
 use axum::{
+    Json, Router,
     extract::{Request, State},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use dashmap::DashMap;
-use fastwebsockets::{upgrade, Frame, OpCode};
-use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+use fastwebsockets::{Frame, OpCode, upgrade};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use lightning_exchange::{
     aeron_channels::{
-        aeron_dir, depth_channel, trade_channel, DEPTH50_STREAM, DEPTH_STREAM, LEVEL2_STREAM,
-        TRADE_STREAM,
+        DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM, TRADE_STREAM, aeron_dir, depth_channel,
+        trade_channel,
     },
     aeron_transport::{DeskDepthMsg, DeskDepthSubscriber, DeskTradeSubscriber},
     api::MarketFanout,
@@ -176,8 +176,7 @@ impl LiveMarketData {
     fn ingest(&mut self, symbol: &str, ts_micros: u64, price: f64, qty: f64) -> [Vec<u8>; 4] {
         let ts_secs = (ts_micros / 1_000_000) as i64;
         let state = self.by_symbol.entry(symbol.to_string()).or_default();
-        let (change, high, low, volume, kline, agg_1s, agg_5s) =
-            state.ingest(ts_secs, price, qty);
+        let (change, high, low, volume, kline, agg_1s, agg_5s) = state.ingest(ts_secs, price, qty);
         [
             ws_sbe::encode_ticker(symbol, price, change, high, low, volume),
             ws_sbe::encode_kline(
@@ -527,7 +526,7 @@ async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Response
                 axum::http::StatusCode::BAD_REQUEST,
                 format!("WS upgrade rejected: {e}"),
             )
-                .into_response()
+                .into_response();
         }
     };
     tokio::spawn(async move {
@@ -542,7 +541,9 @@ async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Response
         let conn_id = CONN_ID_GEN.fetch_add(1, Ordering::Relaxed);
         let (ws_read, ws_write) = socket.split(tio::split);
         let Some((personal_tx, ctrl_tx)) =
-            state.write_pool.register(ws_write, market_ws_queue_cap(), None)
+            state
+                .write_pool
+                .register(ws_write, market_ws_queue_cap(), None)
         else {
             return;
         };
@@ -609,8 +610,8 @@ fn spawn_aeron_public_loop(state: AppState) -> anyhow::Result<()> {
                     let qty = trade.quantity;
                     let side = trade.side;
                     let sym_end = trade.symbol.iter().position(|&b| b == 0).unwrap_or(16);
-                    let symbol = std::str::from_utf8(&trade.symbol[..sym_end])
-                        .unwrap_or("BTC_USDT");
+                    let symbol =
+                        std::str::from_utf8(&trade.symbol[..sym_end]).unwrap_or("BTC_USDT");
                     let ts = unix_now_micros();
 
                     if state.market_fanout.subscriber_count() != 0 {
@@ -688,6 +689,7 @@ fn router(state: AppState) -> Router {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    lightning_exchange::util::install_panic_hook();
 
     let read_pool = Arc::new(PublicReadActorPool::new());
     let market_fanout = Arc::new(MarketFanout::new_with_actors(read_pool.market_senders()));
@@ -716,7 +718,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_public_channel, market_channel, PublicClientMsg};
+    use super::{PublicClientMsg, is_public_channel, market_channel};
     use lightning_exchange::ws_sbe;
 
     #[test]

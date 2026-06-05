@@ -25,6 +25,10 @@ TRACER_ENABLED="${TRACER_ENABLED:-0}"
 CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
 PRESSURE_OWNER_SHARD_SHIFT="${PRESSURE_OWNER_SHARD_SHIFT:-0}"
 COUNTER_FORWARD_DEBUG="${COUNTER_FORWARD_DEBUG:-0}"
+ENGINE_RUST_LOG="${ENGINE_RUST_LOG:-warning}"
+DESK_RUST_LOG="${DESK_RUST_LOG:-warning}"
+MARKET_GATEWAY_RUST_LOG="${MARKET_GATEWAY_RUST_LOG:-warning}"
+PRESSURE_RUST_LOG="${PRESSURE_RUST_LOG:-warning}"
 LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
 
 ENGINE_BIN="${ENGINE_BIN:-$BIN_DIR/exchange-engine}"
@@ -53,7 +57,7 @@ done
 
 mkdir -p "$LOG_DIR"
 echo "logs: $LOG_DIR"
-echo "shape: ${TOTAL_CONNS} conns across ${DESK_COUNT} desk-server processes  TRACER_ENABLED=${TRACER_ENABLED} OWNER_SHARD_SHIFT=${PRESSURE_OWNER_SHARD_SHIFT}"
+echo "shape: ${TOTAL_CONNS} conns across ${DESK_COUNT} desk-server processes  TRACER_ENABLED=${TRACER_ENABLED} OWNER_SHARD_SHIFT=${PRESSURE_OWNER_SHARD_SHIFT} COUNTER_FORWARD_DEBUG=${COUNTER_FORWARD_DEBUG}"
 
 pids=()
 cleanup() {
@@ -67,6 +71,8 @@ sleep 1
 if $IS_LINUX; then
   docker exec work-postgres-1 psql -U user mydb -c \
     "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE status IN ('PENDING','TRADING');"
+  docker exec work-postgres-1 psql -U user mydb -c \
+    "UPDATE accounts SET frozen=0, updated_at=NOW() WHERE frozen <> 0;"
 else
   psql "$DATABASE_URL" -c "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE status IN ('PENDING','TRADING');"
   psql "$DATABASE_URL" -c "UPDATE accounts SET frozen=0, updated_at=NOW() WHERE frozen <> 0;"
@@ -78,27 +84,29 @@ if $IS_LINUX; then
   sleep 1.5
   rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
   taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
-  pids+=("$!")
+  pid=$!
+  pids+=("$pid")
   for i in $(seq 1 20); do
     [[ -f "$AERON_DIR/cnc.dat" ]] && break; sleep 1.5
   done
   [[ -f "$AERON_DIR/cnc.dat" ]] || { echo "aeronmd failed to start" >&2; exit 1; }
-  echo "aeronmd ready (pid=${pids[-1]})"
+  echo "aeronmd ready (pid=$pid)"
 fi
 
 # ── exchange-engine ───────────────────────────────────────────────────────
 env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-  RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+  RUST_LOG="$ENGINE_RUST_LOG" TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
   ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
   "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
-pids+=("$!")
-echo "exchange-engine started (pid=${pids[-1]})"
+pid=$!
+pids+=("$pid")
+echo "exchange-engine started (pid=$pid)"
 if $IS_LINUX; then sleep 5; else sleep 2; fi
 
 # ── market-data-gateway ───────────────────────────────────────────────────
 if [[ -x "$GATEWAY_BIN" ]]; then
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning \
+    RUST_LOG="$MARKET_GATEWAY_RUST_LOG" \
     "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
   pids+=("$!")
 fi
@@ -106,9 +114,9 @@ fi
 # ── desk-servers ──────────────────────────────────────────────────────────
 for ((i = 0; i < DESK_COUNT; i++)); do
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
+    RUST_LOG="$DESK_RUST_LOG" TRACER_ENABLED="$TRACER_ENABLED" \
     COUNTER_FORWARD_DEBUG="$COUNTER_FORWARD_DEBUG" \
-    DESK_SPIN="${DESK_SPIN:-false}" \
+    DESK_SPIN="${DESK_SPIN:-true}" \
     DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
     TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}" NOFILE_LIMIT=262144 \
     "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
@@ -148,7 +156,7 @@ for ((i = 0; i < DESK_COUNT; i++)); do
     PRESSURE_BASE_URL="http://127.0.0.1:${PORTS[$i]}" \
     PRESSURE_SOURCE_IPS="$source_ip" PRESSURE_SYMBOL=BTC_USDT \
     PRESSURE_WORKERS="${PRESSURE_WORKERS:-2}" NOFILE_LIMIT=262144 \
-    RUST_LOG=warning "$PRESSURE_BIN" >"$LOG_DIR/pressure-$i.log" 2>&1 &
+    RUST_LOG="$PRESSURE_RUST_LOG" "$PRESSURE_BIN" >"$LOG_DIR/pressure-$i.log" 2>&1 &
   pids+=("$!")
   echo "pressure-$i: conns=$conns owner_shard=$owner_shard source_ips=$source_ip port=${PORTS[$i]}"
 done

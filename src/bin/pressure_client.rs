@@ -103,6 +103,8 @@ struct Config {
     price: f64,
     qty: f64,
     run_id: String,
+    owner_shard: Option<u16>,
+    owner_shard_count: u16,
     /// Comma-separated list of source IPs to bind each connection's
     /// socket to. With multiple loopback aliases (127.0.0.1, 127.0.0.2,
     /// …) we can scale past the single-IP ~16K ephemeral-port cap on
@@ -127,6 +129,14 @@ impl Config {
             price: env_f64("PRESSURE_PRICE", 5000.0),
             qty: env_f64("PRESSURE_QTY", 0.001),
             run_id: std::env::var("PRESSURE_RUN_ID").unwrap_or_else(|_| default_run_id()),
+            owner_shard: std::env::var("PRESSURE_OWNER_SHARD")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok()),
+            owner_shard_count: std::env::var("PRESSURE_OWNER_SHARD_COUNT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT),
             source_ips: env_string("PRESSURE_SOURCE_IPS", "")
                 .split(',')
                 .filter_map(|s| {
@@ -476,9 +486,7 @@ fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<User
     );
     let started = Instant::now();
     let raw = std::fs::read_to_string(path)?;
-    // Build idx → user_id index for O(1) lookup. CSV is `user_id,idx`.
-    let mut by_idx: std::collections::HashMap<usize, i64> =
-        std::collections::HashMap::with_capacity(raw.lines().count());
+    let mut rows: Vec<(usize, i64)> = Vec::with_capacity(raw.lines().count());
     for line in raw.lines() {
         let mut it = line.split(',');
         let uid: i64 = it
@@ -489,14 +497,36 @@ fn setup_users_from_csv(cfg: &Config, path: &str) -> anyhow::Result<Arc<Vec<User
             .next()
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| anyhow::anyhow!("bad CSV row: {line}"))?;
-        by_idx.insert(idx, uid);
+        rows.push((idx, uid));
     }
+    rows.sort_unstable_by_key(|(idx, _)| *idx);
+
     let mut users = Vec::with_capacity(cfg.users);
-    for i in 0..cfg.users {
-        let idx = cfg.user_offset + i;
-        let user_id = *by_idx.get(&idx).ok_or_else(|| {
-            anyhow::anyhow!("missing user idx {idx} in CSV — pre-create users first")
-        })?;
+    let selected: Vec<(usize, i64)> = if let Some(owner_shard) = cfg.owner_shard {
+        rows.into_iter()
+            .filter(|(_, uid)| {
+                (*uid as u64 % cfg.owner_shard_count as u64) as u16 == owner_shard
+            })
+            .skip(cfg.user_offset)
+            .take(cfg.users)
+            .collect()
+    } else {
+        rows.into_iter()
+            .filter(|(idx, _)| *idx >= cfg.user_offset)
+            .take(cfg.users)
+            .collect()
+    };
+    if selected.len() < cfg.users {
+        anyhow::bail!(
+            "CSV selected {} users, need {} (owner_shard={:?} offset={})",
+            selected.len(),
+            cfg.users,
+            cfg.owner_shard,
+            cfg.user_offset
+        );
+    }
+
+    for (idx, user_id) in selected {
         let email = format!("pressure_{idx}@stress.test");
         let claims = Claims {
             sub: user_id,

@@ -46,6 +46,10 @@ nginx  (TLS termination, reverse proxy)
 only for legacy local runs that still need public market-data subscriptions on the desk
 process.
 
+The compact owner-shard plan uses four counters: desk 0 for BTC, desk 1 for ETH,
+and desks 2/3 for the remaining smaller symbols. Private account ownership stays
+deterministic via `user_id % 4`.
+
 ```
 Browser / API client
     │  private order flow
@@ -65,7 +69,7 @@ exchange-engine
 | Transport | Aeron IPC | Zero-copy ring buffer, sub-microsecond publish latency |
 | Encoding | SBE (Simple Binary Encoding) | Fixed-size, no allocation, 16–72 bytes per message |
 | API server | axum + tokio | Async, zero-cost WS fan-out to thousands of clients |
-| Counter sharding | `user_id % 16` owner shard | Each desk owns private state for a deterministic user shard |
+| Counter sharding | `user_id % 4` owner shard | Four compact counters: BTC, ETH, and two altcoin groups |
 | Market data | diff-based Binance mirror | Only cancel/place changed price levels, ~20× less traffic |
 
 ---

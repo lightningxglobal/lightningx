@@ -52,7 +52,7 @@ fn response_stream_count() -> u16 {
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(16)
+        .unwrap_or(lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT)
 }
 
 fn response_stream_index(stream_id: i32, publishers_len: usize) -> usize {

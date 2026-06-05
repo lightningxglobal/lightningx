@@ -104,7 +104,8 @@ for ((i = 0; i < DESK_COUNT; i++)); do
   ip_index=$((ip_index + ips_needed))
 
   env PRESSURE_TOKENS_CSV="$TOKENS_CSV" PRESSURE_USERS="$conns" \
-    PRESSURE_USER_OFFSET="$user_offset" PRESSURE_CONNS="$conns" \
+    PRESSURE_USER_OFFSET=0 PRESSURE_OWNER_SHARD="$i" PRESSURE_OWNER_SHARD_COUNT="$DESK_COUNT" \
+    PRESSURE_CONNS="$conns" \
     PRESSURE_DURATION_S="${PRESSURE_DURATION_S:-30}" \
     PRESSURE_RAMP_S="${PRESSURE_RAMP_S:-30}" \
     PRESSURE_OPS_PER_SEC="${PRESSURE_OPS_PER_SEC:-0.2}" \
@@ -114,7 +115,7 @@ for ((i = 0; i < DESK_COUNT; i++)); do
     RUST_LOG=warning "$PRESSURE_BIN" >"$LOG_DIR/pressure-$i.log" 2>&1 &
   pids+=("$!")
 
-  echo "pressure-$i: conns=$conns user_offset=$user_offset source_ips=$source_ip port=${PORTS[$i]}"
+  echo "pressure-$i: conns=$conns owner_shard=$i source_ips=$source_ip port=${PORTS[$i]}"
   user_offset=$((user_offset + conns))
 done
 

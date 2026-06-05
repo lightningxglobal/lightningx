@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 100K WS connection pressure test.
 #
-# Defaults to 2 desk-server processes on the local macOS test host because it
-# gives the best accepted-order p50 in the current 100K single-machine shape.
+# Defaults to 4 desk-server processes to match the compact owner-shard model:
+# BTC desk, ETH desk, and two smaller-symbol desks.
 # DESK_COUNT can be overridden for A/B tests:
 #
 #   DESK_COUNT=2 scripts/run_100k_pressure.sh
@@ -20,7 +20,7 @@ DATABASE_URL="${DATABASE_URL:-postgres://user:password@localhost:5432/mydb}"
 AERON_DIR="${AERON_DIR:-/tmp/aeron}"
 TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_100k.csv}"
 TOTAL_CONNS="${TOTAL_CONNS:-100000}"
-DESK_COUNT="${DESK_COUNT:-2}"
+DESK_COUNT="${DESK_COUNT:-4}"
 TRACER_ENABLED="${TRACER_ENABLED:-0}"
 DESK_SPIN="${DESK_SPIN:-false}"
 CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
@@ -115,7 +115,9 @@ for ((i = 0; i < DESK_COUNT; i++)); do
   ip_index=$((ip_index + ips_needed))
 
   env PRESSURE_TOKENS_CSV="$TOKENS_CSV" \
-    PRESSURE_USERS="$conns" PRESSURE_USER_OFFSET="$user_offset" PRESSURE_CONNS="$conns" \
+    PRESSURE_USERS="$conns" PRESSURE_USER_OFFSET=0 \
+    PRESSURE_OWNER_SHARD="$i" PRESSURE_OWNER_SHARD_COUNT="$DESK_COUNT" \
+    PRESSURE_CONNS="$conns" \
     PRESSURE_DURATION_S="${PRESSURE_DURATION_S:-30}" \
     PRESSURE_RAMP_S="${PRESSURE_RAMP_S:-60}" \
     PRESSURE_OPS_PER_SEC="${PRESSURE_OPS_PER_SEC:-0.2}" \
@@ -125,7 +127,7 @@ for ((i = 0; i < DESK_COUNT; i++)); do
     RUST_LOG=warning "$PRESSURE_BIN" >"$LOG_DIR/pressure-$i.log" 2>&1 &
   pids+=("$!")
 
-  echo "pressure-$i: conns=$conns user_offset=$user_offset source_ips=$source_ip port=$port"
+  echo "pressure-$i: conns=$conns owner_shard=$i source_ips=$source_ip port=$port"
   user_offset=$((user_offset + conns))
 done
 

@@ -1367,7 +1367,7 @@ async fn async_main() -> anyhow::Result<()> {
             .unwrap_or(0);
         risk_engine.initialize_account(user_id, usdt_cents);
     }
-    tracing::info!("Risk engine initialized ({} accounts)", risk_engine.accounts.len());
+    tracing::info!("Risk engine initialized ({} accounts)", risk_engine.account_count());
 
     let state = AppState {
         db: Arc::new(pool),
@@ -2053,11 +2053,11 @@ async fn async_main() -> anyhow::Result<()> {
                                 // If this was a liquidation order that got rejected,
                                 // unblock the account so run_risk_tick can retry.
                                 if meta.liq_price_ticks != 0 {
-                                    if let Some(mut acct) = risk_engine.accounts.get_mut(&meta.user_id) {
-                                        if acct.status == lightning_exchange::desk::risk::RiskStatus::Liquidating {
-                                            acct.status = lightning_exchange::desk::risk::RiskStatus::LiquidationPending;
-                                        }
-                                    }
+                                    risk_engine.set_account_status_if(
+                                        meta.user_id,
+                                        lightning_exchange::desk::risk::RiskStatus::Liquidating,
+                                        lightning_exchange::desk::risk::RiskStatus::LiquidationPending,
+                                    );
                                 }
                                 let new_vals = account_cache.get_mut(&meta.user_id).and_then(|mut e| {
                                     let kv = e.get_mut(asset)?;
@@ -2376,7 +2376,7 @@ async fn async_main() -> anyhow::Result<()> {
                     };
 
                     // Notional and margin for fill accounting on the close.
-                    let mark_ticks = risk_engine_tick.mark_prices.get(&evt.symbol).map(|v| *v).unwrap_or(0);
+                    let mark_ticks = risk_engine_tick.mark_price_ticks(&evt.symbol).unwrap_or(0);
                     let notional = if mark_ticks > 0 {
                         lightning_exchange::desk::risk::calc::calc_notional_cents(mark_ticks, evt.qty_lots, rules.notional_scale)
                     } else { 0 };

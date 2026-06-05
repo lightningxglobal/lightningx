@@ -1,6 +1,7 @@
 pub mod account;
 pub mod account_repository;
 pub mod api;
+pub mod counter_shard;
 pub mod db;
 pub mod models;
 pub mod order_state;

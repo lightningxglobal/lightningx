@@ -2290,9 +2290,9 @@ async fn handle_debug_mark_price(
     let b = req.symbol.as_bytes();
     sym_bytes[..b.len().min(16)].copy_from_slice(&b[..b.len().min(16)]);
 
-    // Bypass EWMA by inserting directly into mark_prices, then call
-    // update_mark_price once so unrealized PnL and equity are recomputed.
-    s.risk_engine.mark_prices.insert(sym_bytes, price_ticks);
+    // Test-only path: force the base mark, then run one EWMA update so
+    // unrealized PnL and equity are recomputed deterministically.
+    s.risk_engine.force_mark_price_for_test(sym_bytes, price_ticks);
     s.risk_engine.update_mark_price(sym_bytes, price_ticks, rules.notional_scale);
 
     let events = s.risk_engine.run_risk_tick();
@@ -2307,9 +2307,8 @@ async fn handle_debug_mark_price(
 
         if evt.liq_price_ticks == 0 { continue; }
 
-        if let Some(mut acct) = s.risk_engine.accounts.get_mut(&evt.user_id) {
-            acct.status = crate::desk::risk::RiskStatus::Liquidating;
-        }
+        s.risk_engine
+            .set_account_status(evt.user_id, crate::desk::risk::RiskStatus::Liquidating);
         let Some(ref cmd_tx) = s.liq_cmd_tx else { continue; };
 
         let sym_str_end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
@@ -2330,7 +2329,7 @@ async fn handle_debug_mark_price(
             _pad: [0; 10],
             symbol: evt.symbol,
         };
-        let mark_ticks = s.risk_engine.mark_prices.get(&evt.symbol).map(|v| *v).unwrap_or(0);
+        let mark_ticks = s.risk_engine.mark_price_ticks(&evt.symbol).unwrap_or(0);
         let notional = if mark_ticks > 0 {
             crate::desk::risk::calc::calc_notional_cents(mark_ticks, evt.qty_lots, liq_rules.notional_scale)
         } else { 0 };

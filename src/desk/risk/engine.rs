@@ -37,6 +37,42 @@ impl RiskEngine {
             .insert(user_id, AccountRiskState::new(user_id, usdt_balance_cents));
     }
 
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn mark_price_ticks(&self, symbol: &[u8; 16]) -> Option<i64> {
+        self.mark_prices.get(symbol).map(|v| *v)
+    }
+
+    pub fn force_mark_price_for_test(&self, symbol: [u8; 16], price_ticks: i64) {
+        self.mark_prices.insert(symbol, price_ticks);
+    }
+
+    pub fn set_account_status(&self, user_id: i64, status: RiskStatus) -> bool {
+        let Some(mut acct) = self.accounts.get_mut(&user_id) else {
+            return false;
+        };
+        acct.status = status;
+        true
+    }
+
+    pub fn set_account_status_if(
+        &self,
+        user_id: i64,
+        expected: RiskStatus,
+        status: RiskStatus,
+    ) -> bool {
+        let Some(mut acct) = self.accounts.get_mut(&user_id) else {
+            return false;
+        };
+        if acct.status != expected {
+            return false;
+        }
+        acct.status = status;
+        true
+    }
+
     /// Hot path: O(1) shard-locked reserve. Returns reserved cents on success.
     pub fn check_and_reserve_margin(
         &self,
@@ -102,11 +138,11 @@ impl RiskEngine {
         };
 
         // Compute new position state without holding shard locks.
-        let old_unrealized_pnl = self
+        let (old_unrealized_pnl, old_maintenance_margin) = self
             .positions
             .get(&key)
-            .map(|p| p.unrealized_pnl)
-            .unwrap_or(0);
+            .map(|p| (p.unrealized_pnl, p.maintenance_margin))
+            .unwrap_or((0, 0));
 
         let (new_pos, released_used_margin, realized_pnl_cents) = {
             let existing = self.positions.get(&key);
@@ -125,6 +161,8 @@ impl RiskEngine {
         };
         let new_unrealized_pnl = new_pos.as_ref().map(|p| p.unrealized_pnl).unwrap_or(0);
         let unrealized_pnl_delta = new_unrealized_pnl - old_unrealized_pnl;
+        let new_maintenance_margin = new_pos.as_ref().map(|p| p.maintenance_margin).unwrap_or(0);
+        let maintenance_margin_delta = new_maintenance_margin - old_maintenance_margin;
 
         // Apply position update.
         match new_pos {
@@ -201,6 +239,8 @@ impl RiskEngine {
                 acct.used_margin += fill_margin_cents;
             }
             acct.unrealized_pnl += unrealized_pnl_delta;
+            acct.maintenance_margin =
+                (acct.maintenance_margin + maintenance_margin_delta).max(0);
             acct.equity = acct.available_margin
                 + acct.order_margin
                 + acct.used_margin
@@ -223,23 +263,6 @@ impl RiskEngine {
             }
         } else if let Some(mut idx) = self.symbol_position_index.get_mut(&symbol) {
             idx.retain(|&id| id != user_id);
-        }
-
-        // Recompute account-level maintenance_margin as sum of all open positions.
-        self.recompute_account_maintenance(user_id);
-    }
-
-    /// Recomputes `account.maintenance_margin` as the sum of all open positions'
-    /// maintenance_margin.  Must be called after any position change.
-    fn recompute_account_maintenance(&self, user_id: i64) {
-        let total: i64 = self
-            .positions
-            .iter()
-            .filter(|e| e.key().0 == user_id)
-            .map(|e| e.value().maintenance_margin)
-            .sum();
-        if let Some(mut acct) = self.accounts.get_mut(&user_id) {
-            acct.maintenance_margin = total;
         }
     }
 
@@ -898,6 +921,31 @@ mod tests {
         // notional = 5_000_000 * 100_000 / 1_000_000 = 500_000 cents
         // maintenance_margin = 500_000 * 50 / 10_000 = 2_500 cents
         engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        let acct = engine.accounts.get(&uid).unwrap();
+        assert_eq!(acct.maintenance_margin, 2_500);
+    }
+
+    #[test]
+    fn account_maintenance_margin_updates_incrementally_across_symbols() {
+        let (engine, uid) = make_engine_with_account(1_000_000);
+
+        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        let eth_price = 300_000i64;
+        let eth_qty = 100_000i64;
+        let eth_margin = 3_000i64;
+        engine.check_and_reserve_margin(uid, eth_margin).unwrap();
+        engine.on_fill(uid, eth_sym(), 0, eth_price, eth_qty, eth_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        {
+            let acct = engine.accounts.get(&uid).unwrap();
+            assert_eq!(acct.maintenance_margin, 2_500 + 150);
+        }
+
+        engine.check_and_reserve_margin(uid, eth_margin).unwrap();
+        engine.on_fill(uid, eth_sym(), 1, eth_price, eth_qty, eth_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.maintenance_margin, 2_500);
     }

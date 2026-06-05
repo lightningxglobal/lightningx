@@ -30,6 +30,7 @@ pub struct LoginRequest {
 pub struct AuthResponse {
     pub token: String,
     pub user: User,
+    pub counter_shard_id: u16,
 }
 
 pub async fn register(pool: &PgPool, req: RegisterRequest, ip: Option<String>) -> Result<AuthResponse> {
@@ -60,7 +61,8 @@ pub async fn register(pool: &PgPool, req: RegisterRequest, ip: Option<String>) -
     .await?;
 
     let token = make_token(user.id, &user.email)?;
-    Ok(AuthResponse { token, user })
+    let counter_shard_id = crate::desk::counter_shard::owner_shard_for_user_id(user.id);
+    Ok(AuthResponse { token, user, counter_shard_id })
 }
 
 pub async fn login(pool: &PgPool, req: LoginRequest) -> Result<AuthResponse> {
@@ -79,7 +81,8 @@ pub async fn login(pool: &PgPool, req: LoginRequest) -> Result<AuthResponse> {
     }
 
     let token = make_token(user.id, &user.email)?;
-    Ok(AuthResponse { token, user })
+    let counter_shard_id = crate::desk::counter_shard::owner_shard_for_user_id(user.id);
+    Ok(AuthResponse { token, user, counter_shard_id })
 }
 
 pub fn verify_token(token: &str) -> Result<Claims> {

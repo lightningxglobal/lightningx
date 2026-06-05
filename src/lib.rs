@@ -35,6 +35,7 @@ pub use transport::ws_sbe;
 pub use desk::account;
 pub use desk::account_repository;
 pub use desk::api;
+pub use desk::counter_shard;
 pub use desk::db;
 pub use desk::models;
 pub use desk::order_state;

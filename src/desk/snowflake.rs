@@ -137,19 +137,19 @@ mod tests {
 
     #[test]
     fn test_snowflake_creation() {
-        let gen = SnowflakeIdGenerator::new(1);
-        let id = gen.next_id();
+        let generator = SnowflakeIdGenerator::new(1);
+        let id = generator.next_id();
         assert!(id > 0, "ID should be positive");
     }
 
     #[test]
     fn test_id_uniqueness() {
-        let gen = SnowflakeIdGenerator::new(1);
+        let generator = SnowflakeIdGenerator::new(1);
         let count = 10000;
         let mut ids = HashSet::new();
 
         for _ in 0..count {
-            let id = gen.next_id();
+            let id = generator.next_id();
             assert!(ids.insert(id), "ID should be unique");
         }
 
@@ -158,8 +158,8 @@ mod tests {
 
     #[test]
     fn test_id_parsing() {
-        let gen = SnowflakeIdGenerator::new(42);
-        let id = gen.next_id();
+        let generator = SnowflakeIdGenerator::new(42);
+        let id = generator.next_id();
 
         let (desk_id, _timestamp, _sequence) = SnowflakeIdGenerator::parse(id);
         assert_eq!(desk_id, 42, "desk_id should be preserved in ID");
@@ -183,10 +183,10 @@ mod tests {
 
     #[test]
     fn test_sequence_increment() {
-        let gen = SnowflakeIdGenerator::new(1);
+        let generator = SnowflakeIdGenerator::new(1);
 
-        let id1 = gen.next_id();
-        let id2 = gen.next_id();
+        let id1 = generator.next_id();
+        let id2 = generator.next_id();
 
         let (_desk1, ts1, seq1) = SnowflakeIdGenerator::parse(id1);
         let (_desk2, ts2, seq2) = SnowflakeIdGenerator::parse(id2);
@@ -199,11 +199,11 @@ mod tests {
 
     #[test]
     fn test_timestamp_advances() {
-        let gen = SnowflakeIdGenerator::new(1);
+        let generator = SnowflakeIdGenerator::new(1);
 
-        let id1 = gen.next_id();
+        let id1 = generator.next_id();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let id2 = gen.next_id();
+        let id2 = generator.next_id();
 
         let (_desk1, ts1, _seq1) = SnowflakeIdGenerator::parse(id1);
         let (_desk2, ts2, _seq2) = SnowflakeIdGenerator::parse(id2);
@@ -213,8 +213,8 @@ mod tests {
 
     #[test]
     fn test_batch_generation() {
-        let gen = SnowflakeIdGenerator::new(1);
-        let ids = gen.next_ids(1000);
+        let generator = SnowflakeIdGenerator::new(1);
+        let ids = generator.next_ids(1000);
 
         assert_eq!(ids.len(), 1000);
 
@@ -244,11 +244,11 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let gen = Arc::new(SnowflakeIdGenerator::new(1));
+        let generator = Arc::new(SnowflakeIdGenerator::new(1));
         let mut handles = vec![];
 
         for _ in 0..4 {
-            let gen_clone = Arc::clone(&gen);
+            let gen_clone = Arc::clone(&generator);
             let handle = thread::spawn(move || {
                 let mut ids = Vec::new();
                 for _ in 0..1000 {

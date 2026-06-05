@@ -52,7 +52,8 @@ pub struct NewOrderRequest {
     pub quantity_lots: i64,  // integer quantity in symbol lot units
     pub side: u8,          // 0=Buy, 1=Sell
     pub time_in_force: u8, // 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
-    pub _pad: [u8; 14],
+    pub response_stream_id: i32,
+    pub _pad: [u8; 10],
     pub symbol: [u8; 16],
 }
 
@@ -66,9 +67,11 @@ pub struct CancelOrderRequest {
     /// Who requested the cancel — needed to route the CANCELED/REJECTED ack back
     /// even when the order is a ghost (never accepted, not in uid_map).
     pub participant_id: u64,
+    pub response_stream_id: i32,
+    pub _pad: [u8; 4],
 }
 
-static_assertions::const_assert_eq!(std::mem::size_of::<CancelOrderRequest>(), 16);
+static_assertions::const_assert_eq!(std::mem::size_of::<CancelOrderRequest>(), 24);
 
 // Outbound: 委托已接受
 #[repr(C, packed)]
@@ -176,12 +179,12 @@ pub fn encode_cancel_order(msg: &CancelOrderRequest, buf: &mut [u8]) -> Result<u
         return Err(());
     }
 
-    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_CANCEL_ORDER, 16));
+    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_CANCEL_ORDER, 24));
     let msg_bytes =
-        unsafe { std::slice::from_raw_parts(msg as *const CancelOrderRequest as *const u8, 16) };
-    buf[8..24].copy_from_slice(msg_bytes);
+        unsafe { std::slice::from_raw_parts(msg as *const CancelOrderRequest as *const u8, 24) };
+    buf[8..32].copy_from_slice(msg_bytes);
 
-    Ok(24)
+    Ok(32)
 }
 
 pub fn encode_accepted(msg: &OrderAccepted, buf: &mut [u8]) -> Result<usize, ()> {
@@ -315,7 +318,7 @@ pub fn decode_new_order(buf: &[u8]) -> Option<NewOrderRequest> {
 }
 
 pub fn decode_cancel_order(buf: &[u8]) -> Option<CancelOrderRequest> {
-    if buf.len() < 8 + 8 {
+    if buf.len() < 8 + 24 {
         return None;
     }
     unsafe {
@@ -355,7 +358,8 @@ mod tests {
             quantity_lots: 50_000_000,
             side: 0,          // Buy
             time_in_force: 0, // GTC
-            _pad: [0; 14],
+            response_stream_id: 200,
+            _pad: [0; 10],
             symbol: [0; 16],
         };
 
@@ -420,7 +424,8 @@ mod tests {
             quantity_lots: 50_000_000,
             side: 0,
             time_in_force: 0,
-            _pad: [0; 14],
+            response_stream_id: 200,
+            _pad: [0; 10],
             symbol: [0; 16],
         };
 

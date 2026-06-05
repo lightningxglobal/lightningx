@@ -184,6 +184,9 @@ pub struct AppState {
     /// Whether this process accepts public market-data subscriptions.
     /// desk-server defaults this off; market-data-gateway owns live public data.
     pub public_market_data_enabled: bool,
+    /// Private order-update stream for this desk/counter. New orders and
+    /// cancels carry this id so matching publishes replies only to this desk.
+    pub response_stream_id: i32,
     /// Per-user personal update channel (order fills, balance changes).
     /// Lock-free slab indexed by user_id. See UserTxRegistry for why we
     /// replaced `DashMap<i64, _>` (broke down at 400K subscribers).
@@ -1248,7 +1251,8 @@ async fn handle_place_order(
             quantity_lots: fixed_shape.quantity_lots,
             side: side_byte,
             time_in_force: tif_byte,
-            _pad: [0; 14],
+            response_stream_id: s.response_stream_id,
+            _pad: [0; 10],
             symbol: sym_bytes,
         };
 
@@ -1396,6 +1400,8 @@ async fn handle_cancel_order(
             let cancel_req = crate::sbe::CancelOrderRequest {
                 order_id: order_id as u64,
                 participant_id: user_id as u64,
+                response_stream_id: s.response_stream_id,
+                _pad: [0; 4],
             };
             if aeron_cmd_tx.push(AeronCmd::Cancel(cancel_req)).is_err() {
                 return (
@@ -1456,6 +1462,8 @@ async fn handle_cancel_order(
         let cancel_req = crate::sbe::CancelOrderRequest {
             order_id: order_id as u64,
             participant_id: user_id as u64,
+            response_stream_id: s.response_stream_id,
+            _pad: [0; 4],
         };
         let _ = aeron_cmd_tx.push(AeronCmd::Cancel(cancel_req));
     }
@@ -1566,6 +1574,8 @@ async fn handle_cancel_all_orders(
                 .map(|&id| crate::sbe::CancelOrderRequest {
                     order_id: id as u64,
                     participant_id: user_id as u64,
+                    response_stream_id: s.response_stream_id,
+                    _pad: [0; 4],
                 })
                 .collect();
             let count = reqs.len();
@@ -2316,7 +2326,8 @@ async fn handle_debug_mark_price(
             quantity_lots: evt.qty_lots,
             side: liq_side,
             time_in_force: 1,
-            _pad: [0; 14],
+            response_stream_id: s.response_stream_id,
+            _pad: [0; 10],
             symbol: evt.symbol,
         };
         let mark_ticks = s.risk_engine.mark_prices.get(&evt.symbol).map(|v| *v).unwrap_or(0);

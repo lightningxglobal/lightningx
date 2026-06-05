@@ -96,7 +96,17 @@ pub fn orders_stream_for_symbol(symbol: &str) -> i32 {
 pub fn order_update_channel() -> String {
     channel(20122)
 }
-pub const ORDER_UPDATE_STREAM: i32 = 2;
+pub const ORDER_UPDATE_STREAM: i32 = 2; // legacy single-desk stream
+pub const ORDER_UPDATE_STREAM_BASE: i32 = 200; // sharded private updates: base + desk_id
+
+/// Private response stream owned by one desk/counter.
+///
+/// New orders and cancels carry this stream id in their SBE request, so the
+/// matching thread publishes private updates only to the desk that owns the
+/// client session. This avoids broadcasting every private update to every desk.
+pub fn order_update_stream_for_desk(desk_id: u16) -> i32 {
+    ORDER_UPDATE_STREAM_BASE + desk_id as i32
+}
 
 /// Engine → Desk + kline_service: TradeNotification (SBE)
 /// Multiple subscribers share the same Aeron media driver at /tmp/aeron,

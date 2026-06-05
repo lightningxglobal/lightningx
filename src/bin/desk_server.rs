@@ -2,9 +2,10 @@ use aeron_wrapper::AeronClient;
 use dashmap::DashMap;
 use lightning_exchange::{
     aeron_channels::{
-        aeron_dir, depth_channel, order_update_channel, orders_channel, orders_stream_for_symbol,
-        trade_channel, DEPTH50_STREAM, DEPTH_STREAM, LEVEL2_STREAM, METRICS_CHANNEL,
-        METRICS_STREAM, ORDER_UPDATE_STREAM, PERSIST_CHANNEL, PERSIST_STREAM, TRADE_STREAM,
+        aeron_dir, depth_channel, order_update_channel, order_update_stream_for_desk,
+        orders_channel, orders_stream_for_symbol, trade_channel, DEPTH50_STREAM, DEPTH_STREAM,
+        LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM, PERSIST_CHANNEL, PERSIST_STREAM,
+        TRADE_STREAM,
     },
     aeron_transport::{
         DeskDepthSubscriber, DeskOrderPublisher, DeskOrderUpdateSubscriber, DeskTradeSubscriber,
@@ -1152,6 +1153,11 @@ async fn async_main() -> anyhow::Result<()> {
         AeronClient::new(&aeron_dir())
             .map_err(|e| anyhow::anyhow!("Aeron init failed: {:?}", e))?,
     );
+    let desk_id: u64 = std::env::var("DESK_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let response_stream_id = order_update_stream_for_desk(desk_id as u16);
 
     // PR2 dual-write: every DB-worker mutation also publishes the
     // corresponding PersistEvent to the persist Aeron stream, so the
@@ -1214,7 +1220,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut order_update_sub = DeskOrderUpdateSubscriber::new(
         client.clone(),
         &order_update_channel(),
-        ORDER_UPDATE_STREAM,
+        response_stream_id,
     )
     .map_err(|e| anyhow::anyhow!("DeskOrderUpdateSubscriber: {}", e))?;
 
@@ -1302,10 +1308,6 @@ async fn async_main() -> anyhow::Result<()> {
         .fetch_one(&pool)
         .await
         .unwrap_or(0);
-    let desk_id: u64 = std::env::var("DESK_ID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
     let initial_id = (max_db_id as u64) + 1 + desk_id * 1_000_000_000;
     tracing::info!(
         "next_order_id initial: max_db_id={} desk_id={} initial_id={}",
@@ -1372,6 +1374,7 @@ async fn async_main() -> anyhow::Result<()> {
         engines: None,
         market_fanout: market_fanout.clone(),
         public_market_data_enabled,
+        response_stream_id,
         user_tx: Arc::new(lightning_exchange::api::UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(initial_id)),
         aeron_cmd_tx: Some(aeron_cmd_tx),
@@ -2367,7 +2370,8 @@ async fn async_main() -> anyhow::Result<()> {
                         quantity_lots: evt.qty_lots,
                         side: liq_side,
                         time_in_force: 1, // IOC
-                        _pad: [0; 14],
+                        response_stream_id,
+                        _pad: [0; 10],
                         symbol: evt.symbol,
                     };
 

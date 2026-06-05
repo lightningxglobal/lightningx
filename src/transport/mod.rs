@@ -410,7 +410,8 @@ mod tests {
             quantity_lots: 10_000_000, // 10.0 at step=1e-6
             side: 0,
             time_in_force: 0,
-            _pad: [0; 14],
+            response_stream_id: 200,
+            _pad: [0; 10],
             symbol: [0; 16],
         };
 

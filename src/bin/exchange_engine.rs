@@ -2,9 +2,9 @@ use aeron_wrapper::AeronClient;
 use lightning_exchange::{
     account_repository::AccountRepository,
     aeron_channels::{
-        aeron_dir, depth_channel, order_update_channel, orders_channel, orders_stream_for_symbol,
-        trade_channel, DEPTH50_STREAM, DEPTH_STREAM, LEVEL2_STREAM, METRICS_CHANNEL,
-        METRICS_STREAM, ORDER_UPDATE_STREAM, TRADE_STREAM,
+        aeron_dir, depth_channel, order_update_channel, order_update_stream_for_desk,
+        orders_channel, orders_stream_for_symbol, trade_channel, DEPTH50_STREAM, DEPTH_STREAM,
+        LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM, ORDER_UPDATE_STREAM_BASE, TRADE_STREAM,
     },
     aeron_transport::{
         AeronMarketDataPublisher, AeronOrderSubscriber, AeronOrderUpdatePublisher,
@@ -45,6 +45,33 @@ fn symbol_bytes(symbol: &str) -> [u8; 16] {
 fn symbol_from_bytes(bytes: &[u8; 16]) -> &str {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(16);
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
+fn response_stream_count() -> u16 {
+    std::env::var("ORDER_UPDATE_STREAM_COUNT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(16)
+}
+
+fn response_stream_index(stream_id: i32, publishers_len: usize) -> usize {
+    if stream_id >= ORDER_UPDATE_STREAM_BASE {
+        let idx = (stream_id - ORDER_UPDATE_STREAM_BASE) as usize;
+        if idx < publishers_len {
+            return idx;
+        }
+    }
+    0
+}
+
+fn publish_order_update(
+    publishers: &mut [AeronOrderUpdatePublisher],
+    stream_id: i32,
+    msg: &OrderUpdateMsg,
+) {
+    let idx = response_stream_index(stream_id, publishers.len());
+    let _ = publishers[idx].publish(msg);
 }
 
 fn env_core_at(name: &str, index: usize) -> Option<usize> {
@@ -98,7 +125,7 @@ fn spawn_symbol_thread(
     symbol: String,
     engine: MatchingEngine,
     tracer: Option<lightning_exchange::tracer::ExchangeTracer>,
-    uid_map: HashMap<u64, u64>,
+    uid_map: HashMap<u64, (u64, i32)>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("match-{}", symbol))
@@ -109,12 +136,16 @@ fn spawn_symbol_thread(
             let mut subscriber =
                 AeronOrderSubscriber::new(client.clone(), &orders_channel(), orders_stream)
                     .unwrap_or_else(|e| panic!("[{}] subscriber: {}", symbol, e));
-            let mut ou_pub = AeronOrderUpdatePublisher::new(
-                client.clone(),
-                &order_update_channel(),
-                ORDER_UPDATE_STREAM,
-            )
-            .unwrap_or_else(|e| panic!("[{}] ou_pub: {}", symbol, e));
+            let response_count = response_stream_count();
+            let mut ou_pubs: Vec<AeronOrderUpdatePublisher> = (0..response_count)
+                .map(|desk_id| {
+                    let stream = order_update_stream_for_desk(desk_id);
+                    AeronOrderUpdatePublisher::new(client.clone(), &order_update_channel(), stream)
+                        .unwrap_or_else(|e| {
+                            panic!("[{}] ou_pub stream {}: {}", symbol, stream, e)
+                        })
+                })
+                .collect();
             let mut trade_pub =
                 AeronTradePublisher::new(client.clone(), &trade_channel(), TRADE_STREAM)
                     .unwrap_or_else(|e| panic!("[{}] trade_pub: {}", symbol, e));
@@ -193,6 +224,7 @@ fn spawn_symbol_thread(
                     match msg {
                         InboundMsg::NewOrder(req) => {
                             let req_symbol = symbol_from_bytes(&req.symbol);
+                            let response_stream_id = req.response_stream_id;
                             if req_symbol != symbol {
                                 let client_order_id = req.client_order_id;
                                 let participant_id = req.participant_id;
@@ -202,12 +234,16 @@ fn spawn_symbol_thread(
                                     client_order_id,
                                     req_symbol,
                                 );
-                                let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
-                                    client_order_id,
-                                    participant_id,
-                                    4,
-                                    now_ns(),
-                                ));
+                                publish_order_update(
+                                    &mut ou_pubs,
+                                    response_stream_id,
+                                    &OrderUpdateMsg::rejected(
+                                        client_order_id,
+                                        participant_id,
+                                        4,
+                                        now_ns(),
+                                    ),
+                                );
                                 continue;
                             }
                             // if let Some(ref t) = tracer {
@@ -224,12 +260,16 @@ fn spawn_symbol_thread(
                             };
                             let quantity_lots = req.quantity_lots;
                             if quantity_lots <= 0 {
-                                let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
-                                    req.client_order_id,
-                                    req.participant_id,
-                                    2,
-                                    ts,
-                                ));
+                                publish_order_update(
+                                    &mut ou_pubs,
+                                    response_stream_id,
+                                    &OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        2,
+                                        ts,
+                                    ),
+                                );
                                 continue;
                             }
                             let order = if req.price_ticks == 0 {
@@ -255,12 +295,16 @@ fn spawn_symbol_thread(
                                     //         &req.symbol,
                                     //     );
                                     // }
-                                    let _ = ou_pub.publish(&OrderUpdateMsg::rejected(
-                                        req.client_order_id,
-                                        req.participant_id,
-                                        2,
-                                        ts,
-                                    ));
+                                    publish_order_update(
+                                        &mut ou_pubs,
+                                        response_stream_id,
+                                        &OrderUpdateMsg::rejected(
+                                            req.client_order_id,
+                                            req.participant_id,
+                                            2,
+                                            ts,
+                                        ),
+                                    );
                                     // if let Some(ref t) = tracer {
                                     //     t.record_sym(
                                     //         MS_AERON_UPDATE_SEND,
@@ -286,7 +330,10 @@ fn spawn_symbol_thread(
                                     let total_qty = rules.lots_to_quantity(req.quantity_lots);
                                     let update = match result.status {
                                         OrderStatus::Accepted => {
-                                            uid_map.insert(result.order_id, req.participant_id);
+                                            uid_map.insert(
+                                                result.order_id,
+                                                (req.participant_id, response_stream_id),
+                                            );
                                             OrderUpdateMsg::accepted(
                                                 result.order_id,
                                                 req.client_order_id,
@@ -308,7 +355,10 @@ fn spawn_symbol_thread(
                                         OrderStatus::PartiallyFilled => {
                                             // Order rests in book after partial fill — must track
                                             // participant so cancel confirmations route correctly.
-                                            uid_map.insert(result.order_id, req.participant_id);
+                                            uid_map.insert(
+                                                result.order_id,
+                                                (req.participant_id, response_stream_id),
+                                            );
                                             OrderUpdateMsg::partial_fill(
                                                 result.order_id,
                                                 req.client_order_id,
@@ -356,7 +406,7 @@ fn spawn_symbol_thread(
                                         };
                                         let _ = trade_pub.publish(&trade);
                                     }
-                                    let _ = ou_pub.publish(&update);
+                                    publish_order_update(&mut ou_pubs, response_stream_id, &update);
                                     // if let Some(ref t) = tracer {
                                     //     t.record_sym(
                                     //         MS_AERON_UPDATE_SEND,
@@ -371,20 +421,25 @@ fn spawn_symbol_thread(
                         InboundMsg::CancelOrder(req) => {
                             let ts = now_ns();
                             let cancel_oid: u64 = req.order_id;
+                            let request_stream_id = req.response_stream_id;
                             match engine.cancel_order(cancel_oid) {
                                 Ok(res) => {
                                     // Prefer uid_map; fall back to participant_id in the request
                                     // (covers ghost orders never inserted into uid_map).
-                                    let participant_id = uid_map
+                                    let (participant_id, response_stream_id) = uid_map
                                         .remove(&cancel_oid)
-                                        .unwrap_or(req.participant_id);
-                                    let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
-                                        req.order_id,
-                                        0,
-                                        participant_id,
-                                        rules.lots_to_quantity(res.cancelled_quantity),
-                                        ts,
-                                    ));
+                                        .unwrap_or((req.participant_id, request_stream_id));
+                                    publish_order_update(
+                                        &mut ou_pubs,
+                                        response_stream_id,
+                                        &OrderUpdateMsg::cancelled(
+                                            req.order_id,
+                                            0,
+                                            participant_id,
+                                            rules.lots_to_quantity(res.cancelled_quantity),
+                                            ts,
+                                        ),
+                                    );
                                 }
                                 Err(_) => {
                                     // Order not in this engine (wrong symbol or already gone).
@@ -392,13 +447,17 @@ fn spawn_symbol_thread(
                                     // Use participant_id from the request — uid_map won't have it.
                                     let participant_id = req.participant_id;
                                     if participant_id != 0 {
-                                        let _ = ou_pub.publish(&OrderUpdateMsg::cancelled(
-                                            req.order_id,
-                                            0,
-                                            participant_id,
-                                            0.0,
-                                            ts,
-                                        ));
+                                        publish_order_update(
+                                            &mut ou_pubs,
+                                            request_stream_id,
+                                            &OrderUpdateMsg::cancelled(
+                                                req.order_id,
+                                                0,
+                                                participant_id,
+                                                0.0,
+                                                ts,
+                                            ),
+                                        );
                                     }
                                 }
                             }
@@ -559,7 +618,7 @@ async fn main() -> anyhow::Result<()> {
 
     // uid_maps: symbol → (order_id → participant_id), pre-seeded from restored DB orders
     // so that cancel events for restored orders carry the correct participant_id.
-    let mut uid_maps: HashMap<String, HashMap<u64, u64>> = HashMap::new();
+    let mut uid_maps: HashMap<String, HashMap<u64, (u64, i32)>> = HashMap::new();
 
     let rows = sqlx::query_as::<_, DbOrder>(
         "SELECT * FROM orders WHERE status IN ('PENDING', 'TRADING') ORDER BY id ASC",
@@ -614,7 +673,13 @@ async fn main() -> anyhow::Result<()> {
                 uid_maps
                     .entry(db_order.symbol.clone())
                     .or_default()
-                    .insert(db_order.id as u64, db_order.user_id as u64);
+                    .insert(
+                        db_order.id as u64,
+                        (
+                            db_order.user_id as u64,
+                            order_update_stream_for_desk(0),
+                        ),
+                    );
                 restored += 1;
             }
         }

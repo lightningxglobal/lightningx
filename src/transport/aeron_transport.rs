@@ -106,8 +106,8 @@ impl PollCallback for OrderInboundCallback {
                 }
             }
             2 => {
-                // CancelOrderRequest: header(8) + body(16) = 24字节
-                if data.len() >= 24 {
+                // CancelOrderRequest: header(8) + body(24) = 32 bytes
+                if data.len() >= 32 {
                     unsafe {
                         let req = std::ptr::read_unaligned(
                             &data[8] as *const u8 as *const CancelOrderRequest,
@@ -404,7 +404,7 @@ impl DeskOrderPublisher {
         &mut self,
         req: &crate::sbe::CancelOrderRequest,
     ) -> Result<(), crate::transport::TransportError> {
-        publish_with_retry_claim(&mut self.publisher, 24, |buf| {
+        publish_with_retry_claim(&mut self.publisher, 32, |buf| {
             let _ = crate::sbe::encode_cancel_order(req, buf);
         })
     }
@@ -900,7 +900,8 @@ mod tests {
             quantity_lots: 3_500_000,  // 3.5 at step=1e-6
             side: 0,
             time_in_force: 0,
-            _pad: [0; 14],
+            response_stream_id: 200,
+            _pad: [0; 10],
             symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
         };
         let mut data = [0u8; 72];
@@ -929,8 +930,13 @@ mod tests {
             dropped: dropped.clone(),
         };
 
-        let req = CancelOrderRequest { order_id: 9, participant_id: 42 };
-        let mut data = [0u8; 24];
+        let req = CancelOrderRequest {
+            order_id: 9,
+            participant_id: 42,
+            response_stream_id: 200,
+            _pad: [0; 4],
+        };
+        let mut data = [0u8; 32];
         sbe::encode_cancel_order(&req, &mut data).unwrap();
 
         callback.on_data(&data);

@@ -842,7 +842,8 @@ async fn handle_client_message(
                     quantity_lots: fixed_shape.quantity_lots,
                     side: side_byte,
                     time_in_force: tif_byte,
-                    _pad: [0; 14],
+                    response_stream_id: state.response_stream_id,
+                    _pad: [0; 10],
                     symbol: sym_bytes,
                 };
 
@@ -1379,6 +1380,8 @@ async fn handle_client_message(
                     let cancel_req = crate::sbe::CancelOrderRequest {
                         order_id: order_id as u64,
                         participant_id: user_id as u64,
+                        response_stream_id: state.response_stream_id,
+                        _pad: [0; 4],
                     };
                     if aeron_cmd_tx
                         .push(crate::transport::AeronCmd::Cancel(cancel_req))
@@ -1438,6 +1441,8 @@ async fn handle_client_message(
                 let cancel_req = crate::sbe::CancelOrderRequest {
                     order_id: order_id as u64,
                     participant_id: user_id as u64,
+                    response_stream_id: state.response_stream_id,
+                    _pad: [0; 4],
                 };
                 let _ = aeron_cmd_tx.push(crate::transport::AeronCmd::Cancel(cancel_req));
             }
@@ -1644,7 +1649,8 @@ async fn handle_client_message(
                         quantity_lots: batch_fixed_shape.quantity_lots,
                         side: side_byte,
                         time_in_force: tif_byte,
-                        _pad: [0; 14],
+                        response_stream_id: state.response_stream_id,
+                        _pad: [0; 10],
                         symbol: sym_bytes,
                     };
                     validated.push(V {
@@ -1990,6 +1996,8 @@ async fn batch_cancel_by_ids(
                 .map(|&id| crate::sbe::CancelOrderRequest {
                     order_id: id as u64,
                     participant_id: user_id as u64,
+                    response_stream_id: state.response_stream_id,
+                    _pad: [0; 4],
                 })
                 .collect();
             return if aeron_cmd_tx
@@ -2127,6 +2135,8 @@ async fn bulk_cancel(
                 reqs.push(crate::sbe::CancelOrderRequest {
                     order_id: order.id as u64,
                     participant_id: user_id as u64,
+                    response_stream_id: state.response_stream_id,
+                    _pad: [0; 4],
                 });
             }
             return if aeron_cmd_tx

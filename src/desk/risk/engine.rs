@@ -74,30 +74,42 @@ impl RiskEngine {
         true
     }
 
-    /// Hot path: O(1) shard-locked reserve. Returns reserved cents on success.
+    /// Hot path: lock-free reserve using CAS on `available_margin`.
+    /// Uses `accounts.get()` (shared shard read-lock) so concurrent
+    /// `release_order_margin` calls on other users in the same shard never block.
     pub fn check_and_reserve_margin(
         &self,
         user_id: i64,
         initial_margin_cents: i64,
     ) -> Result<i64, &'static str> {
-        let Some(mut entry) = self.accounts.get_mut(&user_id) else {
-            return Err("Account not found");
-        };
+        use std::sync::atomic::Ordering;
+        let entry = self.accounts.get(&user_id).ok_or("Account not found")?;
         if !entry.can_place_order() {
             return Err("Account in liquidation");
         }
-        if entry.available_margin < initial_margin_cents {
-            return Err("Insufficient margin");
+        loop {
+            let cur = entry.available_margin.load(Ordering::Relaxed);
+            if cur < initial_margin_cents {
+                return Err("Insufficient margin");
+            }
+            if entry.available_margin
+                .compare_exchange_weak(cur, cur - initial_margin_cents, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                entry.order_margin.fetch_add(initial_margin_cents, Ordering::Relaxed);
+                return Ok(initial_margin_cents);
+            }
         }
-        entry.available_margin -= initial_margin_cents;
-        entry.order_margin += initial_margin_cents;
-        Ok(initial_margin_cents)
     }
 
+    /// Hot path (recv-spin): lock-free release using fetch_add/fetch_sub.
+    /// Uses `accounts.get()` (shared shard read-lock) — never blocks concurrent
+    /// `check_and_reserve_margin` on other users in the same shard.
     pub fn release_order_margin(&self, user_id: i64, initial_margin_cents: i64) {
-        if let Some(mut entry) = self.accounts.get_mut(&user_id) {
-            entry.order_margin = (entry.order_margin - initial_margin_cents).max(0);
-            entry.available_margin += initial_margin_cents;
+        use std::sync::atomic::Ordering;
+        if let Some(entry) = self.accounts.get(&user_id) {
+            entry.available_margin.fetch_add(initial_margin_cents, Ordering::Relaxed);
+            entry.order_margin.fetch_sub(initial_margin_cents, Ordering::Relaxed);
         }
     }
 
@@ -219,18 +231,19 @@ impl RiskEngine {
             _ => 0,
         };
         if let Some(mut acct) = self.accounts.get_mut(&user_id) {
-            acct.order_margin = (acct.order_margin - fill_margin_cents).max(0);
+            use std::sync::atomic::Ordering::Relaxed;
+            let old_om = acct.order_margin.load(Relaxed);
+            acct.order_margin.store((old_om - fill_margin_cents).max(0), Relaxed);
             if released_used_margin > 0 {
                 // Closing (or closing+flipping): release old position's used_margin and credit pnl.
                 acct.used_margin = (acct.used_margin - released_used_margin).max(0);
                 // For flip: flip_margin portion stays in used_margin, not available.
                 acct.used_margin += flip_margin;
-                acct.available_margin = (acct.available_margin
-                    + fill_margin_cents
-                    + released_used_margin
-                    + realized_pnl_cents
-                    - flip_margin)
-                    .max(0);
+                let old_av = acct.available_margin.load(Relaxed);
+                acct.available_margin.store(
+                    (old_av + fill_margin_cents + released_used_margin + realized_pnl_cents - flip_margin).max(0),
+                    Relaxed,
+                );
                 // After forced liquidation close, let run_risk_tick re-evaluate status.
                 if acct.status == RiskStatus::Liquidating {
                     acct.status = RiskStatus::Normal;
@@ -242,8 +255,8 @@ impl RiskEngine {
             acct.unrealized_pnl += unrealized_pnl_delta;
             acct.maintenance_margin =
                 (acct.maintenance_margin + maintenance_margin_delta).max(0);
-            acct.equity = acct.available_margin
-                + acct.order_margin
+            acct.equity = acct.available_margin.load(Relaxed)
+                + acct.order_margin.load(Relaxed)
                 + acct.used_margin
                 + acct.unrealized_pnl;
         }
@@ -317,9 +330,10 @@ impl RiskEngine {
                 new_upnl - old_upnl
             };
             if let Some(mut acct) = self.accounts.get_mut(&uid) {
+                use std::sync::atomic::Ordering::Relaxed;
                 acct.unrealized_pnl += upnl_delta;
-                acct.equity = acct.available_margin
-                    + acct.order_margin
+                acct.equity = acct.available_margin.load(Relaxed)
+                    + acct.order_margin.load(Relaxed)
                     + acct.used_margin
                     + acct.unrealized_pnl;
             }
@@ -618,8 +632,9 @@ mod tests {
     fn initialize_account_sets_available_margin() {
         let (engine, user_id) = make_engine_with_account(100_000);
         let state = engine.accounts.get(&user_id).unwrap();
-        assert_eq!(state.available_margin, 100_000);
-        assert_eq!(state.order_margin, 0);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(state.available_margin.load(Relaxed), 100_000);
+        assert_eq!(state.order_margin.load(Relaxed), 0);
         assert_eq!(state.used_margin, 0);
         assert_eq!(state.equity, 100_000);
     }
@@ -630,8 +645,9 @@ mod tests {
         let result = engine.check_and_reserve_margin(user_id, 10_000);
         assert_eq!(result, Ok(10_000));
         let state = engine.accounts.get(&user_id).unwrap();
-        assert_eq!(state.available_margin, 90_000);
-        assert_eq!(state.order_margin, 10_000);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(state.available_margin.load(Relaxed), 90_000);
+        assert_eq!(state.order_margin.load(Relaxed), 10_000);
     }
 
     #[test]
@@ -640,8 +656,9 @@ mod tests {
         let result = engine.check_and_reserve_margin(user_id, 10_000);
         assert!(result.is_err());
         let state = engine.accounts.get(&user_id).unwrap();
-        assert_eq!(state.available_margin, 5_000);
-        assert_eq!(state.order_margin, 0);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(state.available_margin.load(Relaxed), 5_000);
+        assert_eq!(state.order_margin.load(Relaxed), 0);
     }
 
     #[test]
@@ -650,8 +667,9 @@ mod tests {
         engine.check_and_reserve_margin(user_id, 10_000).unwrap();
         engine.release_order_margin(user_id, 10_000);
         let state = engine.accounts.get(&user_id).unwrap();
-        assert_eq!(state.available_margin, 100_000);
-        assert_eq!(state.order_margin, 0);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(state.available_margin.load(Relaxed), 100_000);
+        assert_eq!(state.order_margin.load(Relaxed), 0);
     }
 
     #[test]
@@ -680,8 +698,9 @@ mod tests {
         assert_eq!(success.load(Ordering::Relaxed), 1);
         assert_eq!(failure.load(Ordering::Relaxed), 1);
         let state = engine.accounts.get(&user_id).unwrap();
-        assert_eq!(state.available_margin, 5_000);
-        assert_eq!(state.order_margin, 10_000);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(state.available_margin.load(Relaxed), 5_000);
+        assert_eq!(state.order_margin.load(Relaxed), 10_000);
     }
 
     #[test]
@@ -723,7 +742,8 @@ mod tests {
         assert_eq!(pos.initial_margin, MARGIN_CENTS);
 
         let acct = engine.accounts.get(&uid).unwrap();
-        assert_eq!(acct.order_margin, 0);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(acct.order_margin.load(Relaxed), 0);
         assert_eq!(acct.used_margin, MARGIN_CENTS);
     }
 
@@ -771,13 +791,14 @@ mod tests {
         assert!(engine.positions.get(&(uid, btc_sym())).is_none());
 
         let acct = engine.accounts.get(&uid).unwrap();
+        use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(acct.used_margin, 0);
-        assert_eq!(acct.order_margin, 0);
+        assert_eq!(acct.order_margin.load(Relaxed), 0);
         // open:  500_000 - 50_000 (reserve) = 450_000 available, 50_000 order_margin
         //        on_fill: order_margin → used_margin, available unchanged at 450_000
         // close: 450_000 - 50_000 (reserve) = 400_000 available, 50_000 order_margin
         //        on_fill: +50_000 (close reservation) + 50_000 (used_margin) + 50_000 (profit) = 550_000
-        assert_eq!(acct.available_margin, 550_000);
+        assert_eq!(acct.available_margin.load(Relaxed), 550_000);
     }
 
     #[test]
@@ -797,8 +818,9 @@ mod tests {
         assert_eq!(pos.side, PositionSide::Long);
 
         let acct = engine.accounts.get(&uid).unwrap();
+        use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(acct.used_margin, half_margin); // only half still used
-        assert_eq!(acct.order_margin, 0);
+        assert_eq!(acct.order_margin.load(Relaxed), 0);
     }
 
     #[test]
@@ -965,7 +987,8 @@ mod tests {
         // equity = available(450_000) + used(50_000) + upnl = 2_499 → upnl = -497_501
         if let Some(mut acct) = engine.accounts.get_mut(&uid) {
             acct.unrealized_pnl = -497_501;
-            acct.equity = acct.available_margin + acct.order_margin + acct.used_margin + acct.unrealized_pnl;
+            use std::sync::atomic::Ordering::Relaxed;
+            acct.equity = acct.available_margin.load(Relaxed) + acct.order_margin.load(Relaxed) + acct.used_margin + acct.unrealized_pnl;
         }
 
         let events = engine.run_risk_tick();

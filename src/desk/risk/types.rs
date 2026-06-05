@@ -1,5 +1,7 @@
 // All monetary values in "cents" (0.01 USDT = 1 unit). Prices in ticks. Quantities in lots.
 
+use std::sync::atomic::AtomicI64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RiskStatus {
     #[default]
@@ -17,15 +19,18 @@ pub enum PositionSide {
     Short,
 }
 
-#[derive(Debug, Clone)]
+/// Hot-path fields (`available_margin`, `order_margin`) are `AtomicI64` so
+/// `check_and_reserve_margin` and `release_order_margin` can use a shared
+/// DashMap read-lock (`get`) instead of an exclusive write-lock (`get_mut`).
+/// All other fields are only written under `get_mut` (on_fill, risk_tick).
 pub struct AccountRiskState {
     pub user_id: i64,
     pub equity: i64,
-    pub available_margin: i64,
-    pub order_margin: i64,
-    pub used_margin: i64,
+    pub available_margin: AtomicI64,
+    pub order_margin:     AtomicI64,
+    pub used_margin:      i64,
     pub maintenance_margin: i64,
-    pub unrealized_pnl: i64,
+    pub unrealized_pnl:   i64,
     pub status: RiskStatus,
 }
 
@@ -34,8 +39,8 @@ impl AccountRiskState {
         Self {
             user_id,
             equity: usdt_balance_cents,
-            available_margin: usdt_balance_cents,
-            order_margin: 0,
+            available_margin: AtomicI64::new(usdt_balance_cents),
+            order_margin:     AtomicI64::new(0),
             used_margin: 0,
             maintenance_margin: 0,
             unrealized_pnl: 0,

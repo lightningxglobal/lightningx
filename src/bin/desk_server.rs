@@ -349,6 +349,9 @@ struct OrderRuntimeMeta {
     /// Non-zero for forced-liquidation orders. Passed to RiskEngine::on_fill
     /// so the user is settled at this price; spread → insurance fund.
     liq_price_ticks: i64,
+    /// Margin reserved by check_and_reserve_margin for this order (cents).
+    /// Stored so the else/CANCELLED path (ws_meta=None) can release it.
+    initial_margin_cents: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,6 +363,7 @@ fn remember_runtime_order(
     quantity: f64,
     side: u8,
     symbol: [u8; 16],
+    initial_margin_cents: i64,
 ) {
     cache.insert(
         order_id,
@@ -371,6 +375,7 @@ fn remember_runtime_order(
             side,
             symbol,
             liq_price_ticks: 0,
+            initial_margin_cents,
         },
     );
 }
@@ -421,7 +426,7 @@ mod tests {
     #[test]
     fn runtime_meta_survives_until_terminal_remove() {
         let cache = DashMap::new();
-        remember_runtime_order(&cache, 10, 7, 73000.0, 0.5, 0, sym("BTC_USDT"));
+        remember_runtime_order(&cache, 10, 7, 73000.0, 0.5, 0, sym("BTC_USDT"), 0);
 
         assert_eq!(runtime_user_id(&cache, 10), 7);
         assert_eq!(runtime_user_id(&cache, 11), 0);
@@ -438,7 +443,7 @@ mod tests {
     #[test]
     fn runtime_meta_remaps_client_id_to_engine_order_id() {
         let cache = DashMap::new();
-        remember_runtime_order(&cache, 10, 7, 100.0, 1.0, 1, sym("BTC_USDT"));
+        remember_runtime_order(&cache, 10, 7, 100.0, 1.0, 1, sym("BTC_USDT"), 0);
 
         remap_runtime_order_id(&cache, 10, 99);
 
@@ -455,7 +460,7 @@ mod tests {
     #[test]
     fn runtime_bump_filled_updates_accumulator() {
         let cache = DashMap::new();
-        remember_runtime_order(&cache, 5, 1, 100.0, 2.0, 0, sym("X_Y"));
+        remember_runtime_order(&cache, 5, 1, 100.0, 2.0, 0, sym("X_Y"), 0);
         assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 0.0);
         runtime_bump_filled(&cache, 5, 0.5);
         assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 0.5);
@@ -1140,6 +1145,7 @@ async fn async_main() -> anyhow::Result<()> {
                     side: side_byte,
                     symbol: sym_bytes,
                     liq_price_ticks: 0,
+                    initial_margin_cents: 0, // pre-existing open orders: margin state unknown after restart
                 },
             );
         }
@@ -1467,6 +1473,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     sym_rules.lots_to_quantity(quantity_lots),
                                     side,
                                     symbol,
+                                    0, // liq close side has no margin reservation
                                 );
                                 if liq_ticks != 0 {
                                     if let Some(mut m) = order_meta_cache.get_mut(&order_id) {
@@ -1501,6 +1508,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     sym_rules.lots_to_quantity(req.quantity_lots),
                                     req.side,
                                     req.symbol,
+                                    0, // overwritten on ACCEPTED with authoritative value from pending_meta
                                 );
                                 if let Some(pub_) = order_pubs.get_mut(sym) {
                                     let _ = pub_.publish_new_order(&req);
@@ -1585,6 +1593,7 @@ async fn async_main() -> anyhow::Result<()> {
                                         sym_rules.lots_to_quantity(req.quantity_lots),
                                         req.side,
                                         req.symbol,
+                                        0, // overwritten on ACCEPTED with authoritative value from pending_meta
                                     );
                                     if let Some(pub_) = order_pubs.get_mut(sym) {
                                         let _ = pub_.publish_new_order(req);
@@ -1843,6 +1852,11 @@ async fn async_main() -> anyhow::Result<()> {
                 // of CPU per test inside the recv-spin critical section.
                 let lost_order_updates = AtomicU64::new(0);
                 let full_channels = AtomicU64::new(0);
+                // release_order_margin timing probe — remove after measurement
+                let mut rom_calls: u64 = 0;
+                let mut rom_total_ns: u64 = 0;
+                let mut rom_max_ns: u64 = 0;
+                let mut rom_contended: u64 = 0; // calls that took >1µs
                 loop {
                     let mut did_work = false;
 
@@ -1921,6 +1935,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     meta_ref.qty,
                                     meta_ref.side,
                                     meta_ref.symbol,
+                                    meta_ref.initial_margin_cents,
                                 );
                                 // remember_runtime_order always zeros liq_price_ticks;
                                 // restore it so on_fill settles the user at the correct price.
@@ -2073,6 +2088,27 @@ async fn async_main() -> anyhow::Result<()> {
                                 // funds released by this path, but cache state
                                 // remains correct because no freeze happened on
                                 // our side either.
+                                //
+                                // Release futures margin reserved at order placement.
+                                // This path handles GTC ACCEPTED→CANCELLED: pending_meta
+                                // was consumed on ACCEPTED so ws_meta is None above.
+                                if let Some(m) = runtime_meta(&order_meta_cache, order_id) {
+                                    if m.initial_margin_cents > 0 {
+                                        let _t0 = std::time::Instant::now();
+                                        risk_engine.release_order_margin(m.user_id, m.initial_margin_cents);
+                                        let elapsed = _t0.elapsed().as_nanos() as u64;
+                                        rom_total_ns += elapsed;
+                                        rom_calls += 1;
+                                        if elapsed > 1_000 { rom_contended += 1; }
+                                        if elapsed > rom_max_ns { rom_max_ns = elapsed; }
+                                        if rom_calls % 10_000 == 0 {
+                                            tracing::warn!(
+                                                "release_order_margin: calls={} avg={}ns max={}ns contended(>1µs)={}",
+                                                rom_calls, rom_total_ns / rom_calls, rom_max_ns, rom_contended
+                                            );
+                                        }
+                                    }
+                                }
                                 let entry = runtime_meta(&order_meta_cache, order_id)
                                     .and_then(|m| {
                                         let release_qty = (m.quantity - m.filled).max(0.0);

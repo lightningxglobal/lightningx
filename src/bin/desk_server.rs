@@ -1382,6 +1382,7 @@ async fn async_main() -> anyhow::Result<()> {
         market_fanout: market_fanout.clone(),
         public_market_data_enabled,
         response_stream_id,
+        desk_id: desk_id as u16,
         user_tx: Arc::new(lightning_exchange::api::UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(initial_id)),
         aeron_cmd_tx: Some(aeron_cmd_tx),

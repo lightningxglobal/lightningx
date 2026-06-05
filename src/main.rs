@@ -328,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
         market_fanout,
         public_market_data_enabled: true,
         response_stream_id: lightning_exchange::aeron_channels::ORDER_UPDATE_STREAM,
+        desk_id: 0,
         user_tx: Arc::new(UserTxRegistry::new()),
         next_order_id: Arc::new(AtomicU64::new(max_order_id + 1)),
         aeron_cmd_tx: None,

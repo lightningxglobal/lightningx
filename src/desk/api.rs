@@ -187,6 +187,9 @@ pub struct AppState {
     /// Private order-update stream for this desk/counter. New orders and
     /// cancels carry this id so matching publishes replies only to this desk.
     pub response_stream_id: i32,
+    /// Logical desk/counter id for account ownership. A desk may only mutate
+    /// private user state for users whose owner shard maps to this id.
+    pub desk_id: u16,
     /// Per-user personal update channel (order fills, balance changes).
     /// Lock-free slab indexed by user_id. See UserTxRegistry for why we
     /// replaced `DashMap<i64, _>` (broke down at 400K subscribers).
@@ -386,6 +389,25 @@ fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {
     auth_claims(headers).map(|c| c.sub)
 }
 
+fn ensure_user_owned_by_this_desk(
+    user_id: i64,
+    desk_id: u16,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if crate::desk::counter_shard::is_user_owned_by_desk(user_id, desk_id) {
+        return Ok(());
+    }
+    let owner_shard_id = crate::desk::counter_shard::owner_shard_for_user_id(user_id);
+    Err((
+        StatusCode::MISDIRECTED_REQUEST,
+        Json(json!({
+            "error": "wrong counter shard",
+            "user_id": user_id,
+            "desk_id": desk_id,
+            "owner_shard_id": owner_shard_id,
+        })),
+    ))
+}
+
 // ─── Accounts ─────────────────────────────────────────────────────────────────
 
 /// Atomic in-memory freeze: returns true if balance had enough to cover
@@ -422,6 +444,9 @@ async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl 
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
 
     // Serve from in-memory cache when available (zero DB round-trip).
     if let Some(assets) = s.account_cache.get(&user_id) {
@@ -553,6 +578,9 @@ async fn handle_orders(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     let limit_raw = match q.limit {
         Some(v) => v,
         None => 50,
@@ -616,6 +644,9 @@ async fn handle_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
 
     // Fast path: try Redis first when the order is still active. Redis only
     // holds PENDING/TRADING orders, so missing-in-Redis (Ok(None)) doesn't
@@ -671,6 +702,9 @@ async fn handle_trades(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     let limit = q.limit.unwrap_or(50).min(500);
     // DISTINCT ON (t.id) collapses self-trades (same user on both sides) to a
     // single row; the inner ORDER BY t.id, o.id picks the buy side
@@ -735,6 +769,9 @@ async fn handle_positions(State(s): State<AppState>, headers: HeaderMap) -> impl
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     // All-in-memory path — was a 3-query PG call (90ms p50). Each piece:
     //   • (balance, frozen) from account_cache (DashMap)
     //   • current_price from last_trade_price (DashMap, spin-thread maintained)
@@ -771,6 +808,9 @@ async fn handle_place_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     let fixed_shape = match crate::symbol_rules::normalize_order_shape(
         &req.symbol,
         &req.order_type,
@@ -1358,6 +1398,9 @@ async fn handle_cancel_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
 
     // Fetch order details before cancelling so we know what to unfreeze.
     let order_row = sqlx::query(
@@ -1522,6 +1565,9 @@ async fn handle_cancel_all_orders(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
 
     // Optional ?symbol= filter.
     let symbol_filter: Option<String> = params.get("symbol").cloned();
@@ -1735,6 +1781,9 @@ async fn handle_get_profile(State(s): State<AppState>, headers: HeaderMap) -> im
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(s.db.as_ref())
@@ -1768,6 +1817,9 @@ async fn handle_update_profile(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     match sqlx::query_as::<_, User>(
         "UPDATE users SET full_name = COALESCE($1, full_name), updated_at = NOW()
          WHERE id = $2 RETURNING *",
@@ -1807,6 +1859,9 @@ async fn handle_submit_kyc(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     if req.full_name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1861,6 +1916,9 @@ async fn handle_change_password(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
     if req.new_password.len() < 8 {
         return (
             StatusCode::BAD_REQUEST,
@@ -1936,6 +1994,9 @@ async fn handle_test_funds(State(s): State<AppState>, headers: HeaderMap) -> imp
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
 
     // Check current USDT balance
     let usdt_balance: Option<f64> =
@@ -1984,6 +2045,9 @@ async fn handle_robot_funds(State(s): State<AppState>, headers: HeaderMap) -> im
         return (StatusCode::FORBIDDEN, Json(json!({"error": "Forbidden"}))).into_response();
     }
     let user_id = claims.sub;
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
 
     let result = sqlx::query(
         "INSERT INTO accounts (user_id, asset, balance, frozen)

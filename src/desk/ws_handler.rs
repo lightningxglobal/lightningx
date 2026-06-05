@@ -63,6 +63,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn wrong_counter_shard_message(user_id: i64, desk_id: u16) -> String {
+    let owner = crate::desk::counter_shard::owner_shard_for_user_id(user_id);
+    format!(
+        "wrong counter shard: user_id={} owner_shard_id={} desk_id={}",
+        user_id, owner, desk_id
+    )
+}
+
+#[inline]
+fn is_user_owned_by_this_desk(state: &AppState, user_id: i64) -> bool {
+    crate::desk::counter_shard::is_user_owned_by_desk(user_id, state.desk_id)
+}
+
 #[inline]
 fn ws_status_to_byte(status: crate::order_state::WsOrderStatus) -> u8 {
     use crate::order_state::WsOrderStatus;
@@ -574,6 +587,12 @@ async fn handle_client_message(
     match msg {
         ClientMsg::Auth { token } => match user_service::verify_token(&token) {
             Ok(claims) => {
+                if !is_user_owned_by_this_desk(state, claims.sub) {
+                    return Some(ws_sbe::encode_auth_error(&wrong_counter_shard_message(
+                        claims.sub,
+                        state.desk_id,
+                    )));
+                }
                 session.user_id = Some(claims.sub);
                 state.user_tx.register(claims.sub, personal_tx.clone());
                 Some(ws_sbe::encode_auth_ok(claims.sub))
@@ -584,6 +603,12 @@ async fn handle_client_message(
         ClientMsg::ApiKeyAuth { api_key } => {
             match user_service::verify_api_key(&state.db, &api_key).await {
                 Ok(user_id) => {
+                    if !is_user_owned_by_this_desk(state, user_id) {
+                        return Some(ws_sbe::encode_auth_error(&wrong_counter_shard_message(
+                            user_id,
+                            state.desk_id,
+                        )));
+                    }
                     session.user_id = Some(user_id);
                     state.user_tx.register(user_id, personal_tx.clone());
                     Some(ws_sbe::encode_auth_ok(user_id))
@@ -651,6 +676,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_order_rejected(0, "Not authenticated")),
             };
+            if !is_user_owned_by_this_desk(state, user_id) {
+                return Some(ws_sbe::encode_order_rejected(
+                    0,
+                    &wrong_counter_shard_message(user_id, state.desk_id),
+                ));
+            }
 
             // Client is responsible for ensuring client_order_id uniqueness
             // — no server-side idempotency check. The DB UNIQUE constraint
@@ -1359,6 +1390,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
+            if !is_user_owned_by_this_desk(state, user_id) {
+                return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
+                    user_id,
+                    state.desk_id,
+                )));
+            }
             // Run in background so the WS handler is not blocked on DB operations.
             // This lets queued place_order messages be processed immediately.
             let state2 = state.clone();
@@ -1375,6 +1412,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
+            if !is_user_owned_by_this_desk(state, user_id) {
+                return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
+                    user_id,
+                    state.desk_id,
+                )));
+            }
             let n = bulk_cancel(user_id, None, state, &personal_tx).await;
             Some(ws_sbe::encode_cancel_all_ok(n as u32))
         }
@@ -1384,6 +1427,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
+            if !is_user_owned_by_this_desk(state, user_id) {
+                return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
+                    user_id,
+                    state.desk_id,
+                )));
+            }
 
             // ── Aeron fast path: forward cancel immediately, no DB on the hot
             // path. Fund release + PG DELETE happen when engine's CANCELED
@@ -1503,6 +1552,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
+            if !is_user_owned_by_this_desk(state, user_id) {
+                return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
+                    user_id,
+                    state.desk_id,
+                )));
+            }
 
             // Cap batch at 40 orders.
             let orders = if orders.len() > 40 {
@@ -1977,6 +2032,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
+            if !is_user_owned_by_this_desk(state, user_id) {
+                return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
+                    user_id,
+                    state.desk_id,
+                )));
+            }
             if order_ids.is_empty() {
                 return Some(ws_sbe::encode_batch_cancel_ok(0));
             }

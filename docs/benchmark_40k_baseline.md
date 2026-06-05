@@ -431,3 +431,86 @@ Aeron recv-spin 线程和 engine 撮合线程是 busy-loop，必须独占核心�
 - 测试均在 localhost loopback 上进行，无网络延迟；生产跨机 Aeron UDP 会增加 50–100 µs 往返。
 - 20K 压测用户 CSV + CONNS > USERS 时，多连接复用同一 token（5 个连接/用户），在真实场景中每用户应有独立账户。
 - 每次测试前需执行 `DELETE FROM orders;`，避免历史数据影响 DB 性能。
+
+---
+
+## 10. 2026-06-06 新增测试：Owner-Shard Desk 转发路径
+
+本节对比 owner-shard 场景下的两条私有下单路径：
+
+- **no-forward**：客户端连接到自己账户所属的 owner desk，desk 直接处理并发送到 exchange-engine。
+- **forward**：客户端故意连接到非 owner desk，入口 desk 通过 counter-forward Aeron stream 转发到 owner desk，owner desk 处理后再把私有响应转回入口 desk，由入口 desk 写回 WebSocket。
+
+共同配置：
+
+| 项目 | 值 |
+|------|----|
+| 机器 | Apple M4 Pro / macOS loopback |
+| 连接数 | 40K |
+| desk 数量 | 4 |
+| 每 desk 连接数 | 10K |
+| `TRACER_ENABLED` | 0 |
+| `DESK_SPIN` | true |
+| `SYMBOLS` | BTC_USDT |
+| workload | GTC 下单 + 撤单循环 |
+
+### 10.1 no-forward：owner desk 直连
+
+命令：
+
+```bash
+LOG_DIR=/tmp/lightning-40k-owner-local-20260606-083613 \
+DESK_COUNT=4 \
+TOTAL_CONNS=40000 \
+PRESSURE_OWNER_SHARD_SHIFT=0 \
+PRESSURE_DURATION_S=30 \
+PRESSURE_RAMP_S=30 \
+TRACER_ENABLED=0 \
+scripts/run_40k_pressure.sh
+```
+
+结果目录：`/tmp/lightning-40k-owner-local-20260606-083613`
+
+| lane | 连接失败 | place OK | place p50 | place p90 | place p99 | cancel p50 |
+|------|----------|----------|-----------|-----------|-----------|------------|
+| pressure-0 | 0 | 82147 / 100% | 179 µs | 1202 µs | 8728 µs | 210 µs |
+| pressure-1 | 0 | 82190 / 100% | 175 µs | 1197 µs | 8561 µs | 211 µs |
+| pressure-2 | 0 | 82122 / 100% | 174 µs | 1158 µs | 8987 µs | 208 µs |
+| pressure-3 | 0 | 82270 / 100% | 174 µs | 1196 µs | 9138 µs | 204 µs |
+
+结论：40K no-forward 下，place p50 为 **174-179 µs**，连接和委托成功率均为 **100%**。
+
+### 10.2 forward：wrong-owner desk 转发
+
+命令：
+
+```bash
+LOG_DIR=/tmp/lightning-40k-owner-forward-20260606-020000 \
+DESK_COUNT=4 \
+TOTAL_CONNS=40000 \
+PRESSURE_OWNER_SHARD_SHIFT=1 \
+PRESSURE_DURATION_S=30 \
+PRESSURE_RAMP_S=30 \
+TRACER_ENABLED=0 \
+scripts/run_40k_pressure.sh
+```
+
+结果目录：`/tmp/lightning-40k-owner-forward-20260606-020000`
+
+| lane | 连接失败 | place OK | place p50 | place p90 | place p99 | cancel p50 |
+|------|----------|----------|-----------|-----------|-----------|------------|
+| pressure-0 | 0 | 81044 / 100% | 197 µs | 1529 µs | 24746 µs | 232 µs |
+| pressure-1 | 0 | 81061 / 100% | 199 µs | 1542 µs | 27542 µs | 233 µs |
+| pressure-2 | 0 | 81123 / 100% | 199 µs | 1548 µs | 27122 µs | 233 µs |
+| pressure-3 | 0 | 81071 / 100% | 197 µs | 1573 µs | 21571 µs | 234 µs |
+
+结论：40K forward 下，place p50 为 **197-199 µs**，连接和委托成功率均为 **100%**。
+
+### 10.3 对比结论
+
+| 路径 | place p50 | place p90 | place p99 | 结论 |
+|------|-----------|-----------|-----------|------|
+| no-forward | 174-179 µs | 1158-1202 µs | 8561-9138 µs | 最快路径，符合 owner-shard 直连预期 |
+| forward | 197-199 µs | 1529-1573 µs | 21571-27542 µs | p50 仍达标，但 p99 明显更差 |
+
+forward 路径的 p50 比 no-forward 慢约 **20-25 µs**，不是理论上的单纯 Aeron 读写 1-3 µs。p50 仍低于 600 µs 目标，但 p99 长尾需要继续在 Linux 物理机上确认；macOS 本地调度和 WebSocket 写路径可能放大尾延迟。

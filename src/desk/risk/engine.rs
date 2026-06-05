@@ -9,8 +9,9 @@ pub struct RiskEngine {
     pub accounts: DashMap<i64, AccountRiskState>,
     pub positions: DashMap<(i64, [u8; 16]), PositionRiskState>,
     pub mark_prices: DashMap<[u8; 16], i64>,
-    // symbol → user_ids with open positions (for mark-price scan in Phase 3)
-    pub symbol_position_index: DashMap<[u8; 16], Vec<i64>>,
+    // symbol → user_ids with open positions (for mark-price scan in Phase 3).
+    // HashSet for O(1) insert/remove in on_fill (hot recv-spin path).
+    pub symbol_position_index: DashMap<[u8; 16], std::collections::HashSet<i64>>,
     /// Insurance fund balance in cents.  Positive = surplus absorbed from profitable
     /// liquidations; negative = fund debt from socialised losses.
     pub insurance_fund_cents: AtomicI64,
@@ -251,18 +252,16 @@ impl RiskEngine {
         self.mark_prices.entry(symbol).or_insert(fill_price_ticks);
 
         // Maintain symbol_position_index for Phase 3 mark-price scan.
+        // HashSet insert/remove are O(1) — safe on recv-spin hot path.
         let has_open = self
             .positions
             .get(&key)
             .map(|p| p.qty_lots > 0)
             .unwrap_or(false);
         if has_open {
-            let mut idx = self.symbol_position_index.entry(symbol).or_default();
-            if !idx.contains(&user_id) {
-                idx.push(user_id);
-            }
+            self.symbol_position_index.entry(symbol).or_default().insert(user_id);
         } else if let Some(mut idx) = self.symbol_position_index.get_mut(&symbol) {
-            idx.retain(|&id| id != user_id);
+            idx.remove(&user_id);
         }
     }
 
@@ -296,7 +295,7 @@ impl RiskEngine {
         let user_ids: Vec<i64> = self
             .symbol_position_index
             .get(&symbol)
-            .map(|v| v.clone())
+            .map(|v| v.iter().copied().collect())
             .unwrap_or_default();
 
         for uid in user_ids {

@@ -18,8 +18,9 @@ use lightning_exchange::{
         DbOrderStatus,
     },
     tracer::{
-        spawn_tracer, DESK_INSTANCE_ID, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV,
-        MS_CMD_RING_POPPED, MS_USER_TX_SENT, MS_WS_UPDATE_SEND,
+        spawn_tracer, DESK_INSTANCE_ID,
+        // MS_CMD_RING_POPPED, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV,
+        // MS_USER_TX_SENT, MS_WS_UPDATE_SEND,  // uncomment to enable 6-gap breakdown
         MS_LIQ_TICK_EMIT, MS_LIQ_ORDER_SENT, MS_LIQ_FILL_RECV,
     },
     transport::persist_event::{
@@ -1486,13 +1487,7 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                         match cmd {
                             AeronCmd::NewOrder(req) => {
-                                if let Some(ref t) = spin_tracer {
-                                    t.record_sym(
-                                        MS_CMD_RING_POPPED,
-                                        req.client_order_id,
-                                        &req.symbol,
-                                    );
-                                }
+                                // if let Some(ref t) = spin_tracer { t.record_sym(MS_CMD_RING_POPPED, req.client_order_id, &req.symbol); }
                                 let sym = std::str::from_utf8(&req.symbol)
                                     .unwrap_or("")
                                     .trim_end_matches('\0');
@@ -1524,13 +1519,7 @@ async fn async_main() -> anyhow::Result<()> {
                                         ), 0));
                                     }
                                 }
-                                if let Some(ref t) = spin_tracer {
-                                    t.record_sym(
-                                        MS_AERON_ORDER_SEND,
-                                        req.client_order_id,
-                                        &req.symbol,
-                                    );
-                                }
+                                // if let Some(ref t) = spin_tracer { t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol); }
                             }
                             AeronCmd::Cancel(req) => {
                                 let symbol_bytes =
@@ -1600,13 +1589,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     if let Some(pub_) = order_pubs.get_mut(sym) {
                                         let _ = pub_.publish_new_order(req);
                                     }
-                                    if let Some(ref t) = spin_tracer {
-                                        t.record_sym(
-                                            MS_AERON_ORDER_SEND,
-                                            req.client_order_id,
-                                            &req.symbol,
-                                        );
-                                    }
+                                    // if let Some(ref t) = spin_tracer { t.record_sym(MS_AERON_ORDER_SEND, req.client_order_id, &req.symbol); }
                                 }
                             }
                         }
@@ -1900,10 +1883,7 @@ async fn async_main() -> anyhow::Result<()> {
                         if !owned {
                             continue;
                         }
-                        if let Some(ref t) = spin_tracer {
-                            t.record(MS_AERON_UPDATE_RECV, client_order_id);
-                        }
-
+                        // if let Some(ref t) = spin_tracer { t.record(MS_AERON_UPDATE_RECV, client_order_id); }
                         // For WS fast-path orders, pending_meta holds the order
                         // details. On ACCEPTED we INSERT the DB row + freeze funds.
                         // On REJECTED/CANCELLED we just drop the meta (no freeze happened).
@@ -1960,9 +1940,7 @@ async fn async_main() -> anyhow::Result<()> {
                         // work below so persistence cannot sit in front of the
                         // WS notification on the recv spin thread.
                         if kind == order_update_kind::ACCEPTED {
-                            if let Some(ref t) = spin_tracer {
-                                t.record(MS_WS_UPDATE_SEND, client_order_id);
-                            }
+                            // if let Some(ref t) = spin_tracer { t.record(MS_WS_UPDATE_SEND, client_order_id); }
                             if let Some(tx) = user_tx.get(participant_id as i64) {
                                 let ts = msg.timestamp;
                                 let upd = lightning_exchange::ws_sbe::encode_order_update(
@@ -1975,9 +1953,7 @@ async fn async_main() -> anyhow::Result<()> {
                                         tracing::warn!("personal channel full — order_update dropped (total: {n})");
                                     }
                                 }
-                                if let Some(ref t) = spin_tracer {
-                                    t.record(MS_USER_TX_SENT, client_order_id);
-                                }
+                                // if let Some(ref t) = spin_tracer { t.record(MS_USER_TX_SENT, client_order_id); }
                             }
                             update_pushed = true;
                         }
@@ -2170,12 +2146,7 @@ async fn async_main() -> anyhow::Result<()> {
                         if !update_pushed {
                             // Push order_update to user's personal WS channel.
                             let user_id = participant_id as i64;
-                            // Record latency milestone unconditionally — measures when
-                            // the desk-server is ready to forward the update, regardless
-                            // of whether a WS connection exists for this user.
-                            if let Some(ref t) = spin_tracer {
-                                t.record(MS_WS_UPDATE_SEND, client_order_id);
-                            }
+                            // if let Some(ref t) = spin_tracer { t.record(MS_WS_UPDATE_SEND, client_order_id); }
                             // Single DashMap lookup — was previously two (is_none() +
                             // if let Some()), each taking a shard lock.
                             let maybe_tx = user_tx.get(user_id);

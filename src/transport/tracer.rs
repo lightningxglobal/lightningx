@@ -262,8 +262,9 @@ fn publish_scenario(pub_: &Publisher, instance_id: i32) {
     buf[p] = name.len() as u8; p += 1;
     buf[p..p + name.len()].copy_from_slice(name); p += name.len();
 
-    // 6 milestones: full hot-path breakdown.
-    buf[p] = 6u8; p += 1;
+    // Boundary-only (2 milestones, 1 gap) — apples-to-apples with historical 20µs baseline.
+    // To re-enable 6-gap breakdown: change counts to 6/6 and uncomment the 4 intermediate lines.
+    buf[p] = 2u8; p += 1; // milestone count — change to 6 for full breakdown
 
     macro_rules! milestone {
         ($sid:expr, $sname:expr, $aid:expr, $aname:expr) => {{
@@ -279,21 +280,21 @@ fn publish_scenario(pub_: &Publisher, instance_id: i32) {
     }
 
     milestone!(8i16, b"ExchangeDeskServer", 27i16, b"OnWsOrderRecv");
-    milestone!(8i16, b"ExchangeDeskServer", 35i16, b"OnCmdRingPopped");
-    milestone!(8i16, b"ExchangeDeskServer", 28i16, b"OnAeronOrderSend");
-    milestone!(8i16, b"ExchangeDeskServer", 32i16, b"OnAeronUpdateRecv");
-    milestone!(8i16, b"ExchangeDeskServer", 36i16, b"OnUserTxSent");
+    // milestone!(8i16, b"ExchangeDeskServer", 35i16, b"OnCmdRingPopped");
+    // milestone!(8i16, b"ExchangeDeskServer", 28i16, b"OnAeronOrderSend");
+    // milestone!(8i16, b"ExchangeDeskServer", 32i16, b"OnAeronUpdateRecv");
+    // milestone!(8i16, b"ExchangeDeskServer", 36i16, b"OnUserTxSent");
     milestone!(8i16, b"ExchangeDeskServer", 37i16, b"OnWsResponseSent");
 
-    // 6 gaps: full breakdown — each segment of the hot path
-    buf[p] = 6u8; p += 1;
+    // 1 gap (E2E total only) — change to 6 and uncomment below for full breakdown
+    buf[p] = 1u8; p += 1; // gap count — change to 6 for full breakdown
     for (from, to) in [
-        (MS_WS_ORDER_RECV,    MS_CMD_RING_POPPED),   // gap1: tokio handler → spin thread (cmd ring wait)
-        (MS_CMD_RING_POPPED,  MS_AERON_ORDER_SEND),  // gap2: spin thread pre-Aeron work + risk check
-        (MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV), // gap3: Aeron round-trip + engine match
-        (MS_AERON_UPDATE_RECV, MS_USER_TX_SENT),     // gap4: spin thread dispatch to user_tx
-        (MS_USER_TX_SENT,     MS_WS_RESPONSE_SENT),  // gap5: write actor wakeup + socket write
-        (MS_WS_ORDER_RECV,    MS_WS_RESPONSE_SENT),  // gap6: total E2E server-internal
+        // (MS_WS_ORDER_RECV,     MS_CMD_RING_POPPED),   // gap1: tokio handler → spin thread
+        // (MS_CMD_RING_POPPED,   MS_AERON_ORDER_SEND),  // gap2: spin thread pre-Aeron + risk
+        // (MS_AERON_ORDER_SEND,  MS_AERON_UPDATE_RECV), // gap3: Aeron round-trip + engine match
+        // (MS_AERON_UPDATE_RECV, MS_USER_TX_SENT),      // gap4: spin dispatch to user_tx
+        // (MS_USER_TX_SENT,      MS_WS_RESPONSE_SENT),  // gap5: write actor wakeup + socket write
+        (MS_WS_ORDER_RECV,     MS_WS_RESPONSE_SENT),  // E2E total
     ] {
         buf[p..p + 4].copy_from_slice(&from.to_le_bytes()); p += 4;
         buf[p..p + 4].copy_from_slice(&to.to_le_bytes()); p += 4;

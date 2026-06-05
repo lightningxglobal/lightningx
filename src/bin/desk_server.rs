@@ -1640,6 +1640,41 @@ async fn async_main() -> anyhow::Result<()> {
     // MM/pressure tokio workers outweighed the parallelism. Bottleneck
     // is somewhere else (likely OS scheduler tail + WS/TCP overhead at
     // 350 K parked conns). Future shard experiment lives in git history.
+
+    // Pre-create all counter-forward publications here, before any spin thread
+    // starts. This serializes aeronmd registration requests (no concurrent
+    // add_publication from multiple threads), and prevents the SIGSEGV that
+    // occurred when the spin thread called add_publication while other Aeron
+    // I/O was in flight on the same client.
+    let cf_channel = counter_forward_channel();
+    use lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT;
+    let send_cf_cmd_pubs: HashMap<u16, CounterForwardPublisher> =
+        (0..COUNTER_SHARD_COUNT)
+            .map(|desk| {
+                let stream = counter_forward_cmd_stream_for_desk(desk);
+                let pub_ = new_counter_forward_publisher_with_retry(
+                    counter_forward_cmd_client.clone(),
+                    &cf_channel,
+                    stream,
+                    "cmd",
+                );
+                (desk, pub_)
+            })
+            .collect();
+    let send_cf_resp_pubs: HashMap<u16, CounterForwardPublisher> =
+        (0..COUNTER_SHARD_COUNT)
+            .map(|desk| {
+                let stream = counter_forward_resp_stream_for_desk(desk);
+                let pub_ = new_counter_forward_publisher_with_retry(
+                    counter_forward_cmd_client.clone(),
+                    &cf_channel,
+                    stream,
+                    "send-resp",
+                );
+                (desk, pub_)
+            })
+            .collect();
+
     {
         let aeron_cmd_rx = aeron_cmd_rx.clone();
         let liq_cmd_rx = liq_cmd_rx.clone();
@@ -1651,8 +1686,7 @@ async fn async_main() -> anyhow::Result<()> {
         let user_tx = state.user_tx.clone();
         let account_cache_send = account_cache.clone();
         let risk_engine_send = state.risk_engine.clone();
-        let counter_forward_client = counter_forward_cmd_client.clone();
-        let counter_forward_channel_send = counter_forward_channel();
+        let counter_forward_channel_send = cf_channel.clone();
         let spin_tracer = tracer.clone();
         let queue_metrics = std::env::var("DESK_QUEUE_METRICS")
             .map(|v| v == "1")
@@ -1661,6 +1695,8 @@ async fn async_main() -> anyhow::Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(256);
+        let mut counter_forward_cmd_pubs = send_cf_cmd_pubs;
+        let mut counter_forward_resp_pubs = send_cf_resp_pubs;
         std::thread::Builder::new()
             .name("aeron-send".to_string())
             .spawn(move || {
@@ -1670,32 +1706,6 @@ async fn async_main() -> anyhow::Result<()> {
                 let mut metric_drained: u64 = 0;
                 let mut metric_max_len: usize = 0;
                 let counter_forward_publish_failures = AtomicU64::new(0);
-                let mut counter_forward_cmd_pubs: HashMap<u16, CounterForwardPublisher> =
-                    (0..lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT)
-                        .map(|desk| {
-                            let stream = counter_forward_cmd_stream_for_desk(desk);
-                            let pub_ = new_counter_forward_publisher_with_retry(
-                                counter_forward_client.clone(),
-                                &counter_forward_channel_send,
-                                stream,
-                                "cmd",
-                            );
-                            (desk, pub_)
-                        })
-                        .collect();
-                let mut counter_forward_resp_pubs: HashMap<u16, CounterForwardPublisher> =
-                    (0..lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT)
-                        .map(|desk| {
-                            let stream = counter_forward_resp_stream_for_desk(desk);
-                            let pub_ = new_counter_forward_publisher_with_retry(
-                                counter_forward_client.clone(),
-                                &counter_forward_channel_send,
-                                stream,
-                                "send-resp",
-                            );
-                            (desk, pub_)
-                        })
-                        .collect();
                 loop {
                     let mut did_work = false;
                     counter_forward_cmd_sub.do_work();
@@ -2256,8 +2266,19 @@ async fn async_main() -> anyhow::Result<()> {
         let forward_origin_recv = forwarded_order_origin.clone();
         let public_to_engine_recv = forwarded_public_to_engine.clone();
         let engine_to_public_recv = forwarded_engine_to_public.clone();
-        let counter_forward_client_recv = counter_forward_resp_client.clone();
-        let counter_forward_channel_recv = counter_forward_channel();
+        let recv_cf_resp_pubs: HashMap<u16, CounterForwardPublisher> =
+            (0..COUNTER_SHARD_COUNT)
+                .map(|desk| {
+                    let stream = counter_forward_resp_stream_for_desk(desk);
+                    let pub_ = new_counter_forward_publisher_with_retry(
+                        counter_forward_resp_client.clone(),
+                        &cf_channel,
+                        stream,
+                        "recv-resp",
+                    );
+                    (desk, pub_)
+                })
+                .collect();
         let risk_engine = state.risk_engine.clone();
 
         std::thread::Builder::new()
@@ -2266,19 +2287,7 @@ async fn async_main() -> anyhow::Result<()> {
                 pin_current_thread_to_core("DESK_RECV_CORE", "aeron-recv");
                 let mut idle_us: u64 = 0;
                 let counter_forward_response_failures = AtomicU64::new(0);
-                let mut counter_forward_resp_pubs: HashMap<u16, CounterForwardPublisher> =
-                    (0..lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT)
-                        .map(|desk| {
-                            let stream = counter_forward_resp_stream_for_desk(desk);
-                            let pub_ = new_counter_forward_publisher_with_retry(
-                                counter_forward_client_recv.clone(),
-                                &counter_forward_channel_recv,
-                                stream,
-                                "recv-resp",
-                            );
-                            (desk, pub_)
-                        })
-                        .collect();
+                let mut counter_forward_resp_pubs = recv_cf_resp_pubs;
                 // Accumulator for CANCELLED events observed in one poll burst.
                 // PR5b: each entry carries the fully-resolved (user_id,
                 // asset, release_amount), looked up via OrderRuntimeMeta

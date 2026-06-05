@@ -18,7 +18,11 @@ DATABASE_URL="${DATABASE_URL:-postgres://user:password@localhost:5432/mydb}"
 if $IS_LINUX; then
   AERON_DIR="${AERON_DIR:-/dev/shm/aeron}"
   AERON_BIN="${AERON_BIN:-$HOME/work/3party/aeron/cppbuild/Release/binaries/aeronmd}"
+  # Isolated CPUs (isolcpus=0-11 at boot): aeronmd=0, engine=2, desk spin=4,6,8,10
   CPU_AERONMD="${CPU_AERONMD:-0}"
+  CPU_ENGINE="${CPU_ENGINE:-2}"
+  CPU_DESK_SPIN=(4 6 8 10 12 14 16 18)  # one per desk, physical isolated cores
+  CPU_OTHERS="${CPU_OTHERS:-20-31}"      # tokio workers + gateway + pressure clients
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
 fi
@@ -101,40 +105,64 @@ if $IS_LINUX; then
 fi
 
 # ── exchange-engine ───────────────────────────────────────────────────────
-env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-  RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
-  ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
-  "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
+if $IS_LINUX; then
+  taskset -c "$CPU_ENGINE" \
+  env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
+    "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
+else
+  env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
+    "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
+fi
 pids+=("$!")
 echo "exchange-engine started (pid=${pids[-1]})"
 if $IS_LINUX; then sleep 5; else sleep 2; fi
 
 # ── market-data-gateway ───────────────────────────────────────────────────
 if [[ -x "$GATEWAY_BIN" ]]; then
-  env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning \
-    "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
+  if $IS_LINUX; then
+    taskset -c "$CPU_OTHERS" \
+    env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+      RUST_LOG=warning \
+      "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
+  else
+    env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+      RUST_LOG=warning \
+      "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
+  fi
   pids+=("$!")
 fi
 
 # ── desk-servers ──────────────────────────────────────────────────────────
 for ((i = 0; i < DESK_COUNT; i++)); do
-  env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
-    DESK_SPIN="$DESK_SPIN" \
-    DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
-    TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288 \
-    "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
+  if $IS_LINUX; then
+    spin_cpu="${CPU_DESK_SPIN[$i]}"
+    taskset -c "${spin_cpu},${CPU_OTHERS}" \
+    env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+      RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
+      DESK_SPIN="$DESK_SPIN" DESK_SEND_CORE="$spin_cpu" \
+      DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
+      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288 \
+      "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
+    echo "desk-$i  spin_cpu=$spin_cpu  port=${PORTS[$i]}"
+  else
+    env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
+      RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
+      DESK_SPIN="$DESK_SPIN" \
+      DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
+      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288 \
+      "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
+  fi
   pids+=("$!")
-  # Linux: stagger desk starts so aeronmd can process Aeron registrations serially
+  # Linux: stagger desk starts so aeronmd can serialize Aeron pub registrations
   if $IS_LINUX; then sleep 1.5; fi
 done
-# Linux needs longer warmup for all Aeron publications to register
-if $IS_LINUX; then
-  sleep "${DESK_WARMUP_S:-30}"
-else
-  sleep "${DESK_WARMUP_S:-8}"
-fi
+# Linux: pre-creation fix makes registrations synchronous in main thread,
+# so warmup just needs desks to finish init (8s is enough with the fix)
+sleep "${DESK_WARMUP_S:-8}"
 
 # ── pressure clients ──────────────────────────────────────────────────────
 base_conns=$((TOTAL_CONNS / DESK_COUNT))

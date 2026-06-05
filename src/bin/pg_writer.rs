@@ -18,12 +18,12 @@
 use aeron_wrapper::AeronClient;
 use anyhow::Context;
 use crossbeam_queue::ArrayQueue;
-use lightning_exchange::desk::pg_store::{backfill_from_redis, PgWriteBatch};
-use lightning_exchange::transport::aeron_channels::{aeron_dir, PERSIST_CHANNEL, PERSIST_STREAM};
+use lightning_exchange::desk::pg_store::{PgWriteBatch, backfill_from_redis};
+use lightning_exchange::transport::aeron_channels::{PERSIST_CHANNEL, PERSIST_STREAM, aeron_dir};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
 use lightning_exchange::transport::persist_event::PersistFrame;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -51,8 +51,8 @@ async fn main() -> anyhow::Result<()> {
     let oneshot_backfill = std::env::var("ONESHOT_BACKFILL")
         .map(|s| !s.is_empty())
         .unwrap_or(false);
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
 
     info!(
         "pg-writer starting (pg={}, max_conns={}, max_batch={}, flush_ms={}, backfill={})",
@@ -79,8 +79,7 @@ async fn main() -> anyhow::Result<()> {
         match redis::Client::open(redis_url.as_str()) {
             Ok(client) => match client.get_multiplexed_async_connection().await {
                 Ok(mut conn) => {
-                    let _: Result<String, _> =
-                        redis::cmd("PING").query_async(&mut conn).await;
+                    let _: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
                     match backfill_from_redis(&pg, &mut conn).await {
                         Ok(stats) => info!(
                             "backfill done: scanned={} missing={} backfilled={} skipped_decode={}",
@@ -120,9 +119,8 @@ async fn main() -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("pg-writer-aeron".to_string())
         .spawn(move || {
-            let aeron = Arc::new(
-                AeronClient::new(&aeron_dir_owned).expect("AeronClient::new failed"),
-            );
+            let aeron =
+                Arc::new(AeronClient::new(&aeron_dir_owned).expect("AeronClient::new failed"));
             let mut sub = PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .expect("create PersistSubscriber");
@@ -231,19 +229,19 @@ async fn flush_now(pg: &sqlx::PgPool, batch: &mut PgWriteBatch) -> anyhow::Resul
         Ok(n) => n,
         Err(e) => {
             warn!(
-                "pg flush failed after {:?} ({} frames in batch): {e} — dropping batch",
+                "pg flush failed after {:?} ({} frames in batch): {e} — retaining batch for retry",
                 started.elapsed(),
                 pending
             );
-            // Drop in-flight rows so the next iteration doesn't replay a
-            // poison frame forever. Lifetime `skipped` counter is preserved.
-            batch.clear_payloads();
             return Err(e);
         }
     };
     let dt = started.elapsed();
     if dt > Duration::from_millis(500) {
-        warn!("slow pg flush: {} frames → {} rows in {:?}", pending, written, dt);
+        warn!(
+            "slow pg flush: {} frames → {} rows in {:?}",
+            pending, written, dt
+        );
     }
     Ok(written)
 }

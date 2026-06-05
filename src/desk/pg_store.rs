@@ -19,8 +19,8 @@
 //! - `status` byte → `'PENDING' | 'TRADING' | 'COMPLETED' | 'CANCELED' | 'REJECTED'`.
 
 use crate::transport::persist_event::{
-    unpack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-    PersistFrame, PersistKind, TradeInsertPayload,
+    AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
+    PersistFrame, PersistKind, TradeInsertPayload, unpack_str,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
@@ -29,8 +29,7 @@ use sqlx::PgPool;
 // desk-server actually publishes on the wire — see
 // crate::desk::order_state::DbOrderStatus. Earlier drafts of this module
 // used a 1-indexed mapping which silently coerced everything to PENDING.
-const STATUS_NAMES: [&str; 5] =
-    ["PENDING", "TRADING", "COMPLETED", "CANCELED", "REJECTED"];
+const STATUS_NAMES: [&str; 5] = ["PENDING", "TRADING", "COMPLETED", "CANCELED", "REJECTED"];
 
 fn status_str(code: u8) -> Option<&'static str> {
     if (code as usize) < STATUS_NAMES.len() {
@@ -41,11 +40,7 @@ fn status_str(code: u8) -> Option<&'static str> {
 }
 
 fn side_str(code: u8) -> &'static str {
-    if code == 0 {
-        "buy"
-    } else {
-        "sell"
-    }
+    if code == 0 { "buy" } else { "sell" }
 }
 
 fn from_unix_ms(ms: i64) -> Option<DateTime<Utc>> {
@@ -371,24 +366,31 @@ impl PgWriteBatch {
     }
 
     /// Apply everything to PG inside one transaction per kind. Returns
-    /// total rows written (sum of affected per kind). Empties self.
+    /// total rows written (sum of affected per kind). Rows are removed from
+    /// the batch only after their SQL statement succeeds, so a failed flush
+    /// can be retried without losing accepted frames.
     pub async fn flush(&mut self, pool: &PgPool) -> anyhow::Result<usize> {
         let mut total = 0;
 
         if !self.upserts.is_empty() {
-            total += flush_upserts(pool, std::mem::take(&mut self.upserts)).await?;
+            total += flush_upserts(pool, &self.upserts).await?;
+            self.upserts.clear();
         }
         if !self.deletes.is_empty() {
-            total += flush_deletes(pool, std::mem::take(&mut self.deletes)).await?;
+            total += flush_deletes(pool, &self.deletes).await?;
+            self.deletes.clear();
         }
         if !self.fills.is_empty() {
-            total += flush_fills(pool, std::mem::take(&mut self.fills)).await?;
+            total += flush_fills(pool, &self.fills).await?;
+            self.fills.clear();
         }
         if !self.accounts.is_empty() {
-            total += flush_accounts(pool, std::mem::take(&mut self.accounts)).await?;
+            total += flush_accounts(pool, &self.accounts).await?;
+            self.accounts.clear();
         }
         if !self.trades.is_empty() {
-            total += flush_trades(pool, std::mem::take(&mut self.trades)).await?;
+            total += flush_trades(pool, &self.trades).await?;
+            self.trades.clear();
         }
 
         Ok(total)
@@ -398,6 +400,7 @@ impl PgWriteBatch {
 /// In-place "keep last by key" dedup. Preserves order of the surviving rows
 /// (the position of the LAST occurrence). Used because PG's ON CONFLICT DO
 /// UPDATE refuses batches where the same target row appears twice.
+#[cfg(test)]
 fn dedup_keep_last_by_id<T, F: Fn(&T) -> i64>(rows: Vec<T>, key: F) -> Vec<T> {
     use std::collections::HashMap;
     let mut keep: HashMap<i64, usize> = HashMap::with_capacity(rows.len());
@@ -415,6 +418,7 @@ fn dedup_keep_last_by_id<T, F: Fn(&T) -> i64>(rows: Vec<T>, key: F) -> Vec<T> {
     out
 }
 
+#[cfg(test)]
 fn dedup_accounts_keep_last(rows: Vec<AccountRow>) -> Vec<AccountRow> {
     use std::collections::HashMap;
     let mut keep: HashMap<(i64, String), usize> = HashMap::with_capacity(rows.len());
@@ -432,14 +436,36 @@ fn dedup_accounts_keep_last(rows: Vec<AccountRow>) -> Vec<AccountRow> {
     out
 }
 
-async fn flush_upserts(pool: &PgPool, mut rows: Vec<UpsertRow>) -> anyhow::Result<usize> {
+fn dedup_keep_last_indices_by_id<T, F: Fn(&T) -> i64>(rows: &[T], key: F) -> Vec<usize> {
+    use std::collections::HashMap;
+    let mut keep: HashMap<i64, usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        keep.insert(key(r), i);
+    }
+    let mut keep_idx: Vec<usize> = keep.into_values().collect();
+    keep_idx.sort_unstable();
+    keep_idx
+}
+
+fn dedup_account_indices_keep_last(rows: &[AccountRow]) -> Vec<usize> {
+    use std::collections::HashMap;
+    let mut keep: HashMap<(i64, &str), usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        keep.insert((r.user_id, r.asset.as_str()), i);
+    }
+    let mut keep_idx: Vec<usize> = keep.into_values().collect();
+    keep_idx.sort_unstable();
+    keep_idx
+}
+
+async fn flush_upserts(pool: &PgPool, rows: &[UpsertRow]) -> anyhow::Result<usize> {
     // Dedup by id, keeping the LAST occurrence — PG's ON CONFLICT DO UPDATE
     // rejects batches that touch the same row twice. "Last wins" is the
     // semantics we want anyway: the final state per id reflects the
     // newest event in the batch.
-    rows = dedup_keep_last_by_id(rows, |r| r.id);
+    let keep_idx = dedup_keep_last_indices_by_id(rows, |r| r.id);
     // Pivot to column arrays for UNNEST — single SQL, server-side join.
-    let n = rows.len();
+    let n = keep_idx.len();
     let mut ids = Vec::with_capacity(n);
     let mut user_ids = Vec::with_capacity(n);
     let mut symbols = Vec::with_capacity(n);
@@ -453,18 +479,19 @@ async fn flush_upserts(pool: &PgPool, mut rows: Vec<UpsertRow>) -> anyhow::Resul
     let mut coids: Vec<Option<String>> = Vec::with_capacity(n);
     let mut createds = Vec::with_capacity(n);
 
-    for r in rows {
+    for i in keep_idx {
+        let r = &rows[i];
         ids.push(r.id);
         user_ids.push(r.user_id);
-        symbols.push(r.symbol);
+        symbols.push(r.symbol.clone());
         sides.push(r.side.to_string());
-        order_types.push(r.order_type);
+        order_types.push(r.order_type.clone());
         prices.push(r.price);
         qtys.push(r.quantity);
         filleds.push(r.filled);
         statuses.push(r.status.to_string());
         freeze_prices.push(r.freeze_price);
-        coids.push(r.client_order_id);
+        coids.push(r.client_order_id.clone());
         createds.push(r.created_at);
     }
 
@@ -511,9 +538,9 @@ async fn flush_upserts(pool: &PgPool, mut rows: Vec<UpsertRow>) -> anyhow::Resul
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_deletes(pool: &PgPool, ids: Vec<i64>) -> anyhow::Result<usize> {
+async fn flush_deletes(pool: &PgPool, ids: &[i64]) -> anyhow::Result<usize> {
     // DELETE WHERE ANY tolerates duplicate ids, but trimming saves bytes.
-    let mut ids = ids;
+    let mut ids = ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
     let res = sqlx::query("DELETE FROM orders WHERE id = ANY($1::bigint[])")
@@ -523,15 +550,16 @@ async fn flush_deletes(pool: &PgPool, ids: Vec<i64>) -> anyhow::Result<usize> {
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_fills(pool: &PgPool, rows: Vec<FillRow>) -> anyhow::Result<usize> {
+async fn flush_fills(pool: &PgPool, rows: &[FillRow]) -> anyhow::Result<usize> {
     // UPDATE FROM (UNNEST...) silently joins one VALUES row to the same
     // target row twice when duplicates exist; result is "one of the values
     // wins, undefined which." We force last-wins explicitly.
-    let rows = dedup_keep_last_by_id(rows, |r| r.id);
-    let mut ids = Vec::with_capacity(rows.len());
-    let mut filleds = Vec::with_capacity(rows.len());
-    let mut statuses = Vec::with_capacity(rows.len());
-    for r in rows {
+    let keep_idx = dedup_keep_last_indices_by_id(rows, |r| r.id);
+    let mut ids = Vec::with_capacity(keep_idx.len());
+    let mut filleds = Vec::with_capacity(keep_idx.len());
+    let mut statuses = Vec::with_capacity(keep_idx.len());
+    for i in keep_idx {
+        let r = &rows[i];
         ids.push(r.id);
         filleds.push(r.filled);
         statuses.push(r.status.to_string());
@@ -555,17 +583,18 @@ async fn flush_fills(pool: &PgPool, rows: Vec<FillRow>) -> anyhow::Result<usize>
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_accounts(pool: &PgPool, rows: Vec<AccountRow>) -> anyhow::Result<usize> {
+async fn flush_accounts(pool: &PgPool, rows: &[AccountRow]) -> anyhow::Result<usize> {
     // Dedup by (user_id, asset) keeping the last value — same ON CONFLICT
     // constraint as orders.
-    let rows = dedup_accounts_keep_last(rows);
-    let mut user_ids = Vec::with_capacity(rows.len());
-    let mut assets = Vec::with_capacity(rows.len());
-    let mut balances = Vec::with_capacity(rows.len());
-    let mut frozens = Vec::with_capacity(rows.len());
-    for r in rows {
+    let keep_idx = dedup_account_indices_keep_last(rows);
+    let mut user_ids = Vec::with_capacity(keep_idx.len());
+    let mut assets = Vec::with_capacity(keep_idx.len());
+    let mut balances = Vec::with_capacity(keep_idx.len());
+    let mut frozens = Vec::with_capacity(keep_idx.len());
+    for i in keep_idx {
+        let r = &rows[i];
         user_ids.push(r.user_id);
-        assets.push(r.asset);
+        assets.push(r.asset.clone());
         balances.push(r.balance);
         frozens.push(r.frozen);
     }
@@ -589,7 +618,7 @@ async fn flush_accounts(pool: &PgPool, rows: Vec<AccountRow>) -> anyhow::Result<
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_trades(pool: &PgPool, rows: Vec<TradeRow>) -> anyhow::Result<usize> {
+async fn flush_trades(pool: &PgPool, rows: &[TradeRow]) -> anyhow::Result<usize> {
     let mut buys = Vec::with_capacity(rows.len());
     let mut sells = Vec::with_capacity(rows.len());
     let mut syms = Vec::with_capacity(rows.len());
@@ -599,7 +628,7 @@ async fn flush_trades(pool: &PgPool, rows: Vec<TradeRow>) -> anyhow::Result<usiz
     for r in rows {
         buys.push(r.buy_order_id);
         sells.push(r.sell_order_id);
-        syms.push(r.symbol);
+        syms.push(r.symbol.clone());
         prices.push(r.price);
         qtys.push(r.qty);
         createds.push(r.created_at);
@@ -662,18 +691,19 @@ pub async fn backfill_from_redis(
 
     let mut stats = BackfillStats::default();
 
-    let redis_ids: Vec<i64> = conn.smembers(crate::desk::redis_store::KEY_ACTIVE_ORDERS).await?;
+    let redis_ids: Vec<i64> = conn
+        .smembers(crate::desk::redis_store::KEY_ACTIVE_ORDERS)
+        .await?;
     stats.redis_orders_scanned = redis_ids.len() as u64;
     if redis_ids.is_empty() {
         return Ok(stats);
     }
 
-    let pg_existing: Vec<(i64,)> = sqlx::query_as(
-        "SELECT id FROM orders WHERE id = ANY($1::bigint[])",
-    )
-    .bind(&redis_ids)
-    .fetch_all(pg)
-    .await?;
+    let pg_existing: Vec<(i64,)> =
+        sqlx::query_as("SELECT id FROM orders WHERE id = ANY($1::bigint[])")
+            .bind(&redis_ids)
+            .fetch_all(pg)
+            .await?;
     let pg_set: HashSet<i64> = pg_existing.into_iter().map(|(id,)| id).collect();
 
     let missing: Vec<i64> = redis_ids
@@ -690,8 +720,7 @@ pub async fn backfill_from_redis(
     for id in &missing {
         pipe.hgetall(crate::desk::redis_store::key_order(*id));
     }
-    let hashes: Vec<std::collections::HashMap<String, String>> =
-        pipe.query_async(conn).await?;
+    let hashes: Vec<std::collections::HashMap<String, String>> = pipe.query_async(conn).await?;
 
     let mut batch = PgWriteBatch::new();
     for (id, h) in missing.iter().zip(hashes.into_iter()) {
@@ -710,9 +739,28 @@ pub async fn backfill_from_redis(
         let created_at_ms: Option<i64> = h.get("created_at_ms").and_then(|s| s.parse().ok());
 
         let (user_id, symbol, side, order_type, status, qty, filled, freeze_price, created_at_ms) =
-            match (user_id, symbol, side, order_type, status, qty, filled, freeze_price, created_at_ms) {
-                (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g), Some(h), Some(i)) =>
-                    (a, b, c, d, e, f, g, h, i),
+            match (
+                user_id,
+                symbol,
+                side,
+                order_type,
+                status,
+                qty,
+                filled,
+                freeze_price,
+                created_at_ms,
+            ) {
+                (
+                    Some(a),
+                    Some(b),
+                    Some(c),
+                    Some(d),
+                    Some(e),
+                    Some(f),
+                    Some(g),
+                    Some(h),
+                    Some(i),
+                ) => (a, b, c, d, e, f, g, h, i),
                 _ => {
                     stats.skipped_decode += 1;
                     continue;

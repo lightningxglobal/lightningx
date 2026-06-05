@@ -8,8 +8,8 @@
 
 use lightning_exchange::desk::pg_store::PgWriteBatch;
 use lightning_exchange::transport::persist_event::{
-    pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-    PersistFrame, TradeInsertPayload,
+    AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
+    PersistFrame, TradeInsertPayload, pack_str,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -26,14 +26,12 @@ async fn try_pg() -> Option<PgPool> {
 
 async fn make_user(pg: &PgPool) -> Option<i64> {
     let email = format!("pgwriter_{}@lightning.test", Uuid::new_v4());
-    let row = sqlx::query(
-        "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
-    )
-    .bind(email)
-    .bind("$argon2id$v=19$test$abcdefghijklmnopqrstuvwxyz0123456789")
-    .fetch_one(pg)
-    .await
-    .ok()?;
+    let row = sqlx::query("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
+        .bind(email)
+        .bind("$argon2id$v=19$test$abcdefghijklmnopqrstuvwxyz0123456789")
+        .fetch_one(pg)
+        .await
+        .ok()?;
     let id: i64 = row.try_get("id").ok()?;
     Some(id)
 }
@@ -172,11 +170,12 @@ async fn account_set_upserts() {
     assert!(batch.push(&f1));
     batch.flush(&pg).await.expect("flush insert");
 
-    let row: (f64, f64) = sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset='USDT'")
-        .bind(user_id)
-        .fetch_one(&pg)
-        .await
-        .expect("select after first upsert");
+    let row: (f64, f64) =
+        sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset='USDT'")
+            .bind(user_id)
+            .fetch_one(&pg)
+            .await
+            .expect("select after first upsert");
     assert!((row.0 - 1000.0).abs() < 1e-9);
     assert!((row.1 - 100.0).abs() < 1e-9);
 
@@ -190,15 +189,42 @@ async fn account_set_upserts() {
     let mut batch = PgWriteBatch::new();
     assert!(batch.push(&f2));
     batch.flush(&pg).await.expect("flush update");
-    let row: (f64, f64) = sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset='USDT'")
-        .bind(user_id)
-        .fetch_one(&pg)
-        .await
-        .expect("select after second upsert");
+    let row: (f64, f64) =
+        sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset='USDT'")
+            .bind(user_id)
+            .fetch_one(&pg)
+            .await
+            .expect("select after second upsert");
     assert!((row.0 - 900.0).abs() < 1e-9);
     assert!((row.1 - 50.0).abs() < 1e-9);
 
     cleanup(&pg, user_id).await;
+}
+
+#[tokio::test]
+async fn failed_flush_retains_batch_for_retry() {
+    let Some(pg) = try_pg().await else {
+        eprintln!("skip: no PG");
+        return;
+    };
+
+    let f = PersistFrame::account_set(AccountSetPayload {
+        user_id: -9_999_999_001,
+        asset: pack_str("USDT"),
+        balance: 1000.0,
+        frozen: 100.0,
+    });
+    let mut batch = PgWriteBatch::new();
+    assert!(batch.push(&f));
+    assert_eq!(batch.len(), 1);
+
+    let err = batch.flush(&pg).await.expect_err("flush must fail on FK");
+    assert!(
+        err.to_string().contains("accounts_user_id_fkey")
+            || err.to_string().contains("foreign key"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(batch.len(), 1, "failed flush must keep accepted frames");
 }
 
 #[tokio::test]

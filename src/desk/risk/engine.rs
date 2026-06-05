@@ -1143,4 +1143,244 @@ mod tests {
 
         assert_eq!(engine.insurance_fund(), 0);
     }
+
+    // ── Full end-to-end integration: order book fill → hold → liquidation ────
+    //
+    // This test drives the complete lifecycle without mocking:
+    //   1. Market maker places resting sell orders in the MatchingEngine book.
+    //   2. Taker places a crossing buy → MatchingEngine produces fills.
+    //   3. RiskEngine.on_fill() opens a long position for the taker.
+    //   4. [CHECK] positions, balances, liq_price, unrealized PnL correct.
+    //   5. Mark price is driven down via repeated update_mark_price() calls.
+    //   6. [CHECK] equity drops below maintenance_margin.
+    //   7. run_risk_tick() emits LiquidationEvent with correct liq_price_ticks.
+    //   8. Liquidation fill arrives at a price better than liq_price
+    //      → insurance fund captures the spread.
+    //   9. [CHECK] position closed, realized PnL correct, fund credited, equity final.
+    //
+    // All monetary values in cents ($1 = 100); prices in ticks ($0.01/tick for BTC_USDT).
+    #[test]
+    fn end_to_end_open_hold_liquidate() {
+        use crate::matching::engine::{MatchingEngine, PoolConfig};
+        use crate::matching::order::{Order, Side, TimeInForce};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // ── BTC_USDT constants ────────────────────────────────────────────────
+        // price_tick = $0.01  →  $50,000 = 5_000_000 ticks
+        // lot_size   = 0.000001 BTC  →  0.1 BTC = 100_000 lots
+        // notional_scale = 1_000_000
+        const SCALE: i64 = 1_000_000;
+        const LEV:    u8  = 10;
+        const MBPS:  i64  = 50;    // maintenance rate in basis points
+
+        // Entry fill at $50,000 for 0.1 BTC
+        const ENTRY_TICKS: i64 = 5_000_000;
+        const QTY_LOTS:    i64 = 100_000;
+
+        // Derived:
+        //   notional  = 5_000_000 * 100_000 / 1_000_000 = 500_000 cents ($5,000)
+        //   im        = 500_000 / 10               = 50_000  cents ($500)
+        //   mm        = 500_000 * 50 / 10_000      = 2_500   cents ($25)
+        //   liq_price = 5_000_000 * (10*10000-10000+50)/(10*10000)
+        //             = 5_000_000 * 90050 / 100000 = 4_502_500 ticks ($45,025)
+        //   bkrpt     = 5_000_000 * 9 / 10         = 4_500_000 ticks ($45,000)
+        const NOTIONAL:   i64 = 500_000;
+        const IM:         i64 = 50_000;
+        const MM:         i64 = 2_500;
+        const LIQ_TICKS:  i64 = 4_502_500;
+        const BKRPT_TICKS:i64 = 4_500_000;
+
+        // Taker balance chosen tight so liquidation triggers after ~20 mark-price
+        // EWMA updates toward $44,000.
+        //   equity_at_open = 55_000 cents ($550)
+        //   For trigger: equity < MM  →  55_000 + upnl < 2_500
+        //                upnl < -52_500  →  mark < ~4_475_000
+        //   EWMA α=0.1: after ~20 calls to 4_400_000, mark converges past threshold.
+        const TAKER_BALANCE: i64 = 55_000;
+
+        // ── Setup: matching engine + risk engine ─────────────────────────────
+        let mut me = MatchingEngine::new(PoolConfig::default()).unwrap();
+        let risk = RiskEngine::new();
+
+        const MAKER_ID: i64 = 1;
+        const TAKER_ID: i64 = 2;
+        risk.initialize_account(MAKER_ID, 10_000_000); // maker has plenty
+        risk.initialize_account(TAKER_ID, TAKER_BALANCE);
+
+        // ── Phase 1: market maker places resting sell orders ─────────────────
+        // Two asks: 100_000 lots at $50,000 and 50_000 lots at $51,000.
+        let ask1 = Order::new(101, Side::Sell, ENTRY_TICKS, QTY_LOTS, TimeInForce::GTC, 0);
+        let ask2 = Order::new(102, Side::Sell, 5_100_000, 50_000, TimeInForce::GTC, 0);
+        me.place_order(ask1).unwrap();
+        me.place_order(ask2).unwrap();
+
+        // ── Phase 2: taker places crossing buy order ──────────────────────────
+        // Buy 100_000 lots at $50,000 — fully fills against ask1.
+        let taker_buy = Order::new(201, Side::Buy, ENTRY_TICKS, QTY_LOTS, TimeInForce::GTC, 0);
+        let result = me.place_order(taker_buy).unwrap();
+        assert_eq!(result.filled_lots, QTY_LOTS, "taker order should be fully filled");
+        assert_eq!(result.fills.len(), 1, "should have one fill leg");
+        let (_maker_oid, fill_ticks, fill_lots) = result.fills[0];
+        assert_eq!(fill_ticks, ENTRY_TICKS);
+        assert_eq!(fill_lots, QTY_LOTS);
+
+        // ── Phase 3: register fill in risk engine ────────────────────────────
+        // In production, desk_server.rs does check_and_reserve_margin before
+        // submitting the order, so margin is already reserved when the fill arrives.
+        risk.check_and_reserve_margin(TAKER_ID, IM).unwrap();
+        // Taker is the buyer (side=0=Long).
+        risk.on_fill(TAKER_ID, btc_sym(), 0, fill_ticks as i64, fill_lots as i64, IM, SCALE, LEV, MBPS, 0);
+
+        // ── CHECK A: positions and balances after open ────────────────────────
+        // In production this state is also persisted to PostgreSQL via pg-writer
+        // (PersistEvent::BatchSettleTrade). Here we verify the in-memory source of truth.
+        {
+            let pos = risk.positions.get(&(TAKER_ID, btc_sym()))
+                .expect("Phase 3: position must exist");
+            assert_eq!(pos.side,                 PositionSide::Long,  "long position");
+            assert_eq!(pos.qty_lots,             QTY_LOTS,            "qty");
+            assert_eq!(pos.entry_price_ticks,    ENTRY_TICKS,         "entry price");
+            assert_eq!(pos.initial_margin,       IM,                  "initial margin");
+            assert_eq!(pos.maintenance_margin,   MM,                  "maintenance margin");
+            assert_eq!(pos.liquidation_price_ticks, LIQ_TICKS,        "liq price");
+            assert_eq!(pos.bankruptcy_price_ticks,  BKRPT_TICKS,      "bankruptcy price");
+            assert_eq!(pos.unrealized_pnl,       0,                   "upnl=0 at open (mark=entry)");
+            drop(pos);
+
+            let acct = risk.accounts.get(&TAKER_ID).unwrap();
+            // After reserve + fill:
+            //   available = TAKER_BALANCE - IM = 55_000 - 50_000 = 5_000
+            //   order_margin = 0 (consumed by on_fill: moved to used)
+            //   used_margin  = IM = 50_000
+            assert_eq!(acct.available_margin.load(Relaxed), TAKER_BALANCE - IM, "available after open");
+            assert_eq!(acct.order_margin.load(Relaxed),     0,                  "order_margin after fill");
+            assert_eq!(acct.used_margin,                    IM,                 "used_margin = IM");
+            assert_eq!(acct.unrealized_pnl,                 0,                  "upnl=0");
+            assert_eq!(acct.maintenance_margin,             MM,                 "account MM");
+            assert_eq!(acct.equity,                         TAKER_BALANCE,      "equity = full balance at open");
+            assert_eq!(acct.status,                         RiskStatus::Normal, "status Normal");
+        }
+
+        // ── Phase 4: drive mark price toward $44,000 ─────────────────────────
+        // EWMA α=0.1 → after ~22 calls mark drops below ~4_475_000 and
+        // equity < MM triggers liquidation.
+        let mut mark_at_trigger = 0i64;
+        let mut equity_at_trigger = 0i64;
+        for _ in 0..40 {
+            risk.update_mark_price(btc_sym(), 4_400_000, SCALE);
+            let acct = risk.accounts.get(&TAKER_ID).unwrap();
+            if acct.equity <= acct.maintenance_margin {
+                mark_at_trigger  = *risk.mark_prices.get(&btc_sym()).unwrap();
+                equity_at_trigger = acct.equity;
+                break;
+            }
+        }
+        assert!(mark_at_trigger > 0, "mark price should have dropped enough to trigger liquidation");
+
+        // ── CHECK B: account state just before risk tick ──────────────────────
+        {
+            let acct = risk.accounts.get(&TAKER_ID).unwrap();
+            let pos  = risk.positions.get(&(TAKER_ID, btc_sym())).unwrap();
+
+            // Mark price is below liq_price — position is underwater.
+            assert!(mark_at_trigger < LIQ_TICKS,
+                "mark {} should be below liq {} when liquidation triggers", mark_at_trigger, LIQ_TICKS);
+            // unrealized_pnl is negative and dragged equity below MM.
+            assert!(acct.unrealized_pnl < 0,       "upnl must be negative");
+            assert!(pos.unrealized_pnl  < 0,        "position upnl matches");
+            assert!(equity_at_trigger <= MM,         "equity {} <= MM {}", equity_at_trigger, MM);
+            // used_margin still intact (position not yet closed).
+            assert_eq!(acct.used_margin, IM,         "used_margin unchanged while holding");
+            // Status still Normal — risk tick is what changes it.
+            assert_eq!(acct.status, RiskStatus::Normal);
+        }
+
+        // ── Phase 5: run_risk_tick emits LiquidationEvent ─────────────────────
+        let events = risk.run_risk_tick();
+        assert_eq!(events.len(), 1, "should emit exactly one liquidation event");
+        let evt = &events[0];
+        assert_eq!(evt.user_id,        TAKER_ID,          "event user_id");
+        assert_eq!(evt.symbol,         btc_sym(),          "event symbol");
+        assert_eq!(evt.side,           PositionSide::Long, "event side");
+        assert_eq!(evt.qty_lots,       QTY_LOTS,           "event qty");
+        // The liq_price_ticks in the event is what the system computed at open
+        // and stored on the position — it should match our formula.
+        assert_eq!(evt.liq_price_ticks, LIQ_TICKS,
+            "liq_price_ticks in event: expected {}  ($45,025), got {}",
+            LIQ_TICKS, evt.liq_price_ticks);
+
+        {
+            let acct = risk.accounts.get(&TAKER_ID).unwrap();
+            assert_eq!(acct.status, RiskStatus::LiquidationPending);
+        }
+
+        // ── Phase 6: desk_server sends liquidation market order ───────────────
+        // (In production: tick task sets Liquidating, then places IOC market order.)
+        if let Some(mut acct) = risk.accounts.get_mut(&TAKER_ID) {
+            acct.status = RiskStatus::Liquidating;
+        }
+
+        // The liquidation order fills at $46,000 — above liq_price $45,025.
+        // Exchange captures the spread; user is settled at liq_price (worse for user).
+        let actual_fill_ticks: i64 = 4_600_000; // $46,000
+        // liq_price from the event is passed to on_fill as liq_price_ticks.
+        let liq_price_ticks: i64 = evt.liq_price_ticks;
+
+        // Realized PnL at settlement price (liq_price):
+        //   pnl = (liq_price - entry) × qty / scale
+        //       = (4_502_500 - 5_000_000) × 100_000 / 1_000_000
+        //       = -497_500 × 100 = -49_750 cents  (-$497.50)
+        let realized_pnl: i64 = (liq_price_ticks - ENTRY_TICKS) * QTY_LOTS / SCALE;
+        assert_eq!(realized_pnl, -49_750, "pre-computed realized PnL");
+
+        // Insurance fund = (actual_fill - liq_price) × qty / scale (sell side, sign=+1)
+        //   = (4_600_000 - 4_502_500) × 100_000 / 1_000_000
+        //   = 97_500 × 100 = 9_750 cents  ($97.50)
+        let expected_insurance: i64 = (actual_fill_ticks - liq_price_ticks) * QTY_LOTS / SCALE;
+        assert_eq!(expected_insurance, 9_750, "pre-computed insurance fund credit");
+
+        // fill_margin = 0: no margin was reserved for the system-generated liquidation order.
+        risk.on_fill(TAKER_ID, btc_sym(), 1, actual_fill_ticks, QTY_LOTS, 0, SCALE, LEV, MBPS, liq_price_ticks);
+
+        // ── CHECK C: post-liquidation state ───────────────────────────────────
+        // In production, pg-writer persists the closed position and updated balance.
+        {
+            // Position must be gone.
+            assert!(risk.positions.get(&(TAKER_ID, btc_sym())).is_none(),
+                "position should be removed after liquidation close");
+
+            let acct = risk.accounts.get(&TAKER_ID).unwrap();
+
+            // Status resets to Normal so run_risk_tick can re-evaluate on next tick.
+            assert_eq!(acct.status, RiskStatus::Normal, "status reset to Normal after liq close");
+
+            // No open position → no used margin, no unrealized PnL.
+            assert_eq!(acct.used_margin,  0, "used_margin = 0 after close");
+            assert_eq!(acct.unrealized_pnl, 0, "upnl = 0 after close");
+
+            // available = prev_available + fill_margin(0) + released_used_margin(IM) + realized_pnl
+            //           = (TAKER_BALANCE - IM) + 0 + IM + realized_pnl
+            //           = TAKER_BALANCE + realized_pnl
+            //           = 55_000 + (-49_750) = 5_250 cents  ($52.50)
+            let expected_available = (TAKER_BALANCE - IM) + IM + realized_pnl; // 5_250
+            assert_eq!(
+                acct.available_margin.load(Relaxed),
+                expected_available.max(0),
+                "available_margin after liq: expected {} (${})", expected_available, expected_available / 100
+            );
+
+            // Equity = available + 0 + 0 + 0 = 5_250.
+            assert_eq!(acct.equity, expected_available.max(0), "equity after close");
+
+            // order_margin still 0 throughout.
+            assert_eq!(acct.order_margin.load(Relaxed), 0, "order_margin = 0");
+
+            // Insurance fund captures the fill-vs-liq-price spread.
+            assert_eq!(
+                risk.insurance_fund(), expected_insurance,
+                "insurance fund: expected {} ({} fill - {} liq) × qty / scale",
+                expected_insurance, actual_fill_ticks, liq_price_ticks
+            );
+        }
+    }
 }

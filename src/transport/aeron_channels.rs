@@ -136,3 +136,24 @@ pub const METRICS_STREAM: i32 = 1001;
 /// desk-server.
 pub const PERSIST_CHANNEL: &str = "aeron:ipc";
 pub const PERSIST_STREAM: i32 = 30;
+
+/// Desk ↔ Desk private forwarding for wrong-counter client sessions.
+///
+/// Commands are published to `COUNTER_FORWARD_CMD_STREAM_BASE + owner_desk_id`.
+/// Owner desks process the request and publish binary WS frames back to
+/// `COUNTER_FORWARD_RESP_STREAM_BASE + ingress_desk_id`.
+pub fn counter_forward_channel() -> String {
+    channel(20125)
+}
+pub const COUNTER_FORWARD_CMD_STREAM_BASE: i32 = 300;
+pub const COUNTER_FORWARD_RESP_STREAM_BASE: i32 = 400;
+
+#[inline]
+pub fn counter_forward_cmd_stream_for_desk(desk_id: u16) -> i32 {
+    COUNTER_FORWARD_CMD_STREAM_BASE + desk_id as i32
+}
+
+#[inline]
+pub fn counter_forward_resp_stream_for_desk(desk_id: u16) -> i32 {
+    COUNTER_FORWARD_RESP_STREAM_BASE + desk_id as i32
+}

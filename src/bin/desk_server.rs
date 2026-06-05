@@ -1852,11 +1852,6 @@ async fn async_main() -> anyhow::Result<()> {
                 // of CPU per test inside the recv-spin critical section.
                 let lost_order_updates = AtomicU64::new(0);
                 let full_channels = AtomicU64::new(0);
-                // release_order_margin timing probe — remove after measurement
-                let mut rom_calls: u64 = 0;
-                let mut rom_total_ns: u64 = 0;
-                let mut rom_max_ns: u64 = 0;
-                let mut rom_contended: u64 = 0; // calls that took >1µs
                 loop {
                     let mut did_work = false;
 
@@ -2094,19 +2089,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 // was consumed on ACCEPTED so ws_meta is None above.
                                 if let Some(m) = runtime_meta(&order_meta_cache, order_id) {
                                     if m.initial_margin_cents > 0 {
-                                        let _t0 = std::time::Instant::now();
                                         risk_engine.release_order_margin(m.user_id, m.initial_margin_cents);
-                                        let elapsed = _t0.elapsed().as_nanos() as u64;
-                                        rom_total_ns += elapsed;
-                                        rom_calls += 1;
-                                        if elapsed > 1_000 { rom_contended += 1; }
-                                        if elapsed > rom_max_ns { rom_max_ns = elapsed; }
-                                        if rom_calls % 10_000 == 0 {
-                                            tracing::warn!(
-                                                "release_order_margin: calls={} avg={}ns max={}ns contended(>1µs)={}",
-                                                rom_calls, rom_total_ns / rom_calls, rom_max_ns, rom_contended
-                                            );
-                                        }
                                     }
                                 }
                                 let entry = runtime_meta(&order_meta_cache, order_id)

@@ -24,7 +24,7 @@ use crate::transport::persist_event::{
     OrderUpsertPayload, PersistFrame, PersistKind, TradeInsertPayload, unpack_str,
 };
 use chrono::{DateTime, TimeZone, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 // Status encoding matches `DbOrderStatus` (0-indexed) which is what
 // desk-server actually publishes on the wire — see
@@ -462,37 +462,40 @@ impl PgWriteBatch {
         });
     }
 
-    /// Apply everything to PG inside one transaction per kind. Returns
-    /// total rows written (sum of affected per kind). Rows are removed from
-    /// the batch only after their SQL statement succeeds, so a failed flush
-    /// can be retried without losing accepted frames.
+    /// Apply everything to PG inside one transaction. Returns total rows
+    /// written (sum of affected per kind). Rows are removed from the batch
+    /// only after the transaction commits, so a failed flush can be retried
+    /// without losing accepted frames or landing half a settlement.
     pub async fn flush(&mut self, pool: &PgPool) -> anyhow::Result<usize> {
+        let mut tx = pool.begin().await?;
         let mut total = 0;
 
         if !self.upserts.is_empty() {
-            total += flush_upserts(pool, &self.upserts).await?;
-            self.upserts.clear();
+            total += flush_upserts(&mut *tx, &self.upserts).await?;
         }
         if !self.deletes.is_empty() {
-            total += flush_deletes(pool, &self.deletes).await?;
-            self.deletes.clear();
+            total += flush_deletes(&mut *tx, &self.deletes).await?;
         }
         if !self.fills.is_empty() {
-            total += flush_fills(pool, &self.fills).await?;
-            self.fills.clear();
+            total += flush_fills(&mut *tx, &self.fills).await?;
         }
         if !self.accounts.is_empty() {
-            total += flush_accounts(pool, &self.accounts).await?;
-            self.accounts.clear();
+            total += flush_accounts(&mut *tx, &self.accounts).await?;
         }
         if !self.trades.is_empty() {
-            total += flush_trades(pool, &self.trades).await?;
-            self.trades.clear();
+            total += flush_trades(&mut *tx, &self.trades).await?;
         }
         if !self.matching_events.is_empty() {
-            total += flush_matching_events(pool, &self.matching_events).await?;
-            self.matching_events.clear();
+            total += flush_matching_events(&mut *tx, &self.matching_events).await?;
         }
+        tx.commit().await?;
+
+        self.upserts.clear();
+        self.deletes.clear();
+        self.fills.clear();
+        self.accounts.clear();
+        self.trades.clear();
+        self.matching_events.clear();
 
         Ok(total)
     }
@@ -559,7 +562,7 @@ fn dedup_account_indices_keep_last(rows: &[AccountRow]) -> Vec<usize> {
     keep_idx
 }
 
-async fn flush_upserts(pool: &PgPool, rows: &[UpsertRow]) -> anyhow::Result<usize> {
+async fn flush_upserts(conn: &mut PgConnection, rows: &[UpsertRow]) -> anyhow::Result<usize> {
     // Dedup by id, keeping the LAST occurrence — PG's ON CONFLICT DO UPDATE
     // rejects batches that touch the same row twice. "Last wins" is the
     // semantics we want anyway: the final state per id reflects the
@@ -634,24 +637,24 @@ async fn flush_upserts(pool: &PgPool, rows: &[UpsertRow]) -> anyhow::Result<usiz
     .bind(&freeze_prices)
     .bind(&coids)
     .bind(&createds)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_deletes(pool: &PgPool, ids: &[i64]) -> anyhow::Result<usize> {
+async fn flush_deletes(conn: &mut PgConnection, ids: &[i64]) -> anyhow::Result<usize> {
     // DELETE WHERE ANY tolerates duplicate ids, but trimming saves bytes.
     let mut ids = ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
     let res = sqlx::query("DELETE FROM orders WHERE id = ANY($1::bigint[])")
         .bind(&ids)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_fills(pool: &PgPool, rows: &[FillRow]) -> anyhow::Result<usize> {
+async fn flush_fills(conn: &mut PgConnection, rows: &[FillRow]) -> anyhow::Result<usize> {
     // UPDATE FROM (UNNEST...) silently joins one VALUES row to the same
     // target row twice when duplicates exist; result is "one of the values
     // wins, undefined which." We force last-wins explicitly.
@@ -679,12 +682,12 @@ async fn flush_fills(pool: &PgPool, rows: &[FillRow]) -> anyhow::Result<usize> {
     .bind(&ids)
     .bind(&filleds)
     .bind(&statuses)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_accounts(pool: &PgPool, rows: &[AccountRow]) -> anyhow::Result<usize> {
+async fn flush_accounts(conn: &mut PgConnection, rows: &[AccountRow]) -> anyhow::Result<usize> {
     // Dedup by (user_id, asset) keeping the last value — same ON CONFLICT
     // constraint as orders.
     let keep_idx = dedup_account_indices_keep_last(rows);
@@ -729,12 +732,12 @@ async fn flush_accounts(pool: &PgPool, rows: &[AccountRow]) -> anyhow::Result<us
     .bind(&frozens)
     .bind(&balance_atoms)
     .bind(&frozen_atoms)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_trades(pool: &PgPool, rows: &[TradeRow]) -> anyhow::Result<usize> {
+async fn flush_trades(conn: &mut PgConnection, rows: &[TradeRow]) -> anyhow::Result<usize> {
     let mut buys = Vec::with_capacity(rows.len());
     let mut sells = Vec::with_capacity(rows.len());
     let mut syms = Vec::with_capacity(rows.len());
@@ -768,12 +771,15 @@ async fn flush_trades(pool: &PgPool, rows: &[TradeRow]) -> anyhow::Result<usize>
     .bind(&prices)
     .bind(&qtys)
     .bind(&createds)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)
 }
 
-async fn flush_matching_events(pool: &PgPool, rows: &[MatchingEventRow]) -> anyhow::Result<usize> {
+async fn flush_matching_events(
+    conn: &mut PgConnection,
+    rows: &[MatchingEventRow],
+) -> anyhow::Result<usize> {
     let mut sequences = Vec::with_capacity(rows.len());
     let mut response_stream_ids = Vec::with_capacity(rows.len());
     let mut event_kinds = Vec::with_capacity(rows.len());
@@ -840,7 +846,7 @@ async fn flush_matching_events(pool: &PgPool, rows: &[MatchingEventRow]) -> anyh
     .bind(&quantity_lots)
     .bind(&remaining_lots)
     .bind(&ts_ns)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)
 }

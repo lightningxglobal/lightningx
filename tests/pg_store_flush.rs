@@ -342,3 +342,64 @@ async fn matching_event_lands_idempotently() {
 
     cleanup(&pg, user_id).await;
 }
+
+#[tokio::test]
+async fn failed_flush_rolls_back_matching_event() {
+    let Some(pg) = try_pg().await else {
+        eprintln!("skip: no PG");
+        return;
+    };
+
+    let response_stream_id = 201;
+    let sequence: i64 = 43;
+    sqlx::query(
+        "DELETE FROM matching_events WHERE response_stream_id=$1 AND sequence=$2",
+    )
+    .bind(response_stream_id)
+    .bind(sequence)
+    .execute(&pg)
+    .await
+    .ok();
+
+    let mut batch = PgWriteBatch::new();
+    assert!(batch.push(&PersistFrame::matching_event(MatchingEventPayload {
+        sequence: sequence as u64,
+        response_stream_id,
+        event_kind: matching_event_kind::ACCEPTED,
+        _pad: [0; 3],
+        order_id: 980_000_300_002,
+        client_order_id: 980_000_300_000,
+        participant_id: -1,
+        counterparty_order_id: 0,
+        symbol: pack_str("BTC_USDT"),
+        price_ticks: 7_000_000,
+        quantity_lots: 12_345,
+        remaining_lots: 12_345,
+        ts_ns: 1_700_000_001_000_000_000,
+    })));
+    assert!(batch.push(&PersistFrame::account_set(AccountSetPayload {
+        user_id: -1,
+        asset: pack_str("USDT"),
+        balance: 100.0,
+        frozen: 0.0,
+        balance_atoms: 10_000_000_000,
+        frozen_atoms: 0,
+    })));
+
+    let err = batch.flush(&pg).await.expect_err("flush must fail on FK");
+    assert!(
+        err.to_string().contains("foreign key") || err.to_string().contains("violates"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(batch.len(), 2, "failed transaction must keep frames");
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM matching_events WHERE response_stream_id=$1 AND sequence=$2",
+    )
+    .bind(response_stream_id)
+    .bind(sequence)
+    .fetch_one(&pg)
+    .await
+    .expect("count matching events");
+    assert_eq!(count, 0, "matching event must roll back with failed batch");
+}

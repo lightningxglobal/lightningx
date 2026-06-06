@@ -126,6 +126,15 @@ impl MatchingEngine {
     }
 
     #[inline]
+    pub fn best_price_ticks(&self, is_buy: bool) -> Option<PriceTicks> {
+        if is_buy {
+            self.buy_book.best().map(|node| node.price_ticks)
+        } else {
+            self.sell_book.best().map(|node| node.price_ticks)
+        }
+    }
+
+    #[inline]
     pub fn has_crossing_order_id<F>(
         &self,
         side: Side,

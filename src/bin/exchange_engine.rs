@@ -82,6 +82,32 @@ fn would_self_trade(
     })
 }
 
+fn outside_price_band(
+    engine: &MatchingEngine,
+    side: Side,
+    price_ticks: i64,
+    band_bps: u32,
+) -> bool {
+    if price_ticks <= 0 || band_bps == 0 {
+        return false;
+    }
+    let (Some(best_bid), Some(best_ask)) =
+        (engine.best_price_ticks(true), engine.best_price_ticks(false))
+    else {
+        return false;
+    };
+    if best_bid <= 0 || best_ask <= 0 || best_bid > best_ask {
+        return false;
+    }
+
+    let mid = (best_bid as i128 + best_ask as i128) / 2;
+    let band = mid * band_bps as i128 / 10_000;
+    match side {
+        Side::Buy => (price_ticks as i128) > mid + band,
+        Side::Sell => (price_ticks as i128) < mid - band,
+    }
+}
+
 fn publish_order_update(
     publishers: &mut [AeronOrderUpdatePublisher],
     sequences: &mut [u64],
@@ -181,6 +207,25 @@ mod tests {
             89
         ));
     }
+
+    #[test]
+    fn price_band_rejects_only_aggressive_extremes() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine
+            .place_order(Order::new(1, Side::Buy, 90, 5, TimeInForce::GTC, 0))
+            .unwrap();
+        engine
+            .place_order(Order::new(2, Side::Sell, 110, 5, TimeInForce::GTC, 0))
+            .unwrap();
+
+        assert!(outside_price_band(&engine, Side::Buy, 250, 10_000));
+        assert!(outside_price_band(&engine, Side::Sell, 49, 5_000));
+        assert!(!outside_price_band(&engine, Side::Buy, 50, 10_000));
+        assert!(!outside_price_band(&engine, Side::Sell, 250, 10_000));
+        assert!(!outside_price_band(&engine, Side::Sell, 0, 10_000));
+        assert!(!outside_price_band(&engine, Side::Sell, -1, 10_000));
+        assert!(!outside_price_band(&engine, Side::Buy, 250, 0));
+    }
 }
 
 /// Spawn one fully-independent matching thread for a single symbol.
@@ -268,6 +313,10 @@ fn spawn_symbol_thread(
             };
             let mut idle_iters: u32 = 0;
             let mut idle_sleep_us: u64 = 1;
+            let price_band_bps = std::env::var("ENGINE_PRICE_BAND_BPS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(10_000);
 
             loop {
                 // Only the subscriber needs do_work() — it processes the incoming IPC ring.
@@ -337,6 +386,20 @@ fn spawn_symbol_thread(
                                         req.client_order_id,
                                         req.participant_id,
                                         2,
+                                        ts,
+                                    ),
+                                );
+                                continue;
+                            }
+                            if outside_price_band(&engine, side, req.price_ticks, price_band_bps) {
+                                publish_order_update(
+                                    &mut ou_pubs,
+                                    &mut ou_seqs,
+                                    response_stream_id,
+                                    &OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        7,
                                         ts,
                                     ),
                                 );

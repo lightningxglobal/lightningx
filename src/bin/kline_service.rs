@@ -5,7 +5,7 @@
 
 use aeron_wrapper::{AeronClient, NoopLifecycle, PollCallback};
 use lightning_exchange::{
-    aeron_channels::{aeron_dir, trade_channel, TRADE_STREAM},
+    aeron_channels::{TRADE_STREAM, aeron_dir, trade_channel},
     sbe::TEMPLATE_TRADE_NOTIFICATION,
 };
 use parking_lot::Mutex;
@@ -16,12 +16,7 @@ use tokio::sync::mpsc;
 
 // ─── Intervals ────────────────────────────────────────────────────────────────
 
-const INTERVALS: &[(&str, u64)] = &[
-    ("1m",  60),
-    ("5m",  300),
-    ("15m", 900),
-    ("1h",  3600),
-];
+const INTERVALS: &[(&str, u64)] = &[("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)];
 
 // ─── Bar ──────────────────────────────────────────────────────────────────────
 
@@ -30,7 +25,7 @@ struct Bar {
     symbol: String,
     interval: &'static str,
     interval_secs: u64,
-    open_time: i64,   // Unix seconds, aligned to interval start
+    open_time: i64, // Unix seconds, aligned to interval start
     open: f64,
     high: f64,
     low: f64,
@@ -63,8 +58,12 @@ impl Bar {
     }
 
     fn update(&mut self, price: f64, qty: f64) {
-        if price > self.high { self.high = price; }
-        if price < self.low  { self.low  = price; }
+        if price > self.high {
+            self.high = price;
+        }
+        if price < self.low {
+            self.low = price;
+        }
         self.close = price;
         self.volume += qty;
         self.trade_count += 1;
@@ -88,7 +87,10 @@ struct Accumulators {
 
 impl Accumulators {
     fn new(tx: mpsc::UnboundedSender<Bar>) -> Self {
-        Self { bars: HashMap::new(), closed_tx: tx }
+        Self {
+            bars: HashMap::new(),
+            closed_tx: tx,
+        }
     }
 
     fn ingest(&mut self, symbol: &str, price: f64, qty: f64, ts_nanos: u64) {
@@ -106,13 +108,23 @@ impl Accumulators {
                     let closed = self.bars.remove(&key).unwrap();
                     let _ = self.closed_tx.send(closed);
                     let new_bar = Bar::new(
-                        symbol.to_string(), interval, interval_secs, epoch, price, qty,
+                        symbol.to_string(),
+                        interval,
+                        interval_secs,
+                        epoch,
+                        price,
+                        qty,
                     );
                     self.bars.insert((symbol.to_string(), interval), new_bar);
                 }
                 None => {
                     let bar = Bar::new(
-                        symbol.to_string(), interval, interval_secs, epoch, price, qty,
+                        symbol.to_string(),
+                        interval,
+                        interval_secs,
+                        epoch,
+                        price,
+                        qty,
                     );
                     self.bars.insert((symbol.to_string(), interval), bar);
                 }
@@ -158,7 +170,9 @@ impl PollCallback for TradeCallback {
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        self.queue.lock().push_back((symbol, price, quantity, ts_nanos));
+        self.queue
+            .lock()
+            .push_back((symbol, price, quantity, ts_nanos));
     }
 }
 
@@ -194,12 +208,17 @@ async fn db_writer(pool: PgPool, mut rx: mpsc::UnboundedReceiver<Bar>) {
         if let Err(e) = result {
             tracing::error!(
                 "kline_service: upsert failed {}/{} open_time={}: {}",
-                bar.symbol, bar.interval, bar.open_time, e
+                bar.symbol,
+                bar.interval,
+                bar.open_time,
+                e
             );
         } else {
             tracing::debug!(
                 "kline_service: wrote bar {}/{} open_time={}",
-                bar.symbol, bar.interval, bar.open_time
+                bar.symbol,
+                bar.interval,
+                bar.open_time
             );
         }
     }
@@ -242,22 +261,23 @@ async fn main() -> anyhow::Result<()> {
         };
 
         let ch = trade_channel();
-        let callback = TradeCallback { queue: queue_for_aeron.clone() };
-        let mut sub = match client.add_subscription(
-            &ch,
-            TRADE_STREAM,
-            1024,
-            callback,
-            NoopLifecycle,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("kline_service: subscribe failed: {:?}", e);
-                return;
-            }
+        let callback = TradeCallback {
+            queue: queue_for_aeron.clone(),
         };
+        let mut sub =
+            match client.add_subscription(&ch, TRADE_STREAM, 1024, callback, NoopLifecycle) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("kline_service: subscribe failed: {:?}", e);
+                    return;
+                }
+            };
 
-        tracing::info!("kline_service: subscribed to {} stream {}", ch, TRADE_STREAM);
+        tracing::info!(
+            "kline_service: subscribed to {} stream {}",
+            ch,
+            TRADE_STREAM
+        );
 
         let mut idle_us: u64 = 0;
         loop {

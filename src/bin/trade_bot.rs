@@ -28,8 +28,7 @@ fn trade_bot_email() -> String {
     std::env::var("TRADE_BOT_EMAIL").unwrap_or_else(|_| DEFAULT_TRADE_BOT_EMAIL.to_string())
 }
 fn trade_bot_password() -> String {
-    std::env::var("TRADE_BOT_PASSWORD")
-        .unwrap_or_else(|_| DEFAULT_TRADE_BOT_PASSWORD.to_string())
+    std::env::var("TRADE_BOT_PASSWORD").unwrap_or_else(|_| DEFAULT_TRADE_BOT_PASSWORD.to_string())
 }
 
 struct SymbolConfig {
@@ -37,15 +36,21 @@ struct SymbolConfig {
     base_qty: f64,
 }
 
-const SYMBOLS: &[SymbolConfig] = &[
-    SymbolConfig { symbol: "BTC_USDT", base_qty: 0.003 },
-];
+const SYMBOLS: &[SymbolConfig] = &[SymbolConfig {
+    symbol: "BTC_USDT",
+    base_qty: 0.003,
+}];
 
 #[derive(Serialize)]
-struct LoginRequest<'a> { email: &'a str, password: &'a str }
+struct LoginRequest<'a> {
+    email: &'a str,
+    password: &'a str,
+}
 
 #[derive(Deserialize)]
-struct LoginResponse { token: String }
+struct LoginResponse {
+    token: String,
+}
 
 #[derive(Serialize)]
 struct PlaceOrderRequest<'a> {
@@ -56,7 +61,9 @@ struct PlaceOrderRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct PlaceOrderResponse { id: Option<i64> }
+struct PlaceOrderResponse {
+    id: Option<i64>,
+}
 
 async fn login_with(
     http: &Client,
@@ -131,16 +138,24 @@ async fn login(http: &Client, base: &str) -> anyhow::Result<String> {
 /// Return a pseudo-random multiplier in [1.0, 2.0] based on seed.
 /// Uses a simple LCG to avoid pulling in a rand crate.
 fn qty_jitter(seed: u64) -> f64 {
-    let x = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-    1.0 + (x >> 60) as f64 / 15.0   // 1.0 + [0..15]/15 = [1.0, 2.0]
+    let x = seed
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    1.0 + (x >> 60) as f64 / 15.0 // 1.0 + [0..15]/15 = [1.0, 2.0]
 }
 
 async fn place_market(http: &Client, base: &str, token: &str, symbol: &str, side: &str, qty: f64) {
     let res = http
         .post(format!("{base}/api/orders"))
         .header("Authorization", format!("Bearer {token}"))
-        .json(&PlaceOrderRequest { symbol, side, order_type: "market", quantity: qty })
-        .send().await;
+        .json(&PlaceOrderRequest {
+            symbol,
+            side,
+            order_type: "market",
+            quantity: qty,
+        })
+        .send()
+        .await;
     match res {
         Ok(r) if r.status().is_success() => {
             if let Ok(p) = r.json::<PlaceOrderResponse>().await {
@@ -164,9 +179,14 @@ async fn main() -> anyhow::Result<()> {
     let mut token = String::new();
     for attempt in 1..=10 {
         match login(&http, &base).await {
-            Ok(t) => { token = t; break; }
+            Ok(t) => {
+                token = t;
+                break;
+            }
             Err(e) => {
-                if attempt == 10 { anyhow::bail!("cannot login: {e}"); }
+                if attempt == 10 {
+                    anyhow::bail!("cannot login: {e}");
+                }
                 warn!("login failed ({e}), retry in 3s…");
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
@@ -174,13 +194,16 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("Authenticated");
 
-    let _ = http.post(format!("{base}/api/robot-funds"))
+    let _ = http
+        .post(format!("{base}/api/robot-funds"))
         .header("Authorization", format!("Bearer {token}"))
-        .send().await;
+        .send()
+        .await;
 
     info!(
         "Starting trade loop ({}ms interval, {} symbols in parallel)",
-        TRADE_INTERVAL_MS, SYMBOLS.len()
+        TRADE_INTERVAL_MS,
+        SYMBOLS.len()
     );
 
     let mut cycle: u64 = 0;
@@ -190,12 +213,16 @@ async fn main() -> anyhow::Result<()> {
         let side = if cycle % 2 == 0 { "buy" } else { "sell" };
 
         // Fire all symbols in parallel with jittered quantities.
-        let futs: Vec<_> = SYMBOLS.iter().enumerate().map(|(i, cfg)| {
-            let jitter = qty_jitter(cycle.wrapping_add(i as u64 * 31337));
-            let qty = (cfg.base_qty * jitter * 1e4).round() / 1e4;
-            let qty = qty.max(cfg.base_qty);  // floor at base_qty
-            place_market(&http, &base, &token, cfg.symbol, side, qty)
-        }).collect();
+        let futs: Vec<_> = SYMBOLS
+            .iter()
+            .enumerate()
+            .map(|(i, cfg)| {
+                let jitter = qty_jitter(cycle.wrapping_add(i as u64 * 31337));
+                let qty = (cfg.base_qty * jitter * 1e4).round() / 1e4;
+                let qty = qty.max(cfg.base_qty); // floor at base_qty
+                place_market(&http, &base, &token, cfg.symbol, side, qty)
+            })
+            .collect();
 
         futures::future::join_all(futs).await;
 

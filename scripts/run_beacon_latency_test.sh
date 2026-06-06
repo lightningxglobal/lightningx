@@ -3,9 +3,11 @@
 # Measures the gap between MS_WS_ORDER_RECV (8<<16|27) and
 # MS_WS_RESPONSE_SENT (8<<16|37) — server-side processing only.
 #
-# Prerequisites (Ubuntu):
+# Works on macOS (M4) and Ubuntu Linux.
+#
+# Prerequisites:
 #   - beacon binary: ~/.cargo/global-target/release/beacon
-#   - VictoriaMetrics: docker container work-victoriametrics-1 on port 8428
+#   - VictoriaMetrics running on localhost:8428 (Docker on Ubuntu, or local on Mac)
 #   - Pressure-test tokens: $TOKENS_CSV (default /tmp/pressure_users_40k.csv)
 #   - loopback aliases: 127.0.0.2 ~ 127.0.0.5
 #
@@ -13,6 +15,9 @@
 #   bash scripts/run_beacon_latency_test.sh
 #   TOTAL_CONNS=100000 DESK_COUNT=4 bash scripts/run_beacon_latency_test.sh
 set -euo pipefail
+
+IS_LINUX=false
+[[ "$(uname -s)" == "Linux" ]] && IS_LINUX=true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # If this script lives next to run_40k_pressure.sh (e.g. scripts/), use that.
@@ -23,7 +28,11 @@ else
   PRESSURE_SCRIPT="${PRESSURE_SCRIPT:-/tmp/run_40k_pressure.sh}"
 fi
 BIN_DIR="${BIN_DIR:-$HOME/.cargo/global-target/release}"
-AERON_DIR="${AERON_DIR:-/dev/shm/aeron}"
+if $IS_LINUX; then
+  AERON_DIR="${AERON_DIR:-/dev/shm/aeron}"
+else
+  AERON_DIR="${AERON_DIR:-/tmp/aeron}"
+fi
 VM_ENDPOINT="${VM_ENDPOINT:-http://localhost:8428}"
 
 BEACON_BIN="${BEACON_BIN:-$BIN_DIR/beacon}"

@@ -65,6 +65,23 @@ fn response_stream_index(stream_id: i32, publishers_len: usize) -> usize {
     0
 }
 
+fn would_self_trade(
+    engine: &MatchingEngine,
+    uid_map: &HashMap<u64, (u64, i32)>,
+    participant_id: u64,
+    side: Side,
+    price_ticks: i64,
+) -> bool {
+    if participant_id == 0 {
+        return false;
+    }
+    engine.has_crossing_order_id(side, price_ticks, |maker_order_id| {
+        uid_map
+            .get(&maker_order_id)
+            .is_some_and(|(maker_participant_id, _)| *maker_participant_id == participant_id)
+    })
+}
+
 fn publish_order_update(
     publishers: &mut [AeronOrderUpdatePublisher],
     sequences: &mut [u64],
@@ -121,6 +138,48 @@ fn pin_current_thread_to_core(name: &str, index: usize, label: &str) {
         tracing::warn!(
             "{label} requested cpu pin {core} via {name}[{index}], but this platform does not support pthread affinity"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lightning_exchange::engine::PoolConfig;
+
+    #[test]
+    fn stp_detects_crossing_maker_same_participant() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine
+            .place_order(Order::new(1, Side::Sell, 90, 5, TimeInForce::GTC, 0))
+            .unwrap();
+        engine
+            .place_order(Order::new(2, Side::Sell, 100, 5, TimeInForce::GTC, 0))
+            .unwrap();
+        let mut uid_map = HashMap::new();
+        uid_map.insert(1, (7, 200));
+        uid_map.insert(2, (42, 200));
+
+        assert!(would_self_trade(
+            &engine,
+            &uid_map,
+            42,
+            Side::Buy,
+            100
+        ));
+        assert!(!would_self_trade(
+            &engine,
+            &uid_map,
+            43,
+            Side::Buy,
+            100
+        ));
+        assert!(!would_self_trade(
+            &engine,
+            &uid_map,
+            42,
+            Side::Buy,
+            89
+        ));
     }
 }
 
@@ -278,6 +337,26 @@ fn spawn_symbol_thread(
                                         req.client_order_id,
                                         req.participant_id,
                                         2,
+                                        ts,
+                                    ),
+                                );
+                                continue;
+                            }
+                            if would_self_trade(
+                                &engine,
+                                &uid_map,
+                                req.participant_id,
+                                side,
+                                req.price_ticks,
+                            ) {
+                                publish_order_update(
+                                    &mut ou_pubs,
+                                    &mut ou_seqs,
+                                    response_stream_id,
+                                    &OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        6,
                                         ts,
                                     ),
                                 );

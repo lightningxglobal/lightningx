@@ -125,6 +125,28 @@ impl MatchingEngine {
         }
     }
 
+    #[inline]
+    pub fn has_crossing_order_id<F>(
+        &self,
+        side: Side,
+        price_ticks: PriceTicks,
+        mut matches: F,
+    ) -> bool
+    where
+        F: FnMut(u64) -> bool,
+    {
+        match side {
+            Side::Buy => self.sell_book.any_crossing_order_id(
+                |maker_price| price_ticks == 0 || price_ticks >= maker_price,
+                |order_id| matches(order_id),
+            ),
+            Side::Sell => self.buy_book.any_crossing_order_id(
+                |maker_price| price_ticks == 0 || price_ticks <= maker_price,
+                |order_id| matches(order_id),
+            ),
+        }
+    }
+
     /// 验证订单有效性
     #[inline(always)]
     fn validate_order(&self, order: &Order) -> OrderResult<()> {

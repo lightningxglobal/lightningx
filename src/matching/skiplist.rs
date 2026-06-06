@@ -276,6 +276,36 @@ impl SkipList {
         }
     }
 
+    #[inline]
+    pub fn any_crossing_order_id<P, F>(&self, mut price_crosses: P, mut matches_order: F) -> bool
+    where
+        P: FnMut(PriceTicks) -> bool,
+        F: FnMut(u64) -> bool,
+    {
+        unsafe {
+            let mut level = (*self.head).forward[0];
+            while !level.is_null() {
+                let node = &*level;
+                if !price_crosses(node.price_ticks) {
+                    return false;
+                }
+
+                let mut order_idx = node.orders.front();
+                while let Some(idx) = order_idx {
+                    let Some(order_node) = self.list_pool.get(idx) else {
+                        return false;
+                    };
+                    if matches_order(order_node.order_id) {
+                        return true;
+                    }
+                    order_idx = order_node.next;
+                }
+                level = node.forward[0];
+            }
+        }
+        false
+    }
+
     /// 获取最优且有订单的价格节点（跳过空的价格档位）
     #[inline]
     pub fn best_with_orders(&self) -> Option<&SkipListNode> {

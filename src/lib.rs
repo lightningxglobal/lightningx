@@ -39,6 +39,7 @@ pub use desk::api;
 pub use desk::counter_shard;
 pub use desk::db;
 pub use desk::models;
+pub use desk::money;
 pub use desk::order_state;
 pub use desk::positions;
 pub use desk::rate_limit;

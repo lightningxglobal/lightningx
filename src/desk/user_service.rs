@@ -1,6 +1,6 @@
 use crate::models::User;
-use anyhow::{anyhow, Result};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use anyhow::{Result, anyhow};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -8,7 +8,7 @@ const JWT_SECRET: &[u8] = b"exchange_jwt_secret_change_in_prod";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: i64,   // user id
+    pub sub: i64, // user id
     pub email: String,
     pub exp: usize, // expiry unix timestamp
 }
@@ -33,7 +33,11 @@ pub struct AuthResponse {
     pub counter_shard_id: u16,
 }
 
-pub async fn register(pool: &PgPool, req: RegisterRequest, ip: Option<String>) -> Result<AuthResponse> {
+pub async fn register(
+    pool: &PgPool,
+    req: RegisterRequest,
+    ip: Option<String>,
+) -> Result<AuthResponse> {
     let hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)
         .map_err(|e| anyhow!("Hash error: {}", e))?;
 
@@ -52,8 +56,10 @@ pub async fn register(pool: &PgPool, req: RegisterRequest, ip: Option<String>) -
 
     // Seed test funds: 10,000 USDT + 1 BTC for new users to trade immediately
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 10000, 0), ($1, 'BTC', 1, 0)
+        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+         VALUES
+            ($1, 'USDT', 10000, 0, 1000000000000, 0),
+            ($1, 'BTC', 1, 0, 100000000, 0)
          ON CONFLICT DO NOTHING",
     )
     .bind(user.id)
@@ -62,17 +68,19 @@ pub async fn register(pool: &PgPool, req: RegisterRequest, ip: Option<String>) -
 
     let token = make_token(user.id, &user.email)?;
     let counter_shard_id = crate::desk::counter_shard::owner_shard_for_user_id(user.id);
-    Ok(AuthResponse { token, user, counter_shard_id })
+    Ok(AuthResponse {
+        token,
+        user,
+        counter_shard_id,
+    })
 }
 
 pub async fn login(pool: &PgPool, req: LoginRequest) -> Result<AuthResponse> {
-    let user = sqlx::query_as::<_, User>(
-        "SELECT * FROM users WHERE email = $1",
-    )
-    .bind(&req.email)
-    .fetch_optional(pool)
-    .await?
-    .ok_or_else(|| anyhow!("Invalid email or password"))?;
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
+        .bind(&req.email)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow!("Invalid email or password"))?;
 
     let valid = bcrypt::verify(&req.password, &user.password_hash)
         .map_err(|_| anyhow!("Invalid email or password"))?;
@@ -82,7 +90,11 @@ pub async fn login(pool: &PgPool, req: LoginRequest) -> Result<AuthResponse> {
 
     let token = make_token(user.id, &user.email)?;
     let counter_shard_id = crate::desk::counter_shard::owner_shard_for_user_id(user.id);
-    Ok(AuthResponse { token, user, counter_shard_id })
+    Ok(AuthResponse {
+        token,
+        user,
+        counter_shard_id,
+    })
 }
 
 pub fn verify_token(token: &str) -> Result<Claims> {
@@ -96,9 +108,12 @@ pub fn verify_token(token: &str) -> Result<Claims> {
 }
 
 fn make_token(user_id: i64, email: &str) -> Result<String> {
-    let exp = (chrono::Utc::now() + chrono::Duration::days(7))
-        .timestamp() as usize;
-    let claims = Claims { sub: user_id, email: email.to_owned(), exp };
+    let exp = (chrono::Utc::now() + chrono::Duration::days(7)).timestamp() as usize;
+    let claims = Claims {
+        sub: user_id,
+        email: email.to_owned(),
+        exp,
+    };
     encode(
         &Header::default(),
         &claims,
@@ -133,7 +148,11 @@ pub async fn ensure_robot_api_key(
     let user_id = if let Some(id) = existing {
         id
     } else {
-        let req = RegisterRequest { email: email.to_owned(), password: password.to_owned(), full_name: None };
+        let req = RegisterRequest {
+            email: email.to_owned(),
+            password: password.to_owned(),
+            full_name: None,
+        };
         register(pool, req, None).await?.user.id
     };
     // Upsert API key.

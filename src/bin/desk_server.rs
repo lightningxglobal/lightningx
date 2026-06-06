@@ -465,7 +465,16 @@ fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64
     let Some(kv) = entry.get_mut(asset) else {
         return false;
     };
-    if kv.0 - kv.1 >= amount {
+    let Ok(balance_atoms) = lightning_exchange::money::AmountAtoms::from_f64_round(kv.0) else {
+        return false;
+    };
+    let Ok(frozen_atoms) = lightning_exchange::money::AmountAtoms::from_f64_round(kv.1) else {
+        return false;
+    };
+    let Ok(amount_atoms) = lightning_exchange::money::AmountAtoms::from_f64_round(amount) else {
+        return false;
+    };
+    if balance_atoms.atoms() - frozen_atoms.atoms() >= amount_atoms.atoms() {
         kv.1 += amount;
         true
     } else {
@@ -633,6 +642,24 @@ fn publish_frame(
     }
 }
 
+fn account_set_payload(
+    user_id: i64,
+    asset: &str,
+    balance: f64,
+    frozen: f64,
+) -> anyhow::Result<AccountSetPayload> {
+    let balance_atoms = lightning_exchange::money::AmountAtoms::from_f64_round(balance)?.atoms();
+    let frozen_atoms = lightning_exchange::money::AmountAtoms::from_f64_round(frozen)?.atoms();
+    Ok(AccountSetPayload {
+        user_id,
+        asset: pack_str(asset),
+        balance,
+        frozen,
+        balance_atoms,
+        frozen_atoms,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Now pure-sync — every PG SQL call was already removed by PR5; what
 /// remains is publish_frame (Aeron offer ~1µs), DashMap updates on
@@ -721,15 +748,12 @@ fn process_db_cmd(
                     .get(&uid)
                     .and_then(|entry| entry.get(asset.as_str()).copied());
                 if let Some((bal, frz)) = snapshot {
-                    publish_frame(
-                        &persist_pub,
-                        &PersistFrame::account_set(AccountSetPayload {
-                            user_id: uid,
-                            asset: pack_str(&asset),
-                            balance: bal,
-                            frozen: frz,
-                        }),
-                    );
+                    match account_set_payload(uid, &asset, bal, frz) {
+                        Ok(payload) => {
+                            publish_frame(&persist_pub, &PersistFrame::account_set(payload));
+                        }
+                        Err(e) => tracing::warn!("skip AccountSet persist frame: {e}"),
+                    }
                     // No WS push here — try_freeze_cache already sent it.
                     let _ = user_tx.get(uid);
                 }
@@ -812,15 +836,12 @@ fn process_db_cmd(
                     Some((kv.0, kv.1))
                 });
                 if let Some((bal, frz)) = new_vals {
-                    publish_frame(
-                        &persist_pub,
-                        &PersistFrame::account_set(AccountSetPayload {
-                            user_id: uid,
-                            asset: pack_str(&asset),
-                            balance: bal,
-                            frozen: frz,
-                        }),
-                    );
+                    match account_set_payload(uid, &asset, bal, frz) {
+                        Ok(payload) => {
+                            publish_frame(&persist_pub, &PersistFrame::account_set(payload));
+                        }
+                        Err(e) => tracing::warn!("skip AccountSet persist frame: {e}"),
+                    }
                     if let Some(tx) = user_tx.get(uid) {
                         let _ = tx.try_send((
                             lightning_exchange::ws_sbe::encode_balance_update(
@@ -874,15 +895,12 @@ fn process_db_cmd(
                 Some((kv.0, kv.1))
             });
             if let Some((bal, frz)) = new_vals {
-                publish_frame(
-                    &persist_pub,
-                    &PersistFrame::account_set(AccountSetPayload {
-                        user_id,
-                        asset: pack_str(&asset),
-                        balance: bal,
-                        frozen: frz,
-                    }),
-                );
+                match account_set_payload(user_id, &asset, bal, frz) {
+                    Ok(payload) => {
+                        publish_frame(&persist_pub, &PersistFrame::account_set(payload));
+                    }
+                    Err(e) => tracing::warn!("skip AccountSet persist frame: {e}"),
+                }
                 if let Some(tx) = user_tx.get(user_id) {
                     let _ = tx.try_send((
                         lightning_exchange::ws_sbe::encode_balance_update(
@@ -1052,15 +1070,12 @@ fn process_db_cmd(
 
             // Publish AccountSet + WS balance_update per updated account.
             for (uid, asset, bal, frz) in updated_accounts {
-                publish_frame(
-                    &persist_pub,
-                    &PersistFrame::account_set(AccountSetPayload {
-                        user_id: uid,
-                        asset: pack_str(&asset),
-                        balance: bal,
-                        frozen: frz,
-                    }),
-                );
+                match account_set_payload(uid, &asset, bal, frz) {
+                    Ok(payload) => {
+                        publish_frame(&persist_pub, &PersistFrame::account_set(payload));
+                    }
+                    Err(e) => tracing::warn!("skip AccountSet persist frame: {e}"),
+                }
                 if let Some(tx) = user_tx.get(uid) {
                     let _ = tx.try_send((
                         lightning_exchange::ws_sbe::encode_balance_update(
@@ -1648,32 +1663,30 @@ async fn async_main() -> anyhow::Result<()> {
     // I/O was in flight on the same client.
     let cf_channel = counter_forward_channel();
     use lightning_exchange::desk::counter_shard::COUNTER_SHARD_COUNT;
-    let send_cf_cmd_pubs: HashMap<u16, CounterForwardPublisher> =
-        (0..COUNTER_SHARD_COUNT)
-            .map(|desk| {
-                let stream = counter_forward_cmd_stream_for_desk(desk);
-                let pub_ = new_counter_forward_publisher_with_retry(
-                    counter_forward_cmd_client.clone(),
-                    &cf_channel,
-                    stream,
-                    "cmd",
-                );
-                (desk, pub_)
-            })
-            .collect();
-    let send_cf_resp_pubs: HashMap<u16, CounterForwardPublisher> =
-        (0..COUNTER_SHARD_COUNT)
-            .map(|desk| {
-                let stream = counter_forward_resp_stream_for_desk(desk);
-                let pub_ = new_counter_forward_publisher_with_retry(
-                    counter_forward_cmd_client.clone(),
-                    &cf_channel,
-                    stream,
-                    "send-resp",
-                );
-                (desk, pub_)
-            })
-            .collect();
+    let send_cf_cmd_pubs: HashMap<u16, CounterForwardPublisher> = (0..COUNTER_SHARD_COUNT)
+        .map(|desk| {
+            let stream = counter_forward_cmd_stream_for_desk(desk);
+            let pub_ = new_counter_forward_publisher_with_retry(
+                counter_forward_cmd_client.clone(),
+                &cf_channel,
+                stream,
+                "cmd",
+            );
+            (desk, pub_)
+        })
+        .collect();
+    let send_cf_resp_pubs: HashMap<u16, CounterForwardPublisher> = (0..COUNTER_SHARD_COUNT)
+        .map(|desk| {
+            let stream = counter_forward_resp_stream_for_desk(desk);
+            let pub_ = new_counter_forward_publisher_with_retry(
+                counter_forward_cmd_client.clone(),
+                &cf_channel,
+                stream,
+                "send-resp",
+            );
+            (desk, pub_)
+        })
+        .collect();
 
     {
         let aeron_cmd_rx = aeron_cmd_rx.clone();
@@ -2266,19 +2279,18 @@ async fn async_main() -> anyhow::Result<()> {
         let forward_origin_recv = forwarded_order_origin.clone();
         let public_to_engine_recv = forwarded_public_to_engine.clone();
         let engine_to_public_recv = forwarded_engine_to_public.clone();
-        let recv_cf_resp_pubs: HashMap<u16, CounterForwardPublisher> =
-            (0..COUNTER_SHARD_COUNT)
-                .map(|desk| {
-                    let stream = counter_forward_resp_stream_for_desk(desk);
-                    let pub_ = new_counter_forward_publisher_with_retry(
-                        counter_forward_resp_client.clone(),
-                        &cf_channel,
-                        stream,
-                        "recv-resp",
-                    );
-                    (desk, pub_)
-                })
-                .collect();
+        let recv_cf_resp_pubs: HashMap<u16, CounterForwardPublisher> = (0..COUNTER_SHARD_COUNT)
+            .map(|desk| {
+                let stream = counter_forward_resp_stream_for_desk(desk);
+                let pub_ = new_counter_forward_publisher_with_retry(
+                    counter_forward_resp_client.clone(),
+                    &cf_channel,
+                    stream,
+                    "recv-resp",
+                );
+                (desk, pub_)
+            })
+            .collect();
         let risk_engine = state.risk_engine.clone();
 
         std::thread::Builder::new()

@@ -7,18 +7,18 @@ use crate::order_state::{
     db_status_from_engine, db_status_from_update_kind, ws_status_from_engine,
 };
 use crate::tracer::ExchangeTracer;
-use crate::transport::{pack_str16, AeronCmd, OrderMeta, OrderUpdateMsg};
+use crate::transport::{AeronCmd, OrderMeta, OrderUpdateMsg, pack_str16};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, patch, post},
-    Json, Router,
 };
 use dashmap::DashMap;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -431,7 +431,16 @@ fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64
     let Some(kv) = entry.get_mut(asset) else {
         return false;
     };
-    if kv.0 - kv.1 >= amount {
+    let Ok(balance_atoms) = crate::desk::money::AmountAtoms::from_f64_round(kv.0) else {
+        return false;
+    };
+    let Ok(frozen_atoms) = crate::desk::money::AmountAtoms::from_f64_round(kv.1) else {
+        return false;
+    };
+    let Ok(amount_atoms) = crate::desk::money::AmountAtoms::from_f64_round(amount) else {
+        return false;
+    };
+    if balance_atoms.atoms() - frozen_atoms.atoms() >= amount_atoms.atoms() {
         kv.1 += amount;
         true
     } else {
@@ -506,9 +515,7 @@ fn publish_rest_order_upsert(
     quote_asset: &str,
     base_asset: &str,
 ) {
-    use crate::transport::persist_event::{
-        pack_str, AccountSetPayload, OrderUpsertPayload, PersistFrame,
-    };
+    use crate::transport::persist_event::{OrderUpsertPayload, PersistFrame, pack_str};
     let Some(pp) = state.persist_pub.as_ref() else {
         return;
     };
@@ -557,14 +564,32 @@ fn publish_rest_order_upsert(
         .get(&user_id)
         .and_then(|entry| entry.get(asset).copied());
     if let Some((balance, frozen)) = snapshot {
-        let acc = AccountSetPayload {
-            user_id,
-            asset: pack_str(asset),
-            balance,
-            frozen,
-        };
-        let _ = pp.push(PersistFrame::account_set(acc));
+        match account_set_payload(user_id, asset, balance, frozen) {
+            Ok(acc) => {
+                let _ = pp.push(PersistFrame::account_set(acc));
+            }
+            Err(e) => tracing::warn!("skip AccountSet persist frame: {e}"),
+        }
     }
+}
+
+fn account_set_payload(
+    user_id: i64,
+    asset: &str,
+    balance: f64,
+    frozen: f64,
+) -> anyhow::Result<crate::transport::persist_event::AccountSetPayload> {
+    use crate::desk::money::AmountAtoms;
+    use crate::transport::persist_event::pack_str;
+
+    Ok(crate::transport::persist_event::AccountSetPayload {
+        user_id,
+        asset: pack_str(asset),
+        balance,
+        frozen,
+        balance_atoms: AmountAtoms::from_f64_round(balance)?.atoms(),
+        frozen_atoms: AmountAtoms::from_f64_round(frozen)?.atoms(),
+    })
 }
 
 // ─── Orders ───────────────────────────────────────────────────────────────────
@@ -826,7 +851,7 @@ async fn handle_place_order(
     ) {
         Ok(shape) => shape,
         Err(reason) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
         }
     };
 
@@ -887,7 +912,7 @@ async fn handle_place_order(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "invalid side"})),
             )
-                .into_response()
+                .into_response();
         }
     };
     let tif = match req.order_type.as_str() {
@@ -901,7 +926,7 @@ async fn handle_place_order(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "unknown order_type"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1040,7 +1065,7 @@ async fn handle_place_order(
         ) {
             Ok(order) => order,
             Err(reason) => {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
             }
         };
         let engine_order = if fixed_order.is_market {
@@ -1215,17 +1240,32 @@ async fn handle_place_order(
                 let repo2 = AccountRepository::new(s.db.as_ref());
                 if let Ok(accounts) = repo2.get_all_accounts(uid).await {
                     for acc in accounts {
-                        let _ = tx.send((crate::ws_sbe::encode_balance_update(
-                            &acc.asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                        ), 0)).await;
+                        let _ = tx
+                            .send((
+                                crate::ws_sbe::encode_balance_update(
+                                    &acc.asset,
+                                    acc.balance,
+                                    acc.balance - acc.frozen,
+                                    acc.frozen,
+                                ),
+                                0,
+                            ))
+                            .await;
                     }
                 }
                 if let Some(pos) =
                     crate::positions::position_for_user_asset(s.db.as_ref(), uid, base_asset).await
                 {
-                    let _ = tx.send((crate::ws_sbe::encode_position_update(
-                        base_asset, pos.quantity, pos.entry_price,
-                    ), 0)).await;
+                    let _ = tx
+                        .send((
+                            crate::ws_sbe::encode_position_update(
+                                base_asset,
+                                pos.quantity,
+                                pos.entry_price,
+                            ),
+                            0,
+                        ))
+                        .await;
                 }
             }
         }
@@ -1247,7 +1287,11 @@ async fn handle_place_order(
                 .unwrap_or(0);
             let side_byte: u8 = if req.side == "buy" { 0 } else { 1 };
             let _ = s.market_fanout.send_owned(crate::ws_sbe::encode_trade(
-                avg_fill_price, filled_qty, side_byte, now_us, &req.symbol,
+                avg_fill_price,
+                filled_qty,
+                side_byte,
+                now_us,
+                &req.symbol,
             ));
         }
 
@@ -1260,9 +1304,19 @@ async fn handle_place_order(
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0);
             let status_byte = crate::ws_sbe::ws_status_byte_from_str(ws_status.as_str());
-            let _ = tx.send((crate::ws_sbe::encode_order_update(
-                db_order_id as u64, 0, status_byte, filled_qty, 0.0, ts,
-            ), 0)).await;
+            let _ = tx
+                .send((
+                    crate::ws_sbe::encode_order_update(
+                        db_order_id as u64,
+                        0,
+                        status_byte,
+                        filled_qty,
+                        0.0,
+                        ts,
+                    ),
+                    0,
+                ))
+                .await;
         }
 
         return match sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id=$1")
@@ -1426,14 +1480,14 @@ async fn handle_cancel_order(
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "Order not found or already closed"})),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -1485,14 +1539,14 @@ async fn handle_cancel_order(
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "Order not found or already closed"})),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -1550,9 +1604,19 @@ async fn handle_cancel_order(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
-        let _ = tx.send((crate::ws_sbe::encode_order_update(
-            order_id as u64, 0, crate::ws_sbe::WS_STATUS_CANCELED, 0.0, 0.0, ts,
-        ), 0)).await;
+        let _ = tx
+            .send((
+                crate::ws_sbe::encode_order_update(
+                    order_id as u64,
+                    0,
+                    crate::ws_sbe::WS_STATUS_CANCELED,
+                    0.0,
+                    0.0,
+                    ts,
+                ),
+                0,
+            ))
+            .await;
     }
 
     (StatusCode::OK, Json(json!({"cancelled": order_id}))).into_response()
@@ -1699,9 +1763,19 @@ async fn handle_cancel_all_orders(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_micros() as u64)
                 .unwrap_or(0);
-            let _ = tx.send((crate::ws_sbe::encode_order_update(
-                row.id as u64, 0, crate::ws_sbe::WS_STATUS_CANCELED, 0.0, 0.0, ts,
-            ), 0)).await;
+            let _ = tx
+                .send((
+                    crate::ws_sbe::encode_order_update(
+                        row.id as u64,
+                        0,
+                        crate::ws_sbe::WS_STATUS_CANCELED,
+                        0.0,
+                        0.0,
+                        ts,
+                    ),
+                    0,
+                ))
+                .await;
         }
     }
 
@@ -1945,14 +2019,14 @@ async fn handle_change_password(
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "User not found"})),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response();
         }
     };
     // Verify current password
@@ -1963,7 +2037,7 @@ async fn handle_change_password(
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "Current password is incorrect"})),
             )
-                .into_response()
+                .into_response();
         }
     }
     // Hash and save new password
@@ -1974,7 +2048,7 @@ async fn handle_change_password(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response();
         }
     };
     match sqlx::query("UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2")
@@ -2019,10 +2093,16 @@ async fn handle_test_funds(State(s): State<AppState>, headers: HeaderMap) -> imp
 
     // Credit 10,000 USDT, 1 BTC, 10 ETH, 100 SOL
     let result = sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 10000, 0), ($1, 'BTC', 1, 0), ($1, 'ETH', 10, 0), ($1, 'SOL', 100, 0)
+        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+         VALUES
+            ($1, 'USDT', 10000, 0, 1000000000000, 0),
+            ($1, 'BTC', 1, 0, 100000000, 0),
+            ($1, 'ETH', 10, 0, 1000000000, 0),
+            ($1, 'SOL', 100, 0, 10000000000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = accounts.balance + EXCLUDED.balance, updated_at = NOW()",
+         SET balance = accounts.balance + EXCLUDED.balance,
+             balance_atoms = accounts.balance_atoms + EXCLUDED.balance_atoms,
+             updated_at = NOW()",
     )
     .bind(user_id)
     .execute(s.db.as_ref())
@@ -2057,10 +2137,18 @@ async fn handle_robot_funds(State(s): State<AppState>, headers: HeaderMap) -> im
     }
 
     let result = sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 10000000, 0), ($1, 'BTC', 10000, 0), ($1, 'ETH', 1000000, 0), ($1, 'SOL', 10000000, 0)
+        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+         VALUES
+            ($1, 'USDT', 10000000, 0, 1000000000000000, 0),
+            ($1, 'BTC', 10000, 0, 1000000000000, 0),
+            ($1, 'ETH', 1000000, 0, 100000000000000, 0),
+            ($1, 'SOL', 10000000, 0, 1000000000000000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = GREATEST(accounts.balance, EXCLUDED.balance), frozen = 0, updated_at = NOW()",
+         SET balance = GREATEST(accounts.balance, EXCLUDED.balance),
+             frozen = 0,
+             balance_atoms = GREATEST(accounts.balance_atoms, EXCLUDED.balance_atoms),
+             frozen_atoms = 0,
+             updated_at = NOW()",
     )
     .bind(user_id)
     .execute(s.db.as_ref())
@@ -2159,16 +2247,22 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     // Upsert demo balances (including BTC).
     let _ = sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 100000, 0), ($1, 'BTC', 5, 0), ($1, 'ETH', 50, 0), ($1, 'SOL', 1000, 0)
+        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+         VALUES
+            ($1, 'USDT', 100000, 0, 10000000000000, 0),
+            ($1, 'BTC', 5, 0, 500000000, 0),
+            ($1, 'ETH', 50, 0, 5000000000, 0),
+            ($1, 'SOL', 1000, 0, 100000000000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = GREATEST(accounts.balance, EXCLUDED.balance), updated_at = NOW()",
+         SET balance = GREATEST(accounts.balance, EXCLUDED.balance),
+             balance_atoms = GREATEST(accounts.balance_atoms, EXCLUDED.balance_atoms),
+             updated_at = NOW()",
     )
     .bind(demo_user_id)
     .execute(s.db.as_ref())
@@ -2351,7 +2445,11 @@ async fn handle_debug_mark_price(
     Json(req): Json<DebugMarkPriceReq>,
 ) -> impl IntoResponse {
     if std::env::var("TEST_ENDPOINTS").as_deref() != Ok("1") {
-        return (StatusCode::FORBIDDEN, Json(json!({"error": "TEST_ENDPOINTS not enabled"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "TEST_ENDPOINTS not enabled"})),
+        )
+            .into_response();
     }
 
     let rules = crate::symbol_rules::SymbolRules::for_symbol(&req.symbol);
@@ -2363,24 +2461,30 @@ async fn handle_debug_mark_price(
 
     // Test-only path: force the base mark, then run one EWMA update so
     // unrealized PnL and equity are recomputed deterministically.
-    s.risk_engine.force_mark_price_for_test(sym_bytes, price_ticks);
-    s.risk_engine.update_mark_price(sym_bytes, price_ticks, rules.notional_scale);
+    s.risk_engine
+        .force_mark_price_for_test(sym_bytes, price_ticks);
+    s.risk_engine
+        .update_mark_price(sym_bytes, price_ticks, rules.notional_scale);
 
     let events = s.risk_engine.run_risk_tick();
     let liq_count = events.len();
 
     // Dispatch liquidation events to the priority ring (same as the 10ms task).
     for evt in events {
-        use crate::transport::{AeronCmd, OrderMeta, pack_str16};
-        use crate::sbe::NewOrderRequest as SbeNewOrder;
-        use std::sync::atomic::Ordering;
         use crate::desk::risk::PositionSide;
+        use crate::sbe::NewOrderRequest as SbeNewOrder;
+        use crate::transport::{AeronCmd, OrderMeta, pack_str16};
+        use std::sync::atomic::Ordering;
 
-        if evt.liq_price_ticks == 0 { continue; }
+        if evt.liq_price_ticks == 0 {
+            continue;
+        }
 
         s.risk_engine
             .set_account_status(evt.user_id, crate::desk::risk::RiskStatus::Liquidating);
-        let Some(ref cmd_tx) = s.liq_cmd_tx else { continue; };
+        let Some(ref cmd_tx) = s.liq_cmd_tx else {
+            continue;
+        };
 
         let sym_str_end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
         let sym_str = std::str::from_utf8(&evt.symbol[..sym_str_end]).unwrap_or("BTC_USDT");
@@ -2402,31 +2506,47 @@ async fn handle_debug_mark_price(
         };
         let mark_ticks = s.risk_engine.mark_price_ticks(&evt.symbol).unwrap_or(0);
         let notional = if mark_ticks > 0 {
-            crate::desk::risk::calc::calc_notional_cents(mark_ticks, evt.qty_lots, liq_rules.notional_scale)
-        } else { 0 };
-        let margin_cents = crate::desk::risk::calc::calc_initial_margin_cents(notional, liq_rules.default_leverage);
+            crate::desk::risk::calc::calc_notional_cents(
+                mark_ticks,
+                evt.qty_lots,
+                liq_rules.notional_scale,
+            )
+        } else {
+            0
+        };
+        let margin_cents = crate::desk::risk::calc::calc_initial_margin_cents(
+            notional,
+            liq_rules.default_leverage,
+        );
         let order_type = if liq_side == 0 { "liq-buy" } else { "liq-sell" };
-        s.pending_meta.insert(order_id, OrderMeta {
-            user_id: evt.user_id,
-            symbol: evt.symbol,
-            side: liq_side,
-            order_type: pack_str16(order_type),
-            price: None,
-            qty: liq_rules.lots_to_quantity(evt.qty_lots),
-            client_order_id: format!("liq-{}", order_id),
-            freeze_price: 0.0,
-            initial_margin_cents: margin_cents,
-            liq_price_ticks: evt.liq_price_ticks,
-        });
+        s.pending_meta.insert(
+            order_id,
+            OrderMeta {
+                user_id: evt.user_id,
+                symbol: evt.symbol,
+                side: liq_side,
+                order_type: pack_str16(order_type),
+                price: None,
+                qty: liq_rules.lots_to_quantity(evt.qty_lots),
+                client_order_id: format!("liq-{}", order_id),
+                freeze_price: 0.0,
+                initial_margin_cents: margin_cents,
+                liq_price_ticks: evt.liq_price_ticks,
+            },
+        );
         if cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
             s.pending_meta.remove(&order_id);
         }
     }
 
-    (StatusCode::OK, Json(json!({
-        "symbol": req.symbol,
-        "price": req.price,
-        "price_ticks": price_ticks,
-        "liquidations_triggered": liq_count,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({
+            "symbol": req.symbol,
+            "price": req.price,
+            "price_ticks": price_ticks,
+            "liquidations_triggered": liq_count,
+        })),
+    )
+        .into_response()
 }

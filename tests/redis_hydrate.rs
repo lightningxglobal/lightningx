@@ -8,16 +8,17 @@
 //! Skip:  it auto-skips when DATABASE_URL/REDIS_URL can't connect.
 
 use lightning_exchange::desk::redis_store::{
-    hydrate_from_pg, is_hydrated, key_account, key_order, key_user_orders, purge_all,
-    KEY_ACTIVE_ORDERS,
+    KEY_ACTIVE_ORDERS, hydrate_from_pg, is_hydrated, key_account, key_order, key_user_orders,
+    purge_all,
 };
+use lightning_exchange::db;
 use redis::AsyncCommands;
 
 async fn try_connect() -> Option<(sqlx::PgPool, redis::aio::MultiplexedConnection)> {
     let pg_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@127.0.0.1:5432/mydb".to_string());
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
 
     let pg = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -25,6 +26,7 @@ async fn try_connect() -> Option<(sqlx::PgPool, redis::aio::MultiplexedConnectio
         .connect(&pg_url)
         .await
         .ok()?;
+    db::run_migrations(&pg).await.ok()?;
 
     let client = redis::Client::open(redis_url.as_str()).ok()?;
     let mut conn = client.get_multiplexed_async_connection().await.ok()?;
@@ -43,10 +45,15 @@ async fn ensure_test_user(pg: &sqlx::PgPool, email: &str) -> sqlx::Result<i64> {
     .fetch_one(pg)
     .await?;
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen)
-         VALUES ($1, 'USDT', 12345.6, 100), ($1, 'BTC', 7.5, 0.5)
+        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+         VALUES
+            ($1, 'USDT', 12345.6, 100, 1234560000000, 10000000000),
+            ($1, 'BTC', 7.5, 0.5, 750000000, 50000000)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = EXCLUDED.balance, frozen = EXCLUDED.frozen",
+         SET balance = EXCLUDED.balance,
+             frozen = EXCLUDED.frozen,
+             balance_atoms = EXCLUDED.balance_atoms,
+             frozen_atoms = EXCLUDED.frozen_atoms",
     )
     .bind(id)
     .execute(pg)
@@ -66,7 +73,10 @@ async fn seed_orders(
 ) -> anyhow::Result<Vec<i64>> {
     static SEQ: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(900_000_000_000_000);
-    let start = SEQ.fetch_add((n_active + n_terminal) as i64, std::sync::atomic::Ordering::Relaxed);
+    let start = SEQ.fetch_add(
+        (n_active + n_terminal) as i64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let mut active_ids = Vec::with_capacity(n_active);
     let mut sql = String::from(
         "INSERT INTO orders (id, user_id, symbol, side, order_type,
@@ -116,10 +126,10 @@ async fn hydrate_loads_active_orders_and_accounts() {
 
     // Clean slate.
     purge_all(&mut conn).await.unwrap();
-    let user_id = ensure_test_user(&pg, &format!("rht_{}@lightning.test", uuid::Uuid::new_v4())).await.expect("ensure test user");
-    let active_ids = seed_orders(&pg, user_id, 5, 4)
+    let user_id = ensure_test_user(&pg, &format!("rht_{}@lightning.test", uuid::Uuid::new_v4()))
         .await
-        .expect("seed orders");
+        .expect("ensure test user");
+    let active_ids = seed_orders(&pg, user_id, 5, 4).await.expect("seed orders");
 
     assert!(
         !is_hydrated(&mut conn).await.unwrap(),
@@ -170,6 +180,8 @@ async fn hydrate_loads_active_orders_and_accounts() {
     let frozen: f64 = usdt.get("frozen").unwrap().parse().unwrap();
     assert!((balance - 12345.6).abs() < 1e-9, "USDT balance: {balance}");
     assert!((frozen - 100.0).abs() < 1e-9, "USDT frozen: {frozen}");
+    assert_eq!(usdt.get("balance_atoms").unwrap(), "1234560000000");
+    assert_eq!(usdt.get("frozen_atoms").unwrap(), "10000000000");
 
     let btc: std::collections::HashMap<String, String> =
         conn.hgetall(key_account(user_id, "BTC")).await.unwrap();
@@ -177,6 +189,8 @@ async fn hydrate_loads_active_orders_and_accounts() {
     let frozen: f64 = btc.get("frozen").unwrap().parse().unwrap();
     assert!((balance - 7.5).abs() < 1e-9, "BTC balance: {balance}");
     assert!((frozen - 0.5).abs() < 1e-9, "BTC frozen: {frozen}");
+    assert_eq!(btc.get("balance_atoms").unwrap(), "750000000");
+    assert_eq!(btc.get("frozen_atoms").unwrap(), "50000000");
 
     assert!(
         is_hydrated(&mut conn).await.unwrap(),
@@ -199,7 +213,9 @@ async fn purge_clears_everything_we_wrote() {
         return;
     };
 
-    let user_id = ensure_test_user(&pg, &format!("rht_{}@lightning.test", uuid::Uuid::new_v4())).await.expect("ensure test user");
+    let user_id = ensure_test_user(&pg, &format!("rht_{}@lightning.test", uuid::Uuid::new_v4()))
+        .await
+        .expect("ensure test user");
     seed_orders(&pg, user_id, 3, 0).await.expect("seed");
     hydrate_from_pg(&pg, &mut conn).await.expect("hydrate");
     assert!(is_hydrated(&mut conn).await.unwrap());
@@ -207,10 +223,7 @@ async fn purge_clears_everything_we_wrote() {
     purge_all(&mut conn).await.expect("purge");
     let card: u64 = conn.scard(KEY_ACTIVE_ORDERS).await.unwrap();
     assert_eq!(card, 0, "active_orders should be empty after purge");
-    let acct_exists: bool = conn
-        .exists(key_account(user_id, "USDT"))
-        .await
-        .unwrap();
+    let acct_exists: bool = conn.exists(key_account(user_id, "USDT")).await.unwrap();
     assert!(!acct_exists, "user account hash should be gone after purge");
 
     sqlx::query("DELETE FROM orders WHERE user_id=$1")

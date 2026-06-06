@@ -1,4 +1,4 @@
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
@@ -82,6 +82,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         pool,
         "011_drop_trades_order_fk",
         include_str!("../../migrations/011_drop_trades_order_fk.sql"),
+    )
+    .await?;
+    apply_migration(
+        pool,
+        "012_account_amount_atoms",
+        include_str!("../../migrations/012_account_amount_atoms.sql"),
     )
     .await?;
     Ok(())

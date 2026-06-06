@@ -16,8 +16,9 @@
 
 use aeron_wrapper::AeronClient;
 use anyhow::Context;
+use lightning_exchange::db;
 use lightning_exchange::desk::redis_store;
-use lightning_exchange::transport::aeron_channels::{aeron_dir, PERSIST_CHANNEL, PERSIST_STREAM};
+use lightning_exchange::transport::aeron_channels::{PERSIST_CHANNEL, PERSIST_STREAM, aeron_dir};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&pg_url)
         .await
         .context("connect PG")?;
+    db::run_migrations(&pg).await.context("run migrations")?;
 
     let client = redis::Client::open(redis_url.as_str()).context("open Redis client")?;
     let mut conn = client
@@ -106,8 +108,8 @@ async fn main() -> anyhow::Result<()> {
     // Long-running phase: subscribe to PersistEvent and apply to Redis.
     let dir = aeron_dir();
     info!("connecting Aeron client (dir={})", dir);
-    let aeron = AeronClient::new(&dir)
-        .map_err(|e| anyhow::anyhow!("AeronClient::new failed: {e:?}"))?;
+    let aeron =
+        AeronClient::new(&dir).map_err(|e| anyhow::anyhow!("AeronClient::new failed: {e:?}"))?;
     let aeron = Arc::new(aeron);
 
     let mut sub = PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, PERSIST_STREAM)

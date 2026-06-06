@@ -8,7 +8,8 @@
 //! - `SET active_orders` — global index of order ids (for full scans / cold
 //!   hydrate checks).
 //! - `SET user_orders:{user_id}` — per-user index for `/api/orders?status=open`.
-//! - `HASH acct:{user_id}:{asset}` — fields: balance, frozen.
+//! - `HASH acct:{user_id}:{asset}` — fields: balance, frozen,
+//!   balance_atoms, frozen_atoms.
 //! - `SET user_assets:{user_id}` — assets a user holds (for HMGET fanout).
 //! - `HASH user_coid:{user_id}` — `client_order_id → order_id` (idempotency).
 //!
@@ -51,9 +52,10 @@ pub async fn is_hydrated(conn: &mut redis::aio::MultiplexedConnection) -> anyhow
 // ── Frame application (used by redis-writer subscriber loop) ────────────────
 
 use crate::transport::persist_event::{
-    unpack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-    PersistFrame, PersistKind, TradeInsertPayload,
+    AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
+    PersistFrame, PersistKind, TradeInsertPayload, unpack_str,
 };
+use crate::desk::money::AmountAtoms;
 
 /// Apply one PersistFrame to Redis L1. Idempotent and safe to replay
 /// (subscriber may see duplicates after Aeron lag recovery).
@@ -234,6 +236,16 @@ async fn apply_account_set(
     let user_id: i64 = p.user_id;
     let balance: f64 = p.balance;
     let frozen: f64 = p.frozen;
+    let balance_atoms = if p.balance_atoms == 0 && balance != 0.0 {
+        AmountAtoms::from_f64_round(balance)?.atoms()
+    } else {
+        p.balance_atoms
+    };
+    let frozen_atoms = if p.frozen_atoms == 0 && frozen != 0.0 {
+        AmountAtoms::from_f64_round(frozen)?.atoms()
+    } else {
+        p.frozen_atoms
+    };
     let asset = unpack_str(&p.asset).to_owned();
     if asset.is_empty() {
         return Ok(());
@@ -244,6 +256,8 @@ async fn apply_account_set(
             &[
                 ("balance", balance.to_string()),
                 ("frozen", frozen.to_string()),
+                ("balance_atoms", balance_atoms.to_string()),
+                ("frozen_atoms", frozen_atoms.to_string()),
             ],
         )
         .sadd(key_user_assets(user_id), &asset)
@@ -368,22 +382,23 @@ pub async fn hydrate_from_pg(
 
     let t_pg_acct = std::time::Instant::now();
     // 2) Accounts.
-    let acct_rows: Vec<(i64, String, f64, f64)> = sqlx::query_as(
-        "SELECT user_id, asset, balance, frozen FROM accounts",
-    )
-    .fetch_all(pg)
-    .await?;
+    let acct_rows: Vec<(i64, String, f64, f64, i64, i64)> =
+        sqlx::query_as("SELECT user_id, asset, balance, frozen, balance_atoms, frozen_atoms FROM accounts")
+            .fetch_all(pg)
+            .await?;
     let dt_pg_acct = t_pg_acct.elapsed();
 
     let t_redis_acct = std::time::Instant::now();
     if !acct_rows.is_empty() {
         let mut pipe = redis::pipe();
-        for (user_id, asset, balance, frozen) in &acct_rows {
+        for (user_id, asset, balance, frozen, balance_atoms, frozen_atoms) in &acct_rows {
             pipe.hset_multiple(
                 key_account(*user_id, asset),
                 &[
                     ("balance", balance.to_string()),
                     ("frozen", frozen.to_string()),
+                    ("balance_atoms", balance_atoms.to_string()),
+                    ("frozen_atoms", frozen_atoms.to_string()),
                 ],
             )
             .ignore();
@@ -396,8 +411,12 @@ pub async fn hydrate_from_pg(
 
     tracing::info!(
         "hydrate timings: PG orders={:?} ({} rows), Redis orders write={:?}, PG accounts={:?} ({} rows), Redis accounts write={:?}",
-        dt_pg_orders, rows.len(), dt_redis_orders,
-        dt_pg_acct, acct_rows.len(), dt_redis_acct,
+        dt_pg_orders,
+        rows.len(),
+        dt_redis_orders,
+        dt_pg_acct,
+        acct_rows.len(),
+        dt_redis_acct,
     );
 
     Ok(stats)
@@ -444,12 +463,11 @@ pub async fn reconcile_orphans(
         // Ask PG which ids still exist (any status, not only PENDING/TRADING —
         // a row in COMPLETED briefly before BatchDeleteOrder runs should not
         // be reaped here either).
-        let existing: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM orders WHERE id = ANY($1::bigint[])",
-        )
-        .bind(&order_ids)
-        .fetch_all(pg)
-        .await?;
+        let existing: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM orders WHERE id = ANY($1::bigint[])")
+                .bind(&order_ids)
+                .fetch_all(pg)
+                .await?;
         let existing_set: std::collections::HashSet<i64> =
             existing.into_iter().map(|(id,)| id).collect();
 
@@ -496,12 +514,11 @@ pub async fn reconcile_orphans(
         if ids.is_empty() {
             continue;
         }
-        let existing: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM orders WHERE id = ANY($1::bigint[])",
-        )
-        .bind(&ids)
-        .fetch_all(pg)
-        .await?;
+        let existing: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM orders WHERE id = ANY($1::bigint[])")
+                .bind(&ids)
+                .fetch_all(pg)
+                .await?;
         let existing_set: std::collections::HashSet<i64> =
             existing.into_iter().map(|(id,)| id).collect();
         let orphans: Vec<i64> = ids
@@ -537,9 +554,7 @@ pub async fn reconcile_orphans(
 /// re-hydrate (`FORCE_REHYDRATE`). Walks `active_orders` and `user_assets`
 /// to find dependent keys, then issues all DELs in a single pipeline.
 /// Does NOT call FLUSHALL.
-pub async fn purge_all(
-    conn: &mut redis::aio::MultiplexedConnection,
-) -> anyhow::Result<()> {
+pub async fn purge_all(conn: &mut redis::aio::MultiplexedConnection) -> anyhow::Result<()> {
     // Phase 1 — read all the index keys (one pipelined batch). After this
     // we know every key to delete; no more SCAN/SMEMBERS needed.
     let order_ids: Vec<i64> = conn.smembers(KEY_ACTIVE_ORDERS).await.unwrap_or_default();
@@ -634,7 +649,11 @@ fn decode_hash(id: i64, fields: &HashMap<String, String>) -> Option<DbOrder> {
     // price stored as f64 string; 0 is the documented sentinel for market orders
     // (writers convert Option::None → 0 deliberately — see apply_order_upsert).
     let price_raw: f64 = fields.get("price")?.parse().ok()?;
-    let price = if price_raw == 0.0 { None } else { Some(price_raw) };
+    let price = if price_raw == 0.0 {
+        None
+    } else {
+        Some(price_raw)
+    };
     let client_order_id = match fields.get("client_order_id") {
         Some(s) if !s.is_empty() => Some(s.clone()),
         _ => None,
@@ -711,7 +730,9 @@ pub async fn list_user_open_orders(
         if h.is_empty() {
             continue;
         }
-        let Some(o) = decode_hash(id, &h) else { continue };
+        let Some(o) = decode_hash(id, &h) else {
+            continue;
+        };
         if let Some(sym) = symbol_filter {
             if o.symbol != sym {
                 continue;

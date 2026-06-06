@@ -18,6 +18,7 @@
 //! - `client_order_id` empty string → NULL.
 //! - `status` byte → `'PENDING' | 'TRADING' | 'COMPLETED' | 'CANCELED' | 'REJECTED'`.
 
+use crate::desk::money::AmountAtoms;
 use crate::transport::persist_event::{
     AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
     PersistFrame, PersistKind, TradeInsertPayload, unpack_str,
@@ -74,6 +75,8 @@ struct AccountRow {
     asset: String,
     balance: f64,
     frozen: f64,
+    balance_atoms: i64,
+    frozen_atoms: i64,
 }
 
 struct TradeRow {
@@ -287,17 +290,41 @@ impl PgWriteBatch {
         let user_id: i64 = p.user_id;
         let balance: f64 = p.balance;
         let frozen: f64 = p.frozen;
+        let mut balance_atoms: i64 = p.balance_atoms;
+        let mut frozen_atoms: i64 = p.frozen_atoms;
         let asset = unpack_str(&p.asset).to_owned();
         if asset.is_empty() {
             self.skipped += 1;
             self.skip_counts.account_empty_asset += 1;
             return false;
         }
+        if balance_atoms == 0 && balance != 0.0 {
+            balance_atoms = match AmountAtoms::from_f64_round(balance) {
+                Ok(v) => v.atoms(),
+                Err(_) => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    return false;
+                }
+            };
+        }
+        if frozen_atoms == 0 && frozen != 0.0 {
+            frozen_atoms = match AmountAtoms::from_f64_round(frozen) {
+                Ok(v) => v.atoms(),
+                Err(_) => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    return false;
+                }
+            };
+        }
         self.accounts.push(AccountRow {
             user_id,
             asset,
             balance,
             frozen,
+            balance_atoms,
+            frozen_atoms,
         });
         true
     }
@@ -591,21 +618,34 @@ async fn flush_accounts(pool: &PgPool, rows: &[AccountRow]) -> anyhow::Result<us
     let mut assets = Vec::with_capacity(keep_idx.len());
     let mut balances = Vec::with_capacity(keep_idx.len());
     let mut frozens = Vec::with_capacity(keep_idx.len());
+    let mut balance_atoms = Vec::with_capacity(keep_idx.len());
+    let mut frozen_atoms = Vec::with_capacity(keep_idx.len());
     for i in keep_idx {
         let r = &rows[i];
         user_ids.push(r.user_id);
         assets.push(r.asset.clone());
         balances.push(r.balance);
         frozens.push(r.frozen);
+        balance_atoms.push(r.balance_atoms);
+        frozen_atoms.push(r.frozen_atoms);
     }
     let res = sqlx::query(
         r#"
-        INSERT INTO accounts (user_id, asset, balance, frozen, updated_at)
-        SELECT * FROM UNNEST($1::bigint[], $2::varchar[], $3::float8[], $4::float8[]) AS t(user_id, asset, balance, frozen)
+        INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms, updated_at)
+        SELECT * FROM UNNEST(
+            $1::bigint[],
+            $2::varchar[],
+            $3::float8[],
+            $4::float8[],
+            $5::bigint[],
+            $6::bigint[]
+        ) AS t(user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
         CROSS JOIN LATERAL (SELECT NOW() AS updated_at) u
         ON CONFLICT (user_id, asset) DO UPDATE SET
             balance     = EXCLUDED.balance,
             frozen      = EXCLUDED.frozen,
+            balance_atoms = EXCLUDED.balance_atoms,
+            frozen_atoms  = EXCLUDED.frozen_atoms,
             updated_at  = NOW()
         "#,
     )
@@ -613,6 +653,8 @@ async fn flush_accounts(pool: &PgPool, rows: &[AccountRow]) -> anyhow::Result<us
     .bind(&assets)
     .bind(&balances)
     .bind(&frozens)
+    .bind(&balance_atoms)
+    .bind(&frozen_atoms)
     .execute(pool)
     .await?;
     Ok(res.rows_affected() as usize)
@@ -887,6 +929,8 @@ mod tests {
             asset: pack_str(""),
             balance: 1.0,
             frozen: 0.0,
+            balance_atoms: 100_000_000,
+            frozen_atoms: 0,
         });
         let mut b = PgWriteBatch::new();
         assert!(!b.push(&f));
@@ -925,31 +969,22 @@ mod tests {
 
     #[test]
     fn dedup_accounts_keeps_last_per_user_asset() {
+        fn account_row(user_id: i64, asset: &str, balance: f64, frozen: f64) -> AccountRow {
+            AccountRow {
+                user_id,
+                asset: asset.into(),
+                balance,
+                frozen,
+                balance_atoms: AmountAtoms::from_f64_round(balance).unwrap().atoms(),
+                frozen_atoms: AmountAtoms::from_f64_round(frozen).unwrap().atoms(),
+            }
+        }
+
         let rows = vec![
-            AccountRow {
-                user_id: 1,
-                asset: "USDT".into(),
-                balance: 100.0,
-                frozen: 0.0,
-            },
-            AccountRow {
-                user_id: 2,
-                asset: "USDT".into(),
-                balance: 200.0,
-                frozen: 0.0,
-            },
-            AccountRow {
-                user_id: 1,
-                asset: "USDT".into(),
-                balance: 150.0,
-                frozen: 5.0,
-            }, // overrides user=1,USDT
-            AccountRow {
-                user_id: 1,
-                asset: "BTC".into(),
-                balance: 0.1,
-                frozen: 0.0,
-            },
+            account_row(1, "USDT", 100.0, 0.0),
+            account_row(2, "USDT", 200.0, 0.0),
+            account_row(1, "USDT", 150.0, 5.0), // overrides user=1,USDT
+            account_row(1, "BTC", 0.1, 0.0),
         ];
         let out = dedup_accounts_keep_last(rows);
         assert_eq!(out.len(), 3);

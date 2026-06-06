@@ -6,13 +6,14 @@
 //! Skips gracefully when Redis is unreachable.
 
 use lightning_exchange::desk::redis_store::{
-    apply_frame, get_order, key_account, key_order, key_user_assets, key_user_coid,
-    key_user_orders, list_user_accounts, list_user_open_orders, KEY_ACTIVE_ORDERS,
+    KEY_ACTIVE_ORDERS, apply_frame, get_order, key_account, key_order, key_user_assets,
+    key_user_coid, key_user_orders, list_user_accounts, list_user_open_orders,
 };
 use lightning_exchange::transport::persist_event::{
-    pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-    PersistFrame,
+    AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
+    PersistFrame, pack_str,
 };
+use lightning_exchange::money::AmountAtoms;
 use redis::AsyncCommands;
 
 async fn try_redis() -> Option<redis::aio::MultiplexedConnection> {
@@ -57,6 +58,17 @@ fn upsert_frame(id: i64, user_id: i64, symbol: &str, price: f64, qty: f64) -> Pe
         freeze_price: price,
         client_order_id: pack_str(""),
         created_at_ms: 1_700_000_000_000 + id, // strictly increasing for sort assertions
+    })
+}
+
+fn account_set_frame(user_id: i64, asset: &str, balance: f64, frozen: f64) -> PersistFrame {
+    PersistFrame::account_set(AccountSetPayload {
+        user_id,
+        asset: pack_str(asset),
+        balance,
+        frozen,
+        balance_atoms: AmountAtoms::from_f64_round(balance).unwrap().atoms(),
+        frozen_atoms: AmountAtoms::from_f64_round(frozen).unwrap().atoms(),
     })
 }
 
@@ -207,9 +219,12 @@ async fn fill_update_bumps_updated_at_ms() {
         after.updated_at.timestamp_millis()
     );
 
-    apply_frame(&mut conn, &PersistFrame::order_delete(OrderDeletePayload { id }))
-        .await
-        .unwrap();
+    apply_frame(
+        &mut conn,
+        &PersistFrame::order_delete(OrderDeletePayload { id }),
+    )
+    .await
+    .unwrap();
     purge_user(&mut conn, user_id, &[id]).await;
 }
 
@@ -226,12 +241,7 @@ async fn list_user_accounts_returns_seeded_assets() {
     for (asset, balance, frozen) in &[("USDT", 1000.0, 100.0), ("BTC", 0.5, 0.05)] {
         apply_frame(
             &mut conn,
-            &PersistFrame::account_set(AccountSetPayload {
-                user_id,
-                asset: pack_str(asset),
-                balance: *balance,
-                frozen: *frozen,
-            }),
+            &account_set_frame(user_id, asset, *balance, *frozen),
         )
         .await
         .unwrap();

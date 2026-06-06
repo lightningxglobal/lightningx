@@ -60,9 +60,9 @@ pub struct OrderFillUpdatePayload {
 pub struct OrderUpsertPayload {
     pub id: i64,
     pub user_id: i64,
-    pub symbol: [u8; 16],   // null-padded
-    pub side: u8,           // 0 = buy, 1 = sell
-    pub status: u8,         // DbOrderStatus as u8
+    pub symbol: [u8; 16], // null-padded
+    pub side: u8,         // 0 = buy, 1 = sell
+    pub status: u8,       // DbOrderStatus as u8
     pub _pad: [u8; 6],
     pub order_type: [u8; 16], // null-padded
     pub price: f64,
@@ -83,9 +83,11 @@ pub struct OrderDeletePayload {
 #[derive(Clone, Copy)]
 pub struct AccountSetPayload {
     pub user_id: i64,
-    pub asset: [u8; 16],    // null-padded
+    pub asset: [u8; 16], // null-padded
     pub balance: f64,
     pub frozen: f64,
+    pub balance_atoms: i64,
+    pub frozen_atoms: i64,
 }
 
 #[repr(C, packed)]
@@ -93,7 +95,7 @@ pub struct AccountSetPayload {
 pub struct TradeInsertPayload {
     pub buy_order_id: i64,
     pub sell_order_id: i64,
-    pub symbol: [u8; 16],   // null-padded
+    pub symbol: [u8; 16], // null-padded
     pub price: f64,
     pub qty: f64,
     pub ts_ms: i64,
@@ -138,10 +140,7 @@ impl PersistFrame {
         let mut f = Self::zero();
         f.kind = PersistKind::OrderUpsert as u8;
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &p as *const _ as *const u8,
-                size_of::<OrderUpsertPayload>(),
-            )
+            std::slice::from_raw_parts(&p as *const _ as *const u8, size_of::<OrderUpsertPayload>())
         };
         f.payload[..bytes.len()].copy_from_slice(bytes);
         f
@@ -151,10 +150,7 @@ impl PersistFrame {
         let mut f = Self::zero();
         f.kind = PersistKind::OrderDelete as u8;
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &p as *const _ as *const u8,
-                size_of::<OrderDeletePayload>(),
-            )
+            std::slice::from_raw_parts(&p as *const _ as *const u8, size_of::<OrderDeletePayload>())
         };
         f.payload[..bytes.len()].copy_from_slice(bytes);
         f
@@ -164,10 +160,7 @@ impl PersistFrame {
         let mut f = Self::zero();
         f.kind = PersistKind::AccountSet as u8;
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &p as *const _ as *const u8,
-                size_of::<AccountSetPayload>(),
-            )
+            std::slice::from_raw_parts(&p as *const _ as *const u8, size_of::<AccountSetPayload>())
         };
         f.payload[..bytes.len()].copy_from_slice(bytes);
         f
@@ -190,10 +183,7 @@ impl PersistFrame {
         let mut f = Self::zero();
         f.kind = PersistKind::TradeInsert as u8;
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &p as *const _ as *const u8,
-                size_of::<TradeInsertPayload>(),
-            )
+            std::slice::from_raw_parts(&p as *const _ as *const u8, size_of::<TradeInsertPayload>())
         };
         f.payload[..bytes.len()].copy_from_slice(bytes);
         f
@@ -239,9 +229,7 @@ impl PersistFrame {
         if self.kind() != Some(PersistKind::AccountSet) {
             return None;
         }
-        Some(unsafe {
-            std::ptr::read_unaligned(self.payload.as_ptr() as *const AccountSetPayload)
-        })
+        Some(unsafe { std::ptr::read_unaligned(self.payload.as_ptr() as *const AccountSetPayload) })
     }
 
     pub fn as_order_fill_update(&self) -> Option<OrderFillUpdatePayload> {
@@ -340,6 +328,8 @@ mod tests {
             asset: pack_str("USDT"),
             balance: 12345.6,
             frozen: 100.0,
+            balance_atoms: 1_234_560_000_000,
+            frozen_atoms: 10_000_000_000,
         };
         let f = PersistFrame::account_set(p);
         let back = PersistFrame::from_bytes(f.as_bytes()).expect("parse");
@@ -348,6 +338,8 @@ mod tests {
         assert_eq!(unpack_str(&q.asset), "USDT");
         assert!(({ q.balance } - 12345.6).abs() < 1e-9);
         assert!(({ q.frozen } - 100.0).abs() < 1e-9);
+        assert_eq!({ q.balance_atoms }, 1_234_560_000_000);
+        assert_eq!({ q.frozen_atoms }, 10_000_000_000);
     }
 
     #[test]

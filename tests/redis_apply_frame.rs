@@ -6,17 +6,16 @@
 //! gracefully when Redis is unreachable.
 
 use lightning_exchange::desk::redis_store::{
-    apply_frame, key_account, key_order, key_user_orders, KEY_ACTIVE_ORDERS,
+    KEY_ACTIVE_ORDERS, apply_frame, key_account, key_order, key_user_orders,
 };
 use lightning_exchange::transport::persist_event::{
-    pack_str, AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-    PersistFrame,
+    AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
+    PersistFrame, pack_str,
 };
 use redis::AsyncCommands;
 
 async fn try_redis() -> Option<redis::aio::MultiplexedConnection> {
-    let url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
     let client = redis::Client::open(url).ok()?;
     let mut conn = client.get_multiplexed_async_connection().await.ok()?;
     let _: String = redis::cmd("PING").query_async(&mut conn).await.ok()?;
@@ -61,7 +60,9 @@ async fn upsert_then_fill_then_delete_via_frames() {
     assert_eq!(fields.get("price").map(String::as_str), Some("73000.5"));
     assert!(conn.sismember(KEY_ACTIVE_ORDERS, id).await.unwrap_or(false));
     assert!(
-        conn.sismember(key_user_orders(user_id), id).await.unwrap_or(false),
+        conn.sismember(key_user_orders(user_id), id)
+            .await
+            .unwrap_or(false),
         "user_orders set should include the id"
     );
 
@@ -124,14 +125,21 @@ async fn account_set_overwrites_balance_and_frozen() {
         asset: pack_str(asset),
         balance: 100.5,
         frozen: 10.0,
+        balance_atoms: 10_050_000_000,
+        frozen_atoms: 1_000_000_000,
     });
     apply_frame(&mut conn, &f).await.unwrap();
-    let row: (String, String) = conn
-        .hget(key_account(user_id, asset), &["balance", "frozen"])
+    let row: (String, String, String, String) = conn
+        .hget(
+            key_account(user_id, asset),
+            &["balance", "frozen", "balance_atoms", "frozen_atoms"],
+        )
         .await
         .unwrap();
     assert_eq!(row.0, "100.5");
     assert_eq!(row.1, "10");
+    assert_eq!(row.2, "10050000000");
+    assert_eq!(row.3, "1000000000");
 
     // Second update — overwrites.
     let f = PersistFrame::account_set(AccountSetPayload {
@@ -139,14 +147,21 @@ async fn account_set_overwrites_balance_and_frozen() {
         asset: pack_str(asset),
         balance: 99.0,
         frozen: 9.5,
+        balance_atoms: 9_900_000_000,
+        frozen_atoms: 950_000_000,
     });
     apply_frame(&mut conn, &f).await.unwrap();
-    let row: (String, String) = conn
-        .hget(key_account(user_id, asset), &["balance", "frozen"])
+    let row: (String, String, String, String) = conn
+        .hget(
+            key_account(user_id, asset),
+            &["balance", "frozen", "balance_atoms", "frozen_atoms"],
+        )
         .await
         .unwrap();
     assert_eq!(row.0, "99");
     assert_eq!(row.1, "9.5");
+    assert_eq!(row.2, "9900000000");
+    assert_eq!(row.3, "950000000");
 
     let _: i64 = conn.del(key_account(user_id, asset)).await.unwrap_or(0);
 }

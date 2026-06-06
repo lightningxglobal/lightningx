@@ -18,6 +18,7 @@
 use aeron_wrapper::AeronClient;
 use anyhow::Context;
 use crossbeam_queue::ArrayQueue;
+use lightning_exchange::db;
 use lightning_exchange::desk::pg_store::{PgWriteBatch, backfill_from_redis};
 use lightning_exchange::transport::aeron_channels::{PERSIST_CHANNEL, PERSIST_STREAM, aeron_dir};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
@@ -68,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&pg_url)
         .await
         .context("connect PG")?;
+    db::run_migrations(&pg).await.context("run migrations")?;
 
     // Optional one-shot backfill: any id present in Redis active_orders
     // but missing from PG is rebuilt from the Redis HASH and INSERTed

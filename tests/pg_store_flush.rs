@@ -17,11 +17,13 @@ use uuid::Uuid;
 async fn try_pg() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
-    sqlx::postgres::PgPoolOptions::new()
+    let pg = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&url)
         .await
-        .ok()
+        .ok()?;
+    lightning_exchange::db::run_migrations(&pg).await.ok()?;
+    Some(pg)
 }
 
 async fn make_user(pg: &PgPool) -> Option<i64> {
@@ -165,19 +167,24 @@ async fn account_set_upserts() {
         asset: pack_str("USDT"),
         balance: 1000.0,
         frozen: 100.0,
+        balance_atoms: 100_000_000_000,
+        frozen_atoms: 10_000_000_000,
     });
     let mut batch = PgWriteBatch::new();
     assert!(batch.push(&f1));
     batch.flush(&pg).await.expect("flush insert");
 
-    let row: (f64, f64) =
-        sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset='USDT'")
+    let row: (f64, f64, i64, i64) = sqlx::query_as(
+        "SELECT balance, frozen, balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
+    )
             .bind(user_id)
             .fetch_one(&pg)
             .await
             .expect("select after first upsert");
     assert!((row.0 - 1000.0).abs() < 1e-9);
     assert!((row.1 - 100.0).abs() < 1e-9);
+    assert_eq!(row.2, 100_000_000_000);
+    assert_eq!(row.3, 10_000_000_000);
 
     // Second set must overwrite.
     let f2 = PersistFrame::account_set(AccountSetPayload {
@@ -185,18 +192,23 @@ async fn account_set_upserts() {
         asset: pack_str("USDT"),
         balance: 900.0,
         frozen: 50.0,
+        balance_atoms: 90_000_000_000,
+        frozen_atoms: 5_000_000_000,
     });
     let mut batch = PgWriteBatch::new();
     assert!(batch.push(&f2));
     batch.flush(&pg).await.expect("flush update");
-    let row: (f64, f64) =
-        sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset='USDT'")
+    let row: (f64, f64, i64, i64) = sqlx::query_as(
+        "SELECT balance, frozen, balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
+    )
             .bind(user_id)
             .fetch_one(&pg)
             .await
             .expect("select after second upsert");
     assert!((row.0 - 900.0).abs() < 1e-9);
     assert!((row.1 - 50.0).abs() < 1e-9);
+    assert_eq!(row.2, 90_000_000_000);
+    assert_eq!(row.3, 5_000_000_000);
 
     cleanup(&pg, user_id).await;
 }
@@ -213,6 +225,8 @@ async fn failed_flush_retains_batch_for_retry() {
         asset: pack_str("USDT"),
         balance: 1000.0,
         frozen: 100.0,
+        balance_atoms: 100_000_000_000,
+        frozen_atoms: 10_000_000_000,
     });
     let mut batch = PgWriteBatch::new();
     assert!(batch.push(&f));

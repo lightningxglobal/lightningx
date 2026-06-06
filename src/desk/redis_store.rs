@@ -54,6 +54,53 @@ pub async fn store_persist_floors(
     Ok(())
 }
 
+/// HASH "user_id:op" → "tokens:last_update" (SharedRateLimiter persistence).
+pub const KEY_RATE_BUCKETS: &str = "ratelimit:buckets";
+
+/// Load persisted rate-limit buckets (process restart).
+pub async fn load_rate_buckets(
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> anyhow::Result<Vec<(i64, u8, f64, u64)>> {
+    let raw: std::collections::HashMap<String, String> = conn.hgetall(KEY_RATE_BUCKETS).await?;
+    let mut out = Vec::with_capacity(raw.len());
+    for (k, v) in raw {
+        let (Some((uid, op)), Some((tokens, ts))) = (k.split_once(':'), v.split_once(':')) else {
+            continue;
+        };
+        let (Ok(uid), Ok(op), Ok(tokens), Ok(ts)) = (
+            uid.parse::<i64>(),
+            op.parse::<u8>(),
+            tokens.parse::<f64>(),
+            ts.parse::<u64>(),
+        ) else {
+            continue;
+        };
+        out.push((uid, op, tokens, ts));
+    }
+    Ok(out)
+}
+
+/// Persist rate-limit buckets (periodic snapshot). TTL keeps the key from
+/// outliving a decommissioned desk.
+pub async fn store_rate_buckets(
+    conn: &mut redis::aio::MultiplexedConnection,
+    buckets: &[(i64, u8, f64, u64)],
+) -> anyhow::Result<()> {
+    if buckets.is_empty() {
+        return Ok(());
+    }
+    let items: Vec<(String, String)> = buckets
+        .iter()
+        .map(|&(uid, op, tokens, ts)| (format!("{uid}:{op}"), format!("{tokens}:{ts}")))
+        .collect();
+    let _: () = redis::pipe()
+        .hset_multiple(KEY_RATE_BUCKETS, &items)
+        .expire(KEY_RATE_BUCKETS, 3600)
+        .query_async(conn)
+        .await?;
+    Ok(())
+}
+
 pub fn key_order(id: i64) -> String {
     format!("order:{id}")
 }

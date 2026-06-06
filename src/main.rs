@@ -341,8 +341,15 @@ async fn main() -> anyhow::Result<()> {
         read_pool.market_senders(),
     ));
 
+    // Per-user order-entry rate limiter (WS_RL_* env; off by default).
+    // Restore persisted buckets so a restart doesn't mint fresh budgets.
+    let rate_limiter = std::sync::Arc::new(
+        lightning_exchange::rate_limit::SharedRateLimiter::from_env(),
+    );
+
     let state = AppState {
         db: Arc::new(pool),
+        rate_limiter: rate_limiter.clone(),
         engines: Some(Arc::new(engines)),
         market_fanout,
         public_market_data_enabled: true,

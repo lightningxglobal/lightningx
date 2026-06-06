@@ -239,6 +239,10 @@ pub struct AppState {
     pub valid_symbols: Arc<HashSet<String>>,
     /// Redis L1 read connection. None ⇒ no Redis at startup, REST falls back to PG.
     pub redis: Option<RedisConn>,
+    /// Per-user order-entry rate limiter, shared across WS connections and
+    /// REST handlers (see SharedRateLimiter). Disabled unless WS_RL_* env
+    /// vars are set.
+    pub rate_limiter: std::sync::Arc<crate::rate_limit::SharedRateLimiter>,
     /// PersistEvent publisher (Aeron IPC stream consumed by redis-writer).
     /// None ⇒ standalone mode without Aeron — REST POST will not publish.
     pub persist_pub: Option<PersistPubHandle>,
@@ -841,6 +845,16 @@ async fn handle_place_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(reason) = s
+        .rate_limiter
+        .try_consume(user_id, crate::rate_limit::OpClass::Place)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": reason})),
+        )
+            .into_response();
+    }
     if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
         return e.into_response();
     }
@@ -1460,6 +1474,16 @@ async fn handle_cancel_order(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
+    if let Err(reason) = s
+        .rate_limiter
+        .try_consume(user_id, crate::rate_limit::OpClass::Cancel)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": reason})),
+        )
+            .into_response();
+    }
     if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
         return e.into_response();
     }

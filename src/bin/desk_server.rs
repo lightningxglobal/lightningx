@@ -1712,8 +1712,49 @@ async fn async_main() -> anyhow::Result<()> {
         risk_engine.account_count()
     );
 
+    // Per-user order-entry rate limiter (WS_RL_* env; off by default).
+    // Restore persisted buckets so a restart doesn't mint fresh budgets,
+    // and snapshot them back to Redis every 2s.
+    let rate_limiter = std::sync::Arc::new(
+        lightning_exchange::rate_limit::SharedRateLimiter::from_env(),
+    );
+    if rate_limiter.is_enabled() {
+        if let Some(conn) = redis_conn.clone() {
+            let mut conn_restore = conn.clone();
+            match lightning_exchange::desk::redis_store::load_rate_buckets(&mut conn_restore).await
+            {
+                Ok(entries) if !entries.is_empty() => {
+                    rate_limiter.restore(&entries);
+                    tracing::info!("rate limiter: restored {} buckets", entries.len());
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("rate limiter: restore failed: {e}"),
+            }
+            let limiter_snap = rate_limiter.clone();
+            let mut conn_snap = conn;
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    tick.tick().await;
+                    let snapshot = limiter_snap.snapshot();
+                    if let Err(e) = lightning_exchange::desk::redis_store::store_rate_buckets(
+                        &mut conn_snap,
+                        &snapshot,
+                    )
+                    .await
+                    {
+                        tracing::warn!("rate limiter: snapshot failed: {e}");
+                    }
+                }
+            });
+        } else {
+            tracing::warn!("rate limiter enabled but Redis unavailable — buckets are memory-only");
+        }
+    }
+
     let state = AppState {
         db: Arc::new(pool),
+        rate_limiter: rate_limiter.clone(),
         engines: None,
         market_fanout: market_fanout.clone(),
         public_market_data_enabled,

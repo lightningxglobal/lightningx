@@ -686,6 +686,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_order_rejected(0, "Not authenticated")),
             };
+            if let Err(reason) = state
+                .rate_limiter
+                .try_consume(user_id, crate::rate_limit::OpClass::Place)
+            {
+                return Some(ws_sbe::encode_order_rejected(0, reason));
+            }
             let is_local_owner = is_user_owned_by_this_desk(state, user_id);
 
             // Client is responsible for ensuring client_order_id uniqueness
@@ -1634,6 +1640,12 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
+            if let Err(reason) = state
+                .rate_limiter
+                .try_consume(user_id, crate::rate_limit::OpClass::Cancel)
+            {
+                return Some(ws_sbe::encode_error(reason));
+            }
             let is_local_owner = is_user_owned_by_this_desk(state, user_id);
 
             // ── Aeron fast path: forward cancel immediately, no DB on the hot
@@ -1801,6 +1813,15 @@ async fn handle_client_message(
                 Some(id) => id,
                 None => return Some(ws_sbe::encode_error("Not authenticated")),
             };
+            // Batch costs one place-token per contained order.
+            for _ in 0..orders.len() {
+                if let Err(reason) = state
+                    .rate_limiter
+                    .try_consume(user_id, crate::rate_limit::OpClass::Place)
+                {
+                    return Some(ws_sbe::encode_error(reason));
+                }
+            }
             if !is_user_owned_by_this_desk(state, user_id) {
                 return Some(ws_sbe::encode_error(&wrong_counter_shard_message(
                     user_id,

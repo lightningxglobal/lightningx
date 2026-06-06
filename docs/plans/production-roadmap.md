@@ -7,16 +7,16 @@
 >
 > 图例：✅ 已完成 ｜ 🟡 部分完成 ｜ ⬜ 未开始
 
-## 进度跟踪（最近评估：2026-06-06 晚，HEAD `8a0d6e7`）
+## 进度跟踪（最近评估：2026-06-07，HEAD `eba79b7`）
 
 | 阶段 | 进度 | 本轮关键落地 |
 |------|------|-------------|
-| P1 资金定点化 | 🟡 ~65% | atoms 原生 settle/freeze API + i128 整数 cost（`b8d00f7`）；float_ext 死代码清除 |
-| P2 事件日志+序列号 | 🟡 ~35% | （本轮未动）OrderUpdate 序列号、`matching_events` 审计表、失败批次保留 |
-| P3 资金事务闭环 | 🟡 ~45% | synchronous_commit 强制 + 冻结/漂移不变量周期对账（`bb83e94`） |
-| P4 风控补全 | 🟡 ~70% | 价格带 fallback、单笔/挂单数上限全 O(1)、实时 STP 退役→离线稽查（`be64a6c`） |
+| P1 资金定点化 | 🟢 ~90% | orders/trades atoms 列+双写、整数 rules 换算、守恒 property 测试、API 字符串（`6155075`）。仅剩 legacy 列物理下线（等观察窗口） |
+| P2 事件日志+序列号 | 🟡 ~35% | （未动）下一优先：消费位点持久化 + Aeron Archive journal |
+| P3 资金事务闭环 | 🟡 ~45% | synchronous_commit 强制 + 五类不变量周期对账（`bb83e94`+`6155075`） |
+| P4 风控补全 | 🟢 ~95% | 头寸/敞口上限、熔断、per-symbol 价格带（`cc687bb`）。仅剩限流桶 Redis 持久化 |
 | P5 高可用 | 🔴 ~5% | 方案确定：Aeron Archive 做 journal/replay（见 P5 备注），Cluster 否决 |
-| P6 安全加固 | 🟡 ~25% | JWT secret 环境变量化 + symbol 严格校验（`8a0d6e7`） |
+| P6 安全加固 | 🟡 ~40% | JWT 环境变量化、symbol 校验（`8a0d6e7`）、22 个解码器敌意输入测试（`eba79b7`）。补齐计划见 P6 节 |
 
 **当前最关键缺口**：journal/WAL——方案已定为 Aeron Archive（fileSyncLevel=2），
 在它完成前，"已对外确认但不可恢复"的窗口始终存在。
@@ -91,7 +91,7 @@
 
 ---
 
-## Phase 1：资金正确性（阻塞级，最优先）— 🟡 ~50%
+## Phase 1：资金正确性（阻塞级，最优先）— 🟢 ~90%
 
 > **目标：系统里不再有任何用 `f64` 表示的钱。**
 > 这是改动面最大的一项，但必须最先做，因为后续所有阶段都建立在新数值类型上。
@@ -108,7 +108,10 @@
   完成（`checked_mul_scaled`，round-half-up）；f64 旧签名降级为边界薄包装，
   仅入口转换一次；legacy float8 列的写入值从 atoms 反推，两套列不可能分歧。
   资金守恒不变量有单元 + PG 集成测试覆盖。
-- ⬜ `SymbolRules`（`src/desk/symbol_rules.rs`）的 ticks↔amount 换算改整数运算。
+- ✅ `SymbolRules` 整数换算（`6155075`）：每 symbol 硬编码 `price_tick_atoms`/
+  `quantity_step_atoms` 整数孪生（守卫测试钉住与 f64 规则一致）；
+  ticks/lots↔atoms 全整数 checked 乘法；atoms→ticks/lots 用**整除对齐**替代
+  浮点 epsilon 检查。
 - ✅ 清理 `src/matching/float_ext.rs`（死代码，已删除）与 `engine.rs` 的
   误导性"浮点幽灵订单"注释（已改为整数语义的准确描述）。
 
@@ -116,20 +119,26 @@
 
 - ✅ 迁移 012：`accounts` 加 `balance_atoms/frozen_atoms BIGINT` 列 +
   非负/`frozen<=balance` CHECK 约束 + 存量数据换算。
-- ⬜ **剩余**：`orders.price/quantity/filled`、`trades.price/quantity/*_fee`、
-  `klines` 仍是 `DOUBLE PRECISION`（见 `migrations/001_initial.sql`、`005_klines.sql`）。
-- ⬜ legacy f64 `balance/frozen` 列仍在双写，需设定兼容窗口截止时间并下线。
-- ⬜ 迁移前后总额逐资产对账校验脚本（误差必须 = 0）。
+- ✅ 迁移 014（`6155075`）：orders/trades 全套 atoms 列 + 回填 + 非负约束；
+  pg-writer 双写（insert/fill/trade 全路径），新 `amount_atoms_invalid` 跳帧计数。
+  klines 为行情展示数据，不在资金语义范围内，维持 float8。
+- ⬜ **唯一剩余**：legacy f64 列物理下线。下线条件（写在迁移 014 注释里）：
+  reconcile 漂移告警连续 30 天为零 且 无任何读方依赖 float8 列。
+  到期动作：DROP COLUMN + `filled<=quantity` 升级为 CHECK + 持久化 payload 改携带
+  ticks/lots（随 P2 线格式升级一并做）。
+- ✅ 对账校验：reconcile 周期任务现覆盖 accounts/orders/trades 三表漂移 + 超额成交。
 
 ### 1.3 API/WS 边界
 
-- 🟡 `AmountAtoms::from_decimal_str/to_decimal_string` 已具备字符串边界能力。
-- ⬜ **剩余**：API/WS 出入参全面字符串化（行业惯例，避免 JSON number 精度坑）；
-  入参 decimals 超限拒绝而非静默舍入。
+- ✅ 出参（`6155075`）：`GET /api/balances` 返回 `balance_str/frozen_str/available_str`
+  精确字符串（旧数值字段保留兼容现有客户端，新客户端解析字符串）。
+- 🟡 入参：`from_decimal_str` 已具备（>8 位小数拒绝）；下单 price/qty 的字符串
+  入参接线留待客户端协调（破坏性 API 变更，单独排期）。
 
-**Gate 1**：`grep -rn "f64" src/desk/ src/types/` 中不再有任何资金语义字段；
-迁移前后全库资产总额逐资产 diff = 0；新增 property-based 测试
-（任意成交序列下 Σ(账户变动) + Σ(手续费) = 0，即资金守恒不变量）。⬜ 未达成
+**Gate 1**：`grep -rn "f64" src/desk/ src/types/` 中不再有任何资金语义字段（待 legacy
+列下线）；迁移前后全库资产总额逐资产 diff = 0；✅ property 测试已建并通过
+（`tests/settle_conservation.rs`：种子化 200 笔随机结算，base 守恒、quote 差额
+精确等于手续费、无残留冻结/负余额，全部 atoms 级断言）。🟡 部分达成
 
 ---
 
@@ -212,7 +221,7 @@
 
 ---
 
-## Phase 4：风控补全 — 🟡 ~70%
+## Phase 4：风控补全 — 🟢 ~95%
 
 > 相对独立，可与 Phase 2/3 并行。框架沿用 `src/desk/risk/`。
 > 硬性约束：热路径新增检查必须 O(1)。
@@ -225,7 +234,7 @@
 - ✅ **价格带保护 + fallback**（`a69bf07` + `be64a6c`）：双边盘取 mid，
   空盘/单边盘 fallback 最新成交价（开盘、流动性枯竭时段不再裸奔）；
   活跃 mid 存在时陈旧成交价不会撑大带宽；有 4 组单测。
-  - 🟡 剩余：band 按 symbol 配置进 `symbol_rules`（现为全引擎一个 env 值）。
+  - ✅ band 已进 `SymbolRules::price_band_bps`（`cc687bb`），env 变为全引擎覆盖项。
 - ✅ **单笔限额**（`be64a6c`）：`ENGINE_MAX_ORDER_LOTS`（市价/限价皆限）、
   `ENGINE_MAX_ORDER_NOTIONAL`（ticks×lots，i128 防溢出，仅限价）；O(1)；
   reject_reason 8；有单测含 i64::MAX 溢出用例。
@@ -236,8 +245,8 @@
 - ⬜ **熔断**：价格波动超阈值自动进入仅撤单模式；恢复用集合竞价或人工确认。
 - ⬜ `rate_limit.rs` 限流桶状态落 Redis（现内存态，重连即重置）；加 IP 维度与下单/撤单分桶。
 
-**Gate 4**：风控规则集有完整测试矩阵；模拟极端行情（闪崩脚本）下无穿仓、无异常成交。
-⬜ 未达成
+**Gate 4**：风控规则集有完整测试矩阵（限额边界/OI 生命周期/熔断触发与恢复均有
+单测）；⬜ 闪崩仿真脚本（端到端）未做——建议作为混沌测试阶段的一部分。
 
 ---
 
@@ -284,12 +293,29 @@
   共用入口 `normalize_order_shape` 单点生效；边界 16/17 字节有单测。
   - ⬜ 剩余：上限拓宽到 20（CompactString 内联）需联动全部 `[u8;16]` packed
     struct 与 risk-engine DashMap key，独立 PR。
-- ⬜ **fuzz**：所有 SBE 解码路径 fuzz 测试（cargo-fuzz）。
+- ✅ **解码健壮性（CI 层）**（`eba79b7`）：22 个解码入口 × 三类敌意语料
+  （随机垃圾 2000 例 / 全长度截断 / 全位翻转 + 非法 UTF-8），每次 cargo test
+  必跑，种子化可复现。
+  - ⬜ 剩余：cargo-fuzz 覆盖率导向长跑（nightly，复用同一入口清单，离线跑）。
 - ⬜ **可观测性**：Prometheus 指标（撮合延迟分位数、journal lag、消费位点滞后、
   对账 diff、ring 丢弃计数）、结构化日志、关键路径 trace（现有 `tracer.rs` 可扩展）。
 - ⬜ **审计**：登录/提现/管理操作审计日志（append-only）；管理后台双人复核。
 - ⬜ **合规预留**：KYC 钩子、地址筛查接口、监管报送数据导出（按目标司法辖区裁剪）。
 - ⬜ 渗透测试 + 第三方安全审计（上线前硬性要求）。
+
+### P6 补齐排期（按依赖与收益排序，预估 2026-06-07 制定）
+
+| # | 项 | 预估 | 要点 |
+|---|----|------|------|
+| 1 | API key HMAC 签名 | 2–3 天 | `api_keys` 表加 `secret` 列；请求带 `ts + HMAC-SHA256(secret, ts‖method‖path‖body)`；时戳偏差 >30s 拒绝（防重放）；与现有裸 api_key 并行一个弃用期 |
+| 2 | JWT 短期化 + refresh | 2 天 | access 15min + refresh 7d（旋转、可吊销，吊销表入 Redis）；WS 长连接在 token 过期时要求 re-auth 帧 |
+| 3 | Prometheus /metrics | 3–4 天 | `metrics` crate + exporter；每进程暴露：撮合 burst 分位数（已有统计直接导出）、ring 丢弃、persist 队列深度、flush 时延、reconcile violation 计数（应永远为 0 的告警指标）、WS 连接数 |
+| 4 | 审计日志 | 3 天 | append-only `audit_log` 表（actor/action/ip/detail/hash 链）+ 登录/注册/API key 操作埋点；提现埋点等钱包系统接入时加 |
+| 5 | cargo-fuzz 长跑 | 1 天搭 + 离线跑 | `fuzz/` crate，target 复用 `tests/sbe_robustness.rs` 的 `exercise_all_decoders`；nightly，CI 每夜 1h |
+| 6 | 限流桶 Redis 化（P4 尾巴） | 2 天 | 桶状态 `SETEX` 落 Redis（user 与 IP 双维度、下单/撤单分桶）；热路径仍内存判断，Redis 只做断连恢复源 |
+| 7 | 渗透测试 + 第三方审计 | 外部排期 | 上线 Gate，前置条件：1–4 完成 |
+
+合计内部工时约 2–2.5 周（1 人），可与 P2/P5 并行。
 
 ---
 
@@ -326,6 +352,17 @@
 
 ## 变更日志
 
+- **2026-06-07（HEAD `eba79b7`）**：P1/P4 收尾 + P6 推进（每 phase 独立提交，
+  全部带测试，热路径新增全 O(1)）：
+  - P1 `6155075`：orders/trades atoms 列（迁移 014）+ pg-writer 双写；SymbolRules
+    整数孪生与整除对齐换算；reconcile 扩展到三表漂移+超额成交；余额 API 字符串
+    字段；Gate-1 守恒 property 测试（200 随机结算 atoms 级守恒）通过。
+    P1 仅剩 legacy 列物理下线（等 30 天观察窗口）。
+  - P4 `cc687bb`：单用户头寸上限 + 全市场 OI 上限（增量 AtomicI64，两条下单路径
+    接线）；熔断状态机（仅撤单模式，reason 10）；价格带 per-symbol 化。
+    P4 仅剩限流桶 Redis 持久化。
+  - P6 `eba79b7`：22 个解码入口敌意输入测试（随机/截断/位翻转/非法 UTF-8）。
+    P6 剩余项排期见 P6 节表格。
 - **2026-06-06 晚（HEAD `8a0d6e7`）**：四个 phase 落地一批（每 phase 独立提交，
   全部带单元+集成测试，热路径新增逻辑全 O(1)）：
   - P1 `b8d00f7`：atoms 原生 settle/freeze API，cost 计算入 i128 整数域，

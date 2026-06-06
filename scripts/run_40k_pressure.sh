@@ -17,7 +17,8 @@ if $IS_LINUX; then
   # Isolated CPUs (isolcpus=0-11 at boot): aeronmd=0, engine=2, desk spin=4,6,8,10
   CPU_AERONMD="${CPU_AERONMD:-0}"
   CPU_ENGINE="${CPU_ENGINE:-2}"
-  CPU_DESK_SPIN=(4 8 4 8 4 8 4 8)  # only CPU4/CPU8 (adjacent to engine on CPU2)
+  # One spin thread per physical core: phys2=CPU4, phys3=CPU6, phys4=CPU8, phys5=CPU10, phys1=CPU3
+  CPU_DESK_SPIN=(4 6 8 10 3 4 6 8)
   CPU_OTHERS="${CPU_OTHERS:-20-31}"      # tokio workers + gateway + pressure clients
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
@@ -95,7 +96,7 @@ if $IS_LINUX; then
     pkill -f aeronmd 2>/dev/null || true
     sleep 1.5
     rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
-    env AERON_DIR="$AERON_DIR" taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
+    env AERON_DIR="$AERON_DIR" AERON_USE_HUGE_PAGES=1 taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
     pid=$!
     pids+=("$pid")
     for i in $(seq 1 20); do
@@ -110,12 +111,12 @@ fi
 if $IS_LINUX; then
   taskset -c "$CPU_ENGINE" \
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG="$ENGINE_RUST_LOG" TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    RUST_LOG="$ENGINE_RUST_LOG" TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 AERON_USE_HUGE_PAGES=1 \
     ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
     "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
 else
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG="$ENGINE_RUST_LOG" TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    RUST_LOG="$ENGINE_RUST_LOG" TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 AERON_USE_HUGE_PAGES=1 \
     ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
     "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
 fi
@@ -147,7 +148,7 @@ for ((i = 0; i < DESK_COUNT; i++)); do
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
       RUST_LOG="$DESK_RUST_LOG" TRACER_ENABLED="$TRACER_ENABLED" \
       COUNTER_FORWARD_DEBUG="$COUNTER_FORWARD_DEBUG" \
-      DESK_SPIN="${DESK_SPIN:-true}" DESK_SEND_CORE="$spin_cpu" \
+      DESK_SPIN="${DESK_SPIN:-true}" DESK_SEND_CORE="$spin_cpu" AERON_USE_HUGE_PAGES=1 \
       DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
       TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}" NOFILE_LIMIT=262144 \
       "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &

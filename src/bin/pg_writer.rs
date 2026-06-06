@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     let dropped_tx = dropped_pushes.clone();
     let aeron_dir_owned = dir.clone();
     std::thread::Builder::new()
-        .name("pg-writer-aeron".to_string())
+        .name("pgw-recv".to_string())
         .spawn(move || {
             let aeron =
                 Arc::new(AeronClient::new(&aeron_dir_owned).expect("AeronClient::new failed"));

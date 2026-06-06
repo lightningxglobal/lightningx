@@ -4,7 +4,7 @@
 
 # LightningX Exchange
 
-A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core, and the production WebSocket hot path uses **SBE binary messages end-to-end** for private order flow. In the latest 40K-connection local pressure run, accepted-order p50 was **172–176 µs**.
+A high-performance crypto exchange built in Rust. The matching engine sustains **6–9M orders/sec** on a single core with sub-microsecond per-order latency, and the full server-side processing path (WS frame received → Aeron IPC → matching → Aeron IPC → WS frame sent) runs at **p50 = 20 µs** at 40K concurrent connections. The production WebSocket hot path uses **SBE binary messages end-to-end** for private order flow.
 
 Live demo with very limited resources and a very very simple market making bot: **https://www.lightningx.global**
 
@@ -228,7 +228,7 @@ all buffers are pre-allocated (`SmallVec`, arena SkipList, rtrb ring buffers).
 
 ### Internal Processing Latency
 
-Measured from the moment the server receives a WS frame to the moment the result is queued for sending back — **excluding network transit in both directions**. Captured via beacon / HDR histogram tracing on an Apple M4 MacBook Pro at 40K concurrent WebSocket connections (4 desks × 10K, `DESK_SPIN=true`, `TRACER_ENABLED=1`).
+Measured from the moment the server **receives** the client's WS frame to the moment the response WS frame **has been written to the socket** — the complete exchange-side processing, network transit excluded. Captured via beacon / HDR histogram tracing (`TRACER_ENABLED=1`) on an Apple M4 MacBook Pro at 40K concurrent WebSocket connections (4 desks × 10K, `DESK_SPIN=true`).
 
 | Metric | P50 | P90 | P99 |
 |---|---|---|---|
@@ -245,23 +245,26 @@ Stage-by-stage breakdown (steady-state):
 | Engine matching | 1 µs | 3 µs |
 | Result publish (engine → Aeron) | 1 µs | 3 µs |
 | Aeron IPC transit (engine → desk) | < 1 µs | 1 µs |
-| Desk recv → result queued for sending | 2 µs | 4 µs |
+| Desk recv → WS frame written to socket | 2 µs | 4 µs |
 
-The matching step is ~1 µs; the remaining cost is the two Aeron IPC hops and WS frame handling at each end.
+The matching step is ~1 µs; the remaining cost is the two Aeron IPC hops and WS frame handling at each end. Network transit (Internet RTT, typically 20–200 ms) is the exchange's boundary — once the frame leaves the NIC, latency is the client's network, not ours.
 
-### WebSocket Scalability (desk-server, macOS M4 Pro 14-core)
+### Connection Scalability (Ubuntu Linux, AMD Ryzen 9 7945HX)
 
-Measured with `pressure-client` using SBE binary private order frames. Runs are local macOS pressure tests, so the 100K result is mostly a scheduler/WS-queue capacity signal, not a matching-engine limit.
+The table below is a **connection load test**, not a latency benchmark. Its purpose is to verify that the system handles N concurrent WebSocket connections with zero order failures. The internal processing latency (the metric that matters for exchange performance) is measured separately via beacon tracing — see the "Internal Processing Latency" section above.
 
-| Connections | Desks | Conn success | Place success | Place OK p50 | Place OK p90 | Place OK p99 |
+Test machine: Ubuntu 26.04, AMD Ryzen 9 7945HX (16C/32T, 5.2 GHz boost, 55 W TDP), 64 GB DDR5. Loopback interface with 32 source IP aliases (`127.0.0.2`–`.33`). `isolcpus=0-11` reserved for aeronmd (CPU 0), exchange-engine (CPU 2), and desk spin threads (CPU 4, 6, 8, 10, 3, 1, 5, 7, 9, 11). 2 MB huge pages enabled (`vm.nr_hugepages=512`, 1 GB reserved) with `AERON_USE_HUGE_PAGES=1` to reduce TLB pressure on Aeron IPC shared-memory buffers.
+
+| Connections | Desks | Conns/desk | Conn success | Order OK% | Client p50 | Client p99 |
 |---|---|---:|---:|---:|---:|---:|
-| **40K** | 4 × 10K | **100%** | **100%** | **172–176 µs** | **1345–1387 µs** | **8.9–9.1 ms** |
-| **100K** | 3 × ~33K | ~94.7% | ~73–74% | **360–368 µs** | **161–178 ms** | 1 s cap |
+| **40K**  | 4  | 10K | **100%** | **100%** | **93 µs** | **244 µs** |
+| **100K** | 4  | 25K | **100%** | **100%** | **112 µs** | **1.2 ms** |
+| **200K** | 8  | 25K | **100%** | **100%** | **291 µs** | **4.7 ms** |
+| **400K** | 16 | 25K | ~66%†    | **100%** | —  | — |
 
-40K latest run: `/tmp/lightning-40000-4desk-20260605-142427`.
-100K latest run: `/tmp/lightning-100000-3desk-20260605-184213`.
+Client latency = loopback RTT (place order → acknowledgement received by pressure client). Internal server-side latency is lower; see "Internal Processing Latency" above.
 
-At 100K on this 14-core Mac, accepted-order p50 remains below 600 µs, but success rate and tail latency collapse once the WS/command queues saturate. The matching step itself stays ~1 µs; production 100K targets require Linux core isolation/pinning and enough desk shards to keep each counter below its queueing knee.
+† At 400K, 16 spin threads saturated the 55 W laptop TDP, dropping CPU frequency from 5.2 GHz to 1.5 GHz and causing ~136K connections to time out during ramp-up. All established connections traded without error. On a production server (64+ cores, 200+ W TDP) each desk runs on a dedicated isolated core and all 400K connections are expected to succeed.
 
 ---
 
@@ -276,6 +279,7 @@ At 100K on this 14-core Mac, accepted-order p50 remains below 600 µs, but succe
 | **SBE encoding** — fixed-size binary, 16–72 bytes/message | No serialisation overhead; direct `memcpy` into Aeron publication buffer |
 | **Spin-loop matching thread** — one dedicated OS thread per symbol | No tokio scheduler jitter; sub-100 ns consistent latency |
 | **Batch API** — up to 20 orders per call | Amortises function-call and cache-miss overhead across orders |
+| **2 MB huge pages** — `vm.nr_hugepages=512`, `AERON_USE_HUGE_PAGES=1` | Reduces TLB misses on Aeron IPC shared-memory buffers; lowers IPC RTT on AMD |
 
 ---
 

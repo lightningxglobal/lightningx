@@ -27,7 +27,9 @@ if $IS_LINUX; then
   AERON_BIN="${AERON_BIN:-$HOME/work/3party/aeron/cppbuild/Release/binaries/aeronmd}"
   CPU_AERONMD="${CPU_AERONMD:-0}"
   CPU_ENGINE="${CPU_ENGINE:-2}"
-  CPU_DESK_SPIN=(4 8 4 8 4 8 4 8)  # only CPU4/CPU8 (adjacent to engine on CPU2)
+  # 8 desks: each gets a dedicated spin CPU from isolated pool
+  # Pairs sharing physical core: (4,5) (6,7) — acceptable at 25K/desk load
+  CPU_DESK_SPIN=(4 6 8 10 3 1 5 7)
   CPU_OTHERS="${CPU_OTHERS:-20-31}"
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
@@ -37,7 +39,7 @@ TOTAL_CONNS="${TOTAL_CONNS:-200000}"
 DESK_COUNT="${DESK_COUNT:-8}"
 TRACER_ENABLED="${TRACER_ENABLED:-0}"
 DESK_SPIN="${DESK_SPIN:-true}"
-CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
+CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-25000}"
 LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
 
 ENGINE_BIN="${ENGINE_BIN:-$BIN_DIR/exchange-engine}"
@@ -108,7 +110,7 @@ if $IS_LINUX; then
     pkill -f aeronmd 2>/dev/null || true
     sleep 1.5
     rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
-    env AERON_DIR="$AERON_DIR" taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
+    env AERON_DIR="$AERON_DIR" AERON_USE_HUGE_PAGES=1 taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
     pids+=("$!")
     for i in $(seq 1 20); do
       [[ -f "$AERON_DIR/cnc.dat" ]] && break; sleep 1.5
@@ -122,12 +124,12 @@ fi
 if $IS_LINUX; then
   taskset -c "$CPU_ENGINE" \
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 AERON_USE_HUGE_PAGES=1 \
     ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
     "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
 else
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 AERON_USE_HUGE_PAGES=1 \
     ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
     "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
 fi
@@ -140,11 +142,11 @@ if [[ -x "$GATEWAY_BIN" ]]; then
   if $IS_LINUX; then
     taskset -c "$CPU_OTHERS" \
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG=warning \
+      RUST_LOG=warning MARKET_DATA_PORT=4020 \
       "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
   else
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG=warning \
+      RUST_LOG=warning MARKET_DATA_PORT=4020 \
       "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
   fi
   pids+=("$!")

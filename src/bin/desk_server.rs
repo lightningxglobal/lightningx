@@ -1473,10 +1473,11 @@ async fn async_main() -> anyhow::Result<()> {
         let persist_spin = std::env::var("PERSIST_SPIN")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let thread_name_persist = format!("d{desk_id}-persist");
         std::thread::Builder::new()
-            .name("persist-send".to_string())
+            .name(thread_name_persist.clone())
             .spawn(move || {
-                pin_current_thread_to_core("DESK_PERSIST_CORE", "persist-send");
+                pin_current_thread_to_core("DESK_PERSIST_CORE", &thread_name_persist);
                 let mut idle_us: u64 = 10;
                 loop {
                     let mut did_work = false;
@@ -1795,10 +1796,11 @@ async fn async_main() -> anyhow::Result<()> {
             .unwrap_or(256);
         let mut counter_forward_cmd_pubs = send_cf_cmd_pubs;
         let mut counter_forward_resp_pubs = send_cf_resp_pubs;
+        let thread_name_send = format!("d{desk_id}-send");
         std::thread::Builder::new()
-            .name("aeron-send".to_string())
+            .name(thread_name_send.clone())
             .spawn(move || {
-                pin_current_thread_to_core("DESK_SEND_CORE", "aeron-send");
+                pin_current_thread_to_core("DESK_SEND_CORE", &thread_name_send);
                 let mut idle_us: u64 = 0;
                 let mut metric_last = std::time::Instant::now();
                 let mut metric_drained: u64 = 0;
@@ -2194,10 +2196,11 @@ async fn async_main() -> anyhow::Result<()> {
         let rt_pub = tokio::runtime::Handle::current();
         let order_meta_cache_pub = open_order_meta.clone();
         let risk_engine_pub = state.risk_engine.clone();
+        let thread_name_recv_pub = format!("d{desk_id}-recv-pub");
         std::thread::Builder::new()
-            .name("aeron-recv-public".to_string())
+            .name(thread_name_recv_pub.clone())
             .spawn(move || {
-                pin_current_thread_to_core("DESK_RECV_PUBLIC_CORE", "aeron-recv-public");
+                pin_current_thread_to_core("DESK_RECV_PUBLIC_CORE", &thread_name_recv_pub);
                 let mut live_market_data = LiveMarketData::default();
                 let mut settle_batch: [SettleTradeEntry; 64] = [SettleTradeEntry {
                     taker_id: 0, maker_id: 0, taker_uid: 0, maker_uid: 0,
@@ -2406,10 +2409,11 @@ async fn async_main() -> anyhow::Result<()> {
             .collect();
         let risk_engine = state.risk_engine.clone();
 
+        let thread_name_recv = format!("d{desk_id}-recv");
         std::thread::Builder::new()
-            .name("aeron-recv".to_string())
+            .name(thread_name_recv.clone())
             .spawn(move || {
-                pin_current_thread_to_core("DESK_RECV_CORE", "aeron-recv");
+                pin_current_thread_to_core("DESK_RECV_CORE", &thread_name_recv);
                 let mut idle_us: u64 = 0;
                 let counter_forward_response_failures = AtomicU64::new(0);
                 let mut counter_forward_resp_pubs = recv_cf_resp_pubs;

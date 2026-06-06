@@ -595,7 +595,7 @@ fn spawn_aeron_public_loop(state: AppState) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("DeskDepthSubscriber: {}", e))?;
 
     std::thread::Builder::new()
-        .name("market-aeron-public".to_string())
+        .name("mdg-recv".to_string())
         .spawn(move || {
             let mut live_market_data = LiveMarketData::default();
             let mut idle_us: u64 = 0;

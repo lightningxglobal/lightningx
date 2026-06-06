@@ -24,17 +24,19 @@ if $IS_LINUX; then
   AERON_BIN="${AERON_BIN:-$HOME/work/3party/aeron/cppbuild/Release/binaries/aeronmd}"
   CPU_AERONMD="${CPU_AERONMD:-0}"
   CPU_ENGINE="${CPU_ENGINE:-2}"
-  CPU_DESK_SPIN=(4 8 4 8 4 8 4 8)  # only CPU4/CPU8 (adjacent to engine on CPU2)
+  # 16 desks: isolated first (each its own CPU), then non-isolated
+  # isolated: CPU4,6,8,10,3,1,5,7,9,11 (10 CPUs)  non-isolated: CPU20,22,24,26,28,30
+  CPU_DESK_SPIN=(4 6 8 10 3 1 5 7 9 11 20 22 24 26 28 30)
   CPU_OTHERS="${CPU_OTHERS:-20-31}"
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
 fi
 TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_400k.csv}"
 TOTAL_CONNS="${TOTAL_CONNS:-400000}"
-DESK_COUNT="${DESK_COUNT:-8}"
+DESK_COUNT="${DESK_COUNT:-16}"
 TRACER_ENABLED="${TRACER_ENABLED:-0}"
 DESK_SPIN="${DESK_SPIN:-true}"
-CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
+CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-50000}"
 LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
 
 ENGINE_BIN="${ENGINE_BIN:-$BIN_DIR/exchange-engine}"
@@ -52,7 +54,7 @@ SOURCE_IP_POOL=(
   127.0.0.26 127.0.0.27 127.0.0.28 127.0.0.29
   127.0.0.30 127.0.0.31 127.0.0.32 127.0.0.33
 )
-PORTS=(4003 4004 4005 4006 4007 4008 4009 4010)
+PORTS=(4003 4004 4005 4006 4007 4008 4009 4010 4011 4012 4013 4014 4015 4016 4017 4018)
 
 # ── Validation ────────────────────────────────────────────────────────────
 if (( DESK_COUNT < 1 || DESK_COUNT > ${#PORTS[@]} )); then
@@ -109,7 +111,7 @@ if $IS_LINUX; then
     pkill -f aeronmd 2>/dev/null || true
     sleep 1.5
     rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
-    env AERON_DIR="$AERON_DIR" taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
+    env AERON_DIR="$AERON_DIR" AERON_USE_HUGE_PAGES=1 taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
     pids+=("$!")
     for i in $(seq 1 20); do
       [[ -f "$AERON_DIR/cnc.dat" ]] && break; sleep 1.5
@@ -124,6 +126,7 @@ if $IS_LINUX; then
   taskset -c "$CPU_ENGINE" \
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
     RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    AERON_USE_HUGE_PAGES=1 \
     ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
     "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
 else
@@ -141,11 +144,11 @@ if [[ -x "$GATEWAY_BIN" ]]; then
   if $IS_LINUX; then
     taskset -c "$CPU_OTHERS" \
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG=warning \
+      RUST_LOG=warning MARKET_DATA_PORT=4020 \
       "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
   else
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG=warning \
+      RUST_LOG=warning MARKET_DATA_PORT=4020 \
       "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
   fi
   pids+=("$!")
@@ -160,6 +163,7 @@ for ((i = 0; i < DESK_COUNT; i++)); do
       RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
       DESK_SPIN="$DESK_SPIN" DESK_SEND_CORE="$spin_cpu" \
       DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
+      AERON_USE_HUGE_PAGES=1 \
       TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288 \
       "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
     echo "desk-$i  spin_cpu=$spin_cpu  port=${PORTS[$i]}"

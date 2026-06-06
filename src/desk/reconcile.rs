@@ -52,11 +52,26 @@ pub struct ReconcileReport {
     pub hanging_frozen: Vec<HangingFrozenRow>,
     pub atoms_drift_total: i64,
     pub atoms_drift: Vec<AtomsDriftRow>,
+    /// orders rows whose float and atoms columns disagree (sample of ids).
+    pub orders_drift_total: i64,
+    pub orders_drift_ids: Vec<i64>,
+    /// trades rows whose float and atoms columns disagree (sample of ids).
+    pub trades_drift_total: i64,
+    pub trades_drift_ids: Vec<i64>,
+    /// orders with filled_atoms > quantity_atoms — over-fill is a settlement
+    /// bug. Monitored here instead of a CHECK constraint during the
+    /// dual-write window (see migration 014).
+    pub orders_overfill_total: i64,
+    pub orders_overfill_ids: Vec<i64>,
 }
 
 impl ReconcileReport {
     pub fn is_clean(&self) -> bool {
-        self.hanging_frozen_total == 0 && self.atoms_drift_total == 0
+        self.hanging_frozen_total == 0
+            && self.atoms_drift_total == 0
+            && self.orders_drift_total == 0
+            && self.trades_drift_total == 0
+            && self.orders_overfill_total == 0
     }
 }
 
@@ -104,6 +119,60 @@ pub async fn check_account_invariants(pool: &PgPool) -> Result<ReconcileReport> 
                FROM accounts
               WHERE {drift_filter}
               ORDER BY user_id LIMIT {REPORT_ROW_LIMIT}"
+        ))
+        .fetch_all(pool)
+        .await?;
+    }
+
+    // -- Check 3: orders float/atoms drift + over-fill ----------------------
+    let orders_drift_filter = format!(
+        "ABS(ROUND(quantity * {scale}) - quantity_atoms) > {tol}
+          OR ABS(ROUND(filled * {scale}) - filled_atoms) > {tol}
+          OR (price IS NOT NULL AND price_atoms IS NOT NULL
+              AND ABS(ROUND(price * {scale}) - price_atoms) > {tol})",
+        scale = AMOUNT_SCALE,
+        tol = DRIFT_TOLERANCE_ATOMS,
+    );
+    report.orders_drift_total = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COUNT(*) FROM orders WHERE {orders_drift_filter}"
+    ))
+    .fetch_one(pool)
+    .await?;
+    if report.orders_drift_total > 0 {
+        report.orders_drift_ids = sqlx::query_scalar(&format!(
+            "SELECT id FROM orders WHERE {orders_drift_filter} ORDER BY id LIMIT {REPORT_ROW_LIMIT}"
+        ))
+        .fetch_all(pool)
+        .await?;
+    }
+
+    report.orders_overfill_total =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM orders WHERE filled_atoms > quantity_atoms")
+            .fetch_one(pool)
+            .await?;
+    if report.orders_overfill_total > 0 {
+        report.orders_overfill_ids = sqlx::query_scalar(&format!(
+            "SELECT id FROM orders WHERE filled_atoms > quantity_atoms ORDER BY id LIMIT {REPORT_ROW_LIMIT}"
+        ))
+        .fetch_all(pool)
+        .await?;
+    }
+
+    // -- Check 4: trades float/atoms drift ---------------------------------
+    let trades_drift_filter = format!(
+        "ABS(ROUND(price * {scale}) - price_atoms) > {tol}
+          OR ABS(ROUND(quantity * {scale}) - quantity_atoms) > {tol}",
+        scale = AMOUNT_SCALE,
+        tol = DRIFT_TOLERANCE_ATOMS,
+    );
+    report.trades_drift_total = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COUNT(*) FROM trades WHERE {trades_drift_filter}"
+    ))
+    .fetch_one(pool)
+    .await?;
+    if report.trades_drift_total > 0 {
+        report.trades_drift_ids = sqlx::query_scalar(&format!(
+            "SELECT id FROM trades WHERE {trades_drift_filter} ORDER BY id LIMIT {REPORT_ROW_LIMIT}"
         ))
         .fetch_all(pool)
         .await?;

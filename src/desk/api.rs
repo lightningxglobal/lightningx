@@ -445,6 +445,22 @@ fn cache_set_snapshot(cache: &AccountCache, user_id: i64, asset: &str, snapshot:
         .insert(asset.to_string(), snapshot);
 }
 
+/// Balance response shape. The numeric fields are kept for existing
+/// clients; the `*_str` twins are exact decimal renderings of the atom
+/// values (industry convention — JSON numbers lose precision past 2^53).
+/// New clients should parse the strings.
+fn balance_json(asset: &str, amount: AccountBalance) -> Value {
+    json!({
+        "asset":         asset,
+        "balance":       amount.balance(),
+        "frozen":        amount.frozen(),
+        "available":     amount.available(),
+        "balance_str":   AmountAtoms::from_atoms(amount.balance_atoms).to_decimal_string(),
+        "frozen_str":    AmountAtoms::from_atoms(amount.frozen_atoms).to_decimal_string(),
+        "available_str": AmountAtoms::from_atoms(amount.available_atoms()).to_decimal_string(),
+    })
+}
+
 async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match auth_user(&headers) {
         Ok(id) => id,
@@ -458,16 +474,7 @@ async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl 
     if let Some(assets) = s.account_cache.get(&user_id) {
         let accounts: Vec<Value> = assets
             .iter()
-            .map(|(asset, amount)| {
-                let balance = amount.balance();
-                let frozen = amount.frozen();
-                json!({
-                    "asset":     asset,
-                    "balance":   balance,
-                    "frozen":    frozen,
-                    "available": amount.available(),
-                })
-            })
+            .map(|(asset, amount)| balance_json(asset, *amount))
             .collect();
         return (StatusCode::OK, Json(json!(accounts))).into_response();
     }
@@ -477,13 +484,13 @@ async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl 
     match repo.get_all_accounts(user_id).await {
         Ok(accounts) => {
             let mut entry = s.account_cache.entry(user_id).or_insert_with(HashMap::new);
+            let mut out = Vec::with_capacity(accounts.len());
             for a in &accounts {
-                entry.insert(
-                    a.asset.clone(),
-                    AccountBalance::from_atoms(a.balance_atoms, a.frozen_atoms),
-                );
+                let snapshot = AccountBalance::from_atoms(a.balance_atoms, a.frozen_atoms);
+                entry.insert(a.asset.clone(), snapshot);
+                out.push(balance_json(&a.asset, snapshot));
             }
-            (StatusCode::OK, Json(json!(accounts))).into_response()
+            (StatusCode::OK, Json(json!(out))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

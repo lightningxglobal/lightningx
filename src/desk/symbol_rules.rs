@@ -1,9 +1,15 @@
+use crate::desk::money::AmountAtoms;
 use crate::order::{Side, TimeInForce};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SymbolRules {
     pub price_tick: f64,
     pub quantity_step: f64,
+    /// price_tick expressed in atoms (1e-8). Integer twin of `price_tick`,
+    /// hardcoded per symbol so tick↔atoms conversion never touches f64.
+    pub price_tick_atoms: i64,
+    /// quantity_step expressed in atoms (1e-8). Integer twin of `quantity_step`.
+    pub quantity_step_atoms: i64,
     pub min_notional: f64,
     /// notional_cents = price_ticks * qty_lots / notional_scale
     pub notional_scale: i64,
@@ -62,6 +68,8 @@ impl SymbolRules {
             "BTC_USDT" => Self {
                 price_tick: 0.01,
                 quantity_step: 0.000001,
+                price_tick_atoms: 1_000_000,
+                quantity_step_atoms: 100,
                 min_notional: 5.0,
                 notional_scale: 1_000_000,
                 default_leverage: 10,
@@ -71,6 +79,8 @@ impl SymbolRules {
             "ETH_USDT" => Self {
                 price_tick: 0.01,
                 quantity_step: 0.0001,
+                price_tick_atoms: 1_000_000,
+                quantity_step_atoms: 10_000,
                 min_notional: 5.0,
                 notional_scale: 10_000,
                 default_leverage: 10,
@@ -80,6 +90,8 @@ impl SymbolRules {
             "SOL_USDT" => Self {
                 price_tick: 0.001,
                 quantity_step: 0.001,
+                price_tick_atoms: 100_000,
+                quantity_step_atoms: 100_000,
                 min_notional: 5.0,
                 notional_scale: 10_000,
                 default_leverage: 10,
@@ -89,6 +101,8 @@ impl SymbolRules {
             _ => Self {
                 price_tick: 0.01,
                 quantity_step: 0.000001,
+                price_tick_atoms: 1_000_000,
+                quantity_step_atoms: 100,
                 min_notional: 1.0,
                 notional_scale: 1_000_000,
                 default_leverage: 10,
@@ -116,6 +130,49 @@ impl SymbolRules {
 
     pub fn lots_to_quantity(self, lots: i64) -> f64 {
         lots as f64 * self.quantity_step
+    }
+
+    // ── Integer-domain conversions (no f64 anywhere) ─────────────────────
+
+    /// ticks → price atoms, exact: ticks × price_tick_atoms (checked).
+    pub fn ticks_to_price_atoms(self, ticks: i64) -> Result<AmountAtoms, &'static str> {
+        ticks
+            .checked_mul(self.price_tick_atoms)
+            .map(AmountAtoms::from_atoms)
+            .ok_or("price overflows atoms")
+    }
+
+    /// lots → quantity atoms, exact: lots × quantity_step_atoms (checked).
+    pub fn lots_to_quantity_atoms(self, lots: i64) -> Result<AmountAtoms, &'static str> {
+        lots.checked_mul(self.quantity_step_atoms)
+            .map(AmountAtoms::from_atoms)
+            .ok_or("quantity overflows atoms")
+    }
+
+    /// price atoms → ticks. Exact-division requirement replaces the float
+    /// epsilon alignment check: a price parsed from a decimal string is on
+    /// the tick grid iff atoms % tick_atoms == 0.
+    pub fn price_atoms_to_ticks(self, atoms: AmountAtoms) -> Result<i64, &'static str> {
+        let a = atoms.atoms();
+        if a <= 0 {
+            return Err("price must be > 0");
+        }
+        if a % self.price_tick_atoms != 0 {
+            return Err("price does not match tick size");
+        }
+        Ok(a / self.price_tick_atoms)
+    }
+
+    /// quantity atoms → lots, exact division (see price_atoms_to_ticks).
+    pub fn quantity_atoms_to_lots(self, atoms: AmountAtoms) -> Result<i64, &'static str> {
+        let a = atoms.atoms();
+        if a <= 0 {
+            return Err("quantity must be > 0");
+        }
+        if a % self.quantity_step_atoms != 0 {
+            return Err("quantity does not match lot size");
+        }
+        Ok(a / self.quantity_step_atoms)
     }
 }
 
@@ -207,6 +264,59 @@ pub fn validate_order_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atoms_twins_match_float_rules_for_all_symbols() {
+        // Guard: if someone edits price_tick/quantity_step without updating
+        // the integer twin, this catches the divergence.
+        for sym in ["BTC_USDT", "ETH_USDT", "SOL_USDT", "OTHER"] {
+            let r = SymbolRules::for_symbol(sym);
+            assert_eq!(
+                AmountAtoms::from_f64_round(r.price_tick).unwrap().atoms(),
+                r.price_tick_atoms,
+                "price tick twin mismatch for {sym}"
+            );
+            assert_eq!(
+                AmountAtoms::from_f64_round(r.quantity_step).unwrap().atoms(),
+                r.quantity_step_atoms,
+                "quantity step twin mismatch for {sym}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_conversions_are_exact_and_roundtrip() {
+        let r = SymbolRules::for_symbol("BTC_USDT");
+
+        // 75893.61 → 7_589_361 ticks → back to atoms, exactly.
+        let price = AmountAtoms::from_decimal_str("75893.61").unwrap();
+        let ticks = r.price_atoms_to_ticks(price).unwrap();
+        assert_eq!(ticks, 7_589_361);
+        assert_eq!(r.ticks_to_price_atoms(ticks).unwrap(), price);
+
+        // 0.00123456 BTC → 1234.56 lots? No: step 1e-6 → 1234.56 is OFF-grid.
+        // 0.001234 → 1234 lots, exact.
+        let qty = AmountAtoms::from_decimal_str("0.001234").unwrap();
+        let lots = r.quantity_atoms_to_lots(qty).unwrap();
+        assert_eq!(lots, 1234);
+        assert_eq!(r.lots_to_quantity_atoms(lots).unwrap(), qty);
+
+        // Off-grid values are rejected by exact division, no epsilon.
+        let off_tick = AmountAtoms::from_decimal_str("75893.611").unwrap();
+        assert_eq!(
+            r.price_atoms_to_ticks(off_tick).unwrap_err(),
+            "price does not match tick size"
+        );
+        let off_step = AmountAtoms::from_decimal_str("0.0012345").unwrap();
+        assert_eq!(
+            r.quantity_atoms_to_lots(off_step).unwrap_err(),
+            "quantity does not match lot size"
+        );
+
+        // Zero/negative rejected; overflow checked.
+        assert!(r.price_atoms_to_ticks(AmountAtoms::ZERO).is_err());
+        assert!(r.ticks_to_price_atoms(i64::MAX).is_err());
+    }
 
     #[test]
     fn symbol_validation_rejects_overlong_and_junk_input() {

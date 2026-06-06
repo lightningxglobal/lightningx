@@ -232,9 +232,26 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Ok(report) => {
                     error!(
-                        "reconcile: INVARIANT VIOLATIONS — hanging_frozen={} atoms_drift={}",
-                        report.hanging_frozen_total, report.atoms_drift_total,
+                        "reconcile: INVARIANT VIOLATIONS — hanging_frozen={} atoms_drift={} \
+                         orders_drift={} trades_drift={} orders_overfill={}",
+                        report.hanging_frozen_total,
+                        report.atoms_drift_total,
+                        report.orders_drift_total,
+                        report.trades_drift_total,
+                        report.orders_overfill_total,
                     );
+                    if !report.orders_drift_ids.is_empty() {
+                        error!("reconcile: orders drift ids={:?}", report.orders_drift_ids);
+                    }
+                    if !report.trades_drift_ids.is_empty() {
+                        error!("reconcile: trades drift ids={:?}", report.trades_drift_ids);
+                    }
+                    if !report.orders_overfill_ids.is_empty() {
+                        error!(
+                            "reconcile: orders OVER-FILL ids={:?}",
+                            report.orders_overfill_ids
+                        );
+                    }
                     for r in &report.hanging_frozen {
                         error!(
                             "reconcile: hanging freeze user={} asset={} frozen_atoms={}",

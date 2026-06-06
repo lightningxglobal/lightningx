@@ -48,6 +48,12 @@ fn from_unix_ms(ms: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(ms).single()
 }
 
+/// Boundary f64 → atoms. None on non-finite/out-of-range input; callers
+/// skip the frame and bump `amount_atoms_invalid`.
+fn to_atoms(value: f64) -> Option<i64> {
+    AmountAtoms::from_f64_round(value).ok().map(|a| a.atoms())
+}
+
 /// Decoded upsert row, ready for batch SQL.
 struct UpsertRow {
     id: i64,
@@ -58,6 +64,12 @@ struct UpsertRow {
     price: Option<f64>,
     quantity: f64,
     filled: f64,
+    /// Fixed-point twins, derived once at row construction (the persist
+    /// payload still carries f64 — carrying ticks/lots natively is part of
+    /// the P2 wire upgrade). Authoritative columns in PG.
+    price_atoms: Option<i64>,
+    quantity_atoms: i64,
+    filled_atoms: i64,
     status: &'static str,
     freeze_price: f64,
     client_order_id: Option<String>,
@@ -67,6 +79,7 @@ struct UpsertRow {
 struct FillRow {
     id: i64,
     filled: f64,
+    filled_atoms: i64,
     status: &'static str,
 }
 
@@ -85,6 +98,8 @@ struct TradeRow {
     symbol: String,
     price: f64,
     qty: f64,
+    price_atoms: i64,
+    qty_atoms: i64,
     created_at: DateTime<Utc>,
 }
 
@@ -119,6 +134,8 @@ pub struct SkipCounts {
     pub matching_empty_symbol: u64,
     pub matching_bad_timestamp: u64,
     pub payload_decode_failed: u64,
+    /// f64 → atoms conversion failed (non-finite or beyond i64 atoms range).
+    pub amount_atoms_invalid: u64,
 }
 
 impl SkipCounts {
@@ -134,6 +151,7 @@ impl SkipCounts {
             + self.matching_empty_symbol
             + self.matching_bad_timestamp
             + self.payload_decode_failed
+            + self.amount_atoms_invalid
     }
 }
 
@@ -282,6 +300,22 @@ impl PgWriteBatch {
         // price=0 is the documented sentinel for "market order" (NULL in PG).
         let pg_price = if price == 0.0 { None } else { Some(price) };
         let coid_opt = if coid.is_empty() { None } else { Some(coid) };
+        let (Some(quantity_atoms), Some(filled_atoms)) = (to_atoms(qty), to_atoms(filled)) else {
+            self.skipped += 1;
+            self.skip_counts.amount_atoms_invalid += 1;
+            return false;
+        };
+        let price_atoms = match pg_price {
+            None => None,
+            Some(v) => match to_atoms(v) {
+                Some(a) => Some(a),
+                None => {
+                    self.skipped += 1;
+                    self.skip_counts.amount_atoms_invalid += 1;
+                    return false;
+                }
+            },
+        };
         self.upserts.push(UpsertRow {
             id,
             user_id,
@@ -291,6 +325,9 @@ impl PgWriteBatch {
             price: pg_price,
             quantity: qty,
             filled,
+            price_atoms,
+            quantity_atoms,
+            filled_atoms,
             status,
             freeze_price,
             client_order_id: coid_opt,
@@ -312,7 +349,17 @@ impl PgWriteBatch {
             self.skip_counts.fill_bad_status += 1;
             return false;
         };
-        self.fills.push(FillRow { id, filled, status });
+        let Some(filled_atoms) = to_atoms(filled) else {
+            self.skipped += 1;
+            self.skip_counts.amount_atoms_invalid += 1;
+            return false;
+        };
+        self.fills.push(FillRow {
+            id,
+            filled,
+            filled_atoms,
+            status,
+        });
         true
     }
 
@@ -376,12 +423,19 @@ impl PgWriteBatch {
             self.skip_counts.trade_bad_timestamp += 1;
             return false;
         };
+        let (Some(price_atoms), Some(qty_atoms)) = (to_atoms(price), to_atoms(qty)) else {
+            self.skipped += 1;
+            self.skip_counts.amount_atoms_invalid += 1;
+            return false;
+        };
         self.trades.push(TradeRow {
             buy_order_id,
             sell_order_id,
             symbol,
             price,
             qty,
+            price_atoms,
+            qty_atoms,
             created_at,
         });
         true
@@ -446,6 +500,7 @@ impl PgWriteBatch {
         client_order_id: Option<String>,
         created_at: DateTime<Utc>,
     ) {
+        let price_atoms = price.and_then(to_atoms);
         self.upserts.push(UpsertRow {
             id,
             user_id,
@@ -455,6 +510,9 @@ impl PgWriteBatch {
             price,
             quantity,
             filled,
+            price_atoms,
+            quantity_atoms: to_atoms(quantity).unwrap_or(0),
+            filled_atoms: to_atoms(filled).unwrap_or(0),
             status,
             freeze_price,
             client_order_id,
@@ -578,6 +636,9 @@ async fn flush_upserts(conn: &mut PgConnection, rows: &[UpsertRow]) -> anyhow::R
     let mut prices: Vec<Option<f64>> = Vec::with_capacity(n);
     let mut qtys = Vec::with_capacity(n);
     let mut filleds = Vec::with_capacity(n);
+    let mut price_atoms: Vec<Option<i64>> = Vec::with_capacity(n);
+    let mut qty_atoms = Vec::with_capacity(n);
+    let mut filled_atoms = Vec::with_capacity(n);
     let mut statuses = Vec::with_capacity(n);
     let mut freeze_prices = Vec::with_capacity(n);
     let mut coids: Vec<Option<String>> = Vec::with_capacity(n);
@@ -593,6 +654,9 @@ async fn flush_upserts(conn: &mut PgConnection, rows: &[UpsertRow]) -> anyhow::R
         prices.push(r.price);
         qtys.push(r.quantity);
         filleds.push(r.filled);
+        price_atoms.push(r.price_atoms);
+        qty_atoms.push(r.quantity_atoms);
+        filled_atoms.push(r.filled_atoms);
         statuses.push(r.status.to_string());
         freeze_prices.push(r.freeze_price);
         coids.push(r.client_order_id.clone());
@@ -602,6 +666,7 @@ async fn flush_upserts(conn: &mut PgConnection, rows: &[UpsertRow]) -> anyhow::R
     let res = sqlx::query(
         r#"
         INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled,
+                            price_atoms, quantity_atoms, filled_atoms,
                             status, freeze_price, client_order_id, created_at, updated_at)
         SELECT * FROM UNNEST(
             $1::bigint[],
@@ -612,17 +677,22 @@ async fn flush_upserts(conn: &mut PgConnection, rows: &[UpsertRow]) -> anyhow::R
             $6::float8[],
             $7::float8[],
             $8::float8[],
-            $9::varchar[],
-            $10::float8[],
-            $11::varchar[],
-            $12::timestamptz[]
-        ) AS t(id, user_id, symbol, side, order_type, price, quantity, filled, status,
+            $9::bigint[],
+            $10::bigint[],
+            $11::bigint[],
+            $12::varchar[],
+            $13::float8[],
+            $14::varchar[],
+            $15::timestamptz[]
+        ) AS t(id, user_id, symbol, side, order_type, price, quantity, filled,
+               price_atoms, quantity_atoms, filled_atoms, status,
                freeze_price, client_order_id, created_at)
         CROSS JOIN LATERAL (SELECT NOW() AS updated_at) u
         ON CONFLICT (id) DO UPDATE SET
-            status      = EXCLUDED.status,
-            filled      = EXCLUDED.filled,
-            updated_at  = NOW()
+            status       = EXCLUDED.status,
+            filled       = EXCLUDED.filled,
+            filled_atoms = EXCLUDED.filled_atoms,
+            updated_at   = NOW()
         "#,
     )
     .bind(&ids)
@@ -633,6 +703,9 @@ async fn flush_upserts(conn: &mut PgConnection, rows: &[UpsertRow]) -> anyhow::R
     .bind(&prices)
     .bind(&qtys)
     .bind(&filleds)
+    .bind(&price_atoms)
+    .bind(&qty_atoms)
+    .bind(&filled_atoms)
     .bind(&statuses)
     .bind(&freeze_prices)
     .bind(&coids)
@@ -661,26 +734,30 @@ async fn flush_fills(conn: &mut PgConnection, rows: &[FillRow]) -> anyhow::Resul
     let keep_idx = dedup_keep_last_indices_by_id(rows, |r| r.id);
     let mut ids = Vec::with_capacity(keep_idx.len());
     let mut filleds = Vec::with_capacity(keep_idx.len());
+    let mut filled_atoms = Vec::with_capacity(keep_idx.len());
     let mut statuses = Vec::with_capacity(keep_idx.len());
     for i in keep_idx {
         let r = &rows[i];
         ids.push(r.id);
         filleds.push(r.filled);
+        filled_atoms.push(r.filled_atoms);
         statuses.push(r.status.to_string());
     }
     let res = sqlx::query(
         r#"
         UPDATE orders AS o SET
-            filled     = v.filled,
-            status     = v.status,
-            updated_at = NOW()
-        FROM UNNEST($1::bigint[], $2::float8[], $3::varchar[])
-            AS v(id, filled, status)
+            filled       = v.filled,
+            filled_atoms = v.filled_atoms,
+            status       = v.status,
+            updated_at   = NOW()
+        FROM UNNEST($1::bigint[], $2::float8[], $3::bigint[], $4::varchar[])
+            AS v(id, filled, filled_atoms, status)
         WHERE o.id = v.id
         "#,
     )
     .bind(&ids)
     .bind(&filleds)
+    .bind(&filled_atoms)
     .bind(&statuses)
     .execute(&mut *conn)
     .await?;
@@ -743,6 +820,8 @@ async fn flush_trades(conn: &mut PgConnection, rows: &[TradeRow]) -> anyhow::Res
     let mut syms = Vec::with_capacity(rows.len());
     let mut prices = Vec::with_capacity(rows.len());
     let mut qtys = Vec::with_capacity(rows.len());
+    let mut price_atoms = Vec::with_capacity(rows.len());
+    let mut qty_atoms = Vec::with_capacity(rows.len());
     let mut createds = Vec::with_capacity(rows.len());
     for r in rows {
         buys.push(r.buy_order_id);
@@ -750,19 +829,25 @@ async fn flush_trades(conn: &mut PgConnection, rows: &[TradeRow]) -> anyhow::Res
         syms.push(r.symbol.clone());
         prices.push(r.price);
         qtys.push(r.qty);
+        price_atoms.push(r.price_atoms);
+        qty_atoms.push(r.qty_atoms);
         createds.push(r.created_at);
     }
     let res = sqlx::query(
         r#"
-        INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+        INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity,
+                            price_atoms, quantity_atoms, created_at)
         SELECT * FROM UNNEST(
             $1::varchar[],
             $2::bigint[],
             $3::bigint[],
             $4::float8[],
             $5::float8[],
-            $6::timestamptz[]
-        ) AS t(symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+            $6::bigint[],
+            $7::bigint[],
+            $8::timestamptz[]
+        ) AS t(symbol, buy_order_id, sell_order_id, price, quantity,
+               price_atoms, quantity_atoms, created_at)
         "#,
     )
     .bind(&syms)
@@ -770,6 +855,8 @@ async fn flush_trades(conn: &mut PgConnection, rows: &[TradeRow]) -> anyhow::Res
     .bind(&sells)
     .bind(&prices)
     .bind(&qtys)
+    .bind(&price_atoms)
+    .bind(&qty_atoms)
     .bind(&createds)
     .execute(&mut *conn)
     .await?;

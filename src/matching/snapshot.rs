@@ -25,8 +25,14 @@ impl Default for DepthSnapshot {
             sequence: 0,
             num_bids: 0,
             num_asks: 0,
-            bids: [PriceLevel { price: 0.0, quantity: 0.0 }; 20],
-            asks: [PriceLevel { price: 0.0, quantity: 0.0 }; 20],
+            bids: [PriceLevel {
+                price: 0.0,
+                quantity: 0.0,
+            }; 20],
+            asks: [PriceLevel {
+                price: 0.0,
+                quantity: 0.0,
+            }; 20],
         }
     }
 }

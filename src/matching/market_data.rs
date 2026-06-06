@@ -5,8 +5,8 @@
 
 use crate::order::Side;
 use rtrb::Producer;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -15,16 +15,16 @@ use std::time::Duration;
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TradeEvent {
-    pub sequence: u64,        // 全局交易序列号
-    pub order_id: u64,        // 订单ID
-    pub maker_order_id: u64,  // 挂单ID
-    pub timestamp: u64,       // 纳秒时间戳
-    pub price: f64,           // 成交价格
-    pub quantity: f64,        // 成交数量
-    pub taker_id: u64,        // 吃单者ID
-    pub maker_id: u64,        // 挂单者ID
-    pub side: Side,           // 吃单方向 (Buy/Sell)
-    _padding: [u8; 7],        // 填充至64字节
+    pub sequence: u64,       // 全局交易序列号
+    pub order_id: u64,       // 订单ID
+    pub maker_order_id: u64, // 挂单ID
+    pub timestamp: u64,      // 纳秒时间戳
+    pub price: f64,          // 成交价格
+    pub quantity: f64,       // 成交数量
+    pub taker_id: u64,       // 吃单者ID
+    pub maker_id: u64,       // 挂单者ID
+    pub side: Side,          // 吃单方向 (Buy/Sell)
+    _padding: [u8; 7],       // 填充至64字节
 }
 
 impl TradeEvent {
@@ -76,15 +76,15 @@ impl Default for TradeEvent {
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BBOSnapshot {
-    pub timestamp: u64,           // 纳秒时间戳
-    pub sequence: u64,            // 序列号
-    pub best_bid_price: f64,      // 最高买价
-    pub best_bid_qty: f64,        // 最高买价数量
-    pub best_ask_price: f64,      // 最低卖价
-    pub best_ask_qty: f64,        // 最低卖价数量
-    pub bid_level_count: u16,     // 买方档位数
-    pub ask_level_count: u16,     // 卖方档位数
-    _padding: [u8; 12],           // 填充至64字节
+    pub timestamp: u64,       // 纳秒时间戳
+    pub sequence: u64,        // 序列号
+    pub best_bid_price: f64,  // 最高买价
+    pub best_bid_qty: f64,    // 最高买价数量
+    pub best_ask_price: f64,  // 最低卖价
+    pub best_ask_qty: f64,    // 最低卖价数量
+    pub bid_level_count: u16, // 买方档位数
+    pub ask_level_count: u16, // 卖方档位数
+    _padding: [u8; 12],       // 填充至64字节
 }
 
 impl BBOSnapshot {
@@ -169,13 +169,13 @@ impl Default for PriceLevel {
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct Level2Snapshot {
-    pub timestamp: u64,                           // 纳秒时间戳
-    pub sequence: u64,                            // 序列号
-    pub bids: [PriceLevel; 10],                   // 买方前10档
-    pub asks: [PriceLevel; 10],                   // 卖方前10档
-    pub num_bids: u16,                            // 实际买方档位数
-    pub num_asks: u16,                            // 实际卖方档位数
-    _padding: [u8; 12],                           // 填充至64字节
+    pub timestamp: u64,         // 纳秒时间戳
+    pub sequence: u64,          // 序列号
+    pub bids: [PriceLevel; 10], // 买方前10档
+    pub asks: [PriceLevel; 10], // 卖方前10档
+    pub num_bids: u16,          // 实际买方档位数
+    pub num_asks: u16,          // 实际卖方档位数
+    _padding: [u8; 12],         // 填充至64字节
 }
 
 impl Level2Snapshot {
@@ -251,16 +251,16 @@ impl Default for Level2Snapshot {
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct AggregateTrade {
-    pub start_time: u64,              // 开始时间（纳秒）
-    pub end_time: u64,                // 结束时间（纳秒）
-    pub sequence: u64,                // 序列号范围（起始）
-    pub open: f64,                    // 开盘价
-    pub close: f64,                   // 收盘价
-    pub high: f64,                    // 最高价
-    pub low: f64,                     // 最低价
-    pub volume: f64,                  // 总交易量
-    pub quote_asset_volume: f64,      // 总交易额（成交量*价格）
-    pub trade_count: u64,             // 成交笔数
+    pub start_time: u64,         // 开始时间（纳秒）
+    pub end_time: u64,           // 结束时间（纳秒）
+    pub sequence: u64,           // 序列号范围（起始）
+    pub open: f64,               // 开盘价
+    pub close: f64,              // 收盘价
+    pub high: f64,               // 最高价
+    pub low: f64,                // 最低价
+    pub volume: f64,             // 总交易量
+    pub quote_asset_volume: f64, // 总交易额（成交量*价格）
+    pub trade_count: u64,        // 成交笔数
 }
 
 impl AggregateTrade {
@@ -321,18 +321,18 @@ impl Default for AggregateTrade {
 /// 时间桶类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketType {
-    OneSecond,      // 1秒桶
-    FiveSeconds,    // 5秒桶
-    OneMinute,      // 1分钟桶
+    OneSecond,   // 1秒桶
+    FiveSeconds, // 5秒桶
+    OneMinute,   // 1分钟桶
 }
 
 impl BucketType {
     /// 获取桶的时间窗口（纳秒）
     pub fn window_nanos(&self) -> u64 {
         match self {
-            BucketType::OneSecond => 1_000_000_000,      // 1秒 = 1e9纳秒
-            BucketType::FiveSeconds => 5_000_000_000,    // 5秒 = 5e9纳秒
-            BucketType::OneMinute => 60_000_000_000,     // 1分钟 = 6e10纳秒
+            BucketType::OneSecond => 1_000_000_000,   // 1秒 = 1e9纳秒
+            BucketType::FiveSeconds => 5_000_000_000, // 5秒 = 5e9纳秒
+            BucketType::OneMinute => 60_000_000_000,  // 1分钟 = 6e10纳秒
         }
     }
 }
@@ -351,7 +351,7 @@ pub struct AggregateTradeWindow {
     pub quote_asset_volume: f64,
     pub trade_count: u32,
     pub sequence: u64,
-    pub has_trades: bool,  // 是否有成交
+    pub has_trades: bool, // 是否有成交
 }
 
 impl AggregateTradeWindow {
@@ -517,14 +517,14 @@ impl Default for Statistics24h {
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct PublishedSnapshot {
-    pub timestamp: u64,              // 快照时间戳（纳秒）
-    pub sequence: u64,               // 快照序列号
-    pub bbo: BBOSnapshot,            // 最优买卖价快照
-    pub level2: Level2Snapshot,      // Level2深度快照
-    pub current_agg_1s: AggregateTrade,   // 当前活跃的1秒聚合成交
-    pub current_agg_5s: AggregateTrade,   // 当前活跃的5秒聚合成交
-    pub current_agg_1m: AggregateTrade,   // 当前活跃的1分钟聚合成交
-    pub stats_24h: Statistics24h,    // 24小时统计数据
+    pub timestamp: u64,                 // 快照时间戳（纳秒）
+    pub sequence: u64,                  // 快照序列号
+    pub bbo: BBOSnapshot,               // 最优买卖价快照
+    pub level2: Level2Snapshot,         // Level2深度快照
+    pub current_agg_1s: AggregateTrade, // 当前活跃的1秒聚合成交
+    pub current_agg_5s: AggregateTrade, // 当前活跃的5秒聚合成交
+    pub current_agg_1m: AggregateTrade, // 当前活跃的1分钟聚合成交
+    pub stats_24h: Statistics24h,       // 24小时统计数据
 }
 
 impl PublishedSnapshot {
@@ -782,7 +782,8 @@ impl MarketDataEngine {
                     }
 
                     // 插入新档位
-                    self.level2_snapshot.asks[insert_pos] = PriceLevel::new(event.price, event.quantity);
+                    self.level2_snapshot.asks[insert_pos] =
+                        PriceLevel::new(event.price, event.quantity);
                     self.level2_snapshot.num_asks += 1;
                     changed = true;
                 }
@@ -826,7 +827,8 @@ impl MarketDataEngine {
                     }
 
                     // 插入新档位
-                    self.level2_snapshot.bids[insert_pos] = PriceLevel::new(event.price, event.quantity);
+                    self.level2_snapshot.bids[insert_pos] =
+                        PriceLevel::new(event.price, event.quantity);
                     self.level2_snapshot.num_bids += 1;
                     changed = true;
                 }
@@ -922,55 +924,70 @@ impl MarketDataEngine {
         // 更新1秒桶
         if self.active_1s_bucket.contains_time(event.timestamp) {
             if !self.active_1s_bucket.has_trades {
-                self.active_1s_bucket.init_with_first_trade(event.price, event.quantity);
+                self.active_1s_bucket
+                    .init_with_first_trade(event.price, event.quantity);
             } else {
-                self.active_1s_bucket.update_with_trade(event.price, event.quantity);
+                self.active_1s_bucket
+                    .update_with_trade(event.price, event.quantity);
             }
         } else {
             if self.active_1s_bucket.has_trades {
-                self.completed_1s_trades.push(self.active_1s_bucket.to_aggregate_trade());
+                self.completed_1s_trades
+                    .push(self.active_1s_bucket.to_aggregate_trade());
                 if self.completed_1s_trades.len() > self.max_history {
                     self.completed_1s_trades.remove(0);
                 }
             }
-            self.active_1s_bucket = AggregateTradeWindow::new(BucketType::OneSecond, event.timestamp, event.sequence);
-            self.active_1s_bucket.init_with_first_trade(event.price, event.quantity);
+            self.active_1s_bucket =
+                AggregateTradeWindow::new(BucketType::OneSecond, event.timestamp, event.sequence);
+            self.active_1s_bucket
+                .init_with_first_trade(event.price, event.quantity);
         }
 
         // 更新5秒桶
         if self.active_5s_bucket.contains_time(event.timestamp) {
             if !self.active_5s_bucket.has_trades {
-                self.active_5s_bucket.init_with_first_trade(event.price, event.quantity);
+                self.active_5s_bucket
+                    .init_with_first_trade(event.price, event.quantity);
             } else {
-                self.active_5s_bucket.update_with_trade(event.price, event.quantity);
+                self.active_5s_bucket
+                    .update_with_trade(event.price, event.quantity);
             }
         } else {
             if self.active_5s_bucket.has_trades {
-                self.completed_5s_trades.push(self.active_5s_bucket.to_aggregate_trade());
+                self.completed_5s_trades
+                    .push(self.active_5s_bucket.to_aggregate_trade());
                 if self.completed_5s_trades.len() > self.max_history {
                     self.completed_5s_trades.remove(0);
                 }
             }
-            self.active_5s_bucket = AggregateTradeWindow::new(BucketType::FiveSeconds, event.timestamp, event.sequence);
-            self.active_5s_bucket.init_with_first_trade(event.price, event.quantity);
+            self.active_5s_bucket =
+                AggregateTradeWindow::new(BucketType::FiveSeconds, event.timestamp, event.sequence);
+            self.active_5s_bucket
+                .init_with_first_trade(event.price, event.quantity);
         }
 
         // 更新1分钟桶
         if self.active_1m_bucket.contains_time(event.timestamp) {
             if !self.active_1m_bucket.has_trades {
-                self.active_1m_bucket.init_with_first_trade(event.price, event.quantity);
+                self.active_1m_bucket
+                    .init_with_first_trade(event.price, event.quantity);
             } else {
-                self.active_1m_bucket.update_with_trade(event.price, event.quantity);
+                self.active_1m_bucket
+                    .update_with_trade(event.price, event.quantity);
             }
         } else {
             if self.active_1m_bucket.has_trades {
-                self.completed_1m_trades.push(self.active_1m_bucket.to_aggregate_trade());
+                self.completed_1m_trades
+                    .push(self.active_1m_bucket.to_aggregate_trade());
                 if self.completed_1m_trades.len() > self.max_history {
                     self.completed_1m_trades.remove(0);
                 }
             }
-            self.active_1m_bucket = AggregateTradeWindow::new(BucketType::OneMinute, event.timestamp, event.sequence);
-            self.active_1m_bucket.init_with_first_trade(event.price, event.quantity);
+            self.active_1m_bucket =
+                AggregateTradeWindow::new(BucketType::OneMinute, event.timestamp, event.sequence);
+            self.active_1m_bucket
+                .init_with_first_trade(event.price, event.quantity);
         }
     }
 
@@ -1137,10 +1154,12 @@ impl MarketDataEngine {
         // Depth-20（更新到level2_snapshot）
         self.level2_snapshot.clear();
         for i in 0..event.num_bids as usize {
-            self.level2_snapshot.add_bid(event.bids[i].0, event.bids[i].1);
+            self.level2_snapshot
+                .add_bid(event.bids[i].0, event.bids[i].1);
         }
         for i in 0..event.num_asks as usize {
-            self.level2_snapshot.add_ask(event.asks[i].0, event.asks[i].1);
+            self.level2_snapshot
+                .add_ask(event.asks[i].0, event.asks[i].1);
         }
         self.level2_snapshot.timestamp = now;
         self.level2_snapshot.sequence = event.sequence;
@@ -1205,7 +1224,10 @@ impl MarketDataEngine {
     }
 
     /// 消费Depth-50快照 - 计算增量
-    pub fn consume_depth50_snapshot(&mut self, event: &Depth50SnapshotEvent) -> Depth50SnapshotEvent {
+    pub fn consume_depth50_snapshot(
+        &mut self,
+        event: &Depth50SnapshotEvent,
+    ) -> Depth50SnapshotEvent {
         let mut out = Depth50SnapshotEvent::new(event.timestamp, event.sequence);
 
         // 计算bid差异
@@ -1336,7 +1358,6 @@ impl MarketDataEngine {
 
         out
     }
-
 }
 
 /// 1ms定时器和快照发布器
@@ -1420,21 +1441,20 @@ impl SnapshotTimer {
     }
 }
 
-
 /// 浅层深度快照事件 - 由撮合引擎每10ms生成
 /// 包含BBO (1档) + Depth-20 (20档)
 /// Plain/POD 结构体：align(64)、Copy、零堆分配
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct DepthSnapshotEvent {
-    pub timestamp: u64,           // 纳秒时间戳
-    pub sequence: u64,            // 快照序列号
-    pub num_bids: u8,             // 实际bid档位数 (≤20)
-    pub num_asks: u8,             // 实际ask档位数 (≤20)
+    pub timestamp: u64, // 纳秒时间戳
+    pub sequence: u64,  // 快照序列号
+    pub num_bids: u8,   // 实际bid档位数 (≤20)
+    pub num_asks: u8,   // 实际ask档位数 (≤20)
     pub symbol: [u8; 16],
-    _pad1: [u8; 46],              // 填充至64字节对齐
-    pub bids: [(f64, f64); 20],   // (price, quantity)，从高到低排序
-    pub asks: [(f64, f64); 20],   // (price, quantity)，从低到高排序
+    _pad1: [u8; 46],            // 填充至64字节对齐
+    pub bids: [(f64, f64); 20], // (price, quantity)，从高到低排序
+    pub asks: [(f64, f64); 20], // (price, quantity)，从低到高排序
 }
 
 impl DepthSnapshotEvent {
@@ -1499,9 +1519,9 @@ impl Default for Depth50SnapshotEvent {
 pub struct Level2SnapshotEvent {
     pub timestamp: u64,
     pub sequence: u64,
-    pub num_bids: u16,           // 实际bid档位数 (≤400)
-    pub num_asks: u16,           // 实际ask档位数 (≤400)
-    _pad1: [u8; 60],             // 填充至64字节对齐
+    pub num_bids: u16, // 实际bid档位数 (≤400)
+    pub num_asks: u16, // 实际ask档位数 (≤400)
+    _pad1: [u8; 60],   // 填充至64字节对齐
     pub bids: [(f64, f64); 400],
     pub asks: [(f64, f64); 400],
 }
@@ -1562,10 +1582,10 @@ impl MarketDataConfig {
 impl Default for MarketDataConfig {
     fn default() -> Self {
         Self {
-            shallow_sample_interval_ns: 10_000_000,   // 10ms
+            shallow_sample_interval_ns: 10_000_000, // 10ms
             enable_depth_increments: false,
-            depth50_interval_ns: 50_000_000,          // 50ms
-            level2_interval_ns: 100_000_000,          // 100ms
+            depth50_interval_ns: 50_000_000, // 50ms
+            level2_interval_ns: 100_000_000, // 100ms
             _pad1: [0; 39],
         }
     }
@@ -1609,7 +1629,7 @@ mod tests {
     #[test]
     fn test_depth_snapshot_event_copy_and_plain() {
         let evt1 = DepthSnapshotEvent::new(1000, 1);
-        let evt2 = evt1;  // Copy should work
+        let evt2 = evt1; // Copy should work
         assert_eq!(evt1.timestamp, evt2.timestamp);
     }
 
@@ -1627,8 +1647,8 @@ mod tests {
         let cfg = MarketDataConfig::default();
         assert_eq!(cfg.shallow_sample_interval_ns, 10_000_000); // 10ms
         assert_eq!(cfg.enable_depth_increments, false);
-        assert_eq!(cfg.depth50_interval_ns, 50_000_000);  // 50ms
-        assert_eq!(cfg.level2_interval_ns, 100_000_000);  // 100ms
+        assert_eq!(cfg.depth50_interval_ns, 50_000_000); // 50ms
+        assert_eq!(cfg.level2_interval_ns, 100_000_000); // 100ms
     }
 
     #[test]
@@ -1638,7 +1658,11 @@ mod tests {
         // This is expected behavior for cache-line aligned structures
         let size = std::mem::size_of::<TradeEvent>();
         println!("TradeEvent size: {}", size);
-        assert!(size >= 64 && size <= 128, "TradeEvent size {} should be 64-128 bytes", size);
+        assert!(
+            size >= 64 && size <= 128,
+            "TradeEvent size {} should be 64-128 bytes",
+            size
+        );
     }
 
     #[test]
@@ -1667,7 +1691,11 @@ mod tests {
         println!("Level2Snapshot size: {}", size);
         // 8 (ts) + 8 (seq) + 10*16 (bids) + 10*16 (asks) + 2 (num_bids) + 2 (num_asks) + 12 (padding)
         // = 8 + 8 + 160 + 160 + 2 + 2 + 12 = 352
-        assert!(size <= 384, "Level2Snapshot size {} should be reasonable", size);
+        assert!(
+            size <= 384,
+            "Level2Snapshot size {} should be reasonable",
+            size
+        );
     }
 
     #[test]
@@ -1682,7 +1710,11 @@ mod tests {
         // = 80 bytes, with align(64) this becomes 128 bytes (next multiple)
         let size = std::mem::size_of::<AggregateTrade>();
         println!("AggregateTrade size: {}", size);
-        assert!(size == 80 || size == 128, "AggregateTrade size {} should be 80 or 128 bytes", size);
+        assert!(
+            size == 80 || size == 128,
+            "AggregateTrade size {} should be 80 or 128 bytes",
+            size
+        );
     }
 
     #[test]
@@ -1696,7 +1728,11 @@ mod tests {
         println!("Statistics24h size: {}", size);
         // 8*4 (timestamps) + 8*7 (f64 prices/volumes) + 8*3 (trade IDs) + 8 (count)
         // = 32 + 56 + 24 + 8 = 120
-        assert!(size <= 192, "Statistics24h size {} should be reasonable", size);
+        assert!(
+            size <= 192,
+            "Statistics24h size {} should be reasonable",
+            size
+        );
     }
 
     // ===== TradeEvent 测试 =====
@@ -1983,13 +2019,34 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_24h_statistics_clears_all_fields() {        let mut engine = MarketDataEngine::new();
+    fn test_reset_24h_statistics_clears_all_fields() {
+        let mut engine = MarketDataEngine::new();
 
         // Add trades to accumulate statistics
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50100.0, 5.0, Side::Sell, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50100.0,
+            5.0,
+            Side::Sell,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         // Verify statistics are accumulated
@@ -2021,10 +2078,21 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_24h_statistics_allows_new_trades() {        let mut engine = MarketDataEngine::new();
+    fn test_reset_24h_statistics_allows_new_trades() {
+        let mut engine = MarketDataEngine::new();
 
         // Add first trade
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         // Verify first trade is recorded
@@ -2043,7 +2111,17 @@ mod tests {
         assert_eq!(stats.first_trade_id, 0);
 
         // Add new trade after reset
-        let event2 = TradeEvent::new(2, 200, 199, 3_000_000_000, 51000.0, 5.0, Side::Sell, 2001, 3001);
+        let event2 = TradeEvent::new(
+            2,
+            200,
+            199,
+            3_000_000_000,
+            51000.0,
+            5.0,
+            Side::Sell,
+            2001,
+            3001,
+        );
         engine.consume_trade_event(event2);
 
         // Verify new trade is correctly recorded
@@ -2057,10 +2135,21 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_24h_statistics_preserves_bbo_and_level2() {        let mut engine = MarketDataEngine::new();
+    fn test_reset_24h_statistics_preserves_bbo_and_level2() {
+        let mut engine = MarketDataEngine::new();
 
         // Add trade
-        let event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event);
 
         // Verify BBO was updated
@@ -2095,15 +2184,25 @@ mod tests {
         assert_eq!(l2.best_ask().unwrap().price, 50001.0);
 
         // Create a trade event
-        let trade_event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.5, 10.0, Side::Buy, 1001, 2001);
+        let trade_event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.5,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         assert_eq!(trade_event.quantity, 10.0);
     }
 
     // ===== MarketDataEngine 测试 =====
 
-    
     #[test]
-    fn test_market_data_engine_creation() {        let engine = MarketDataEngine::new();
+    fn test_market_data_engine_creation() {
+        let engine = MarketDataEngine::new();
 
         // Verify initial state
         let bbo = engine.get_bbo_snapshot();
@@ -2123,18 +2222,19 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_consume_single_event() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_consume_single_event() {
+        let mut engine = MarketDataEngine::new();
 
         let event = TradeEvent::new(
-            1,                  // sequence
-            100,                // order_id
-            99,                 // maker_order_id
-            1_000_000_000,      // timestamp
-            50000.0,            // price
-            10.5,               // quantity
-            Side::Buy,          // side
-            1001,               // taker_id
-            2001,               // maker_id
+            1,             // sequence
+            100,           // order_id
+            99,            // maker_order_id
+            1_000_000_000, // timestamp
+            50000.0,       // price
+            10.5,          // quantity
+            Side::Buy,     // side
+            1001,          // taker_id
+            2001,          // maker_id
         );
 
         assert!(engine.consume_trade_event(event));
@@ -2158,18 +2258,49 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_consume_multiple_events() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_consume_multiple_events() {
+        let mut engine = MarketDataEngine::new();
 
         // First event - buy at 50000
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         assert!(engine.consume_trade_event(event1));
 
         // Second event - sell at 50100
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50100.0, 5.0, Side::Sell, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50100.0,
+            5.0,
+            Side::Sell,
+            1002,
+            2002,
+        );
         assert!(engine.consume_trade_event(event2));
 
         // Third event - buy at 50050
-        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 50050.0, 8.0, Side::Buy, 1003, 2003);
+        let event3 = TradeEvent::new(
+            3,
+            102,
+            101,
+            3_000_000_000,
+            50050.0,
+            8.0,
+            Side::Buy,
+            1003,
+            2003,
+        );
         assert!(engine.consume_trade_event(event3));
 
         // Verify final state
@@ -2189,7 +2320,8 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_buy_side_event() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_buy_side_event() {
+        let mut engine = MarketDataEngine::new();
 
         let event = TradeEvent::new(
             1,
@@ -2210,12 +2342,9 @@ mod tests {
         assert_eq!(stats.ask_price, 50000.0);
     }
 
-
-
-
-
     #[test]
-    fn test_market_data_engine_statistics_accumulation() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_statistics_accumulation() {
+        let mut engine = MarketDataEngine::new();
 
         // Simulate a series of trades with different prices and quantities
         let trades = vec![
@@ -2296,10 +2425,10 @@ mod tests {
 
         // 更新第二笔成交
         bucket.update_with_trade(101.0, 5.0);
-        assert_eq!(bucket.open, 100.0);  // 开盘价不变
-        assert_eq!(bucket.close, 101.0);  // 收盘价更新
-        assert_eq!(bucket.high, 101.0);   // 最高价更新
-        assert_eq!(bucket.low, 100.0);    // 最低价不变
+        assert_eq!(bucket.open, 100.0); // 开盘价不变
+        assert_eq!(bucket.close, 101.0); // 收盘价更新
+        assert_eq!(bucket.high, 101.0); // 最高价更新
+        assert_eq!(bucket.low, 100.0); // 最低价不变
         assert_eq!(bucket.volume, 15.0);
         assert_eq!(bucket.quote_asset_volume, 1505.0);
         assert_eq!(bucket.trade_count, 2);
@@ -2333,7 +2462,8 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_single_trade_updates_all_buckets() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_single_trade_updates_all_buckets() {
+        let mut engine = MarketDataEngine::new();
 
         let event = TradeEvent::new(
             1,
@@ -2370,7 +2500,8 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_multiple_trades_within_bucket() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_multiple_trades_within_bucket() {
+        let mut engine = MarketDataEngine::new();
 
         // 三笔成交在同一秒内
         let trades = vec![
@@ -2400,12 +2531,16 @@ mod tests {
         assert_eq!(agg_1s.high, 101.0);
         assert_eq!(agg_1s.low, 100.0);
         assert_eq!(agg_1s.volume, 23.0);
-        assert_eq!(agg_1s.quote_asset_volume, 100.0*10.0 + 101.0*5.0 + 100.5*8.0);
+        assert_eq!(
+            agg_1s.quote_asset_volume,
+            100.0 * 10.0 + 101.0 * 5.0 + 100.5 * 8.0
+        );
         assert_eq!(agg_1s.trade_count, 3);
     }
 
     #[test]
-    fn test_market_data_engine_bucket_expiration_1s() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_bucket_expiration_1s() {
+        let mut engine = MarketDataEngine::new();
 
         // 第一笔成交在1秒时
         let event1 = TradeEvent::new(
@@ -2430,7 +2565,7 @@ mod tests {
             2,
             101,
             100,
-            2_100_000_000,  // 超过第一个1秒窗口的结束时间 (2_000_000_000)
+            2_100_000_000, // 超过第一个1秒窗口的结束时间 (2_000_000_000)
             101.0,
             5.0,
             Side::Buy,
@@ -2453,7 +2588,8 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_rolling_window_history() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_rolling_window_history() {
+        let mut engine = MarketDataEngine::new();
 
         // 创建12个连续的1秒桶（超过max_history=10）
         for i in 0..12 {
@@ -2479,13 +2615,14 @@ mod tests {
         assert_eq!(history.len(), 10);
 
         // 验证最早的桶（来自事件i=1，体积=11）
-        assert_eq!(history[0].volume, 11.0);  // 事件i=1
+        assert_eq!(history[0].volume, 11.0); // 事件i=1
         // 验证最后的桶（来自事件i=10，体积=20）
-        assert_eq!(history[9].volume, 20.0);  // 事件i=10（最后一个完成的桶）
+        assert_eq!(history[9].volume, 20.0); // 事件i=10（最后一个完成的桶）
     }
 
     #[test]
-    fn test_market_data_engine_bucket_expiration_5s() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_bucket_expiration_5s() {
+        let mut engine = MarketDataEngine::new();
 
         // 第一笔成交在1秒
         let event1 = TradeEvent::new(
@@ -2533,7 +2670,8 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_bucket_expiration_1m() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_bucket_expiration_1m() {
+        let mut engine = MarketDataEngine::new();
 
         // 第一笔成交在0秒
         let event1 = TradeEvent::new(
@@ -2554,7 +2692,7 @@ mod tests {
             2,
             101,
             100,
-            61_000_000_000 + 100,  // 61秒 + 100纳秒
+            61_000_000_000 + 100, // 61秒 + 100纳秒
             101.0,
             5.0,
             Side::Buy,
@@ -2574,7 +2712,8 @@ mod tests {
     }
 
     #[test]
-    fn test_market_data_engine_independent_bucket_types() {        let mut engine = MarketDataEngine::new();
+    fn test_market_data_engine_independent_bucket_types() {
+        let mut engine = MarketDataEngine::new();
 
         // 在同一时间戳创建多个事件，不同的桶应该独立更新
         for i in 0..3 {
@@ -2609,7 +2748,8 @@ mod tests {
     // ===== Level2 更新逻辑测试 - Task 2.3 =====
 
     #[test]
-    fn test_level2_initialization_empty_state() {        let engine = MarketDataEngine::new();
+    fn test_level2_initialization_empty_state() {
+        let engine = MarketDataEngine::new();
 
         let l2 = engine.get_level2_snapshot();
         assert_eq!(l2.timestamp, 0);
@@ -2619,9 +2759,20 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_update_on_first_buy_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_update_on_first_buy_trade() {
+        let mut engine = MarketDataEngine::new();
 
-        let event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event);
 
         let l2 = engine.get_level2_snapshot();
@@ -2633,9 +2784,20 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_update_on_first_sell_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_update_on_first_sell_trade() {
+        let mut engine = MarketDataEngine::new();
 
-        let event = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        let event = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event);
 
         let l2 = engine.get_level2_snapshot();
@@ -2647,10 +2809,21 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_ask_quantity_reduction() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_ask_quantity_reduction() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade at 50000 with qty 20
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            20.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let l2_1 = engine.get_level2_snapshot();
@@ -2658,7 +2831,17 @@ mod tests {
         assert_eq!(l2_1.asks[0].quantity, 20.0);
 
         // Second trade at same price with qty 8
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            8.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let l2_2 = engine.get_level2_snapshot();
@@ -2668,10 +2851,21 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_bid_quantity_reduction() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_bid_quantity_reduction() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade at 50000 with qty 20
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            20.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let l2_1 = engine.get_level2_snapshot();
@@ -2679,7 +2873,17 @@ mod tests {
         assert_eq!(l2_1.bids[0].quantity, 20.0);
 
         // Second trade at same price with qty 8
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Sell, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            8.0,
+            Side::Sell,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let l2_2 = engine.get_level2_snapshot();
@@ -2689,17 +2893,38 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_level_removal_when_quantity_depleted() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_level_removal_when_quantity_depleted() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade at 50000 with qty 10
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let l2_1 = engine.get_level2_snapshot();
         assert_eq!(l2_1.num_asks, 1);
 
         // Second trade at same price consuming all qty
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 10.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let l2_2 = engine.get_level2_snapshot();
@@ -2708,16 +2933,47 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_multiple_ask_levels_ascending_order() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_multiple_ask_levels_ascending_order() {
+        let mut engine = MarketDataEngine::new();
 
         // Add ask levels at different prices
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50001.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50001.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 20.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            20.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
-        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 50002.0, 5.0, Side::Buy, 1003, 2003);
+        let event3 = TradeEvent::new(
+            3,
+            102,
+            101,
+            3_000_000_000,
+            50002.0,
+            5.0,
+            Side::Buy,
+            1003,
+            2003,
+        );
         engine.consume_trade_event(event3);
 
         let l2 = engine.get_level2_snapshot();
@@ -2732,16 +2988,47 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_multiple_bid_levels_descending_order() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_multiple_bid_levels_descending_order() {
+        let mut engine = MarketDataEngine::new();
 
         // Add bid levels at different prices
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 49999.0, 10.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            49999.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 20.0, Side::Sell, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            20.0,
+            Side::Sell,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
-        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 49998.0, 5.0, Side::Sell, 1003, 2003);
+        let event3 = TradeEvent::new(
+            3,
+            102,
+            101,
+            3_000_000_000,
+            49998.0,
+            5.0,
+            Side::Sell,
+            1003,
+            2003,
+        );
         engine.consume_trade_event(event3);
 
         let l2 = engine.get_level2_snapshot();
@@ -2756,7 +3043,8 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_max_10_levels() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_max_10_levels() {
+        let mut engine = MarketDataEngine::new();
 
         // Add 10 ask levels
         for i in 0..10 {
@@ -2778,7 +3066,17 @@ mod tests {
         assert_eq!(l2.num_asks, 10);
 
         // Try to add 11th level - should not be added
-        let event11 = TradeEvent::new(11, 110, 109, 11_000_000_000, 50010.0, 10.0, Side::Buy, 1011, 2011);
+        let event11 = TradeEvent::new(
+            11,
+            110,
+            109,
+            11_000_000_000,
+            50010.0,
+            10.0,
+            Side::Buy,
+            1011,
+            2011,
+        );
         engine.consume_trade_event(event11);
 
         let l2_after = engine.get_level2_snapshot();
@@ -2787,7 +3085,8 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_mixed_bid_ask_updates() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_mixed_bid_ask_updates() {
+        let mut engine = MarketDataEngine::new();
 
         // Sequence of trades: sell, buy, sell, buy
         let trades = vec![
@@ -2829,7 +3128,8 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_timestamp_and_sequence() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_timestamp_and_sequence() {
+        let mut engine = MarketDataEngine::new();
 
         let event = TradeEvent::new(
             5,
@@ -2850,7 +3150,8 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_complex_scenario() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_complex_scenario() {
+        let mut engine = MarketDataEngine::new();
 
         // Simulate a complex order flow
         // Sell orders at 50000, 50001, 50002 (bids)
@@ -2901,7 +3202,8 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_level_removal_maintains_order() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_level_removal_maintains_order() {
+        let mut engine = MarketDataEngine::new();
 
         // Add 3 ask levels: 50000, 50001, 50002
         for i in 0..3 {
@@ -2926,7 +3228,17 @@ mod tests {
         assert_eq!(l2_1.asks[2].price, 50002.0);
 
         // Remove middle level (50001) by consuming all quantity
-        let event = TradeEvent::new(4, 104, 103, 4_000_000_000, 50001.0, 10.0, Side::Buy, 1004, 2004);
+        let event = TradeEvent::new(
+            4,
+            104,
+            103,
+            4_000_000_000,
+            50001.0,
+            10.0,
+            Side::Buy,
+            1004,
+            2004,
+        );
         engine.consume_trade_event(event);
 
         let l2_2 = engine.get_level2_snapshot();
@@ -2937,9 +3249,20 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_snapshot_independence() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_snapshot_independence() {
+        let mut engine = MarketDataEngine::new();
 
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let l2_1 = engine.get_level2_snapshot();
@@ -2947,7 +3270,17 @@ mod tests {
         assert_eq!(l2_1.asks[0].quantity, 10.0);
 
         // Consume some quantity
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 3.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            3.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let l2_2 = engine.get_level2_snapshot();
@@ -2961,17 +3294,38 @@ mod tests {
     }
 
     #[test]
-    fn test_level2_best_bid_ask() {        let mut engine = MarketDataEngine::new();
+    fn test_level2_best_bid_ask() {
+        let mut engine = MarketDataEngine::new();
 
         // Add bid
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let l2_1 = engine.get_level2_snapshot();
         assert_eq!(l2_1.best_bid(), Some(PriceLevel::new(50000.0, 10.0)));
 
         // Add ask
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 20.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50050.0,
+            20.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let l2_2 = engine.get_level2_snapshot();
@@ -2982,7 +3336,8 @@ mod tests {
     // ===== BBO 更新逻辑测试 - Task 2.2 =====
 
     #[test]
-    fn test_bbo_initialization_empty_state() {        let engine = MarketDataEngine::new();
+    fn test_bbo_initialization_empty_state() {
+        let engine = MarketDataEngine::new();
 
         let bbo = engine.get_bbo_snapshot();
         assert_eq!(bbo.best_bid_price, 0.0);
@@ -2994,7 +3349,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_update_on_first_buy_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_update_on_first_buy_trade() {
+        let mut engine = MarketDataEngine::new();
 
         let event = TradeEvent::new(
             1,
@@ -3020,7 +3376,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_update_on_first_sell_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_update_on_first_sell_trade() {
+        let mut engine = MarketDataEngine::new();
 
         let event = TradeEvent::new(
             1,
@@ -3046,10 +3403,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_ask_price_improvement_on_buy_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_ask_price_improvement_on_buy_trade() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade sets initial ask at 50100
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50100.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50100.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let bbo1 = engine.get_bbo_snapshot();
@@ -3057,7 +3425,17 @@ mod tests {
         assert_eq!(bbo1.best_ask_qty, 10.0);
 
         // Second trade at lower price: ask price improves (decreases)
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 5.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50050.0,
+            5.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo2 = engine.get_bbo_snapshot();
@@ -3067,10 +3445,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_bid_price_improvement_on_sell_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_bid_price_improvement_on_sell_trade() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade sets initial bid at 49900
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 49900.0, 10.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            49900.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let bbo1 = engine.get_bbo_snapshot();
@@ -3078,7 +3467,17 @@ mod tests {
         assert_eq!(bbo1.best_bid_qty, 10.0);
 
         // Second trade at higher price: bid price improves (increases)
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 49950.0, 5.0, Side::Sell, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            49950.0,
+            5.0,
+            Side::Sell,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo2 = engine.get_bbo_snapshot();
@@ -3088,10 +3487,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_quantity_reduction_on_same_price_buy_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_quantity_reduction_on_same_price_buy_trade() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade sets initial ask
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            20.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let bbo1 = engine.get_bbo_snapshot();
@@ -3099,7 +3509,17 @@ mod tests {
         assert_eq!(bbo1.best_ask_qty, 20.0);
 
         // Second trade at same price: quantity consumed from the level
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            8.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo2 = engine.get_bbo_snapshot();
@@ -3109,10 +3529,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_quantity_reduction_on_same_price_sell_trade() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_quantity_reduction_on_same_price_sell_trade() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade sets initial bid
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 20.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            20.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let bbo1 = engine.get_bbo_snapshot();
@@ -3120,7 +3551,17 @@ mod tests {
         assert_eq!(bbo1.best_bid_qty, 20.0);
 
         // Second trade at same price: quantity consumed from the level
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 8.0, Side::Sell, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            8.0,
+            Side::Sell,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo2 = engine.get_bbo_snapshot();
@@ -3130,14 +3571,15 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_multiple_consecutive_trades() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_multiple_consecutive_trades() {
+        let mut engine = MarketDataEngine::new();
 
         // Sequence of trades: sell, buy, sell, buy
         let trades = vec![
-            (50000.0, 10.0, Side::Sell),  // bid = 50000, qty = 10
-            (50050.0, 5.0, Side::Buy),    // ask = 50050, qty = 5
-            (50025.0, 8.0, Side::Sell),   // bid improves to 50025, qty = 8
-            (50040.0, 3.0, Side::Buy),    // ask improves to 50040, qty = 3
+            (50000.0, 10.0, Side::Sell), // bid = 50000, qty = 10
+            (50050.0, 5.0, Side::Buy),   // ask = 50050, qty = 5
+            (50025.0, 8.0, Side::Sell),  // bid improves to 50025, qty = 8
+            (50040.0, 3.0, Side::Buy),   // ask improves to 50040, qty = 3
         ];
 
         for (idx, (price, qty, side)) in trades.iter().enumerate() {
@@ -3164,7 +3606,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_timestamp_and_sequence_tracking() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_timestamp_and_sequence_tracking() {
+        let mut engine = MarketDataEngine::new();
 
         for i in 1..=5 {
             let event = TradeEvent::new(
@@ -3187,10 +3630,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_market_spread_changes() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_market_spread_changes() {
+        let mut engine = MarketDataEngine::new();
 
         // Start with sell at 50000 (bid = 50000, ask = 0)
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let bbo1 = engine.get_bbo_snapshot();
@@ -3198,7 +3652,17 @@ mod tests {
         assert_eq!(bbo1.best_ask_price, 0.0); // ask not set yet
 
         // Add buy at 50050 (ask = 50050)
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 5.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50050.0,
+            5.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo2 = engine.get_bbo_snapshot();
@@ -3207,7 +3671,17 @@ mod tests {
         assert_eq!(bbo2.spread(), 50.0);
 
         // Bid improves to 50040 (sell at 50040)
-        let event3 = TradeEvent::new(3, 102, 101, 3_000_000_000, 50040.0, 8.0, Side::Sell, 1003, 2003);
+        let event3 = TradeEvent::new(
+            3,
+            102,
+            101,
+            3_000_000_000,
+            50040.0,
+            8.0,
+            Side::Sell,
+            1003,
+            2003,
+        );
         engine.consume_trade_event(event3);
 
         let bbo3 = engine.get_bbo_snapshot();
@@ -3217,17 +3691,38 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_quantity_goes_negative_protection() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_quantity_goes_negative_protection() {
+        let mut engine = MarketDataEngine::new();
 
         // First trade sets ask at 50000 with qty 10
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Buy, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Buy,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let bbo1 = engine.get_bbo_snapshot();
         assert_eq!(bbo1.best_ask_qty, 10.0);
 
         // Second trade consumes 15 at same price (more than available)
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50000.0, 15.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50000.0,
+            15.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo2 = engine.get_bbo_snapshot();
@@ -3237,14 +3732,35 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_mid_price_with_active_bid_ask() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_mid_price_with_active_bid_ask() {
+        let mut engine = MarketDataEngine::new();
 
         // Sell at 50000 (bid = 50000)
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         // Buy at 50100 (ask = 50100)
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50100.0, 5.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50100.0,
+            5.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo = engine.get_bbo_snapshot();
@@ -3253,16 +3769,17 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_after_complex_order_flow() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_after_complex_order_flow() {
+        let mut engine = MarketDataEngine::new();
 
         // Complex order flow simulating real market
         let trades = vec![
-            (50000.0, 10.0, Side::Sell),   // bid = 50000, qty = 10
-            (50100.0, 5.0, Side::Buy),     // ask = 50100, qty = 5
-            (50000.0, 3.0, Side::Sell),    // bid qty: 10 - 3 = 7
-            (50100.0, 2.0, Side::Buy),     // ask qty: 5 - 2 = 3
-            (50050.0, 8.0, Side::Sell),    // bid improves to 50050, qty = 8
-            (50080.0, 4.0, Side::Buy),     // ask improves to 50080, qty = 4
+            (50000.0, 10.0, Side::Sell), // bid = 50000, qty = 10
+            (50100.0, 5.0, Side::Buy),   // ask = 50100, qty = 5
+            (50000.0, 3.0, Side::Sell),  // bid qty: 10 - 3 = 7
+            (50100.0, 2.0, Side::Buy),   // ask qty: 5 - 2 = 3
+            (50050.0, 8.0, Side::Sell),  // bid improves to 50050, qty = 8
+            (50080.0, 4.0, Side::Buy),   // ask improves to 50080, qty = 4
         ];
 
         for (idx, (price, qty, side)) in trades.iter().enumerate() {
@@ -3290,15 +3807,36 @@ mod tests {
     }
 
     #[test]
-    fn test_bbo_snapshot_independence() {        let mut engine = MarketDataEngine::new();
+    fn test_bbo_snapshot_independence() {
+        let mut engine = MarketDataEngine::new();
 
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         let bbo1 = engine.get_bbo_snapshot();
         let bid1 = bbo1.best_bid_price;
 
-        let event2 = TradeEvent::new(2, 101, 100, 2_000_000_000, 50050.0, 5.0, Side::Sell, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            2_000_000_000,
+            50050.0,
+            5.0,
+            Side::Sell,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         let bbo2 = engine.get_bbo_snapshot();
@@ -3321,16 +3859,8 @@ mod tests {
         let agg_1m = AggregateTrade::default();
         let stats = Statistics24h::default();
 
-        let snapshot = PublishedSnapshot::new(
-            1_000_000_000,
-            1,
-            bbo,
-            level2,
-            agg_1s,
-            agg_5s,
-            agg_1m,
-            stats,
-        );
+        let snapshot =
+            PublishedSnapshot::new(1_000_000_000, 1, bbo, level2, agg_1s, agg_5s, agg_1m, stats);
 
         assert_eq!(snapshot.timestamp, 1_000_000_000);
         assert_eq!(snapshot.sequence, 1);
@@ -3348,18 +3878,39 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_published_snapshot() {        let mut engine = MarketDataEngine::new();
+    fn test_generate_published_snapshot() {
+        let mut engine = MarketDataEngine::new();
 
         // Consume some events within the same time bucket (to keep them in active_1s_bucket)
-        let event1 = TradeEvent::new(1, 100, 99, 1_000_000_000, 50000.0, 10.0, Side::Sell, 1001, 2001);
+        let event1 = TradeEvent::new(
+            1,
+            100,
+            99,
+            1_000_000_000,
+            50000.0,
+            10.0,
+            Side::Sell,
+            1001,
+            2001,
+        );
         engine.consume_trade_event(event1);
 
         // Keep the second event within the same 1s bucket (1_500_000_000 is still within the first 1s window)
-        let event2 = TradeEvent::new(2, 101, 100, 1_500_000_000, 50100.0, 5.0, Side::Buy, 1002, 2002);
+        let event2 = TradeEvent::new(
+            2,
+            101,
+            100,
+            1_500_000_000,
+            50100.0,
+            5.0,
+            Side::Buy,
+            1002,
+            2002,
+        );
         engine.consume_trade_event(event2);
 
         // Generate snapshot
-        let ts = 1_800_000_000u64;  // Still within the same 1s bucket
+        let ts = 1_800_000_000u64; // Still within the same 1s bucket
         let seq = 42u64;
         let snapshot = engine.generate_published_snapshot(ts, seq);
 
@@ -3373,7 +3924,8 @@ mod tests {
     }
 
     #[test]
-    fn test_published_snapshot_reflects_engine_state() {        let mut engine = MarketDataEngine::new();
+    fn test_published_snapshot_reflects_engine_state() {
+        let mut engine = MarketDataEngine::new();
 
         // Add multiple trades
         for i in 0..5 {
@@ -3400,14 +3952,7 @@ mod tests {
         assert_eq!(snapshot.current_agg_1s.volume, 50.0);
     }
 
-
-
     // ===== SnapshotTimer Tests =====
 
-
-
     // ===== TradePublisherThread 测试 =====
-
-
-
 }

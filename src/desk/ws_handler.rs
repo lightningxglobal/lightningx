@@ -1088,7 +1088,7 @@ async fn handle_client_message(
                     repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
                         .await
                 } else {
-                    Ok((0.0, 0.0))
+                    Ok(AccountBalance::default())
                 }
             } else {
                 repo.freeze_for_sell(user_id, base_asset, qty).await
@@ -1107,22 +1107,20 @@ async fn handle_client_message(
                             .await;
                         return Some(ws_sbe::encode_order_rejected(0, &e.to_string()));
                     }
-                    Ok((bal, frz)) if bal > 0.0 || frz >= 0.0 => {
+                    Ok(snapshot) if snapshot.balance_atoms > 0 || snapshot.frozen_atoms >= 0 => {
                         // Update cache and push WS balance_update from RETURNING values.
-                        if let Ok(snapshot) = AccountBalance::from_f64_round(bal, frz) {
-                            state
-                                .account_cache
-                                .entry(user_id)
-                                .or_insert_with(std::collections::HashMap::new)
-                                .insert(frozen_asset.to_string(), snapshot);
-                            if let Some(tx) = state.user_tx.get(user_id) {
-                                let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                    frozen_asset,
-                                    snapshot.balance(),
-                                    snapshot.available(),
-                                    snapshot.frozen(),
-                                ), 0));
-                            }
+                        state
+                            .account_cache
+                            .entry(user_id)
+                            .or_insert_with(std::collections::HashMap::new)
+                            .insert(frozen_asset.to_string(), snapshot);
+                        if let Some(tx) = state.user_tx.get(user_id) {
+                            let _ = tx.try_send((ws_sbe::encode_balance_update(
+                                frozen_asset,
+                                snapshot.balance(),
+                                snapshot.available(),
+                                snapshot.frozen(),
+                            ), 0));
                         }
                     }
                     Ok(_) => {} // no-op freeze (zero amount)
@@ -1331,17 +1329,15 @@ async fn handle_client_message(
                         } else {
                             (base_asset, unfilled)
                         };
-                        if let Ok((bal, frz)) =
+                        if let Ok(snapshot) =
                             repo.release_frozen(user_id, rel_asset, rel_amount).await
                         {
-                            if bal > 0.0 || frz >= 0.0 {
-                                if let Ok(snapshot) = AccountBalance::from_f64_round(bal, frz) {
-                                    state
-                                        .account_cache
-                                        .entry(user_id)
-                                        .or_insert_with(std::collections::HashMap::new)
-                                        .insert(rel_asset.to_string(), snapshot);
-                                }
+                            if snapshot.balance_atoms > 0 || snapshot.frozen_atoms >= 0 {
+                                state
+                                    .account_cache
+                                    .entry(user_id)
+                                    .or_insert_with(std::collections::HashMap::new)
+                                    .insert(rel_asset.to_string(), snapshot);
                             }
                         }
                     }
@@ -2024,7 +2020,7 @@ async fn handle_client_message(
                         repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
                             .await
                     } else {
-                        Ok((0.0, 0.0))
+                        Ok(AccountBalance::default())
                     }
                 } else {
                     repo.freeze_for_sell(user_id, base_asset, qty).await
@@ -2040,21 +2036,19 @@ async fn handle_client_message(
                         sa_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED));
                         continue;
                     }
-                    Ok((bal, frz)) if bal > 0.0 || frz >= 0.0 => {
-                        if let Ok(snapshot) = AccountBalance::from_f64_round(bal, frz) {
-                            state
-                                .account_cache
-                                .entry(user_id)
-                                .or_insert_with(std::collections::HashMap::new)
-                                .insert(frozen_asset.to_string(), snapshot);
-                            if let Some(tx) = state.user_tx.get(user_id) {
-                                let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                    frozen_asset,
-                                    snapshot.balance(),
-                                    snapshot.available(),
-                                    snapshot.frozen(),
-                                ), 0));
-                            }
+                    Ok(snapshot) if snapshot.balance_atoms > 0 || snapshot.frozen_atoms >= 0 => {
+                        state
+                            .account_cache
+                            .entry(user_id)
+                            .or_insert_with(std::collections::HashMap::new)
+                            .insert(frozen_asset.to_string(), snapshot);
+                        if let Some(tx) = state.user_tx.get(user_id) {
+                            let _ = tx.try_send((ws_sbe::encode_balance_update(
+                                frozen_asset,
+                                snapshot.balance(),
+                                snapshot.available(),
+                                snapshot.frozen(),
+                            ), 0));
                         }
                     }
                     Ok(_) => {}

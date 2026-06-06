@@ -438,11 +438,7 @@ fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64
     kv.try_freeze_atoms(amount_atoms.atoms())
 }
 
-fn cache_set(cache: &AccountCache, user_id: i64, asset: &str, balance: f64, frozen: f64) {
-    let Ok(snapshot) = AccountBalance::from_f64_round(balance, frozen) else {
-        tracing::warn!("skip account cache set for invalid amount user={user_id} asset={asset}");
-        return;
-    };
+fn cache_set_snapshot(cache: &AccountCache, user_id: i64, asset: &str, snapshot: AccountBalance) {
     cache
         .entry(user_id)
         .or_insert_with(HashMap::new)
@@ -1578,19 +1574,19 @@ async fn handle_cancel_order(
     if side == "buy" {
         let freeze_price = price.unwrap_or(0.0);
         if freeze_price > 0.0 && remaining > 0.0 {
-            if let Ok((bal, frz)) = repo
+            if let Ok(snapshot) = repo
                 .release_frozen(user_id, quote_asset, freeze_price * remaining)
                 .await
             {
-                if bal > 0.0 || frz >= 0.0 {
-                    cache_set(&s.account_cache, user_id, quote_asset, bal, frz);
+                if snapshot.balance_atoms > 0 || snapshot.frozen_atoms >= 0 {
+                    cache_set_snapshot(&s.account_cache, user_id, quote_asset, snapshot);
                 }
             }
         }
     } else if remaining > 0.0 {
-        if let Ok((bal, frz)) = repo.release_frozen(user_id, base_asset, remaining).await {
-            if bal > 0.0 || frz >= 0.0 {
-                cache_set(&s.account_cache, user_id, base_asset, bal, frz);
+        if let Ok(snapshot) = repo.release_frozen(user_id, base_asset, remaining).await {
+            if snapshot.balance_atoms > 0 || snapshot.frozen_atoms >= 0 {
+                cache_set_snapshot(&s.account_cache, user_id, base_asset, snapshot);
             }
         }
     }
@@ -1742,16 +1738,16 @@ async fn handle_cancel_all_orders(
             let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
             if row.side == "buy" {
                 if let Some(fp) = row.price.filter(|&p| p > 0.0) {
-                    if let Ok((bal, frz)) = repo
+                    if let Ok(snapshot) = repo
                         .release_frozen(user_id, quote_asset, fp * remaining)
                         .await
                     {
-                        cache_set(&s.account_cache, user_id, quote_asset, bal, frz);
+                        cache_set_snapshot(&s.account_cache, user_id, quote_asset, snapshot);
                     }
                 }
-            } else if let Ok((bal, frz)) = repo.release_frozen(user_id, base_asset, remaining).await
+            } else if let Ok(snapshot) = repo.release_frozen(user_id, base_asset, remaining).await
             {
-                cache_set(&s.account_cache, user_id, base_asset, bal, frz);
+                cache_set_snapshot(&s.account_cache, user_id, base_asset, snapshot);
             }
         }
 

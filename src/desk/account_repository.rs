@@ -1,6 +1,6 @@
 /// Persistent account operations backed by PostgreSQL.
 /// Mirrors the in-memory AccountManager semantics with DB atomicity.
-use crate::desk::money::AmountAtoms;
+use crate::desk::money::{AccountBalance, AmountAtoms};
 use crate::models::DbAccount;
 use anyhow::{Result, anyhow};
 use sqlx::PgPool;
@@ -46,22 +46,22 @@ impl<'a> AccountRepository<'a> {
         Ok(())
     }
 
-    /// Freeze funds for a buy order atomically. Returns (balance, frozen) after update.
+    /// Freeze funds for a buy order atomically. Returns fixed-point balance after update.
     pub async fn freeze_for_buy(
         &self,
         user_id: i64,
         asset: &str,
         amount: f64,
-    ) -> Result<(f64, f64)> {
+    ) -> Result<AccountBalance> {
         let amount_atoms = AmountAtoms::from_f64_round(amount)?.atoms();
-        let row: Option<(f64, f64)> = sqlx::query_as(
+        let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
                 frozen = frozen + $1,
                 frozen_atoms = frozen_atoms + $2,
                 updated_at = NOW()
              WHERE user_id = $3 AND asset = $4
                AND (balance_atoms - frozen_atoms) >= $2
-             RETURNING balance, frozen",
+             RETURNING balance_atoms, frozen_atoms",
         )
         .bind(amount)
         .bind(amount_atoms)
@@ -70,20 +70,28 @@ impl<'a> AccountRepository<'a> {
         .fetch_optional(self.pool)
         .await?;
 
-        row.ok_or_else(|| anyhow!("Insufficient {} balance to freeze {}", asset, amount))
+        row.map(|(balance_atoms, frozen_atoms)| {
+            AccountBalance::from_atoms(balance_atoms, frozen_atoms)
+        })
+        .ok_or_else(|| anyhow!("Insufficient {} balance to freeze {}", asset, amount))
     }
 
-    /// Freeze position for a sell order atomically. Returns (balance, frozen) after update.
-    pub async fn freeze_for_sell(&self, user_id: i64, asset: &str, qty: f64) -> Result<(f64, f64)> {
+    /// Freeze position for a sell order atomically. Returns fixed-point balance after update.
+    pub async fn freeze_for_sell(
+        &self,
+        user_id: i64,
+        asset: &str,
+        qty: f64,
+    ) -> Result<AccountBalance> {
         let qty_atoms = AmountAtoms::from_f64_round(qty)?.atoms();
-        let row: Option<(f64, f64)> = sqlx::query_as(
+        let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
                 frozen = frozen + $1,
                 frozen_atoms = frozen_atoms + $2,
                 updated_at = NOW()
              WHERE user_id = $3 AND asset = $4
                AND (balance_atoms - frozen_atoms) >= $2
-             RETURNING balance, frozen",
+             RETURNING balance_atoms, frozen_atoms",
         )
         .bind(qty)
         .bind(qty_atoms)
@@ -92,24 +100,27 @@ impl<'a> AccountRepository<'a> {
         .fetch_optional(self.pool)
         .await?;
 
-        row.ok_or_else(|| anyhow!("Insufficient {} position to freeze {}", asset, qty))
+        row.map(|(balance_atoms, frozen_atoms)| {
+            AccountBalance::from_atoms(balance_atoms, frozen_atoms)
+        })
+        .ok_or_else(|| anyhow!("Insufficient {} position to freeze {}", asset, qty))
     }
 
-    /// Release frozen funds (on order cancel). Returns (balance, frozen) after update.
+    /// Release frozen funds (on order cancel). Returns fixed-point balance after update.
     pub async fn release_frozen(
         &self,
         user_id: i64,
         asset: &str,
         amount: f64,
-    ) -> Result<(f64, f64)> {
+    ) -> Result<AccountBalance> {
         let amount_atoms = AmountAtoms::from_f64_round(amount)?.atoms();
-        let row: Option<(f64, f64)> = sqlx::query_as(
+        let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
                 frozen = GREATEST(frozen - $1, 0),
                 frozen_atoms = GREATEST(frozen_atoms - $2, 0),
                 updated_at = NOW()
              WHERE user_id = $3 AND asset = $4
-             RETURNING balance, frozen",
+             RETURNING balance_atoms, frozen_atoms",
         )
         .bind(amount)
         .bind(amount_atoms)
@@ -119,7 +130,11 @@ impl<'a> AccountRepository<'a> {
         .await?;
 
         // If no row matched (account doesn't exist), treat as a no-op.
-        Ok(row.unwrap_or((0.0, 0.0)))
+        Ok(row
+            .map(|(balance_atoms, frozen_atoms)| {
+                AccountBalance::from_atoms(balance_atoms, frozen_atoms)
+            })
+            .unwrap_or_default())
     }
 
     /// Settle a fill: debit quote asset from buyer, credit base asset; debit base from seller, credit quote.

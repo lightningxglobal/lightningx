@@ -87,7 +87,7 @@ if $IS_LINUX; then
   pkill -f aeronmd 2>/dev/null || true
   sleep 1.5
   rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
-  taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
+  env AERON_DIR="$AERON_DIR" taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
   pid=$!
   pids+=("$pid")
   for i in $(seq 1 20); do

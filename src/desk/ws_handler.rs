@@ -1,5 +1,6 @@
 use crate::account_repository::AccountRepository;
 use crate::api::AppState;
+use crate::desk::money::{AccountBalance, AmountAtoms};
 use crate::desk::counter_shard::owner_shard_for_user_id;
 use crate::desk::read_actor::{ConnMarketInfo, ReadConn};
 use dashmap::DashMap as ActorConnMap;
@@ -41,12 +42,10 @@ fn try_freeze_cache(
     let Some(kv) = entry.get_mut(asset) else {
         return false;
     };
-    if kv.0 - kv.1 >= amount {
-        kv.1 += amount;
-        true
-    } else {
-        false
-    }
+    let Ok(amount_atoms) = AmountAtoms::from_f64_round(amount) else {
+        return false;
+    };
+    kv.try_freeze_atoms(amount_atoms.atoms())
 }
 
 fn release_cache_frozen(cache: &crate::api::AccountCache, user_id: i64, asset: &str, amount: f64) {
@@ -55,7 +54,9 @@ fn release_cache_frozen(cache: &crate::api::AccountCache, user_id: i64, asset: &
     }
     if let Some(mut entry) = cache.get_mut(&user_id) {
         if let Some(kv) = entry.get_mut(asset) {
-            kv.1 = (kv.1 - amount).max(0.0);
+            if let Ok(amount_atoms) = AmountAtoms::from_f64_round(amount) {
+                kv.release_atoms(amount_atoms.atoms());
+            }
         }
     }
 }
@@ -893,7 +894,9 @@ async fn handle_client_message(
                 };
                 if push_bal {
                     if let Some(user_assets) = state.account_cache.get(&user_id) {
-                        if let Some(&(bal, frz)) = user_assets.get(freeze_asset) {
+                        if let Some(snapshot) = user_assets.get(freeze_asset).copied() {
+                            let bal = snapshot.balance();
+                            let frz = snapshot.frozen();
                             if let Some(tx) = state.user_tx.get(user_id) {
                                 let _ = tx.try_send((ws_sbe::encode_balance_update(
                                     freeze_asset, bal, bal - frz, frz,
@@ -1106,15 +1109,20 @@ async fn handle_client_message(
                     }
                     Ok((bal, frz)) if bal > 0.0 || frz >= 0.0 => {
                         // Update cache and push WS balance_update from RETURNING values.
-                        state
-                            .account_cache
-                            .entry(user_id)
-                            .or_insert_with(std::collections::HashMap::new)
-                            .insert(frozen_asset.to_string(), (bal, frz));
-                        if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                frozen_asset, bal, bal - frz, frz,
-                            ), 0));
+                        if let Ok(snapshot) = AccountBalance::from_f64_round(bal, frz) {
+                            state
+                                .account_cache
+                                .entry(user_id)
+                                .or_insert_with(std::collections::HashMap::new)
+                                .insert(frozen_asset.to_string(), snapshot);
+                            if let Some(tx) = state.user_tx.get(user_id) {
+                                let _ = tx.try_send((ws_sbe::encode_balance_update(
+                                    frozen_asset,
+                                    snapshot.balance(),
+                                    snapshot.available(),
+                                    snapshot.frozen(),
+                                ), 0));
+                            }
                         }
                     }
                     Ok(_) => {} // no-op freeze (zero amount)
@@ -1327,11 +1335,13 @@ async fn handle_client_message(
                             repo.release_frozen(user_id, rel_asset, rel_amount).await
                         {
                             if bal > 0.0 || frz >= 0.0 {
-                                state
-                                    .account_cache
-                                    .entry(user_id)
-                                    .or_insert_with(std::collections::HashMap::new)
-                                    .insert(rel_asset.to_string(), (bal, frz));
+                                if let Ok(snapshot) = AccountBalance::from_f64_round(bal, frz) {
+                                    state
+                                        .account_cache
+                                        .entry(user_id)
+                                        .or_insert_with(std::collections::HashMap::new)
+                                        .insert(rel_asset.to_string(), snapshot);
+                                }
                             }
                         }
                     }
@@ -1818,7 +1828,9 @@ async fn handle_client_message(
                         v.freeze_amount,
                     ) {
                         if let Some(user_assets) = state.account_cache.get(&user_id) {
-                            if let Some(&(bal, frz)) = user_assets.get(v.freeze_asset.as_str()) {
+                            if let Some(snapshot) = user_assets.get(v.freeze_asset.as_str()).copied() {
+                                let bal = snapshot.balance();
+                                let frz = snapshot.frozen();
                                 if let Some(tx) = state.user_tx.get(user_id) {
                                     let _ = tx.try_send((ws_sbe::encode_balance_update(
                                         &v.freeze_asset, bal, bal - frz, frz,
@@ -2029,15 +2041,20 @@ async fn handle_client_message(
                         continue;
                     }
                     Ok((bal, frz)) if bal > 0.0 || frz >= 0.0 => {
-                        state
-                            .account_cache
-                            .entry(user_id)
-                            .or_insert_with(std::collections::HashMap::new)
-                            .insert(frozen_asset.to_string(), (bal, frz));
-                        if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                frozen_asset, bal, bal - frz, frz,
-                            ), 0));
+                        if let Ok(snapshot) = AccountBalance::from_f64_round(bal, frz) {
+                            state
+                                .account_cache
+                                .entry(user_id)
+                                .or_insert_with(std::collections::HashMap::new)
+                                .insert(frozen_asset.to_string(), snapshot);
+                            if let Some(tx) = state.user_tx.get(user_id) {
+                                let _ = tx.try_send((ws_sbe::encode_balance_update(
+                                    frozen_asset,
+                                    snapshot.balance(),
+                                    snapshot.available(),
+                                    snapshot.frozen(),
+                                ), 0));
+                            }
                         }
                     }
                     Ok(_) => {}

@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# 40K WebSocket connection pressure test.
+# 400K WebSocket connection pressure test.
+# 8 desk-servers × 50K connections each.
 # Works on macOS (lo0 aliases, psql, /tmp/aeron) and Linux (lo aliases,
 # docker-postgres, /dev/shm/aeron, taskset aeronmd).
+#
+# Required loopback aliases for the default 32 source IP pool:
+#   macOS: for i in $(seq 2 33); do sudo ifconfig lo0 alias 127.0.0.$i up; done
+#   Linux: for i in $(seq 2 33); do sudo ip addr add 127.0.0.$i/8 dev lo; done
+#
+# No-forward: same counter_shard layout as 200K (8 desks, COUNTER_SHARD_COUNT=4).
+# owner_shard = desk_id % 4, user_offset = (desk_id / 4) * 50K.
 set -euo pipefail
 
 # ── Platform ──────────────────────────────────────────────────────────────
@@ -14,28 +22,19 @@ DATABASE_URL="${DATABASE_URL:-postgres://user:password@localhost:5432/mydb}"
 if $IS_LINUX; then
   AERON_DIR="${AERON_DIR:-/dev/shm/aeron}"
   AERON_BIN="${AERON_BIN:-$HOME/work/3party/aeron/cppbuild/Release/binaries/aeronmd}"
-  # Isolated CPUs (isolcpus=0-11 at boot): aeronmd=0, engine=2, desk spin=4,6,8,10
   CPU_AERONMD="${CPU_AERONMD:-0}"
   CPU_ENGINE="${CPU_ENGINE:-2}"
   CPU_DESK_SPIN=(4 8 4 8 4 8 4 8)  # only CPU4/CPU8 (adjacent to engine on CPU2)
-  CPU_OTHERS="${CPU_OTHERS:-20-31}"      # tokio workers + gateway + pressure clients
+  CPU_OTHERS="${CPU_OTHERS:-20-31}"
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
 fi
-TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_40k.csv}"
-TOTAL_CONNS="${TOTAL_CONNS:-40000}"
-DESK_COUNT="${DESK_COUNT:-4}"
+TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_400k.csv}"
+TOTAL_CONNS="${TOTAL_CONNS:-400000}"
+DESK_COUNT="${DESK_COUNT:-8}"
 TRACER_ENABLED="${TRACER_ENABLED:-0}"
+DESK_SPIN="${DESK_SPIN:-true}"
 CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
-# PRESSURE_OWNER_SHARD_SHIFT=0 → each pressure-i uses owner_shard=i users and
-# connects to desk-i, so the desk never forwards (no-forward benchmark mode).
-# Set to non-zero to deliberately test the forwarding path.
-PRESSURE_OWNER_SHARD_SHIFT="${PRESSURE_OWNER_SHARD_SHIFT:-0}"
-COUNTER_FORWARD_DEBUG="${COUNTER_FORWARD_DEBUG:-0}"
-ENGINE_RUST_LOG="${ENGINE_RUST_LOG:-warning}"
-DESK_RUST_LOG="${DESK_RUST_LOG:-warning}"
-MARKET_GATEWAY_RUST_LOG="${MARKET_GATEWAY_RUST_LOG:-warning}"
-PRESSURE_RUST_LOG="${PRESSURE_RUST_LOG:-warning}"
 LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
 
 ENGINE_BIN="${ENGINE_BIN:-$BIN_DIR/exchange-engine}"
@@ -43,16 +42,32 @@ DESK_BIN="${DESK_BIN:-$BIN_DIR/desk-server}"
 PRESSURE_BIN="${PRESSURE_BIN:-$BIN_DIR/pressure-client}"
 GATEWAY_BIN="${GATEWAY_BIN:-$BIN_DIR/market-data-gateway}"
 
-SOURCE_IPS=(127.0.0.2 127.0.0.3 127.0.0.4 127.0.0.5)
-PORTS=(4003 4004 4005 4006)
+SOURCE_IP_POOL=(
+  127.0.0.2  127.0.0.3  127.0.0.4  127.0.0.5
+  127.0.0.6  127.0.0.7  127.0.0.8  127.0.0.9
+  127.0.0.10 127.0.0.11 127.0.0.12 127.0.0.13
+  127.0.0.14 127.0.0.15 127.0.0.16 127.0.0.17
+  127.0.0.18 127.0.0.19 127.0.0.20 127.0.0.21
+  127.0.0.22 127.0.0.23 127.0.0.24 127.0.0.25
+  127.0.0.26 127.0.0.27 127.0.0.28 127.0.0.29
+  127.0.0.30 127.0.0.31 127.0.0.32 127.0.0.33
+)
+PORTS=(4003 4004 4005 4006 4007 4008 4009 4010)
 
 # ── Validation ────────────────────────────────────────────────────────────
 if (( DESK_COUNT < 1 || DESK_COUNT > ${#PORTS[@]} )); then
-  echo "DESK_COUNT must be between 1 and ${#PORTS[@]} (got $DESK_COUNT)" >&2; exit 2
+  echo "DESK_COUNT must be 1-${#PORTS[@]} (got $DESK_COUNT)" >&2; exit 2
 fi
 [[ -f "$TOKENS_CSV" ]] || { echo "missing token csv: $TOKENS_CSV" >&2; exit 2; }
+token_rows=$(wc -l < "$TOKENS_CSV" | tr -d ' ')
+if (( token_rows < TOTAL_CONNS )); then
+  echo "token csv has $token_rows rows, need $TOTAL_CONNS" >&2; exit 2
+fi
 
-for ip in "${SOURCE_IPS[@]}"; do
+conns_per_desk=$(( (TOTAL_CONNS + DESK_COUNT - 1) / DESK_COUNT ))
+ips_per_desk=$(( (conns_per_desk + CONNS_PER_SOURCE_IP - 1) / CONNS_PER_SOURCE_IP ))
+total_ips_needed=$(( ips_per_desk * DESK_COUNT ))
+for ip in "${SOURCE_IP_POOL[@]::$total_ips_needed}"; do
   if $IS_LINUX; then
     ip addr show lo | grep -q "inet ${ip}/" \
       || { echo "missing lo alias ${ip}; run: sudo ip addr add ${ip}/8 dev lo" >&2; exit 2; }
@@ -64,7 +79,7 @@ done
 
 mkdir -p "$LOG_DIR"
 echo "logs: $LOG_DIR"
-echo "shape: ${TOTAL_CONNS} conns across ${DESK_COUNT} desk-server processes  TRACER_ENABLED=${TRACER_ENABLED} OWNER_SHARD_SHIFT=${PRESSURE_OWNER_SHARD_SHIFT} COUNTER_FORWARD_DEBUG=${COUNTER_FORWARD_DEBUG}"
+echo "shape: ${TOTAL_CONNS} conns across ${DESK_COUNT} desk-server processes  TRACER_ENABLED=${TRACER_ENABLED}"
 
 pids=()
 cleanup() {
@@ -85,8 +100,7 @@ else
   psql "$DATABASE_URL" -c "UPDATE accounts SET frozen=0, updated_at=NOW() WHERE frozen <> 0;"
 fi
 
-# ── aeronmd (Linux: manage it; macOS: assumed already running) ────────────
-# Set REUSE_AERONMD=1 to skip restart when chaining tests back-to-back.
+# ── aeronmd ───────────────────────────────────────────────────────────────
 REUSE_AERONMD="${REUSE_AERONMD:-0}"
 if $IS_LINUX; then
   if [[ "$REUSE_AERONMD" == "1" ]] && pgrep -f aeronmd > /dev/null && [[ -f "$AERON_DIR/cnc.dat" ]]; then
@@ -96,13 +110,12 @@ if $IS_LINUX; then
     sleep 1.5
     rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
     env AERON_DIR="$AERON_DIR" taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
-    pid=$!
-    pids+=("$pid")
+    pids+=("$!")
     for i in $(seq 1 20); do
       [[ -f "$AERON_DIR/cnc.dat" ]] && break; sleep 1.5
     done
     [[ -f "$AERON_DIR/cnc.dat" ]] || { echo "aeronmd failed to start" >&2; exit 1; }
-    echo "aeronmd ready (pid=$pid)"
+    echo "aeronmd ready (pid=${pids[-1]})"
   fi
 fi
 
@@ -110,18 +123,17 @@ fi
 if $IS_LINUX; then
   taskset -c "$CPU_ENGINE" \
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG="$ENGINE_RUST_LOG" TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
     ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
     "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
 else
   env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-    RUST_LOG="$ENGINE_RUST_LOG" TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
+    RUST_LOG=warning TRACER_ENABLED=0 ENGINE_IDLE_SPINS=0 \
     ORDER_UPDATE_STREAM_COUNT="$DESK_COUNT" \
     "$ENGINE_BIN" >"$LOG_DIR/engine.log" 2>&1 &
 fi
-pid=$!
-pids+=("$pid")
-echo "exchange-engine started (pid=$pid)"
+pids+=("$!")
+echo "exchange-engine started (pid=${pids[-1]})"
 if $IS_LINUX; then sleep 5; else sleep 2; fi
 
 # ── market-data-gateway ───────────────────────────────────────────────────
@@ -129,11 +141,11 @@ if [[ -x "$GATEWAY_BIN" ]]; then
   if $IS_LINUX; then
     taskset -c "$CPU_OTHERS" \
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG="$MARKET_GATEWAY_RUST_LOG" \
+      RUST_LOG=warning \
       "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
   else
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG="$MARKET_GATEWAY_RUST_LOG" \
+      RUST_LOG=warning \
       "$GATEWAY_BIN" >"$LOG_DIR/market-gateway.log" 2>&1 &
   fi
   pids+=("$!")
@@ -145,29 +157,28 @@ for ((i = 0; i < DESK_COUNT; i++)); do
     spin_cpu="${CPU_DESK_SPIN[$i]}"
     taskset -c "${spin_cpu},${CPU_OTHERS}" \
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG="$DESK_RUST_LOG" TRACER_ENABLED="$TRACER_ENABLED" \
-      COUNTER_FORWARD_DEBUG="$COUNTER_FORWARD_DEBUG" \
-      DESK_SPIN="${DESK_SPIN:-true}" DESK_SEND_CORE="$spin_cpu" \
+      RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
+      DESK_SPIN="$DESK_SPIN" DESK_SEND_CORE="$spin_cpu" \
       DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
-      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}" NOFILE_LIMIT=262144 \
+      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288 \
       "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
     echo "desk-$i  spin_cpu=$spin_cpu  port=${PORTS[$i]}"
   else
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG="$DESK_RUST_LOG" TRACER_ENABLED="$TRACER_ENABLED" \
-      COUNTER_FORWARD_DEBUG="$COUNTER_FORWARD_DEBUG" \
-      DESK_SPIN="${DESK_SPIN:-true}" \
+      RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
+      DESK_SPIN="$DESK_SPIN" \
       DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
-      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}" NOFILE_LIMIT=262144 \
+      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288 \
       "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
   fi
   pids+=("$!")
-  # Linux: stagger desk starts — pub pre-creation serializes registrations
   if $IS_LINUX; then sleep 1.5; fi
 done
-sleep "${DESK_WARMUP_S:-8}"
+sleep "${DESK_WARMUP_S:-12}"
 
 # ── pressure clients ──────────────────────────────────────────────────────
+# 8 desks, COUNTER_SHARD_COUNT=4: desk i shares counter_shard i%4 with desk i+4.
+# owner_shard = i%4, user_offset = (i/4)*conns_per_desk → no forwarding.
 base_conns=$((TOTAL_CONNS / DESK_COUNT))
 extra_conns=$((TOTAL_CONNS % DESK_COUNT))
 ip_index=0
@@ -177,29 +188,32 @@ for ((i = 0; i < DESK_COUNT; i++)); do
   (( i < extra_conns )) && conns=$((conns + 1))
 
   ips_needed=$(((conns + CONNS_PER_SOURCE_IP - 1) / CONNS_PER_SOURCE_IP))
-  if (( ip_index + ips_needed > ${#SOURCE_IPS[@]} )); then
-    echo "not enough source IPs for ${TOTAL_CONNS}/${DESK_COUNT}; need ${ips_needed} more for desk $i" >&2; exit 2
+  if (( ip_index + ips_needed > ${#SOURCE_IP_POOL[@]} )); then
+    echo "not enough source IPs for desk $i (need $ips_needed more)" >&2; exit 2
   fi
-  source_ip="${SOURCE_IPS[$ip_index]}"
+  source_ip="${SOURCE_IP_POOL[$ip_index]}"
   for ((j = 1; j < ips_needed; j++)); do
-    source_ip="${source_ip},${SOURCE_IPS[$((ip_index + j))]}"
+    source_ip="${source_ip},${SOURCE_IP_POOL[$((ip_index + j))]}"
   done
   ip_index=$((ip_index + ips_needed))
 
-  owner_shard=$(((i + PRESSURE_OWNER_SHARD_SHIFT) % DESK_COUNT))
+  owner_shard=$(( i % 4 ))
+  layer=$(( i / 4 ))
+  user_offset=$(( layer * base_conns ))
 
-  env PRESSURE_TOKENS_CSV="$TOKENS_CSV" PRESSURE_USERS="$conns" \
-    PRESSURE_USER_OFFSET=0 PRESSURE_OWNER_SHARD="$owner_shard" PRESSURE_OWNER_SHARD_COUNT="$DESK_COUNT" \
+  env PRESSURE_TOKENS_CSV="$TOKENS_CSV" \
+    PRESSURE_USERS="$conns" PRESSURE_USER_OFFSET="$user_offset" \
+    PRESSURE_OWNER_SHARD="$owner_shard" PRESSURE_OWNER_SHARD_COUNT=4 \
     PRESSURE_CONNS="$conns" \
     PRESSURE_DURATION_S="${PRESSURE_DURATION_S:-60}" \
-    PRESSURE_RAMP_S="${PRESSURE_RAMP_S:-30}" \
+    PRESSURE_RAMP_S="${PRESSURE_RAMP_S:-90}" \
     PRESSURE_OPS_PER_SEC="${PRESSURE_OPS_PER_SEC:-0.2}" \
     PRESSURE_BASE_URL="http://127.0.0.1:${PORTS[$i]}" \
     PRESSURE_SOURCE_IPS="$source_ip" PRESSURE_SYMBOL=BTC_USDT \
-    PRESSURE_WORKERS="${PRESSURE_WORKERS:-2}" NOFILE_LIMIT=262144 \
-    RUST_LOG="$PRESSURE_RUST_LOG" "$PRESSURE_BIN" >"$LOG_DIR/pressure-$i.log" 2>&1 &
+    PRESSURE_WORKERS="${PRESSURE_WORKERS:-4}" NOFILE_LIMIT=524288 \
+    RUST_LOG=warning "$PRESSURE_BIN" >"$LOG_DIR/pressure-$i.log" 2>&1 &
   pids+=("$!")
-  echo "pressure-$i: conns=$conns owner_shard=$owner_shard source_ips=$source_ip port=${PORTS[$i]}"
+  echo "pressure-$i: conns=$conns owner_shard=$owner_shard user_offset=$user_offset source_ips=$source_ip port=${PORTS[$i]}"
 done
 
 # Wait for pressure clients only (skip long-running services)

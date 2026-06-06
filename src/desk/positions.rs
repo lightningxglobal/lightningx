@@ -24,7 +24,7 @@ pub struct Position {
 }
 
 /// All non-USDT positions with non-zero balance for the user. In-memory
-/// only — pulls (balance, frozen) from account_cache, current_price from
+/// only — pulls fixed-point balances from account_cache, current_price from
 /// last_trade_price, and entry_price from the running vwap_cache. This
 /// replaces a 3-query PG path (the 3rd of which was a 90ms aggregate
 /// over the trades table per call).
@@ -38,7 +38,9 @@ pub fn all_positions_in_memory(
         return Vec::new();
     };
     let mut out: Vec<Position> = Vec::with_capacity(assets_ref.len());
-    for (asset, &(balance, frozen)) in assets_ref.iter() {
+    for (asset, amount) in assets_ref.iter() {
+        let balance = amount.balance();
+        let frozen = amount.frozen();
         if asset == "USDT" || balance <= 0.0 {
             continue;
         }

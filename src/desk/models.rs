@@ -21,6 +21,8 @@ pub struct DbAccount {
     pub asset: String,
     pub balance: f64,
     pub frozen: f64,
+    pub balance_atoms: i64,
+    pub frozen_atoms: i64,
     pub updated_at: DateTime<Utc>,
 }
 

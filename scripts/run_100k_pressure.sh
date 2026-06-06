@@ -21,7 +21,7 @@ if $IS_LINUX; then
   # Isolated CPUs (isolcpus=0-11 at boot): aeronmd=0, engine=2, desk spin=4,6,8,10
   CPU_AERONMD="${CPU_AERONMD:-0}"
   CPU_ENGINE="${CPU_ENGINE:-2}"
-  CPU_DESK_SPIN=(4 6 8 10 12 14 16 18)  # one per desk, physical isolated cores
+  CPU_DESK_SPIN=(4 8 4 8 4 8 4 8)  # only CPU4/CPU8 (adjacent to engine on CPU2)
   CPU_OTHERS="${CPU_OTHERS:-20-31}"      # tokio workers + gateway + pressure clients
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
@@ -30,7 +30,7 @@ TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_100k.csv}"
 TOTAL_CONNS="${TOTAL_CONNS:-100000}"
 DESK_COUNT="${DESK_COUNT:-4}"
 TRACER_ENABLED="${TRACER_ENABLED:-0}"
-DESK_SPIN="${DESK_SPIN:-false}"
+DESK_SPIN="${DESK_SPIN:-true}"
 CONNS_PER_SOURCE_IP="${CONNS_PER_SOURCE_IP:-15000}"
 LOG_DIR="${LOG_DIR:-/tmp/lightning-${TOTAL_CONNS}-${DESK_COUNT}desk-$(date +%Y%m%d-%H%M%S)}"
 

@@ -1,5 +1,6 @@
 /// REST API layer: auth, accounts, orders, user profile, KYC
 use crate::account_repository::AccountRepository;
+use crate::desk::money::{AccountBalance, AmountAtoms};
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::models::{DbOrder, User};
 use crate::order::{Order, Side, TimeInForce};
@@ -25,9 +26,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-/// In-memory account cache: user_id → { asset → (balance, frozen) }.
+/// In-memory account cache: user_id → { asset → fixed-point balance }.
 /// Updated after every DB write so GET /api/balances never hits the DB.
-pub type AccountCache = Arc<DashMap<i64, HashMap<String, (f64, f64)>>>;
+pub type AccountCache = Arc<DashMap<i64, HashMap<String, AccountBalance>>>;
 
 /// Running VWAP of a user's BUY fills per (user_id, base_asset).
 /// Updated on every BatchSettleTrade so GET /api/positions can compute
@@ -311,8 +312,8 @@ pub fn router(state: AppState) -> Router {
 /// (which would otherwise produce "Insufficient balance" errors even when
 /// the user has plenty in PG — the hot path doesn't fall back to PG).
 async fn warm_account_cache_for(s: &AppState, user_id: i64) {
-    let rows: Vec<(String, f64, f64)> =
-        sqlx::query_as("SELECT asset, balance, frozen FROM accounts WHERE user_id=$1")
+    let rows: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT asset, balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1")
             .bind(user_id)
             .fetch_all(s.db.as_ref())
             .await
@@ -322,7 +323,7 @@ async fn warm_account_cache_for(s: &AppState, user_id: i64) {
     }
     let mut entry = s.account_cache.entry(user_id).or_insert_with(HashMap::new);
     for (asset, bal, frz) in rows {
-        entry.insert(asset, (bal, frz));
+        entry.insert(asset, AccountBalance::from_atoms(bal, frz));
     }
 }
 
@@ -431,28 +432,21 @@ fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64
     let Some(kv) = entry.get_mut(asset) else {
         return false;
     };
-    let Ok(balance_atoms) = crate::desk::money::AmountAtoms::from_f64_round(kv.0) else {
+    let Ok(amount_atoms) = AmountAtoms::from_f64_round(amount) else {
         return false;
     };
-    let Ok(frozen_atoms) = crate::desk::money::AmountAtoms::from_f64_round(kv.1) else {
-        return false;
-    };
-    let Ok(amount_atoms) = crate::desk::money::AmountAtoms::from_f64_round(amount) else {
-        return false;
-    };
-    if balance_atoms.atoms() - frozen_atoms.atoms() >= amount_atoms.atoms() {
-        kv.1 += amount;
-        true
-    } else {
-        false
-    }
+    kv.try_freeze_atoms(amount_atoms.atoms())
 }
 
 fn cache_set(cache: &AccountCache, user_id: i64, asset: &str, balance: f64, frozen: f64) {
+    let Ok(snapshot) = AccountBalance::from_f64_round(balance, frozen) else {
+        tracing::warn!("skip account cache set for invalid amount user={user_id} asset={asset}");
+        return;
+    };
     cache
         .entry(user_id)
         .or_insert_with(HashMap::new)
-        .insert(asset.to_string(), (balance, frozen));
+        .insert(asset.to_string(), snapshot);
 }
 
 async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -468,12 +462,14 @@ async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl 
     if let Some(assets) = s.account_cache.get(&user_id) {
         let accounts: Vec<Value> = assets
             .iter()
-            .map(|(asset, &(balance, frozen))| {
+            .map(|(asset, amount)| {
+                let balance = amount.balance();
+                let frozen = amount.frozen();
                 json!({
                     "asset":     asset,
                     "balance":   balance,
                     "frozen":    frozen,
-                    "available": balance - frozen,
+                    "available": amount.available(),
                 })
             })
             .collect();
@@ -486,7 +482,10 @@ async fn handle_accounts(State(s): State<AppState>, headers: HeaderMap) -> impl 
         Ok(accounts) => {
             let mut entry = s.account_cache.entry(user_id).or_insert_with(HashMap::new);
             for a in &accounts {
-                entry.insert(a.asset.clone(), (a.balance, a.frozen));
+                entry.insert(
+                    a.asset.clone(),
+                    AccountBalance::from_atoms(a.balance_atoms, a.frozen_atoms),
+                );
             }
             (StatusCode::OK, Json(json!(accounts))).into_response()
         }
@@ -559,12 +558,12 @@ fn publish_rest_order_upsert(
     } else {
         base_asset
     };
-    let snapshot: Option<(f64, f64)> = state
+    let snapshot: Option<AccountBalance> = state
         .account_cache
         .get(&user_id)
         .and_then(|entry| entry.get(asset).copied());
-    if let Some((balance, frozen)) = snapshot {
-        match account_set_payload(user_id, asset, balance, frozen) {
+    if let Some(snapshot) = snapshot {
+        match account_set_payload(user_id, asset, snapshot.balance(), snapshot.frozen()) {
             Ok(acc) => {
                 let _ = pp.push(PersistFrame::account_set(acc));
             }
@@ -579,7 +578,6 @@ fn account_set_payload(
     balance: f64,
     frozen: f64,
 ) -> anyhow::Result<crate::transport::persist_event::AccountSetPayload> {
-    use crate::desk::money::AmountAtoms;
     use crate::transport::persist_event::pack_str;
 
     Ok(crate::transport::persist_event::AccountSetPayload {

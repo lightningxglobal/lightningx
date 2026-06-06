@@ -14,6 +14,7 @@ use lightning_exchange::{
     },
     api::{AccountCache, AppState, router},
     db,
+    money::{AccountBalance, AmountAtoms},
     order_state::{DbOrderStatus, db_status_from_update_kind, ws_status_from_update_kind},
     tracer::{
         DESK_INSTANCE_ID,
@@ -465,21 +466,10 @@ fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64
     let Some(kv) = entry.get_mut(asset) else {
         return false;
     };
-    let Ok(balance_atoms) = lightning_exchange::money::AmountAtoms::from_f64_round(kv.0) else {
+    let Ok(amount_atoms) = AmountAtoms::from_f64_round(amount) else {
         return false;
     };
-    let Ok(frozen_atoms) = lightning_exchange::money::AmountAtoms::from_f64_round(kv.1) else {
-        return false;
-    };
-    let Ok(amount_atoms) = lightning_exchange::money::AmountAtoms::from_f64_round(amount) else {
-        return false;
-    };
-    if balance_atoms.atoms() - frozen_atoms.atoms() >= amount_atoms.atoms() {
-        kv.1 += amount;
-        true
-    } else {
-        false
-    }
+    kv.try_freeze_atoms(amount_atoms.atoms())
 }
 
 fn release_cache_frozen(cache: &AccountCache, user_id: i64, asset: &str, amount: f64) {
@@ -488,7 +478,9 @@ fn release_cache_frozen(cache: &AccountCache, user_id: i64, asset: &str, amount:
     }
     if let Some(mut entry) = cache.get_mut(&user_id) {
         if let Some(kv) = entry.get_mut(asset) {
-            kv.1 = (kv.1 - amount).max(0.0);
+            if let Ok(amount_atoms) = AmountAtoms::from_f64_round(amount) {
+                kv.release_atoms(amount_atoms.atoms());
+            }
         }
     }
 }
@@ -744,10 +736,12 @@ fn process_db_cmd(
                 accounts_to_emit.insert((e.user_id, asset), ());
             }
             for ((uid, asset), _) in accounts_to_emit {
-                let snapshot: Option<(f64, f64)> = account_cache
+                let snapshot: Option<AccountBalance> = account_cache
                     .get(&uid)
                     .and_then(|entry| entry.get(asset.as_str()).copied());
-                if let Some((bal, frz)) = snapshot {
+                if let Some(snapshot) = snapshot {
+                    let bal = snapshot.balance();
+                    let frz = snapshot.frozen();
                     match account_set_payload(uid, &asset, bal, frz) {
                         Ok(payload) => {
                             publish_frame(&persist_pub, &PersistFrame::account_set(payload));
@@ -832,10 +826,13 @@ fn process_db_cmd(
                 // the frozen counter back into available.
                 let new_vals = account_cache.get_mut(&uid).and_then(|mut entry| {
                     let kv = entry.get_mut(&asset)?;
-                    kv.1 = (kv.1 - amount).max(0.0);
-                    Some((kv.0, kv.1))
+                    let amount_atoms = AmountAtoms::from_f64_round(amount).ok()?;
+                    kv.release_atoms(amount_atoms.atoms());
+                    Some(*kv)
                 });
-                if let Some((bal, frz)) = new_vals {
+                if let Some(snapshot) = new_vals {
+                    let bal = snapshot.balance();
+                    let frz = snapshot.frozen();
                     match account_set_payload(uid, &asset, bal, frz) {
                         Ok(payload) => {
                             publish_frame(&persist_pub, &PersistFrame::account_set(payload));
@@ -891,10 +888,13 @@ fn process_db_cmd(
             }
             let new_vals = account_cache.get_mut(&user_id).and_then(|mut entry| {
                 let kv = entry.get_mut(&asset)?;
-                kv.1 = (kv.1 - amount).max(0.0);
-                Some((kv.0, kv.1))
+                let amount_atoms = AmountAtoms::from_f64_round(amount).ok()?;
+                kv.release_atoms(amount_atoms.atoms());
+                Some(*kv)
             });
-            if let Some((bal, frz)) = new_vals {
+            if let Some(snapshot) = new_vals {
+                let bal = snapshot.balance();
+                let frz = snapshot.frozen();
                 match account_set_payload(user_id, &asset, bal, frz) {
                     Ok(payload) => {
                         publish_frame(&persist_pub, &PersistFrame::account_set(payload));
@@ -969,8 +969,8 @@ fn process_db_cmd(
             //   seller quote: +cost
             #[derive(Default, Clone, Copy)]
             struct Delta {
-                balance: f64,
-                frozen_release: f64,
+                balance_atoms: i64,
+                frozen_release_atoms: i64,
             }
             let mut deltas: HashMap<(i64, String), Delta> = HashMap::new();
             for r in &resolved {
@@ -981,6 +981,12 @@ fn process_db_cmd(
                     None => continue,
                 };
                 let cost = r.price * r.qty;
+                let Ok(cost_atoms) = AmountAtoms::from_f64_round(cost).map(|v| v.atoms()) else {
+                    continue;
+                };
+                let Ok(qty_atoms) = AmountAtoms::from_f64_round(r.qty).map(|v| v.atoms()) else {
+                    continue;
+                };
                 let (buyer_uid, seller_uid) = if r.side == 0 {
                     (r.taker_uid, r.maker_uid)
                 } else {
@@ -988,18 +994,18 @@ fn process_db_cmd(
                 };
 
                 let e = deltas.entry((buyer_uid, quote.to_string())).or_default();
-                e.balance -= cost;
-                e.frozen_release += cost;
+                e.balance_atoms -= cost_atoms;
+                e.frozen_release_atoms += cost_atoms;
 
                 let e = deltas.entry((buyer_uid, base.to_string())).or_default();
-                e.balance += r.qty;
+                e.balance_atoms += qty_atoms;
 
                 let e = deltas.entry((seller_uid, base.to_string())).or_default();
-                e.balance -= r.qty;
-                e.frozen_release += r.qty;
+                e.balance_atoms -= qty_atoms;
+                e.frozen_release_atoms += qty_atoms;
 
                 let e = deltas.entry((seller_uid, quote.to_string())).or_default();
-                e.balance += cost;
+                e.balance_atoms += cost_atoms;
 
                 // VWAP cache for /api/positions: running weighted sum of
                 // BUY fills per (user_id, base_asset). Replaces the 90ms
@@ -1020,11 +1026,12 @@ fn process_db_cmd(
                 Vec::with_capacity(deltas.len());
             for ((uid, asset), d) in deltas {
                 let mut entry = account_cache.entry(uid).or_insert_with(HashMap::new);
-                let kv = entry.entry(asset.clone()).or_insert((0.0, 0.0));
-                kv.0 = (kv.0 + d.balance).max(0.0);
-                kv.1 = (kv.1 - d.frozen_release).max(0.0);
-                let bal = kv.0;
-                let frz = kv.1;
+                let kv = entry
+                    .entry(asset.clone())
+                    .or_insert_with(AccountBalance::default);
+                kv.apply_atoms_delta(d.balance_atoms, d.frozen_release_atoms);
+                let bal = kv.balance();
+                let frz = kv.frozen();
                 drop(entry);
                 updated_accounts.push((uid, asset, bal, frz));
             }
@@ -1262,8 +1269,8 @@ async fn async_main() -> anyhow::Result<()> {
     // Pre-load all account balances into memory so GET /api/balances never touches DB.
     let account_cache: AccountCache = AccountCache::default();
     {
-        let rows: Vec<(i64, String, f64, f64)> =
-            sqlx::query_as("SELECT user_id, asset, balance, frozen FROM accounts")
+        let rows: Vec<(i64, String, i64, i64)> =
+            sqlx::query_as("SELECT user_id, asset, balance_atoms, frozen_atoms FROM accounts")
                 .fetch_all(&pool)
                 .await
                 .unwrap_or_default();
@@ -1271,7 +1278,7 @@ async fn async_main() -> anyhow::Result<()> {
             account_cache
                 .entry(uid)
                 .or_insert_with(HashMap::new)
-                .insert(asset, (bal, frz));
+                .insert(asset, AccountBalance::from_atoms(bal, frz));
         }
         tracing::info!("Account cache loaded ({} rows)", account_cache.len());
     }
@@ -1599,7 +1606,7 @@ async fn async_main() -> anyhow::Result<()> {
         let usdt_cents = entry
             .value()
             .get("USDT")
-            .map(|&(bal, _)| (bal * 100.0).round() as i64)
+            .map(|amount| (amount.balance_atoms + 500_000) / 1_000_000)
             .unwrap_or(0);
         risk_engine.initialize_account(user_id, usdt_cents);
     }
@@ -2592,10 +2599,13 @@ async fn async_main() -> anyhow::Result<()> {
                                 }
                                 let new_vals = account_cache.get_mut(&meta.user_id).and_then(|mut e| {
                                     let kv = e.get_mut(asset)?;
-                                    kv.1 = (kv.1 - rel_amount).max(0.0);
-                                    Some((kv.0, kv.1))
+                                    let rel_atoms = AmountAtoms::from_f64_round(rel_amount).ok()?;
+                                    kv.release_atoms(rel_atoms.atoms());
+                                    Some(*kv)
                                 });
-                                if let Some((bal, frz)) = new_vals {
+                                if let Some(snapshot) = new_vals {
+                                    let bal = snapshot.balance();
+                                    let frz = snapshot.frozen();
                                     if let Some(tx) = user_tx.get(meta.user_id) {
                                         let _ = tx.try_send((lightning_exchange::ws_sbe::encode_balance_update(
                                             asset, bal, bal - frz, frz,

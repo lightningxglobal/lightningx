@@ -134,26 +134,12 @@ impl MatchingEngine {
         }
     }
 
+    /// O(1) liveness check: is this order id still resting in the book?
+    /// Used by the engine front-end to garbage-collect per-order metadata
+    /// (participant routing, open-order counters) after maker fills.
     #[inline]
-    pub fn has_crossing_order_id<F>(
-        &self,
-        side: Side,
-        price_ticks: PriceTicks,
-        mut matches: F,
-    ) -> bool
-    where
-        F: FnMut(u64) -> bool,
-    {
-        match side {
-            Side::Buy => self.sell_book.any_crossing_order_id(
-                |maker_price| price_ticks == 0 || price_ticks >= maker_price,
-                |order_id| matches(order_id),
-            ),
-            Side::Sell => self.buy_book.any_crossing_order_id(
-                |maker_price| price_ticks == 0 || price_ticks <= maker_price,
-                |order_id| matches(order_id),
-            ),
-        }
+    pub fn contains_order(&self, order_id: u64) -> bool {
+        self.orders.contains_key(&order_id)
     }
 
     /// 验证订单有效性

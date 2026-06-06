@@ -65,21 +65,28 @@ fn response_stream_index(stream_id: i32, publishers_len: usize) -> usize {
     0
 }
 
-fn would_self_trade(
-    engine: &MatchingEngine,
-    uid_map: &HashMap<u64, (u64, i32)>,
-    participant_id: u64,
-    side: Side,
-    price_ticks: i64,
-) -> bool {
-    if participant_id == 0 {
-        return false;
+// Self-trade prevention is intentionally NOT done in the matching hot path.
+// Compliance runs its own offline, non-realtime surveillance; the engine's
+// job is to attach sufficient metadata to every trade (both user ids are
+// denormalized onto the trades table via TradeInsertPayload). A realtime
+// book scan per inbound order would be O(crossing orders) — unacceptable.
+
+/// Reference price for the band check, O(1):
+/// prefer the book mid when both sides are present and sane, otherwise fall
+/// back to the last trade price so an empty/one-sided book (open, liquidity
+/// drought — exactly when protection matters most) is still covered.
+fn band_reference_ticks(engine: &MatchingEngine, last_trade_ticks: i64) -> Option<i128> {
+    if let (Some(best_bid), Some(best_ask)) =
+        (engine.best_price_ticks(true), engine.best_price_ticks(false))
+    {
+        if best_bid > 0 && best_ask > 0 && best_bid <= best_ask {
+            return Some((best_bid as i128 + best_ask as i128) / 2);
+        }
     }
-    engine.has_crossing_order_id(side, price_ticks, |maker_order_id| {
-        uid_map
-            .get(&maker_order_id)
-            .is_some_and(|(maker_participant_id, _)| *maker_participant_id == participant_id)
-    })
+    if last_trade_ticks > 0 {
+        return Some(last_trade_ticks as i128);
+    }
+    None
 }
 
 fn outside_price_band(
@@ -87,24 +94,62 @@ fn outside_price_band(
     side: Side,
     price_ticks: i64,
     band_bps: u32,
+    last_trade_ticks: i64,
 ) -> bool {
     if price_ticks <= 0 || band_bps == 0 {
         return false;
     }
-    let (Some(best_bid), Some(best_ask)) =
-        (engine.best_price_ticks(true), engine.best_price_ticks(false))
-    else {
+    let Some(reference) = band_reference_ticks(engine, last_trade_ticks) else {
         return false;
     };
-    if best_bid <= 0 || best_ask <= 0 || best_bid > best_ask {
-        return false;
-    }
-
-    let mid = (best_bid as i128 + best_ask as i128) / 2;
-    let band = mid * band_bps as i128 / 10_000;
+    let band = reference * band_bps as i128 / 10_000;
     match side {
-        Side::Buy => (price_ticks as i128) > mid + band,
-        Side::Sell => (price_ticks as i128) < mid - band,
+        Side::Buy => (price_ticks as i128) > reference + band,
+        Side::Sell => (price_ticks as i128) < reference - band,
+    }
+}
+
+/// Per-order size limits, O(1). `max_lots`/`max_notional` of 0 disable the
+/// respective check. Notional is in ticks×lots units (i128, overflow-free).
+/// Market orders (price 0) are only bounded by lots.
+fn exceeds_order_limits(
+    price_ticks: i64,
+    quantity_lots: i64,
+    max_lots: i64,
+    max_notional: i128,
+) -> bool {
+    if max_lots > 0 && quantity_lots > max_lots {
+        return true;
+    }
+    if max_notional > 0 && price_ticks > 0 {
+        let notional = price_ticks as i128 * quantity_lots as i128;
+        if notional > max_notional {
+            return true;
+        }
+    }
+    false
+}
+
+/// Per-participant open-order accounting, O(1) per transition. Counts are
+/// kept exactly in sync with uid_map insert/remove so a cap can be enforced
+/// without scanning anything.
+#[inline]
+fn open_count_inc(counts: &mut HashMap<u64, u32>, participant_id: u64) {
+    if participant_id != 0 {
+        *counts.entry(participant_id).or_insert(0) += 1;
+    }
+}
+
+#[inline]
+fn open_count_dec(counts: &mut HashMap<u64, u32>, participant_id: u64) {
+    if participant_id == 0 {
+        return;
+    }
+    if let Some(c) = counts.get_mut(&participant_id) {
+        *c = c.saturating_sub(1);
+        if *c == 0 {
+            counts.remove(&participant_id);
+        }
     }
 }
 
@@ -173,42 +218,6 @@ mod tests {
     use lightning_exchange::engine::PoolConfig;
 
     #[test]
-    fn stp_detects_crossing_maker_same_participant() {
-        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
-        engine
-            .place_order(Order::new(1, Side::Sell, 90, 5, TimeInForce::GTC, 0))
-            .unwrap();
-        engine
-            .place_order(Order::new(2, Side::Sell, 100, 5, TimeInForce::GTC, 0))
-            .unwrap();
-        let mut uid_map = HashMap::new();
-        uid_map.insert(1, (7, 200));
-        uid_map.insert(2, (42, 200));
-
-        assert!(would_self_trade(
-            &engine,
-            &uid_map,
-            42,
-            Side::Buy,
-            100
-        ));
-        assert!(!would_self_trade(
-            &engine,
-            &uid_map,
-            43,
-            Side::Buy,
-            100
-        ));
-        assert!(!would_self_trade(
-            &engine,
-            &uid_map,
-            42,
-            Side::Buy,
-            89
-        ));
-    }
-
-    #[test]
     fn price_band_rejects_only_aggressive_extremes() {
         let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
         engine
@@ -218,13 +227,93 @@ mod tests {
             .place_order(Order::new(2, Side::Sell, 110, 5, TimeInForce::GTC, 0))
             .unwrap();
 
-        assert!(outside_price_band(&engine, Side::Buy, 250, 10_000));
-        assert!(outside_price_band(&engine, Side::Sell, 49, 5_000));
-        assert!(!outside_price_band(&engine, Side::Buy, 50, 10_000));
-        assert!(!outside_price_band(&engine, Side::Sell, 250, 10_000));
-        assert!(!outside_price_band(&engine, Side::Sell, 0, 10_000));
-        assert!(!outside_price_band(&engine, Side::Sell, -1, 10_000));
-        assert!(!outside_price_band(&engine, Side::Buy, 250, 0));
+        assert!(outside_price_band(&engine, Side::Buy, 250, 10_000, 0));
+        assert!(outside_price_band(&engine, Side::Sell, 49, 5_000, 0));
+        assert!(!outside_price_band(&engine, Side::Buy, 50, 10_000, 0));
+        assert!(!outside_price_band(&engine, Side::Sell, 250, 10_000, 0));
+        assert!(!outside_price_band(&engine, Side::Sell, 0, 10_000, 0));
+        assert!(!outside_price_band(&engine, Side::Sell, -1, 10_000, 0));
+        assert!(!outside_price_band(&engine, Side::Buy, 250, 0, 0));
+    }
+
+    #[test]
+    fn price_band_falls_back_to_last_trade_when_book_is_empty() {
+        let engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+
+        // Empty book + no last trade → no reference, no protection (cold start).
+        assert_eq!(band_reference_ticks(&engine, 0), None);
+        assert!(!outside_price_band(&engine, Side::Buy, 1_000_000, 10_000, 0));
+
+        // Empty book + last trade at 100 → band anchors on the last trade.
+        assert_eq!(band_reference_ticks(&engine, 100), Some(100));
+        assert!(outside_price_band(&engine, Side::Buy, 201, 10_000, 100));
+        assert!(!outside_price_band(&engine, Side::Buy, 200, 10_000, 100));
+        assert!(outside_price_band(&engine, Side::Sell, 49, 5_000, 100));
+        assert!(!outside_price_band(&engine, Side::Sell, 50, 5_000, 100));
+    }
+
+    #[test]
+    fn price_band_falls_back_when_book_is_one_sided() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine
+            .place_order(Order::new(1, Side::Buy, 90, 5, TimeInForce::GTC, 0))
+            .unwrap();
+
+        // Only a bid in the book → mid is undefined → last trade anchors.
+        assert_eq!(band_reference_ticks(&engine, 100), Some(100));
+        assert!(outside_price_band(&engine, Side::Buy, 201, 10_000, 100));
+    }
+
+    #[test]
+    fn price_band_prefers_book_mid_over_last_trade() {
+        let mut engine = MatchingEngine::new(PoolConfig::default()).unwrap();
+        engine
+            .place_order(Order::new(1, Side::Buy, 90, 5, TimeInForce::GTC, 0))
+            .unwrap();
+        engine
+            .place_order(Order::new(2, Side::Sell, 110, 5, TimeInForce::GTC, 0))
+            .unwrap();
+
+        // Stale last trade at 10_000 must NOT widen the band: mid (100) wins.
+        assert_eq!(band_reference_ticks(&engine, 10_000), Some(100));
+        assert!(outside_price_band(&engine, Side::Buy, 250, 10_000, 10_000));
+    }
+
+    #[test]
+    fn order_limits_enforce_lots_and_notional() {
+        // Disabled limits pass everything.
+        assert!(!exceeds_order_limits(1_000_000, 1_000_000, 0, 0));
+        // Lots cap applies to limit and market orders alike.
+        assert!(exceeds_order_limits(100, 11, 10, 0));
+        assert!(exceeds_order_limits(0, 11, 10, 0)); // market order
+        assert!(!exceeds_order_limits(100, 10, 10, 0));
+        // Notional cap (ticks × lots) applies to priced orders only.
+        assert!(exceeds_order_limits(100, 11, 0, 1_000));
+        assert!(!exceeds_order_limits(100, 10, 0, 1_000));
+        assert!(!exceeds_order_limits(0, 1_000_000, 0, 1_000)); // market: lots-only
+        // i128 product cannot overflow even at i64 extremes.
+        assert!(exceeds_order_limits(i64::MAX, i64::MAX, 0, 1));
+    }
+
+    #[test]
+    fn open_order_counts_track_inserts_and_removes_exactly() {
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        open_count_inc(&mut counts, 42);
+        open_count_inc(&mut counts, 42);
+        open_count_inc(&mut counts, 7);
+        assert_eq!(counts.get(&42), Some(&2));
+        assert_eq!(counts.get(&7), Some(&1));
+
+        open_count_dec(&mut counts, 42);
+        assert_eq!(counts.get(&42), Some(&1));
+        open_count_dec(&mut counts, 42);
+        assert_eq!(counts.get(&42), None, "zero entries are evicted");
+        // Underflow and unknown ids are no-ops, not panics.
+        open_count_dec(&mut counts, 42);
+        open_count_dec(&mut counts, 999);
+        // participant 0 (unattributed) is never tracked.
+        open_count_inc(&mut counts, 0);
+        assert!(!counts.contains_key(&0));
     }
 }
 
@@ -317,6 +406,28 @@ fn spawn_symbol_thread(
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(10_000);
+            // Per-order / per-participant limits. 0 disables a limit.
+            let max_order_lots = std::env::var("ENGINE_MAX_ORDER_LOTS")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            let max_order_notional = std::env::var("ENGINE_MAX_ORDER_NOTIONAL")
+                .ok()
+                .and_then(|s| s.parse::<i128>().ok())
+                .unwrap_or(0);
+            let max_open_orders = std::env::var("ENGINE_MAX_OPEN_ORDERS_PER_USER")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            tracing::info!(
+                "[{}] limits: band_bps={} max_order_lots={} max_order_notional={} max_open_orders={}",
+                symbol, price_band_bps, max_order_lots, max_order_notional, max_open_orders,
+            );
+            // O(1) per-participant resting-order counts, kept in lockstep
+            // with uid_map (see open_count_inc/dec).
+            let mut open_counts: HashMap<u64, u32> = HashMap::new();
+            // Band fallback anchor when the book is empty/one-sided.
+            let mut last_trade_ticks: i64 = 0;
 
             loop {
                 // Only the subscriber needs do_work() — it processes the incoming IPC ring.
@@ -391,7 +502,13 @@ fn spawn_symbol_thread(
                                 );
                                 continue;
                             }
-                            if outside_price_band(&engine, side, req.price_ticks, price_band_bps) {
+                            if outside_price_band(
+                                &engine,
+                                side,
+                                req.price_ticks,
+                                price_band_bps,
+                                last_trade_ticks,
+                            ) {
                                 publish_order_update(
                                     &mut ou_pubs,
                                     &mut ou_seqs,
@@ -405,12 +522,14 @@ fn spawn_symbol_thread(
                                 );
                                 continue;
                             }
-                            if would_self_trade(
-                                &engine,
-                                &uid_map,
-                                req.participant_id,
-                                side,
+                            // reject_reason 6 (was realtime STP) is retired:
+                            // self-trade handling moved to offline compliance
+                            // surveillance over trade metadata.
+                            if exceeds_order_limits(
                                 req.price_ticks,
+                                quantity_lots,
+                                max_order_lots,
+                                max_order_notional,
                             ) {
                                 publish_order_update(
                                     &mut ou_pubs,
@@ -419,7 +538,27 @@ fn spawn_symbol_thread(
                                     &OrderUpdateMsg::rejected(
                                         req.client_order_id,
                                         req.participant_id,
-                                        6,
+                                        8,
+                                        ts,
+                                    ),
+                                );
+                                continue;
+                            }
+                            let participant_id: u64 = req.participant_id;
+                            if max_open_orders > 0
+                                && participant_id != 0
+                                && open_counts
+                                    .get(&participant_id)
+                                    .is_some_and(|&c| c >= max_open_orders)
+                            {
+                                publish_order_update(
+                                    &mut ou_pubs,
+                                    &mut ou_seqs,
+                                    response_stream_id,
+                                    &OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        9,
                                         ts,
                                     ),
                                 );
@@ -484,10 +623,18 @@ fn spawn_symbol_thread(
                                     let total_qty = rules.lots_to_quantity(req.quantity_lots);
                                     let update = match result.status {
                                         OrderStatus::Accepted => {
-                                            uid_map.insert(
-                                                result.order_id,
-                                                (req.participant_id, response_stream_id),
-                                            );
+                                            if uid_map
+                                                .insert(
+                                                    result.order_id,
+                                                    (req.participant_id, response_stream_id),
+                                                )
+                                                .is_none()
+                                            {
+                                                open_count_inc(
+                                                    &mut open_counts,
+                                                    req.participant_id,
+                                                );
+                                            }
                                             OrderUpdateMsg::accepted(
                                                 result.order_id,
                                                 req.client_order_id,
@@ -496,7 +643,11 @@ fn spawn_symbol_thread(
                                             )
                                         }
                                         OrderStatus::Filled => {
-                                            uid_map.remove(&result.order_id);
+                                            if let Some((pid, _)) =
+                                                uid_map.remove(&result.order_id)
+                                            {
+                                                open_count_dec(&mut open_counts, pid);
+                                            }
                                             OrderUpdateMsg::filled(
                                                 result.order_id,
                                                 req.client_order_id,
@@ -509,10 +660,18 @@ fn spawn_symbol_thread(
                                         OrderStatus::PartiallyFilled => {
                                             // Order rests in book after partial fill — must track
                                             // participant so cancel confirmations route correctly.
-                                            uid_map.insert(
-                                                result.order_id,
-                                                (req.participant_id, response_stream_id),
-                                            );
+                                            if uid_map
+                                                .insert(
+                                                    result.order_id,
+                                                    (req.participant_id, response_stream_id),
+                                                )
+                                                .is_none()
+                                            {
+                                                open_count_inc(
+                                                    &mut open_counts,
+                                                    req.participant_id,
+                                                );
+                                            }
                                             OrderUpdateMsg::partial_fill(
                                                 result.order_id,
                                                 req.client_order_id,
@@ -524,7 +683,11 @@ fn spawn_symbol_thread(
                                             )
                                         }
                                         OrderStatus::Cancelled => {
-                                            uid_map.remove(&result.order_id);
+                                            if let Some((pid, _)) =
+                                                uid_map.remove(&result.order_id)
+                                            {
+                                                open_count_dec(&mut open_counts, pid);
+                                            }
                                             OrderUpdateMsg::cancelled(
                                                 result.order_id,
                                                 req.client_order_id,
@@ -546,6 +709,7 @@ fn spawn_symbol_thread(
                                         &result.fills
                                     {
                                         trade_seq += 1;
+                                        last_trade_ticks = fill_price_ticks;
                                         let fill_price = rules.ticks_to_price(fill_price_ticks);
                                         let fill_qty = rules.lots_to_quantity(fill_qty_lots);
                                         let trade = TradeNotification {
@@ -559,6 +723,15 @@ fn spawn_symbol_thread(
                                             symbol: sym_bytes_fixed,
                                         };
                                         let _ = trade_pub.publish(&trade);
+                                        // GC routing metadata for makers this fill fully
+                                        // consumed (the engine has already evicted them).
+                                        // O(1) per fill; also fixes uid_map growing
+                                        // unboundedly with filled maker entries.
+                                        if !engine.contains_order(maker_order_id)
+                                            && let Some((pid, _)) = uid_map.remove(&maker_order_id)
+                                        {
+                                            open_count_dec(&mut open_counts, pid);
+                                        }
                                     }
                                     publish_order_update(
                                         &mut ou_pubs,
@@ -585,9 +758,12 @@ fn spawn_symbol_thread(
                                 Ok(res) => {
                                     // Prefer uid_map; fall back to participant_id in the request
                                     // (covers ghost orders never inserted into uid_map).
-                                    let (participant_id, response_stream_id) = uid_map
-                                        .remove(&cancel_oid)
-                                        .unwrap_or((req.participant_id, request_stream_id));
+                                    let removed = uid_map.remove(&cancel_oid);
+                                    if let Some((pid, _)) = removed {
+                                        open_count_dec(&mut open_counts, pid);
+                                    }
+                                    let (participant_id, response_stream_id) =
+                                        removed.unwrap_or((req.participant_id, request_stream_id));
                                     publish_order_update(
                                         &mut ou_pubs,
                                         &mut ou_seqs,

@@ -260,11 +260,8 @@ Test machine: Ubuntu 26.04, AMD Ryzen 9 7945HX (16C/32T, 5.2 GHz boost, 55 W TDP
 | **40K**  | 4  | 10K | **100%** | **100%** | **93 µs** | **244 µs** |
 | **100K** | 4  | 25K | **100%** | **100%** | **112 µs** | **1.2 ms** |
 | **200K** | 8  | 25K | **100%** | **100%** | **291 µs** | **4.7 ms** |
-| **400K** | 16 | 25K | ~66%†    | **100%** | —  | — |
 
 Client latency = loopback RTT (place order → acknowledgement received by pressure client). Internal server-side latency is lower; see "Internal Processing Latency" above.
-
-† At 400K, 16 spin threads saturated the 55 W laptop TDP, dropping CPU frequency from 5.2 GHz to 1.5 GHz and causing ~136K connections to time out during ramp-up. All established connections traded without error. On a production server (64+ cores, 200+ W TDP) each desk runs on a dedicated isolated core and all 400K connections are expected to succeed.
 
 ---
 

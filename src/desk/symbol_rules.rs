@@ -137,12 +137,39 @@ fn to_units(value: f64, step: f64, misaligned_error: &'static str) -> Result<i64
     }
 }
 
+/// Hard cap on symbol length, matching the `[u8; 16]` null-padded wire
+/// fields (NewOrderRequest, persist payloads, risk-engine keys). Input
+/// longer than this used to be SILENTLY truncated by pack_str16 — meaning
+/// two distinct user-supplied strings could alias the same wire symbol.
+/// Reject at entry instead. Raising this requires a coordinated wire-format
+/// change across every packed struct carrying a symbol.
+pub const MAX_SYMBOL_LEN: usize = 16;
+
+/// Validate a user-supplied symbol before it touches any fixed-width wire
+/// field or cache key. O(len), len ≤ a few bytes.
+pub fn validate_symbol(symbol: &str) -> Result<(), &'static str> {
+    if symbol.is_empty() {
+        return Err("symbol must not be empty");
+    }
+    if symbol.len() > MAX_SYMBOL_LEN {
+        return Err("symbol too long");
+    }
+    if !symbol
+        .bytes()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err("symbol has invalid characters");
+    }
+    Ok(())
+}
+
 pub fn normalize_order_shape(
     symbol: &str,
     order_type: &str,
     price: Option<f64>,
     quantity: f64,
 ) -> Result<FixedOrderShape, &'static str> {
+    validate_symbol(symbol)?;
     let rules = SymbolRules::for_symbol(symbol);
     if quantity <= 0.0 || !quantity.is_finite() {
         return Err("quantity must be > 0");
@@ -180,6 +207,39 @@ pub fn validate_order_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_validation_rejects_overlong_and_junk_input() {
+        // The exact wire width must pass; one byte more must fail —
+        // silent pack_str16 truncation is what this guards against.
+        assert!(validate_symbol("ABCDEFGH_ABCDEFG").is_ok()); // 16 bytes
+        assert_eq!(
+            validate_symbol("ABCDEFGH_ABCDEFGH").unwrap_err(), // 17 bytes
+            "symbol too long"
+        );
+        assert!(validate_symbol("BTC_USDT").is_ok());
+        assert!(validate_symbol("1000SHIB_USDT").is_ok());
+        assert_eq!(validate_symbol("").unwrap_err(), "symbol must not be empty");
+        for bad in ["btc_usdt", "BTC-USDT", "BTC USDT", "BTC\0USDT", "BTC.USDT"] {
+            assert_eq!(
+                validate_symbol(bad).unwrap_err(),
+                "symbol has invalid characters",
+                "must reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_shape_rejects_invalid_symbol_at_entry() {
+        assert_eq!(
+            normalize_order_shape("ABCDEFGH_ABCDEFGH", "limit", Some(100.0), 1.0).unwrap_err(),
+            "symbol too long"
+        );
+        assert_eq!(
+            validate_order_shape("btc_usdt", "market", None, 1.0).unwrap_err(),
+            "symbol has invalid characters"
+        );
+    }
 
     #[test]
     fn normalizes_btc_limit_to_ticks_and_lots() {

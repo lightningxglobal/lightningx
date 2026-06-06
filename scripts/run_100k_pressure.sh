@@ -91,17 +91,23 @@ else
 fi
 
 # ── aeronmd (Linux: manage it; macOS: assumed already running) ────────────
+# Set REUSE_AERONMD=1 to skip restart when chaining tests back-to-back.
+REUSE_AERONMD="${REUSE_AERONMD:-0}"
 if $IS_LINUX; then
-  pkill -f aeronmd 2>/dev/null || true
-  sleep 1.5
-  rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
-  env AERON_DIR="$AERON_DIR" taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
-  pids+=("$!")
-  for i in $(seq 1 20); do
-    [[ -f "$AERON_DIR/cnc.dat" ]] && break; sleep 1.5
-  done
-  [[ -f "$AERON_DIR/cnc.dat" ]] || { echo "aeronmd failed to start" >&2; exit 1; }
-  echo "aeronmd ready (pid=${pids[-1]})"
+  if [[ "$REUSE_AERONMD" == "1" ]] && pgrep -f aeronmd > /dev/null && [[ -f "$AERON_DIR/cnc.dat" ]]; then
+    echo "aeronmd already running, reusing (pid=$(pgrep -f aeronmd | head -1))"
+  else
+    pkill -f aeronmd 2>/dev/null || true
+    sleep 1.5
+    rm -rf "$AERON_DIR"; mkdir -p "$AERON_DIR"
+    env AERON_DIR="$AERON_DIR" taskset -c "$CPU_AERONMD" "$AERON_BIN" >"$LOG_DIR/aeronmd.log" 2>&1 &
+    pids+=("$!")
+    for i in $(seq 1 20); do
+      [[ -f "$AERON_DIR/cnc.dat" ]] && break; sleep 1.5
+    done
+    [[ -f "$AERON_DIR/cnc.dat" ]] || { echo "aeronmd failed to start" >&2; exit 1; }
+    echo "aeronmd ready (pid=${pids[-1]})"
+  fi
 fi
 
 # ── exchange-engine ───────────────────────────────────────────────────────
@@ -165,6 +171,9 @@ done
 sleep "${DESK_WARMUP_S:-8}"
 
 # ── pressure clients ──────────────────────────────────────────────────────
+# No-forward benchmark: pressure-i uses owner_shard=i users → desk-i owns them
+# directly and never counter-forwards. PRESSURE_OWNER_SHARD_COUNT must equal
+# DESK_COUNT (both default to 4) for the uid%N formula to match.
 base_conns=$((TOTAL_CONNS / DESK_COUNT))
 extra_conns=$((TOTAL_CONNS % DESK_COUNT))
 ip_index=0

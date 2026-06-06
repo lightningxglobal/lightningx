@@ -18,6 +18,7 @@
 
 use crate::desk::money::AMOUNT_SCALE;
 use anyhow::Result;
+use redis::AsyncCommands;
 use sqlx::PgPool;
 
 /// Atom tolerance for the legacy-float comparison. f64 keeps ~15-16
@@ -73,6 +74,98 @@ impl ReconcileReport {
             && self.trades_drift_total == 0
             && self.orders_overfill_total == 0
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CrossStoreMismatch {
+    pub user_id: i64,
+    pub asset: String,
+    pub pg_balance_atoms: i64,
+    pub pg_frozen_atoms: i64,
+    pub redis_balance_atoms: Option<i64>,
+    pub redis_frozen_atoms: Option<i64>,
+}
+
+/// PG ↔ Redis account comparison (three-way reconciliation, L1 vs cold).
+#[derive(Debug, Default)]
+pub struct CrossStoreReport {
+    pub compared: u64,
+    pub missing_in_redis: u64,
+    pub mismatched_total: u64,
+    /// Detail sample, capped at 100 rows.
+    pub mismatched: Vec<CrossStoreMismatch>,
+}
+
+impl CrossStoreReport {
+    pub fn is_clean(&self) -> bool {
+        self.missing_in_redis == 0 && self.mismatched_total == 0
+    }
+}
+
+/// Compare recently-settled PG accounts against the Redis L1 cache.
+///
+/// Both stores are written asynchronously from the same persist stream, so
+/// a row updated milliseconds ago may legitimately differ; only rows whose
+/// PG `updated_at` is older than `grace_secs` are compared. A transient
+/// nonzero result can still occur if Redis received a NEWER event than the
+/// PG row — alert on PERSISTENT divergence across sweeps, not single hits.
+/// Bounded to `limit` most-recently-updated rows per sweep; off hot path.
+pub async fn check_pg_redis_accounts(
+    pool: &PgPool,
+    redis: &mut redis::aio::MultiplexedConnection,
+    grace_secs: i64,
+    limit: i64,
+) -> Result<CrossStoreReport> {
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT user_id, asset, balance_atoms, frozen_atoms
+           FROM accounts
+          WHERE updated_at < NOW() - make_interval(secs => $1)
+          ORDER BY updated_at DESC
+          LIMIT $2",
+    )
+    .bind(grace_secs as f64)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut report = CrossStoreReport::default();
+    for (user_id, asset, pg_balance_atoms, pg_frozen_atoms) in rows {
+        report.compared += 1;
+        let key = crate::desk::redis_store::key_account(user_id, &asset);
+        let fields: Vec<Option<i64>> = redis
+            .hget(&key, &["balance_atoms", "frozen_atoms"])
+            .await
+            .unwrap_or_else(|_| vec![None, None]);
+        let redis_balance = fields.first().copied().flatten();
+        let redis_frozen = fields.get(1).copied().flatten();
+        match (redis_balance, redis_frozen) {
+            (None, None) => {
+                // Account never hydrated into L1 — only suspicious when the
+                // PG row holds funds.
+                if pg_balance_atoms != 0 || pg_frozen_atoms != 0 {
+                    report.missing_in_redis += 1;
+                }
+            }
+            _ => {
+                let rb = redis_balance.unwrap_or(0);
+                let rf = redis_frozen.unwrap_or(0);
+                if rb != pg_balance_atoms || rf != pg_frozen_atoms {
+                    report.mismatched_total += 1;
+                    if report.mismatched.len() < 100 {
+                        report.mismatched.push(CrossStoreMismatch {
+                            user_id,
+                            asset,
+                            pg_balance_atoms,
+                            pg_frozen_atoms,
+                            redis_balance_atoms: redis_balance,
+                            redis_frozen_atoms: redis_frozen,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Run all account invariant checks. Read-only.

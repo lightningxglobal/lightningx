@@ -176,6 +176,21 @@ async fn main() -> anyhow::Result<()> {
     let mut total_flushes: u64 = 0;
     let mut last_log = Instant::now();
     let mut last_reconcile = Instant::now();
+    // Optional Redis connection for the cross-store reconcile sweep.
+    let mut reconcile_redis: Option<redis::aio::MultiplexedConnection> =
+        match redis::Client::open(redis_url.as_str()) {
+            Ok(client) => match client.get_multiplexed_async_connection().await {
+                Ok(conn) => Some(conn),
+                Err(e) => {
+                    warn!("reconcile: Redis unavailable ({e}) — pg↔redis sweep disabled");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("reconcile: invalid REDIS_URL ({e}) — pg↔redis sweep disabled");
+                None
+            }
+        };
 
     loop {
         let mut did_work = false;
@@ -241,6 +256,34 @@ async fn main() -> anyhow::Result<()> {
         // Periodic account invariant sweep (read-only; see desk::reconcile).
         if reconcile_secs > 0 && last_reconcile.elapsed() >= Duration::from_secs(reconcile_secs) {
             last_reconcile = Instant::now();
+            // Cross-store (PG ↔ Redis L1) comparison: persistent nonzero
+            // results across sweeps indicate a writer bug; single transient
+            // hits are normal eventual-consistency noise.
+            if let Some(conn) = &mut reconcile_redis {
+                match reconcile::check_pg_redis_accounts(&pg, conn, 10, 1000).await {
+                    Ok(x) if x.is_clean() => {
+                        info!("reconcile: pg↔redis clean ({} compared)", x.compared);
+                    }
+                    Ok(x) => {
+                        warn!(
+                            "reconcile: pg↔redis divergence — compared={} missing_in_redis={} mismatched={}",
+                            x.compared, x.missing_in_redis, x.mismatched_total,
+                        );
+                        for m in x.mismatched.iter().take(10) {
+                            warn!(
+                                "reconcile: pg↔redis user={} asset={} pg=({},{}) redis=({:?},{:?})",
+                                m.user_id,
+                                m.asset,
+                                m.pg_balance_atoms,
+                                m.pg_frozen_atoms,
+                                m.redis_balance_atoms,
+                                m.redis_frozen_atoms,
+                            );
+                        }
+                    }
+                    Err(e) => warn!("reconcile: pg↔redis sweep failed: {e}"),
+                }
+            }
             match reconcile::check_account_invariants(&pg).await {
                 Ok(report) if report.is_clean() => {
                     info!("reconcile: account invariants clean");

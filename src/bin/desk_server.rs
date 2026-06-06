@@ -29,8 +29,8 @@ use lightning_exchange::{
         CounterForwardMsg, CounterForwardOrderMeta, CounterForwardWsFrame,
     },
     transport::persist_event::{
-        AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-        PersistFrame, TradeInsertPayload, pack_str,
+        AccountSetPayload, MatchingEventPayload, OrderDeletePayload, OrderFillUpdatePayload,
+        OrderUpsertPayload, PersistFrame, TradeInsertPayload, matching_event_kind, pack_str,
     },
     transport::{AeronCmd, unpack_str16},
     ws_handler::market_data_broadcaster,
@@ -632,6 +632,84 @@ fn publish_frame(
             tracing::warn!("persist queue full — dropped {n} frames");
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_matching_order_event(
+    tx: &std::sync::Arc<crossbeam_queue::ArrayQueue<PersistFrame>>,
+    sequence: u64,
+    response_stream_id: i32,
+    kind: u8,
+    order_id: u64,
+    client_order_id: u64,
+    participant_id: u64,
+    fill_price: f64,
+    fill_qty: f64,
+    remaining_qty: f64,
+    timestamp_ns: u64,
+    meta: &OrderRuntimeMeta,
+) {
+    let symbol = unpack_str16(&meta.symbol).unwrap_or("BTC_USDT");
+    let rules = lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(symbol);
+    let event_kind = match kind {
+        lightning_exchange::transport::order_update_kind::ACCEPTED => matching_event_kind::ACCEPTED,
+        lightning_exchange::transport::order_update_kind::FILLED => matching_event_kind::FILLED,
+        lightning_exchange::transport::order_update_kind::PARTIAL_FILL => {
+            matching_event_kind::PARTIAL_FILL
+        }
+        lightning_exchange::transport::order_update_kind::CANCELLED => matching_event_kind::CANCELLED,
+        lightning_exchange::transport::order_update_kind::REJECTED => matching_event_kind::REJECTED,
+        _ => return,
+    };
+    let event_order_id = if order_id == 0 {
+        client_order_id
+    } else {
+        order_id
+    };
+    let price = if fill_price > 0.0 {
+        fill_price
+    } else {
+        meta.freeze_price
+    };
+    let qty = if fill_qty > 0.0 { fill_qty } else { meta.quantity };
+    let remaining = if remaining_qty > 0.0 {
+        remaining_qty
+    } else if event_kind == matching_event_kind::ACCEPTED {
+        meta.quantity
+    } else {
+        0.0
+    };
+    let price_ticks = if price > 0.0 {
+        rules
+            .price_to_ticks(price)
+            .unwrap_or_else(|_| (price / rules.price_tick).round() as i64)
+    } else {
+        0
+    };
+    let quantity_lots = rules
+        .quantity_to_lots(qty)
+        .unwrap_or_else(|_| (qty / rules.quantity_step).round() as i64);
+    let remaining_lots = rules
+        .quantity_to_lots(remaining)
+        .unwrap_or_else(|_| (remaining / rules.quantity_step).round() as i64);
+    publish_frame(
+        tx,
+        &PersistFrame::matching_event(MatchingEventPayload {
+            sequence,
+            response_stream_id,
+            event_kind,
+            _pad: [0; 3],
+            order_id: event_order_id as i64,
+            client_order_id: client_order_id as i64,
+            participant_id: participant_id as i64,
+            counterparty_order_id: 0,
+            symbol: pack_str(symbol),
+            price_ticks,
+            quantity_lots,
+            remaining_lots,
+            ts_ns: timestamp_ns,
+        }),
+    );
 }
 
 fn account_set_payload(
@@ -2152,6 +2230,34 @@ async fn async_main() -> anyhow::Result<()> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_micros() as u64)
                             .unwrap_or(0);
+                        let rules =
+                            lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(
+                                symbol_str,
+                            );
+                        let price_ticks = rules
+                            .price_to_ticks(price)
+                            .unwrap_or_else(|_| (price / rules.price_tick).round() as i64);
+                        let quantity_lots = rules
+                            .quantity_to_lots(qty)
+                            .unwrap_or_else(|_| (qty / rules.quantity_step).round() as i64);
+                        publish_frame(
+                            &persist_pub_pub,
+                            &PersistFrame::matching_event(MatchingEventPayload {
+                                sequence: trade.sequence,
+                                response_stream_id: TRADE_STREAM,
+                                event_kind: matching_event_kind::TRADE,
+                                _pad: [0; 3],
+                                order_id: taker_id,
+                                client_order_id: 0,
+                                participant_id: taker_uid,
+                                counterparty_order_id: maker_id,
+                                symbol: pack_str(symbol_str),
+                                price_ticks,
+                                quantity_lots,
+                                remaining_lots: 0,
+                                ts_ns: ts * 1_000,
+                            }),
+                        );
                         market_fanout.send_owned(lightning_exchange::ws_sbe::encode_trade(
                             price, qty, side, ts, symbol_str,
                         ));
@@ -2395,6 +2501,8 @@ async fn async_main() -> anyhow::Result<()> {
                         let participant_id: u64 = msg.participant_id;
                         let fill_qty: f64 = msg.fill_qty;
                         let fill_price: f64 = msg.fill_price;
+                        let remaining_qty: f64 = msg.remaining_qty;
+                        let update_ts: u64 = msg.timestamp;
                         let kind: u8 = msg.kind;
                         // Owner-filter: every desk subscribes to OrderUpdate via
                         // Aeron fan-out, so without this check each desk re-runs
@@ -2486,6 +2594,35 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                         // client_order_id is only available on the first event (ACCEPTED).
                         let ws_client_oid = ws_meta.as_ref().map(|m| m.client_order_id.as_str());
+                        if let Some(meta) = ws_meta
+                            .as_ref()
+                            .map(|m| OrderRuntimeMeta {
+                                user_id: m.user_id,
+                                freeze_price: m.freeze_price,
+                                quantity: m.qty,
+                                filled: 0.0,
+                                side: m.side,
+                                symbol: m.symbol,
+                                initial_margin_cents: m.initial_margin_cents,
+                                liq_price_ticks: m.liq_price_ticks,
+                            })
+                            .or_else(|| runtime_meta(&order_meta_cache, order_id))
+                        {
+                            publish_matching_order_event(
+                                &persist_pub,
+                                sequence,
+                                response_stream_id,
+                                kind,
+                                order_id,
+                                client_order_id,
+                                participant_id,
+                                fill_price,
+                                fill_qty,
+                                remaining_qty,
+                                update_ts,
+                                &meta,
+                            );
+                        }
                         let mut update_pushed = false;
 
                         // For the client's place-order SLA, ACCEPTED is the

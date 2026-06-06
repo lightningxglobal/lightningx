@@ -88,6 +88,9 @@ pub async fn apply_frame(
             // trades aren't held in Redis (append-only history); skip.
             // pg-writer is responsible for trades.
         }
+        Some(PersistKind::MatchingEvent) => {
+            // Append-only audit/replay scaffold; pg-writer owns durable storage.
+        }
         None => {
             tracing::warn!("PersistFrame with unknown kind={}", frame.kind);
         }

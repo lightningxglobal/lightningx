@@ -20,8 +20,8 @@
 
 use crate::desk::money::AmountAtoms;
 use crate::transport::persist_event::{
-    AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-    PersistFrame, PersistKind, TradeInsertPayload, unpack_str,
+    AccountSetPayload, MatchingEventPayload, OrderDeletePayload, OrderFillUpdatePayload,
+    OrderUpsertPayload, PersistFrame, PersistKind, TradeInsertPayload, unpack_str,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
@@ -88,6 +88,21 @@ struct TradeRow {
     created_at: DateTime<Utc>,
 }
 
+struct MatchingEventRow {
+    sequence: i64,
+    response_stream_id: i32,
+    event_kind: i16,
+    order_id: i64,
+    client_order_id: i64,
+    participant_id: i64,
+    counterparty_order_id: i64,
+    symbol: String,
+    price_ticks: i64,
+    quantity_lots: i64,
+    remaining_lots: i64,
+    ts_ns: i64,
+}
+
 /// Reason a frame was rejected by `push`, for diagnostics. Counters are
 /// printed by the pg-writer stats log so we can see whether the persist
 /// stream is carrying malformed frames or just unknown kinds.
@@ -101,6 +116,8 @@ pub struct SkipCounts {
     pub account_empty_asset: u64,
     pub trade_empty_symbol: u64,
     pub trade_bad_timestamp: u64,
+    pub matching_empty_symbol: u64,
+    pub matching_bad_timestamp: u64,
     pub payload_decode_failed: u64,
 }
 
@@ -114,6 +131,8 @@ impl SkipCounts {
             + self.account_empty_asset
             + self.trade_empty_symbol
             + self.trade_bad_timestamp
+            + self.matching_empty_symbol
+            + self.matching_bad_timestamp
             + self.payload_decode_failed
     }
 }
@@ -125,6 +144,7 @@ pub struct PgWriteBatch {
     fills: Vec<FillRow>,
     accounts: Vec<AccountRow>,
     trades: Vec<TradeRow>,
+    matching_events: Vec<MatchingEventRow>,
     skipped: u64,
     skip_counts: SkipCounts,
 }
@@ -140,6 +160,7 @@ impl PgWriteBatch {
             + self.fills.len()
             + self.accounts.len()
             + self.trades.len()
+            + self.matching_events.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -164,6 +185,7 @@ impl PgWriteBatch {
         self.fills.clear();
         self.accounts.clear();
         self.trades.clear();
+        self.matching_events.clear();
     }
 
     /// Accept one frame into the batch. Returns false when the frame is
@@ -207,6 +229,14 @@ impl PgWriteBatch {
             },
             Some(PersistKind::TradeInsert) => match frame.as_trade_insert() {
                 Some(p) => self.push_trade(&p),
+                None => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    false
+                }
+            },
+            Some(PersistKind::MatchingEvent) => match frame.as_matching_event() {
+                Some(p) => self.push_matching_event(&p),
                 None => {
                     self.skipped += 1;
                     self.skip_counts.payload_decode_failed += 1;
@@ -357,6 +387,46 @@ impl PgWriteBatch {
         true
     }
 
+    fn push_matching_event(&mut self, p: &MatchingEventPayload) -> bool {
+        let sequence = p.sequence;
+        let response_stream_id = p.response_stream_id;
+        let event_kind = p.event_kind;
+        let order_id = p.order_id;
+        let client_order_id = p.client_order_id;
+        let participant_id = p.participant_id;
+        let counterparty_order_id = p.counterparty_order_id;
+        let price_ticks = p.price_ticks;
+        let quantity_lots = p.quantity_lots;
+        let remaining_lots = p.remaining_lots;
+        let ts_ns = p.ts_ns;
+        let symbol = unpack_str(&p.symbol).to_owned();
+        if symbol.is_empty() {
+            self.skipped += 1;
+            self.skip_counts.matching_empty_symbol += 1;
+            return false;
+        }
+        if sequence > i64::MAX as u64 || ts_ns > i64::MAX as u64 {
+            self.skipped += 1;
+            self.skip_counts.matching_bad_timestamp += 1;
+            return false;
+        }
+        self.matching_events.push(MatchingEventRow {
+            sequence: sequence as i64,
+            response_stream_id,
+            event_kind: event_kind as i16,
+            order_id,
+            client_order_id,
+            participant_id,
+            counterparty_order_id,
+            symbol,
+            price_ticks,
+            quantity_lots,
+            remaining_lots,
+            ts_ns: ts_ns as i64,
+        });
+        true
+    }
+
     /// Public hook for backfill: stage a fully-decoded row from Redis
     /// into the upsert buffer without going through PersistFrame parsing.
     /// Used by `backfill_from_redis` below.
@@ -418,6 +488,10 @@ impl PgWriteBatch {
         if !self.trades.is_empty() {
             total += flush_trades(pool, &self.trades).await?;
             self.trades.clear();
+        }
+        if !self.matching_events.is_empty() {
+            total += flush_matching_events(pool, &self.matching_events).await?;
+            self.matching_events.clear();
         }
 
         Ok(total)
@@ -694,6 +768,78 @@ async fn flush_trades(pool: &PgPool, rows: &[TradeRow]) -> anyhow::Result<usize>
     .bind(&prices)
     .bind(&qtys)
     .bind(&createds)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() as usize)
+}
+
+async fn flush_matching_events(pool: &PgPool, rows: &[MatchingEventRow]) -> anyhow::Result<usize> {
+    let mut sequences = Vec::with_capacity(rows.len());
+    let mut response_stream_ids = Vec::with_capacity(rows.len());
+    let mut event_kinds = Vec::with_capacity(rows.len());
+    let mut order_ids = Vec::with_capacity(rows.len());
+    let mut client_order_ids = Vec::with_capacity(rows.len());
+    let mut participant_ids = Vec::with_capacity(rows.len());
+    let mut counterparty_order_ids = Vec::with_capacity(rows.len());
+    let mut symbols = Vec::with_capacity(rows.len());
+    let mut price_ticks = Vec::with_capacity(rows.len());
+    let mut quantity_lots = Vec::with_capacity(rows.len());
+    let mut remaining_lots = Vec::with_capacity(rows.len());
+    let mut ts_ns = Vec::with_capacity(rows.len());
+    for r in rows {
+        sequences.push(r.sequence);
+        response_stream_ids.push(r.response_stream_id);
+        event_kinds.push(r.event_kind);
+        order_ids.push(r.order_id);
+        client_order_ids.push(r.client_order_id);
+        participant_ids.push(r.participant_id);
+        counterparty_order_ids.push(r.counterparty_order_id);
+        symbols.push(r.symbol.clone());
+        price_ticks.push(r.price_ticks);
+        quantity_lots.push(r.quantity_lots);
+        remaining_lots.push(r.remaining_lots);
+        ts_ns.push(r.ts_ns);
+    }
+    let res = sqlx::query(
+        r#"
+        INSERT INTO matching_events (
+            sequence, response_stream_id, event_kind, order_id, client_order_id,
+            participant_id, counterparty_order_id, symbol, price_ticks,
+            quantity_lots, remaining_lots, ts_ns
+        )
+        SELECT * FROM UNNEST(
+            $1::bigint[],
+            $2::integer[],
+            $3::smallint[],
+            $4::bigint[],
+            $5::bigint[],
+            $6::bigint[],
+            $7::bigint[],
+            $8::varchar[],
+            $9::bigint[],
+            $10::bigint[],
+            $11::bigint[],
+            $12::bigint[]
+        ) AS t(
+            sequence, response_stream_id, event_kind, order_id, client_order_id,
+            participant_id, counterparty_order_id, symbol, price_ticks,
+            quantity_lots, remaining_lots, ts_ns
+        )
+        ON CONFLICT (response_stream_id, sequence) DO NOTHING
+        "#,
+    )
+    .bind(&sequences)
+    .bind(&response_stream_ids)
+    .bind(&event_kinds)
+    .bind(&order_ids)
+    .bind(&client_order_ids)
+    .bind(&participant_ids)
+    .bind(&counterparty_order_ids)
+    .bind(&symbols)
+    .bind(&price_ticks)
+    .bind(&quantity_lots)
+    .bind(&remaining_lots)
+    .bind(&ts_ns)
     .execute(pool)
     .await?;
     Ok(res.rows_affected() as usize)

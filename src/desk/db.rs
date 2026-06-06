@@ -90,6 +90,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         include_str!("../../migrations/012_account_amount_atoms.sql"),
     )
     .await?;
+    apply_migration(
+        pool,
+        "013_matching_events",
+        include_str!("../../migrations/013_matching_events.sql"),
+    )
+    .await?;
     Ok(())
 }
 

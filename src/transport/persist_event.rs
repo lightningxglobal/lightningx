@@ -31,6 +31,8 @@ pub enum PersistKind {
     /// Partial-fill update for an already-known order: only filled (and
     /// status) change. Avoids overwriting price/qty/etc with sentinels.
     OrderFillUpdate = 5,
+    /// Append-only matching output event for audit/replay scaffolding.
+    MatchingEvent = 6,
 }
 
 impl PersistKind {
@@ -41,9 +43,19 @@ impl PersistKind {
             3 => Some(Self::AccountSet),
             4 => Some(Self::TradeInsert),
             5 => Some(Self::OrderFillUpdate),
+            6 => Some(Self::MatchingEvent),
             _ => None,
         }
     }
+}
+
+pub mod matching_event_kind {
+    pub const ACCEPTED: u8 = 1;
+    pub const FILLED: u8 = 2;
+    pub const PARTIAL_FILL: u8 = 3;
+    pub const CANCELLED: u8 = 4;
+    pub const REJECTED: u8 = 5;
+    pub const TRADE: u8 = 6;
 }
 
 #[repr(C, packed)]
@@ -101,6 +113,24 @@ pub struct TradeInsertPayload {
     pub ts_ms: i64,
 }
 
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct MatchingEventPayload {
+    pub sequence: u64,
+    pub response_stream_id: i32,
+    pub event_kind: u8,
+    pub _pad: [u8; 3],
+    pub order_id: i64,
+    pub client_order_id: i64,
+    pub participant_id: i64,
+    pub counterparty_order_id: i64,
+    pub symbol: [u8; 16], // null-padded
+    pub price_ticks: i64,
+    pub quantity_lots: i64,
+    pub remaining_lots: i64,
+    pub ts_ns: u64,
+}
+
 /// Largest payload size. Anything new must fit here or the union grows.
 pub const MAX_PAYLOAD: usize = 136;
 
@@ -111,6 +141,7 @@ const _: () = {
     assert!(size_of::<AccountSetPayload>() <= MAX_PAYLOAD);
     assert!(size_of::<TradeInsertPayload>() <= MAX_PAYLOAD);
     assert!(size_of::<OrderFillUpdatePayload>() <= MAX_PAYLOAD);
+    assert!(size_of::<MatchingEventPayload>() <= MAX_PAYLOAD);
 };
 
 #[repr(C, packed)]
@@ -189,6 +220,19 @@ impl PersistFrame {
         f
     }
 
+    pub fn matching_event(p: MatchingEventPayload) -> Self {
+        let mut f = Self::zero();
+        f.kind = PersistKind::MatchingEvent as u8;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &p as *const _ as *const u8,
+                size_of::<MatchingEventPayload>(),
+            )
+        };
+        f.payload[..bytes.len()].copy_from_slice(bytes);
+        f
+    }
+
     /// Cast the frame as a flat byte slice for an Aeron `publish`.
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, FRAME_SIZE) }
@@ -247,6 +291,15 @@ impl PersistFrame {
         }
         Some(unsafe {
             std::ptr::read_unaligned(self.payload.as_ptr() as *const TradeInsertPayload)
+        })
+    }
+
+    pub fn as_matching_event(&self) -> Option<MatchingEventPayload> {
+        if self.kind() != Some(PersistKind::MatchingEvent) {
+            return None;
+        }
+        Some(unsafe {
+            std::ptr::read_unaligned(self.payload.as_ptr() as *const MatchingEventPayload)
         })
     }
 }
@@ -358,6 +411,36 @@ mod tests {
         assert_eq!({ q.buy_order_id }, 100);
         assert_eq!({ q.sell_order_id }, 101);
         assert_eq!(unpack_str(&q.symbol), "BTC_USDT");
+    }
+
+    #[test]
+    fn matching_event_roundtrip() {
+        let p = MatchingEventPayload {
+            sequence: 9,
+            response_stream_id: 200,
+            event_kind: matching_event_kind::ACCEPTED,
+            _pad: [0; 3],
+            order_id: 1001,
+            client_order_id: 1000,
+            participant_id: 77,
+            counterparty_order_id: 0,
+            symbol: pack_str("BTC_USDT"),
+            price_ticks: 7_000_000,
+            quantity_lots: 12_345,
+            remaining_lots: 12_345,
+            ts_ns: 1_700_000_001_000_000_000,
+        };
+        let f = PersistFrame::matching_event(p);
+        assert_eq!(f.kind(), Some(PersistKind::MatchingEvent));
+        let back = PersistFrame::from_bytes(f.as_bytes()).expect("parse");
+        let q = back.as_matching_event().expect("matching event");
+        assert_eq!({ q.sequence }, 9);
+        assert_eq!({ q.response_stream_id }, 200);
+        assert_eq!(q.event_kind, matching_event_kind::ACCEPTED);
+        assert_eq!({ q.order_id }, 1001);
+        assert_eq!(unpack_str(&q.symbol), "BTC_USDT");
+        assert_eq!({ q.price_ticks }, 7_000_000);
+        assert_eq!({ q.quantity_lots }, 12_345);
     }
 
     #[test]

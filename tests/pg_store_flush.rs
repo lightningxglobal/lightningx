@@ -8,8 +8,8 @@
 
 use lightning_exchange::desk::pg_store::PgWriteBatch;
 use lightning_exchange::transport::persist_event::{
-    AccountSetPayload, OrderDeletePayload, OrderFillUpdatePayload, OrderUpsertPayload,
-    PersistFrame, TradeInsertPayload, pack_str,
+    AccountSetPayload, MatchingEventPayload, OrderDeletePayload, OrderFillUpdatePayload,
+    OrderUpsertPayload, PersistFrame, TradeInsertPayload, matching_event_kind, pack_str,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -278,6 +278,67 @@ async fn trade_insert_lands() {
     assert_eq!(row.0, "BTC_USDT");
     assert!((row.3 - 70123.5).abs() < 1e-9);
     assert!((row.4 - 0.0123).abs() < 1e-9);
+
+    cleanup(&pg, user_id).await;
+}
+
+#[tokio::test]
+async fn matching_event_lands_idempotently() {
+    let Some(pg) = try_pg().await else {
+        eprintln!("skip: no PG");
+        return;
+    };
+    let Some(user_id) = make_user(&pg).await else {
+        eprintln!("skip: cannot make_user");
+        return;
+    };
+
+    let response_stream_id = 200;
+    let sequence: i64 = 42;
+    sqlx::query(
+        "DELETE FROM matching_events WHERE response_stream_id=$1 AND sequence=$2",
+    )
+    .bind(response_stream_id)
+    .bind(sequence)
+    .execute(&pg)
+    .await
+    .ok();
+
+    let f = PersistFrame::matching_event(MatchingEventPayload {
+        sequence: sequence as u64,
+        response_stream_id,
+        event_kind: matching_event_kind::ACCEPTED,
+        _pad: [0; 3],
+        order_id: 980_000_300_001,
+        client_order_id: 980_000_300_000,
+        participant_id: user_id,
+        counterparty_order_id: 0,
+        symbol: pack_str("BTC_USDT"),
+        price_ticks: 7_000_000,
+        quantity_lots: 12_345,
+        remaining_lots: 12_345,
+        ts_ns: 1_700_000_001_000_000_000,
+    });
+    let mut batch = PgWriteBatch::new();
+    assert!(batch.push(&f));
+    assert!(batch.push(&f));
+    let n = batch.flush(&pg).await.expect("flush matching event");
+    assert_eq!(n, 1);
+
+    let row: (i16, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT event_kind, order_id, participant_id, price_ticks, symbol
+         FROM matching_events WHERE response_stream_id=$1 AND sequence=$2",
+    )
+    .bind(response_stream_id)
+    .bind(sequence)
+    .fetch_one(&pg)
+    .await
+    .expect("select matching_event");
+    assert_eq!(row.0, matching_event_kind::ACCEPTED as i16);
+    assert_eq!(row.1, 980_000_300_001);
+    assert_eq!(row.2, user_id);
+    assert_eq!(row.3, 7_000_000);
+    assert_eq!(row.4, "BTC_USDT");
 
     cleanup(&pg, user_id).await;
 }

@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
                 "pg-writer: applied={} flushes={} skipped={} bridge_dropped={} queue_depth={} \
                  [unknown_kind={} upsert_bad_status={} upsert_bad_ts={} upsert_empty_str={} \
                  fill_bad_status={} account_empty_asset={} trade_empty_symbol={} \
-                 trade_bad_ts={} decode_failed={}]",
+                 trade_bad_ts={} matching_empty_symbol={} matching_bad_ts={} decode_failed={}]",
                 total_applied,
                 total_flushes,
                 batch.skipped(),
@@ -210,6 +210,8 @@ async fn main() -> anyhow::Result<()> {
                 sc.account_empty_asset,
                 sc.trade_empty_symbol,
                 sc.trade_bad_timestamp,
+                sc.matching_empty_symbol,
+                sc.matching_bad_timestamp,
                 sc.payload_decode_failed,
             );
             last_log = Instant::now();

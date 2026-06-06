@@ -1,10 +1,41 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
-    PgPoolOptions::new()
-        .max_connections(20)
+    create_pool_sized(database_url, 20).await
+}
+
+/// Create a PG pool that enforces durable commits.
+///
+/// Every pooled connection runs `SET synchronous_commit = on` on connect,
+/// overriding any weaker server/database/role-level default (benchmark
+/// setups commonly flip it off globally). Settled funds and trade records
+/// must be in the WAL before COMMIT returns — a crash right after an
+/// acknowledged settle must never lose it. The setting is then verified
+/// once so a misconfigured server fails fast at startup instead of
+/// silently running with reduced durability.
+pub async fn create_pool_sized(database_url: &str, max_conns: u32) -> Result<PgPool, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(max_conns)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET synchronous_commit = on")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(database_url)
-        .await
+        .await?;
+
+    let (value,): (String,) = sqlx::query_as("SHOW synchronous_commit")
+        .fetch_one(&pool)
+        .await?;
+    if value != "on" {
+        return Err(sqlx::Error::Configuration(
+            format!("synchronous_commit must be 'on', server reports '{value}'").into(),
+        ));
+    }
+    Ok(pool)
 }
 
 /// Run all migrations. Uses raw_sql to support multi-statement migration files.

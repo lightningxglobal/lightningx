@@ -10,6 +10,7 @@ pub mod pg_store;
 pub mod positions;
 pub mod rate_limit;
 pub mod read_actor;
+pub mod reconcile;
 pub mod redis_store;
 pub mod risk;
 pub mod snowflake;

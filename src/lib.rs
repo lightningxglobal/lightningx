@@ -43,6 +43,7 @@ pub use desk::order_state;
 pub use desk::positions;
 pub use desk::rate_limit;
 pub use desk::read_actor;
+pub use desk::reconcile;
 pub use desk::snowflake;
 pub use desk::symbol_rules;
 pub use desk::user_service;

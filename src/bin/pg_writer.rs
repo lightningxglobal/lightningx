@@ -20,6 +20,7 @@ use anyhow::Context;
 use crossbeam_queue::ArrayQueue;
 use lightning_exchange::db;
 use lightning_exchange::desk::pg_store::{PgWriteBatch, backfill_from_redis};
+use lightning_exchange::desk::reconcile;
 use lightning_exchange::transport::aeron_channels::{PERSIST_CHANNEL, PERSIST_STREAM, aeron_dir};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
 use lightning_exchange::transport::persist_event::PersistFrame;
@@ -46,6 +47,10 @@ async fn main() -> anyhow::Result<()> {
     // Aeron client never times out because the polling thread doesn't
     // share its loop with PG `.await`.
     let queue_cap: usize = parse_env_u32("PG_WRITER_QUEUE", 5_000_000) as usize;
+    // Account invariant sweep interval (hanging freezes, legacy/atoms
+    // drift). Read-only SQL, runs in this writer process — never on the
+    // order hot path. 0 disables.
+    let reconcile_secs: u64 = parse_env_u32("PG_RECONCILE_SECS", 300) as u64;
     let backfill = std::env::var("BACKFILL_ON_START")
         .map(|s| !s.is_empty())
         .unwrap_or(false);
@@ -64,9 +69,9 @@ async fn main() -> anyhow::Result<()> {
         backfill,
     );
 
-    let pg = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(max_conns)
-        .connect(&pg_url)
+    // Durability-enforcing pool: every connection pins synchronous_commit=on
+    // (fails fast at startup if the server can't honor it).
+    let pg = db::create_pool_sized(&pg_url, max_conns)
         .await
         .context("connect PG")?;
     db::run_migrations(&pg).await.context("run migrations")?;
@@ -159,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let mut total_applied: u64 = 0;
     let mut total_flushes: u64 = 0;
     let mut last_log = Instant::now();
+    let mut last_reconcile = Instant::now();
 
     loop {
         let mut did_work = false;
@@ -215,6 +221,35 @@ async fn main() -> anyhow::Result<()> {
                 sc.payload_decode_failed,
             );
             last_log = Instant::now();
+        }
+
+        // Periodic account invariant sweep (read-only; see desk::reconcile).
+        if reconcile_secs > 0 && last_reconcile.elapsed() >= Duration::from_secs(reconcile_secs) {
+            last_reconcile = Instant::now();
+            match reconcile::check_account_invariants(&pg).await {
+                Ok(report) if report.is_clean() => {
+                    info!("reconcile: account invariants clean");
+                }
+                Ok(report) => {
+                    error!(
+                        "reconcile: INVARIANT VIOLATIONS — hanging_frozen={} atoms_drift={}",
+                        report.hanging_frozen_total, report.atoms_drift_total,
+                    );
+                    for r in &report.hanging_frozen {
+                        error!(
+                            "reconcile: hanging freeze user={} asset={} frozen_atoms={}",
+                            r.user_id, r.asset, r.frozen_atoms
+                        );
+                    }
+                    for r in &report.atoms_drift {
+                        error!(
+                            "reconcile: atoms drift user={} asset={} balance={} balance_atoms={} frozen={} frozen_atoms={}",
+                            r.user_id, r.asset, r.balance, r.balance_atoms, r.frozen, r.frozen_atoms
+                        );
+                    }
+                }
+                Err(e) => warn!("reconcile sweep failed: {e}"),
+            }
         }
 
         if !did_work {

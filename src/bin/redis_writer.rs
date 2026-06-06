@@ -47,9 +47,8 @@ async fn main() -> anyhow::Result<()> {
         redis_url
     );
 
-    let pg = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&pg_url)
+    // Durability-enforcing pool (synchronous_commit=on per connection).
+    let pg = db::create_pool_sized(&pg_url, 4)
         .await
         .context("connect PG")?;
     db::run_migrations(&pg).await.context("run migrations")?;

@@ -20,12 +20,22 @@ IS_LINUX=false
 [[ "$(uname -s)" == "Linux" ]] && IS_LINUX=true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# If this script lives next to run_40k_pressure.sh (e.g. scripts/), use that.
-# Otherwise fall back to /tmp (when the script was copied standalone).
-if [[ -f "$SCRIPT_DIR/run_40k_pressure.sh" ]]; then
-  PRESSURE_SCRIPT="$SCRIPT_DIR/run_40k_pressure.sh"
-else
-  PRESSURE_SCRIPT="${PRESSURE_SCRIPT:-/tmp/run_40k_pressure.sh}"
+# PRESSURE_SCRIPT can be set explicitly; otherwise auto-select by TOTAL_CONNS/DESK_COUNT.
+if [[ -z "${PRESSURE_SCRIPT:-}" ]]; then
+  _conns="${TOTAL_CONNS:-40000}"
+  _desks="${DESK_COUNT:-4}"
+  if (( _desks >= 8 )); then
+    _base="run_200k_pressure.sh"
+  elif (( _conns > 40000 )); then
+    _base="run_100k_pressure.sh"
+  else
+    _base="run_40k_pressure.sh"
+  fi
+  if [[ -f "$SCRIPT_DIR/$_base" ]]; then
+    PRESSURE_SCRIPT="$SCRIPT_DIR/$_base"
+  else
+    PRESSURE_SCRIPT="/tmp/$_base"
+  fi
 fi
 BIN_DIR="${BIN_DIR:-$HOME/.cargo/global-target/release}"
 if $IS_LINUX; then

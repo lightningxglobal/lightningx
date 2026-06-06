@@ -23,6 +23,8 @@ if $IS_LINUX; then
   CPU_ENGINE="${CPU_ENGINE:-2}"
   # One spin thread per physical core: phys2=CPU4, phys3=CPU6, phys4=CPU8, phys5=CPU10, phys1=CPU3
   CPU_DESK_SPIN=(4 6 8 10 3 4 6 8)
+  # recv threads — isolated cores offset from send; all in 0-11 range
+  CPU_DESK_RECV=(5 7 9 11 1 5 7 9)
   CPU_OTHERS="${CPU_OTHERS:-20-31}"      # tokio workers + gateway + pressure clients
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
@@ -147,14 +149,18 @@ fi
 for ((i = 0; i < DESK_COUNT; i++)); do
   if $IS_LINUX; then
     spin_cpu="${CPU_DESK_SPIN[$i]}"
-    taskset -c "${spin_cpu},${CPU_OTHERS}" \
-    env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
-      RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \
-      DESK_SPIN="$DESK_SPIN" DESK_SEND_CORE="$spin_cpu" \
-      DESK_PORT="${PORTS[$i]}" DESK_ID="$i" \
-      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288 \
-      "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
-    echo "desk-$i  spin_cpu=$spin_cpu  port=${PORTS[$i]}"
+    recv_cpu="${CPU_DESK_RECV[$i]:-}"
+    affinity="${spin_cpu}${recv_cpu:+,$recv_cpu},${CPU_OTHERS}"
+    desk_env=(
+      DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT
+      RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED"
+      DESK_SPIN="$DESK_SPIN" DESK_SEND_CORE="$spin_cpu" AERON_USE_HUGE_PAGES=1
+      DESK_PORT="${PORTS[$i]}" DESK_ID="$i"
+      TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-4}" NOFILE_LIMIT=524288
+    )
+    [[ -n "$recv_cpu" ]] && desk_env+=(DESK_RECV_CORE="$recv_cpu")
+    taskset -c "$affinity" env "${desk_env[@]}" "$DESK_BIN" >"$LOG_DIR/desk-$i.log" 2>&1 &
+    echo "desk-$i  send_cpu=$spin_cpu  recv_cpu=${recv_cpu:-unset}  port=${PORTS[$i]}"
   else
     env DATABASE_URL="$DATABASE_URL" AERON_DIR="$AERON_DIR" SYMBOLS=BTC_USDT \
       RUST_LOG=warning TRACER_ENABLED="$TRACER_ENABLED" \

@@ -7,20 +7,20 @@
 >
 > 图例：✅ 已完成 ｜ 🟡 部分完成 ｜ ⬜ 未开始
 
-## 进度跟踪（最近评估：2026-06-07，HEAD `eba79b7`）
+## 进度跟踪（最近评估：2026-06-07 晚，HEAD `86e0563`）
 
 | 阶段 | 进度 | 本轮关键落地 |
 |------|------|-------------|
-| P1 资金定点化 | 🟢 ~90% | orders/trades atoms 列+双写、整数 rules 换算、守恒 property 测试、API 字符串（`6155075`）。仅剩 legacy 列物理下线（等观察窗口） |
-| P2 事件日志+序列号 | 🟡 ~35% | （未动）下一优先：消费位点持久化 + Aeron Archive journal |
-| P3 资金事务闭环 | 🟡 ~45% | synchronous_commit 强制 + 五类不变量周期对账（`bb83e94`+`6155075`） |
-| P4 风控补全 | 🟢 ~95% | 头寸/敞口上限、熔断、per-symbol 价格带（`cc687bb`）。仅剩限流桶 Redis 持久化 |
-| P5 高可用 | 🔴 ~5% | 方案确定：Aeron Archive 做 journal/replay（见 P5 备注），Cluster 否决 |
-| P6 安全加固 | 🟡 ~40% | JWT 环境变量化、symbol 校验（`8a0d6e7`）、22 个解码器敌意输入测试（`eba79b7`）。补齐计划见 P6 节 |
+| P1 资金定点化 | 🟢 ~90% | （稳定）仅剩 legacy 列物理下线（等 30 天观察窗口，流程约束） |
+| P2 事件日志+序列号 | 🟡 ~60% | persist 帧 (publisher_id, seq) + pg-writer 位点同事务提交=exactly-once、redis-writer 位点（`e642cf0`）；skiplist 种子化 RNG + 引擎重放确定性验证（`7b0e0e1`）。剩：Aeron Archive journal（外部依赖 wrapper 扩展） |
+| P3 资金事务闭环 | 🟡 ~55% | PG↔Redis 跨存储账户对账（`fb6bc14`）。剩：双轨结算统一（依赖 journal）、冻结事件化 |
+| P4 风控补全 | 🟢 100% | 限流从"未接线"修到全入口接线 + 分桶 + Redis 持久化（`3518336`）——P4 关闭 |
+| P5 高可用 | 🔴 ~10% | 重放确定性前置条件已满足（P2b）；剩 Archive + 选主 + 备机 |
+| P6 安全加固 | 🟢 ~75% | HMAC API key、JWT refresh、append-only 审计日志、fuzz 脚手架（`86e0563`）。剩：Prometheus、fuzz 长跑、JWT 吊销表、渗透测试 |
 
-**当前最关键缺口**：journal/WAL——方案已定为 Aeron Archive（fileSyncLevel=2），
-在它完成前，"已对外确认但不可恢复"的窗口始终存在。
-**下一个最低阻力项**：pg-writer 消费位点持久化（P2.3），与 Archive 互补。
+**当前最关键缺口**：Aeron Archive journal（需 `aeron-wrapper` 扩展 Archive C 客户端，
+唯一剩余的"外部依赖"型工程）。消费位点、确定性重放、跨存储对账等所有可独立闭环的
+前置项已全部完成。
 
 ### 本轮设计决定（用户拍板，已存档）
 
@@ -142,7 +142,7 @@
 
 ---
 
-## Phase 2：事件日志与序列号（可靠性的地基）— 🟡 ~35%
+## Phase 2：事件日志与序列号（可靠性的地基）— 🟡 ~60%
 
 > **目标：撮合输入/输出全部带全局递增序列号并先落盘，任何下游可断点重放。**
 > 解决：消息无序列号、Ring Buffer 满静默丢弃、Aeron 不可重放、崩溃丢成交。
@@ -152,9 +152,12 @@
 - ✅ `OrderUpdateMsg` 已加 `sequence: u64`（64→72 字节，`11f3132`），
   engine 端按 response stream 递增分配，desk_server 做 gap 检测
   （`desk_server.rs:2374` 一带）。
-- ⬜ **剩余**：gap 检测到目前只能 `warn!`，无恢复手段（依赖 2.2 journal）；
-  其余流（persist/depth/counter-forward）未覆盖；无 `schema_version` 字段；
-  `read_unaligned` 裸读未替换（`aeron_transport.rs:101-110`）。
+- ✅ persist 流已带 (publisher_id, seq)（`e642cf0`）：desk 单一 drain 点赋值，
+  时钟纳秒种子保证跨重启单调；消费端区分真实 gap 与 publisher 重启。
+- ✅ 订单解码收敛到统一 `sbe::decode_*` 路径（`7b0e0e1`）；其余 `read_unaligned`
+  审计确认全部有 size_of 长度守卫（有界 unsafe，健全）。
+- ⬜ **剩余**：order-update 流 gap 仍只能 `warn!`（恢复依赖 journal）；
+  depth/counter-forward 流未覆盖；无 `schema_version` 字段。
 
 ### 2.2 输入/输出 Journal
 
@@ -172,14 +175,18 @@
 
 - ✅ pg-writer flush 失败**保留批次重试**（`e1d3e00`），有 poison frame 防护计数。
 - ✅ flush 全部 6 类 payload 合并**单事务提交**（`783fab4`，归属 P3 但在此实现）。
-- ⬜ **剩余**：消费者断点位点（记录"已应用到 seq=N"，重启从 N+1 重放追赶）——
-  位点应与数据同事务提交，实现 exactly-once 落库。
+- ✅ **消费者断点位点**（`e642cf0`）：pg-writer 位点表与数据**同事务**提交
+  （GREATEST 防并发回退）= exactly-once；重启/重放去重；毒帧丢弃路径不推进位点；
+  redis-writer 位点周期落 Redis（幂等 HSET 容忍 at-least-once）。集成测试覆盖
+  重启续传、批内/重放去重、gap/重启区分。
 - ⬜ 现有 `hydrate/backfill/reconcile` 降级为监控期对账工具。
 
 ### 2.4 撮合确定性收尾
 
-- ⬜ `skiplist.rs:87` 的 `rand::random()` 换成种子化 RNG（种子入 journal）。
-- ⬜ 撮合路径禁止读系统时钟：时间戳由 sequencer 入站时打好、随指令进 journal。
+- ✅ skiplist 种子化 xorshift64*（`7b0e0e1`）：结构跨实例可复现（节点层级逐一
+  比对测试）；双引擎 2000 单混合负载逐单状态/成交/订单簿一致性测试；性能略升 ~3%。
+- ✅ 撮合时间戳已由引擎前端（事实上的 sequencer）在入站时赋值；journal 化随
+  Archive 工作落地。
 
 **Gate 2**：kill -9 撮合引擎/任一 writer 进程 100 次（压测流量下），重启重放后：
 ① 无丢失成交；② 重放状态与 kill 前快照比特级一致；③ PG/Redis 与 journal 对账 diff = 0。
@@ -187,7 +194,7 @@
 
 ---
 
-## Phase 3：资金事务闭环 — 🟡 ~30%
+## Phase 3：资金事务闭环 — 🟡 ~55%
 
 > **目标：冻结→撮合→结算→记录 全链路无"中间态丢失"窗口。**
 
@@ -212,8 +219,9 @@
 
 ### 3.3 对账系统（与交易系统同级别）
 
-- ⬜ 每日 + 每小时增量三方对账：journal ↔ PG ↔ Redis
-  （资产总额、逐用户余额、逐订单状态三个层级）。
+- ✅ PG ↔ Redis 账户对账（`fb6bc14`）：宽限窗口防异步误报、缺失/不匹配分类、
+  样本限量；pg-writer 周期执行。journal 腿随 Archive 落地后补齐三方。
+- ⬜ 三方对账完整版（+journal 腿）与逐订单状态层级。
 - ⬜ 不变量监控：资金守恒、冻结一致性、订单簿总量 = Σ未成交订单，违反即告警+熔断出入金。
 
 **Gate 3**：混沌测试（随机 kill、网络分区、PG 故障切换）一周连续运行，
@@ -352,6 +360,18 @@
 
 ## 变更日志
 
+- **2026-06-07 晚（HEAD `86e0563`）**：「可独立闭环项全部清零」批次，5 个提交：
+  - P2 `e642cf0`：persist 帧带 (publisher_id, seq)（时钟种子跨重启单调）；pg-writer
+    位点与数据同事务=exactly-once、毒帧路径不推进位点；redis-writer 位点周期落 Redis；
+    gap 与 publisher 重启区分计数。
+  - P2 `7b0e0e1`：skiplist xorshift64* 种子化（结构可复现，性能略升 ~3%）；
+    双引擎 2000 单 LCG 工作负载逐单一致性测试；订单解码收敛到统一路径。
+  - P3 `fb6bc14`：PG↔Redis 账户对账（宽限窗口防误报、缺失/不匹配分类）。
+  - P4 `3518336`：发现原 RateLimiter 完全未接线！SharedRateLimiter 跨连接共享、
+    下单/撤单分桶、全部 WS+REST 入口接线、Redis 持久化防重启重置。P4 关闭。
+  - P6 `86e0563`：HMAC-SHA256 签名 API key（±30s 防重放、常数时间比较、legacy
+    弃用期）；JWT refresh + TTL env；append-only 审计日志（触发器禁改删）；
+    cargo-fuzz 脚手架（与 CI 健壮性套件共享入口清单）。
 - **2026-06-07（HEAD `eba79b7`）**：P1/P4 收尾 + P6 推进（每 phase 独立提交，
   全部带测试，热路径新增全 O(1)）：
   - P1 `6155075`：orders/trades atoms 列（迁移 014）+ pg-writer 双写；SymbolRules

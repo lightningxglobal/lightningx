@@ -68,7 +68,10 @@ async fn main() -> anyhow::Result<()> {
     print_stats("batch  (1× DELETE ANY)", &batch_times);
     let s_p50 = pctl(&single_times, 50);
     let b_p50 = pctl(&batch_times, 50);
-    println!("\nbatch is {:.1}× faster at p50", s_p50.as_secs_f64() / b_p50.as_secs_f64());
+    println!(
+        "\nbatch is {:.1}× faster at p50",
+        s_p50.as_secs_f64() / b_p50.as_secs_f64()
+    );
     Ok(())
 }
 
@@ -115,7 +118,9 @@ async fn seed(pool: &PgPool, user_id: i64, n: usize) -> anyhow::Result<Vec<i64>>
         ids.push(id);
         let side = if i % 2 == 0 { "buy" } else { "sell" };
         let price = 70_000.0 + i as f64;
-        if i > 0 { sql.push(','); }
+        if i > 0 {
+            sql.push(',');
+        }
         sql.push_str(&format!(
             "({id}, {user_id}, 'BTC_USDT', '{side}', 'market', {price}, 0.001, 0.001, 'COMPLETED', 0)"
         ));

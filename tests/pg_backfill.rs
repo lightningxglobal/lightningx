@@ -5,8 +5,10 @@
 //! is unreachable.
 
 use lightning_exchange::desk::pg_store::backfill_from_redis;
-use lightning_exchange::desk::redis_store::{apply_frame, key_order, key_user_orders, KEY_ACTIVE_ORDERS};
-use lightning_exchange::transport::persist_event::{pack_str, OrderUpsertPayload, PersistFrame};
+use lightning_exchange::desk::redis_store::{
+    KEY_ACTIVE_ORDERS, apply_frame, key_order, key_user_orders,
+};
+use lightning_exchange::transport::persist_event::{OrderUpsertPayload, PersistFrame, pack_str};
 use redis::AsyncCommands;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -103,33 +105,37 @@ async fn backfill_inserts_missing_rows_from_redis() {
     .expect("seed present in PG");
 
     // Sanity.
-    let pre_in_pg: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE id = ANY($1::bigint[])")
-        .bind(&[id_present, id_missing])
-        .fetch_one(&pg)
-        .await
-        .unwrap();
+    let pre_in_pg: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE id = ANY($1::bigint[])")
+            .bind(&[id_present, id_missing])
+            .fetch_one(&pg)
+            .await
+            .unwrap();
     assert_eq!(pre_in_pg, 1, "PG should start with only id_present");
 
     let stats = backfill_from_redis(&pg, &mut conn).await.unwrap();
     assert!(stats.redis_orders_scanned >= 2);
-    assert!(stats.missing_in_pg >= 1, "should detect id_missing as missing: stats={stats:?}");
+    assert!(
+        stats.missing_in_pg >= 1,
+        "should detect id_missing as missing: stats={stats:?}"
+    );
     assert!(stats.backfilled >= 1, "should backfill at least id_missing");
 
-    let post_in_pg: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE id = ANY($1::bigint[])")
-        .bind(&[id_present, id_missing])
-        .fetch_one(&pg)
-        .await
-        .unwrap();
+    let post_in_pg: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE id = ANY($1::bigint[])")
+            .bind(&[id_present, id_missing])
+            .fetch_one(&pg)
+            .await
+            .unwrap();
     assert_eq!(post_in_pg, 2, "PG should have both after backfill");
 
     // Confirm backfilled row carries the correct decoded fields.
-    let row: (String, String, f64, f64) = sqlx::query_as(
-        "SELECT symbol, side, COALESCE(price, 0), quantity FROM orders WHERE id=$1",
-    )
-    .bind(id_missing)
-    .fetch_one(&pg)
-    .await
-    .unwrap();
+    let row: (String, String, f64, f64) =
+        sqlx::query_as("SELECT symbol, side, COALESCE(price, 0), quantity FROM orders WHERE id=$1")
+            .bind(id_missing)
+            .fetch_one(&pg)
+            .await
+            .unwrap();
     assert_eq!(row.0, "BTC_USDT");
     assert_eq!(row.1, "buy");
     assert!((row.2 - 71000.0).abs() < 1e-9);
@@ -152,8 +158,12 @@ async fn backfill_inserts_missing_rows_from_redis() {
 #[serial_test::serial]
 #[tokio::test]
 async fn backfill_is_idempotent_when_pg_already_has_everything() {
-    let Some(pg) = try_pg().await else { return; };
-    let Some(mut conn) = try_redis().await else { return; };
+    let Some(pg) = try_pg().await else {
+        return;
+    };
+    let Some(mut conn) = try_redis().await else {
+        return;
+    };
 
     // Run twice — second should report 0 backfilled.
     let _first = backfill_from_redis(&pg, &mut conn).await.unwrap();

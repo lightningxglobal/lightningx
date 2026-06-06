@@ -1,11 +1,10 @@
+use std::sync::OnceLock;
 /// 时间提供器 - 统一处理系统时间和单调时间
 ///
 /// 注意：在macOS上，SystemTime.now()的精度为微秒(us)，无法达到纳秒(ns)精度。
 /// 对于采样间隔计算，使用Instant::elapsed()获得单调时间，精度充足。
 /// 对于时间戳生成，使用SystemTime但应意识到精度限制。
-
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use std::sync::OnceLock;
 
 /// 全局单调时间参考点（用于采样间隔计算）
 static MONOTONIC_START: OnceLock<Instant> = OnceLock::new();

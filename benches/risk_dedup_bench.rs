@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::collections::HashSet;
 
 fn sort_dedup(mut user_ids: Vec<i64>) -> Vec<i64> {

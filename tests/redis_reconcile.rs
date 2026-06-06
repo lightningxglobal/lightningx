@@ -6,9 +6,9 @@
 //! is unreachable.
 
 use lightning_exchange::desk::redis_store::{
-    apply_frame, key_order, key_user_orders, reconcile_orphans, KEY_ACTIVE_ORDERS,
+    KEY_ACTIVE_ORDERS, apply_frame, key_order, key_user_orders, reconcile_orphans,
 };
-use lightning_exchange::transport::persist_event::{pack_str, OrderUpsertPayload, PersistFrame};
+use lightning_exchange::transport::persist_event::{OrderUpsertPayload, PersistFrame, pack_str};
 use redis::AsyncCommands;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -43,11 +43,7 @@ async fn make_user(pg: &PgPool) -> Option<i64> {
     Some(id)
 }
 
-async fn purge_test_state(
-    conn: &mut redis::aio::MultiplexedConnection,
-    user_id: i64,
-    ids: &[i64],
-) {
+async fn purge_test_state(conn: &mut redis::aio::MultiplexedConnection, user_id: i64, ids: &[i64]) {
     let mut pipe = redis::pipe();
     for id in ids {
         pipe.del(key_order(*id)).ignore();
@@ -124,7 +120,10 @@ async fn reconcile_drops_orphans_keeps_pg_backed_ids() {
         .await
         .unwrap_or(false);
     assert!(orphan_active_before, "orphan should start in active_orders");
-    assert!(survivor_active_before, "survivor should start in active_orders");
+    assert!(
+        survivor_active_before,
+        "survivor should start in active_orders"
+    );
 
     let stats = reconcile_orphans(&pg, &mut conn).await.unwrap();
     assert!(
@@ -140,11 +139,11 @@ async fn reconcile_drops_orphans_keeps_pg_backed_ids() {
         .sismember(KEY_ACTIVE_ORDERS, survivor_id)
         .await
         .unwrap_or(false);
-    assert!(!orphan_active_after, "orphan must be SREM'd from active_orders");
     assert!(
-        survivor_active_after,
-        "survivor must remain (still in PG)"
+        !orphan_active_after,
+        "orphan must be SREM'd from active_orders"
     );
+    assert!(survivor_active_after, "survivor must remain (still in PG)");
 
     // user_orders cleanup too.
     let orphan_user: bool = conn

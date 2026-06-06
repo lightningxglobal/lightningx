@@ -100,7 +100,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("\n=== results over {TRIALS} trials, batch size {BATCH_SIZE} ===");
-    print_stats(&format!("single ({}× txn)        ", BATCH_SIZE), &single_times);
+    print_stats(
+        &format!("single ({}× txn)        ", BATCH_SIZE),
+        &single_times,
+    );
     print_stats(" batch  (1× multi-row txn)", &batch_times);
 
     let single_p50 = pctl(&single_times, 50);
@@ -123,10 +126,7 @@ async fn run_single_path(pool: &PgPool, fills: &[Fill]) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn settle_one(
-    txn: &mut Transaction<'_, Postgres>,
-    f: &Fill,
-) -> anyhow::Result<()> {
+async fn settle_one(txn: &mut Transaction<'_, Postgres>, f: &Fill) -> anyhow::Result<()> {
     let (base, quote) = split_symbol(&f.symbol);
     let cost = f.price * f.qty;
     let (buyer_id, seller_id, buy_oid, sell_oid) = if f.side == 0 {
@@ -230,7 +230,11 @@ async fn run_batch_path(pool: &PgPool, fills: &[Fill]) -> anyhow::Result<()> {
         }
         sql.push_str(&format!(
             "(${},${},${},${},${},NOW())",
-            n + 1, n + 2, n + 3, n + 4, n + 5,
+            n + 1,
+            n + 2,
+            n + 3,
+            n + 4,
+            n + 5,
         ));
     }
     let mut q = sqlx::query(&sql);
@@ -366,12 +370,10 @@ async fn reset_accounts(pool: &PgPool, taker_uid: i64, maker_uid: i64) -> anyhow
     // Reset balances per trial so the check constraint (balance >= 0) doesn't
     // trip as the bench accumulates many simulated trades.
     for uid in [taker_uid, maker_uid] {
-        sqlx::query(
-            "UPDATE accounts SET balance = 1e12, frozen = 0 WHERE user_id = $1",
-        )
-        .bind(uid)
-        .execute(pool)
-        .await?;
+        sqlx::query("UPDATE accounts SET balance = 1e12, frozen = 0 WHERE user_id = $1")
+            .bind(uid)
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
@@ -401,10 +403,16 @@ async fn build_fills(
         let price = 70_000.0 + i as f64;
         let qty = 0.001_f64;
         let side = (i as u8) & 1; // alternate
-        let (taker_side, maker_side) = if side == 0 { ("buy", "sell") } else { ("sell", "buy") };
+        let (taker_side, maker_side) = if side == 0 {
+            ("buy", "sell")
+        } else {
+            ("sell", "buy")
+        };
         let taker_freeze = if taker_side == "buy" { price } else { 0.0 };
         let maker_freeze = if maker_side == "buy" { price } else { 0.0 };
-        if !first { sql.push(','); }
+        if !first {
+            sql.push(',');
+        }
         first = false;
         sql.push_str(&format!(
             "({taker_id},{taker_uid},'BTC_USDT','{taker_side}','market',{price},{qty},0,'PENDING',{taker_freeze}),

@@ -161,7 +161,13 @@ async fn run_batch_path(pool: &PgPool, orders: &[OrderRow]) -> anyhow::Result<()
         let n = i * 7;
         binds.push(format!(
             "(${}, ${}, ${}, ${}, 'limit', ${}, ${}, 0, 'PENDING', ${})",
-            n + 1, n + 2, n + 3, n + 4, n + 5, n + 6, n + 7
+            n + 1,
+            n + 2,
+            n + 3,
+            n + 4,
+            n + 5,
+            n + 6,
+            n + 7
         ));
     }
     sql.push_str(&binds.join(","));

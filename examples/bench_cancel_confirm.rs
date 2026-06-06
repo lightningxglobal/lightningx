@@ -31,9 +31,8 @@ const TEST_EMAIL: &str = "bench_cancel@lightning.test";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://user:password@127.0.0.1:5432/mydb".to_string()
-    });
+    let url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://user:password@127.0.0.1:5432/mydb".to_string());
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(8)
         .connect(&url)
@@ -223,11 +222,7 @@ async fn ensure_test_user(pool: &PgPool) -> anyhow::Result<i64> {
     Ok(id)
 }
 
-async fn seed_pending_orders(
-    pool: &PgPool,
-    user_id: i64,
-    n: usize,
-) -> anyhow::Result<Vec<i64>> {
+async fn seed_pending_orders(pool: &PgPool, user_id: i64, n: usize) -> anyhow::Result<Vec<i64>> {
     // Alternate buy/sell, varying prices, fixed quantity. coid is NULL so
     // the unique index doesn't get involved (it's the orders body cost we
     // want to measure, not coid contention).
@@ -235,7 +230,8 @@ async fn seed_pending_orders(
     // Reserve the high i64 range (>= 10^14) for the bench so a concurrently
     // running MM / trade-bot can never collide on orders.id. Per-bench
     // counter resets when no rows of the test user remain.
-    static SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100_000_000_000_000);
+    static SEQ: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(100_000_000_000_000);
     let start = SEQ.fetch_add(n as i64, std::sync::atomic::Ordering::Relaxed);
     let next_id = start;
     let mut ids = Vec::with_capacity(n);

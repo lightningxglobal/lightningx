@@ -88,7 +88,7 @@ impl Pools {
     pub fn new(order_capacity: usize, queue_capacity: usize) -> Self {
         Self {
             orders: ObjectPool::new(order_capacity),
-            trades: ObjectPool::new(order_capacity),  // Trade容量 = Order容量（保守估计）
+            trades: ObjectPool::new(order_capacity), // Trade容量 = Order容量（保守估计）
             queues: ObjectPool::new(queue_capacity),
         }
     }

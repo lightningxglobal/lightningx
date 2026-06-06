@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod sbe_encoding_tests {
     use crate::sbe::{
-        self, CancelOrderRequest, NewOrderRequest, TradeNotification, TEMPLATE_ORDER_UPDATE,
-        TEMPLATE_TRADE_NOTIFICATION,
+        self, CancelOrderRequest, NewOrderRequest, TEMPLATE_ORDER_UPDATE,
+        TEMPLATE_TRADE_NOTIFICATION, TradeNotification,
     };
     use crate::transport::OrderUpdateMsg;
 
@@ -187,8 +187,8 @@ mod sbe_encoding_tests {
         let quantity: f64 = 15.0;
         data[40..48].copy_from_slice(&quantity.to_le_bytes());
         data[48] = 1; // side = SELL
-                      // bytes 49..56 = _pad
-                      // bytes 56..72 = symbol
+        // bytes 49..56 = _pad
+        // bytes 56..72 = symbol
         let sym = b"ETH_USDT\0\0\0\0\0\0\0\0";
         data[56..72].copy_from_slice(sym);
 
@@ -221,10 +221,16 @@ mod sbe_encoding_tests {
 
     #[test]
     fn test_order_request_response_stream_layout() {
-        assert_eq!(std::mem::offset_of!(NewOrderRequest, response_stream_id), 34);
+        assert_eq!(
+            std::mem::offset_of!(NewOrderRequest, response_stream_id),
+            34
+        );
         assert_eq!(std::mem::offset_of!(NewOrderRequest, _pad), 38);
         assert_eq!(std::mem::offset_of!(NewOrderRequest, symbol), 48);
-        assert_eq!(std::mem::offset_of!(CancelOrderRequest, response_stream_id), 16);
+        assert_eq!(
+            std::mem::offset_of!(CancelOrderRequest, response_stream_id),
+            16
+        );
         assert_eq!(std::mem::offset_of!(CancelOrderRequest, _pad), 20);
 
         let new_req = NewOrderRequest {
@@ -244,7 +250,10 @@ mod sbe_encoding_tests {
                 std::mem::size_of::<NewOrderRequest>(),
             )
         };
-        assert_eq!(i32::from_le_bytes(new_bytes[34..38].try_into().unwrap()), 203);
+        assert_eq!(
+            i32::from_le_bytes(new_bytes[34..38].try_into().unwrap()),
+            203
+        );
         assert_eq!(&new_bytes[48..64], b"BTC_USDT\0\0\0\0\0\0\0\0");
 
         let cancel_req = CancelOrderRequest {
@@ -259,7 +268,10 @@ mod sbe_encoding_tests {
                 std::mem::size_of::<CancelOrderRequest>(),
             )
         };
-        assert_eq!(i32::from_le_bytes(cancel_bytes[16..20].try_into().unwrap()), 204);
+        assert_eq!(
+            i32::from_le_bytes(cancel_bytes[16..20].try_into().unwrap()),
+            204
+        );
     }
 
     // Test full round-trip: create -> encode -> decode -> verify

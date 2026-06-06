@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lightning_exchange::{MatchingEngine, Order, Side, TimeInForce, PoolConfig};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use lightning_exchange::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
 
 fn create_test_order(id: u64, side: Side, price_ticks: i64) -> Order {
     Order::new(
@@ -15,16 +15,15 @@ fn create_test_order(id: u64, side: Side, price_ticks: i64) -> Order {
 fn bench_place_order_only(c: &mut Criterion) {
     c.bench_function("place_order_10k", |b| {
         b.iter_batched(
-            || {
-                match MatchingEngine::new(PoolConfig::default()) {
-                    Ok(engine) => Some(engine),
-                    Err(_) => None,
-                }
+            || match MatchingEngine::new(PoolConfig::default()) {
+                Ok(engine) => Some(engine),
+                Err(_) => None,
             },
             |engine| {
                 if let Some(mut engine) = engine {
                     for i in 0..10_000 {
-                        let order = black_box(create_test_order(i, Side::Buy, 5_000_000 + i as i64));
+                        let order =
+                            black_box(create_test_order(i, Side::Buy, 5_000_000 + i as i64));
                         let _ = engine.place_order(order);
                     }
                 }
@@ -37,16 +36,15 @@ fn bench_place_order_only(c: &mut Criterion) {
 fn bench_matching_only(c: &mut Criterion) {
     c.bench_function("matching_10k", |b| {
         b.iter_batched(
-            || {
-                match MatchingEngine::new(PoolConfig::default()) {
-                    Ok(engine) => Some(engine),
-                    Err(_) => None,
-                }
+            || match MatchingEngine::new(PoolConfig::default()) {
+                Ok(engine) => Some(engine),
+                Err(_) => None,
             },
             |engine| {
                 if let Some(mut engine) = engine {
                     for i in 0..5_000 {
-                        let order = black_box(create_test_order(i, Side::Sell, 5_000_000 + i as i64));
+                        let order =
+                            black_box(create_test_order(i, Side::Sell, 5_000_000 + i as i64));
                         let _ = engine.place_order(order);
                     }
 
@@ -64,11 +62,9 @@ fn bench_matching_only(c: &mut Criterion) {
 fn bench_mixed_workload(c: &mut Criterion) {
     c.bench_function("mixed_workload_10k", |b| {
         b.iter_batched(
-            || {
-                match MatchingEngine::new(PoolConfig::default()) {
-                    Ok(engine) => Some(engine),
-                    Err(_) => None,
-                }
+            || match MatchingEngine::new(PoolConfig::default()) {
+                Ok(engine) => Some(engine),
+                Err(_) => None,
             },
             |engine| {
                 if let Some(mut engine) = engine {
@@ -90,5 +86,10 @@ fn bench_mixed_workload(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_place_order_only, bench_matching_only, bench_mixed_workload);
+criterion_group!(
+    benches,
+    bench_place_order_only,
+    bench_matching_only,
+    bench_mixed_workload
+);
 criterion_main!(benches);

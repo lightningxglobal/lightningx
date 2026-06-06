@@ -1,6 +1,4 @@
-use lightning_exchange::{
-    MatchingEngine, Order, Side, TimeInForce, PoolConfig,
-};
+use lightning_exchange::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
 
 fn main() {
     println!("=== 市价委托演示 ===\n");

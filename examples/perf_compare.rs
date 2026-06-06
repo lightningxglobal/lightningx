@@ -8,7 +8,7 @@
 //!
 //! Run: cargo run --example perf_compare --release
 
-use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, Order, PoolConfig, Side, TimeInForce, TradeEvent};
 use rtrb::RingBuffer;
 use smallvec::SmallVec;
 use std::time::Instant;
@@ -36,7 +36,9 @@ fn bench_real_business_single() -> (f64, u64, u64) {
         }
         for i in 0..5i64 {
             let p = 5_000_000 + round as i64 % 50 + i;
-            let _ = engine.place_order(make_order(id, Side::Sell, p, 1)).unwrap();
+            let _ = engine
+                .place_order(make_order(id, Side::Sell, p, 1))
+                .unwrap();
             id += 1;
         }
     }
@@ -46,7 +48,11 @@ fn bench_real_business_single() -> (f64, u64, u64) {
     while rx.pop().is_ok() {
         events += 1;
     }
-    (total as f64 / (elapsed_ns as f64 / 1e9), elapsed_ns / total, events)
+    (
+        total as f64 / (elapsed_ns as f64 / 1e9),
+        elapsed_ns / total,
+        events,
+    )
 }
 
 fn bench_real_business_batch() -> (f64, u64, u64) {
@@ -75,7 +81,11 @@ fn bench_real_business_batch() -> (f64, u64, u64) {
         }
     }
     let elapsed_ns = start.elapsed().as_nanos() as u64;
-    (total as f64 / (elapsed_ns as f64 / 1e9), elapsed_ns / total, trades)
+    (
+        total as f64 / (elapsed_ns as f64 / 1e9),
+        elapsed_ns / total,
+        trades,
+    )
 }
 
 // ─── Deep OB (same scenario as old deep_orderbook_benchmark) ─────────────────
@@ -112,7 +122,7 @@ fn bench_deep_ob_batch() -> (f64, u64, u64) {
         for i in 0..10u64 {
             let oid = batch_idx * 20 + i * 2;
             // buy just below best ask (base+1) — does not cross
-            batch.push(make_order(id + oid,     Side::Buy,  base,     10));
+            batch.push(make_order(id + oid, Side::Buy, base, 10));
             // sell just above best bid (base-1) — does not cross
             batch.push(make_order(id + oid + 1, Side::Sell, base + 1, 10));
         }
@@ -125,9 +135,15 @@ fn bench_deep_ob_batch() -> (f64, u64, u64) {
     }
     let elapsed_ns = start.elapsed().as_nanos() as u64;
     let mut events = 0u64;
-    while rx.pop().is_ok() { events += 1; }
+    while rx.pop().is_ok() {
+        events += 1;
+    }
     let _ = events;
-    (total as f64 / (elapsed_ns as f64 / 1e9), elapsed_ns / total, trades)
+    (
+        total as f64 / (elapsed_ns as f64 / 1e9),
+        elapsed_ns / total,
+        trades,
+    )
 }
 
 fn diff_str(current: f64, baseline: f64) -> String {
@@ -165,7 +181,10 @@ fn main() {
     let (tps, ns, tr) = bench_deep_ob_batch();
     println!("  5 000 orders, Trades={tr}");
     println!("  TPS: {:.2}M  ({ns} ns/order)", tps / 1e6);
-    println!("  Historical: 21.13M TPS  =>  {}", diff_str(tps / 1e6, 21.13));
+    println!(
+        "  Historical: 21.13M TPS  =>  {}",
+        diff_str(tps / 1e6, 21.13)
+    );
 
     println!("\n╔══════════════════════════════════════════════════════════════════╗");
     println!("║  Historical baseline (BENCHMARK_SUMMARY.md, commit 095ee1c)     ║");

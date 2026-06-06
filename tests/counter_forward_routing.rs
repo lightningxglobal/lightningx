@@ -113,7 +113,10 @@ fn wrong_owner_order_uses_owner_cmd_stream_and_ingress_resp_stream() {
         COUNTER_FORWARD_RESP_STREAM_BASE + ingress as i32
     );
     assert_eq!({ frame.ingress_desk_id }, ingress);
-    assert_eq!({ frame.req.response_stream_id }, order_update_stream_for_desk(owner));
+    assert_eq!(
+        { frame.req.response_stream_id },
+        order_update_stream_for_desk(owner)
+    );
 }
 
 #[test]
@@ -134,7 +137,10 @@ fn forwarded_cancel_targets_owner_private_update_stream() {
     assert_eq!({ frame.kind }, COUNTER_FORWARD_KIND_CANCEL);
     assert_eq!({ frame.ingress_desk_id }, ingress);
     assert_eq!({ frame.req.participant_id }, user_id as u64);
-    assert_eq!({ frame.req.response_stream_id }, order_update_stream_for_desk(owner));
+    assert_eq!(
+        { frame.req.response_stream_id },
+        order_update_stream_for_desk(owner)
+    );
 }
 
 #[test]

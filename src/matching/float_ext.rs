@@ -24,19 +24,35 @@ pub trait FloatExt {
 
 impl FloatExt for f64 {
     #[inline(always)]
-    fn eq_eps(self, other: f64) -> bool { (self - other).abs() < FLOAT_EPS }
+    fn eq_eps(self, other: f64) -> bool {
+        (self - other).abs() < FLOAT_EPS
+    }
     #[inline(always)]
-    fn lt_eps(self, other: f64) -> bool { other - self > FLOAT_EPS }
+    fn lt_eps(self, other: f64) -> bool {
+        other - self > FLOAT_EPS
+    }
     #[inline(always)]
-    fn gt_eps(self, other: f64) -> bool { self - other > FLOAT_EPS }
+    fn gt_eps(self, other: f64) -> bool {
+        self - other > FLOAT_EPS
+    }
     #[inline(always)]
-    fn le_eps(self, other: f64) -> bool { self - other < FLOAT_EPS }
+    fn le_eps(self, other: f64) -> bool {
+        self - other < FLOAT_EPS
+    }
     #[inline(always)]
-    fn ge_eps(self, other: f64) -> bool { self - other > -FLOAT_EPS }
+    fn ge_eps(self, other: f64) -> bool {
+        self - other > -FLOAT_EPS
+    }
     #[inline(always)]
-    fn near_zero(self) -> bool { self.abs() < FLOAT_EPS }
+    fn near_zero(self) -> bool {
+        self.abs() < FLOAT_EPS
+    }
     #[inline(always)]
-    fn positive(self) -> bool { self > FLOAT_EPS }
+    fn positive(self) -> bool {
+        self > FLOAT_EPS
+    }
     #[inline(always)]
-    fn nonneg(self) -> bool { self > -FLOAT_EPS }
+    fn nonneg(self) -> bool {
+        self > -FLOAT_EPS
+    }
 }

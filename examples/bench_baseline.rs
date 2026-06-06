@@ -13,7 +13,7 @@
 //!
 //! Run: cargo run --example bench_baseline --release
 
-use lightning_exchange::{MatchingEngine, PoolConfig, Order, Side, TimeInForce, TradeEvent};
+use lightning_exchange::{MatchingEngine, Order, PoolConfig, Side, TimeInForce, TradeEvent};
 use rtrb::RingBuffer;
 use smallvec::SmallVec;
 use std::time::Instant;
@@ -27,8 +27,18 @@ fn make_order(id: u64, side: Side, price_ticks: i64, qty_lots: i64) -> Order {
 /// Pre-fill `levels` bid + ask levels around BASE. Returns next free order id.
 fn prefill(engine: &mut MatchingEngine, levels: i64) -> u64 {
     for i in 0..levels {
-        let _ = engine.place_order(make_order(i as u64 * 2,     Side::Buy,  BASE - levels + i, 10_000));
-        let _ = engine.place_order(make_order(i as u64 * 2 + 1, Side::Sell, BASE + 1 + i,      10_000));
+        let _ = engine.place_order(make_order(
+            i as u64 * 2,
+            Side::Buy,
+            BASE - levels + i,
+            10_000,
+        ));
+        let _ = engine.place_order(make_order(
+            i as u64 * 2 + 1,
+            Side::Sell,
+            BASE + 1 + i,
+            10_000,
+        ));
     }
     (levels * 2) as u64
 }
@@ -61,11 +71,22 @@ fn bench_single(pool: PoolConfig, total: u64, pre_levels: i64) -> (f64, u64, u64
     let elapsed_ns = start.elapsed().as_nanos() as u64;
 
     let mut events = 0u64;
-    while rx.pop().is_ok() { events += 1; }
-    (total as f64 / (elapsed_ns as f64 / 1e9), elapsed_ns / total, events)
+    while rx.pop().is_ok() {
+        events += 1;
+    }
+    (
+        total as f64 / (elapsed_ns as f64 / 1e9),
+        elapsed_ns / total,
+        events,
+    )
 }
 
-fn bench_batch(pool: PoolConfig, total: u64, batch_size: usize, pre_levels: i64) -> (f64, u64, u64) {
+fn bench_batch(
+    pool: PoolConfig,
+    total: u64,
+    batch_size: usize,
+    pre_levels: i64,
+) -> (f64, u64, u64) {
     let mut engine = MatchingEngine::new(pool).unwrap();
     let mut id = prefill(&mut engine, pre_levels);
 
@@ -83,7 +104,11 @@ fn bench_batch(pool: PoolConfig, total: u64, batch_size: usize, pre_levels: i64)
         }
     }
     let elapsed_ns = start.elapsed().as_nanos() as u64;
-    (total as f64 / (elapsed_ns as f64 / 1e9), elapsed_ns / total, trades)
+    (
+        total as f64 / (elapsed_ns as f64 / 1e9),
+        elapsed_ns / total,
+        trades,
+    )
 }
 
 fn main() {
@@ -92,24 +117,46 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════════════╝\n");
 
     println!("【Single order — 2M pool, ~5% fill】");
-    let _ = bench_single(PoolConfig::default(), 50_000, 500);  // warm-up
+    let _ = bench_single(PoolConfig::default(), 50_000, 500); // warm-up
     let (tps, ns, ev) = bench_single(PoolConfig::default(), 50_000, 500);
-    println!("  50 000 orders, TradeEvents={ev} ({:.1}%)", ev as f64 / 50_000.0 * 100.0);
+    println!(
+        "  50 000 orders, TradeEvents={ev} ({:.1}%)",
+        ev as f64 / 50_000.0 * 100.0
+    );
     println!("  TPS: {:.2}M  ({ns} ns/order)", tps / 1e6);
 
     println!("\n【Batch-20 — 2M pool, ~5% fill】");
-    let _ = bench_batch(PoolConfig::default(), 50_000, 20, 500);  // warm-up
+    let _ = bench_batch(PoolConfig::default(), 50_000, 20, 500); // warm-up
     let (tps, ns, tr) = bench_batch(PoolConfig::default(), 50_000, 20, 500);
-    println!("  50 000 orders, Trades={tr} ({:.1}%)", tr as f64 / 50_000.0 * 100.0);
+    println!(
+        "  50 000 orders, Trades={tr} ({:.1}%)",
+        tr as f64 / 50_000.0 * 100.0
+    );
     println!("  TPS: {:.2}M  ({ns} ns/order)", tps / 1e6);
 
     println!("\n【Deep OB Batch-20 — 100K pool, 400 levels, ~5% fill】");
-    let _ = bench_batch(PoolConfig { order_capacity: 100_000, queue_capacity: 100_000 }, 5_000, 20, 400);  // warm-up
+    let _ = bench_batch(
+        PoolConfig {
+            order_capacity: 100_000,
+            queue_capacity: 100_000,
+        },
+        5_000,
+        20,
+        400,
+    ); // warm-up
     let (tps, ns, tr) = bench_batch(
-        PoolConfig { order_capacity: 100_000, queue_capacity: 100_000 },
-        5_000, 20, 400,
+        PoolConfig {
+            order_capacity: 100_000,
+            queue_capacity: 100_000,
+        },
+        5_000,
+        20,
+        400,
     );
-    println!("  5 000 orders, Trades={tr} ({:.1}%)", tr as f64 / 5_000.0 * 100.0);
+    println!(
+        "  5 000 orders, Trades={tr} ({:.1}%)",
+        tr as f64 / 5_000.0 * 100.0
+    );
     println!("  TPS: {:.2}M  ({ns} ns/order)", tps / 1e6);
 
     println!();

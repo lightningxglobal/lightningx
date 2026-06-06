@@ -13,6 +13,7 @@ mod sbe_encoding_tests {
             kind: 1, // ACCEPTED
             reject_reason: 0,
             _pad1: [0; 6],
+            sequence: 77,
             order_id: 12345,
             client_order_id: 67890,
             participant_id: 1,
@@ -22,11 +23,11 @@ mod sbe_encoding_tests {
             timestamp: 1234567890,
         };
 
-        let mut data = [0u8; 72];
+        let mut data = [0u8; 80];
         sbe::encode_order_update(&msg, &mut data).unwrap();
 
         // Verify header
-        assert_eq!(u16::from_le_bytes([data[0], data[1]]), 64); // block_length
+        assert_eq!(u16::from_le_bytes([data[0], data[1]]), 72); // block_length
         assert_eq!(
             u16::from_le_bytes([data[2], data[3]]),
             TEMPLATE_ORDER_UPDATE
@@ -40,11 +41,17 @@ mod sbe_encoding_tests {
             u64::from_le_bytes([
                 data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23]
             ]),
+            77
+        ); // sequence
+        assert_eq!(
+            u64::from_le_bytes([
+                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31]
+            ]),
             12345
         ); // order_id
         assert_eq!(
             u64::from_le_bytes([
-                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31]
+                data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39]
             ]),
             67890
         ); // client_order_id
@@ -54,10 +61,10 @@ mod sbe_encoding_tests {
     #[test]
     fn test_orderupdate_sbe_decoding_with_header() {
         // Simulate received message from Aeron (with header)
-        let mut data = vec![0u8; 72];
+        let mut data = vec![0u8; 80];
 
         // Header
-        data[0..2].copy_from_slice(&64u16.to_le_bytes());
+        data[0..2].copy_from_slice(&72u16.to_le_bytes());
         data[2..4].copy_from_slice(&TEMPLATE_ORDER_UPDATE.to_le_bytes());
         data[4..6].copy_from_slice(&1u16.to_le_bytes());
         data[6..8].copy_from_slice(&0u16.to_le_bytes());
@@ -65,32 +72,36 @@ mod sbe_encoding_tests {
         // OrderUpdateMsg fields (starting at byte 8)
         data[8] = 1; // kind = ACCEPTED
         data[9] = 0; // reject_reason
+        let sequence: u64 = 77;
+        data[16..24].copy_from_slice(&sequence.to_le_bytes());
         let order_id: u64 = 12345;
-        data[16..24].copy_from_slice(&order_id.to_le_bytes());
+        data[24..32].copy_from_slice(&order_id.to_le_bytes());
         let client_order_id: u64 = 67890;
-        data[24..32].copy_from_slice(&client_order_id.to_le_bytes());
+        data[32..40].copy_from_slice(&client_order_id.to_le_bytes());
         let participant_id: u64 = 1;
-        data[32..40].copy_from_slice(&participant_id.to_le_bytes());
+        data[40..48].copy_from_slice(&participant_id.to_le_bytes());
         let fill_price: f64 = 50000.0;
-        data[40..48].copy_from_slice(&fill_price.to_le_bytes());
+        data[48..56].copy_from_slice(&fill_price.to_le_bytes());
         let fill_qty: f64 = 15.0;
-        data[48..56].copy_from_slice(&fill_qty.to_le_bytes());
+        data[56..64].copy_from_slice(&fill_qty.to_le_bytes());
         let remaining_qty: f64 = 5.0;
-        data[56..64].copy_from_slice(&remaining_qty.to_le_bytes());
+        data[64..72].copy_from_slice(&remaining_qty.to_le_bytes());
         let timestamp: u64 = 1234567890;
-        data[64..72].copy_from_slice(&timestamp.to_le_bytes());
+        data[72..80].copy_from_slice(&timestamp.to_le_bytes());
 
         // Client-side parsing (skip header, read from byte 8)
         let kind = data[8];
-        let order_id_parsed = u64::from_le_bytes(data[16..24].try_into().unwrap());
-        let client_order_id_parsed = u64::from_le_bytes(data[24..32].try_into().unwrap());
-        let participant_id_parsed = u64::from_le_bytes(data[32..40].try_into().unwrap());
-        let fill_price_parsed = f64::from_le_bytes(data[40..48].try_into().unwrap());
-        let fill_qty_parsed = f64::from_le_bytes(data[48..56].try_into().unwrap());
-        let remaining_qty_parsed = f64::from_le_bytes(data[56..64].try_into().unwrap());
-        let timestamp_parsed = u64::from_le_bytes(data[64..72].try_into().unwrap());
+        let sequence_parsed = u64::from_le_bytes(data[16..24].try_into().unwrap());
+        let order_id_parsed = u64::from_le_bytes(data[24..32].try_into().unwrap());
+        let client_order_id_parsed = u64::from_le_bytes(data[32..40].try_into().unwrap());
+        let participant_id_parsed = u64::from_le_bytes(data[40..48].try_into().unwrap());
+        let fill_price_parsed = f64::from_le_bytes(data[48..56].try_into().unwrap());
+        let fill_qty_parsed = f64::from_le_bytes(data[56..64].try_into().unwrap());
+        let remaining_qty_parsed = f64::from_le_bytes(data[64..72].try_into().unwrap());
+        let timestamp_parsed = u64::from_le_bytes(data[72..80].try_into().unwrap());
 
         assert_eq!(kind, 1);
+        assert_eq!(sequence_parsed, 77);
         assert_eq!(order_id_parsed, 12345);
         assert_eq!(client_order_id_parsed, 67890);
         assert_eq!(participant_id_parsed, 1);
@@ -204,7 +215,7 @@ mod sbe_encoding_tests {
     fn test_message_struct_sizes() {
         assert_eq!(std::mem::size_of::<NewOrderRequest>(), 64);
         assert_eq!(std::mem::size_of::<CancelOrderRequest>(), 24);
-        assert_eq!(std::mem::size_of::<OrderUpdateMsg>(), 64);
+        assert_eq!(std::mem::size_of::<OrderUpdateMsg>(), 72);
         assert_eq!(std::mem::size_of::<TradeNotification>(), 64);
     }
 
@@ -258,6 +269,7 @@ mod sbe_encoding_tests {
             kind: 2, // FILLED
             reject_reason: 0,
             _pad1: [0; 6],
+            sequence: 123,
             order_id: 999,
             client_order_id: 888,
             participant_id: 777,
@@ -268,21 +280,23 @@ mod sbe_encoding_tests {
         };
 
         // Encode
-        let mut encoded = [0u8; 72];
+        let mut encoded = [0u8; 80];
         sbe::encode_order_update(&original, &mut encoded).unwrap();
 
         // Decode
         let kind = encoded[8];
-        let order_id = u64::from_le_bytes(encoded[16..24].try_into().unwrap());
-        let client_order_id = u64::from_le_bytes(encoded[24..32].try_into().unwrap());
-        let participant_id = u64::from_le_bytes(encoded[32..40].try_into().unwrap());
-        let fill_price = f64::from_le_bytes(encoded[40..48].try_into().unwrap());
-        let fill_qty = f64::from_le_bytes(encoded[48..56].try_into().unwrap());
-        let remaining_qty = f64::from_le_bytes(encoded[56..64].try_into().unwrap());
-        let timestamp = u64::from_le_bytes(encoded[64..72].try_into().unwrap());
+        let sequence = u64::from_le_bytes(encoded[16..24].try_into().unwrap());
+        let order_id = u64::from_le_bytes(encoded[24..32].try_into().unwrap());
+        let client_order_id = u64::from_le_bytes(encoded[32..40].try_into().unwrap());
+        let participant_id = u64::from_le_bytes(encoded[40..48].try_into().unwrap());
+        let fill_price = f64::from_le_bytes(encoded[48..56].try_into().unwrap());
+        let fill_qty = f64::from_le_bytes(encoded[56..64].try_into().unwrap());
+        let remaining_qty = f64::from_le_bytes(encoded[64..72].try_into().unwrap());
+        let timestamp = u64::from_le_bytes(encoded[72..80].try_into().unwrap());
 
         // Verify
         assert_eq!(kind, 2);
+        assert_eq!(sequence, 123);
         assert_eq!(order_id, 999);
         assert_eq!(client_order_id, 888);
         assert_eq!(participant_id, 777);

@@ -238,8 +238,8 @@ impl OrderUpdatePublisher for AeronOrderUpdatePublisher {
 
     fn publish(&mut self, msg: &OrderUpdateMsg) -> Result<(), TransportError> {
         use tracing::info;
-        let result = publish_with_retry_claim(&mut self.publisher, 72, |buf| {
-            // Buffer is exactly 72 B (8-byte header + 64-byte body); the
+        let result = publish_with_retry_claim(&mut self.publisher, 80, |buf| {
+            // Buffer is exactly 80 B (8-byte header + 72-byte body); the
             // encoder never errors here, so ignore the Result.
             let _ = sbe::encode_order_update(msg, buf);
         });
@@ -579,8 +579,8 @@ struct OrderUpdateCallback {
 
 impl PollCallback for OrderUpdateCallback {
     fn on_data(&mut self, data: &[u8]) {
-        // SBE: 8-byte header + 64-byte body = 72 bytes
-        if data.len() < 72 {
+        // SBE: 8-byte header + 72-byte body = 80 bytes
+        if data.len() < 80 {
             return;
         }
         let template_id = u16::from_le_bytes([data[2], data[3]]);
@@ -1114,7 +1114,7 @@ mod tests {
         };
 
         let msg = crate::transport::OrderUpdateMsg::accepted(11, 22, 33, 44);
-        let mut data = [0u8; 72];
+        let mut data = [0u8; 80];
         sbe::encode_order_update(&msg, &mut data).unwrap();
 
         callback.on_data(&data);

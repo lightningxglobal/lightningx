@@ -90,6 +90,7 @@ pub struct OrderUpdateMsg {
     pub kind: u8, // ACCEPTED=1, FILLED=2, PARTIAL=3, CANCELLED=4, REJECTED=5
     pub reject_reason: u8,
     pub _pad1: [u8; 6],
+    pub sequence: u64,
     pub order_id: u64,
     pub client_order_id: u64,
     pub participant_id: u64,
@@ -99,7 +100,7 @@ pub struct OrderUpdateMsg {
     pub timestamp: u64,
 }
 
-static_assertions::const_assert_eq!(std::mem::size_of::<OrderUpdateMsg>(), 64);
+static_assertions::const_assert_eq!(std::mem::size_of::<OrderUpdateMsg>(), 72);
 
 pub mod order_update_kind {
     pub const ACCEPTED: u8 = 1;
@@ -115,6 +116,7 @@ impl OrderUpdateMsg {
             kind: order_update_kind::ACCEPTED,
             reject_reason: 0,
             _pad1: [0; 6],
+            sequence: 0,
             order_id,
             client_order_id,
             participant_id,
@@ -137,6 +139,7 @@ impl OrderUpdateMsg {
             kind: order_update_kind::FILLED,
             reject_reason: 0,
             _pad1: [0; 6],
+            sequence: 0,
             order_id,
             client_order_id,
             participant_id,
@@ -160,6 +163,7 @@ impl OrderUpdateMsg {
             kind: order_update_kind::PARTIAL_FILL,
             reject_reason: 0,
             _pad1: [0; 6],
+            sequence: 0,
             order_id,
             client_order_id,
             participant_id,
@@ -181,6 +185,7 @@ impl OrderUpdateMsg {
             kind: order_update_kind::CANCELLED,
             reject_reason: 0,
             _pad1: [0; 6],
+            sequence: 0,
             order_id,
             client_order_id,
             participant_id,
@@ -196,6 +201,7 @@ impl OrderUpdateMsg {
             kind: order_update_kind::REJECTED,
             reject_reason: reason,
             _pad1: [0; 6],
+            sequence: 0,
             order_id: 0,
             client_order_id,
             participant_id,

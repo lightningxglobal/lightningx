@@ -67,11 +67,17 @@ fn response_stream_index(stream_id: i32, publishers_len: usize) -> usize {
 
 fn publish_order_update(
     publishers: &mut [AeronOrderUpdatePublisher],
+    sequences: &mut [u64],
     stream_id: i32,
     msg: &OrderUpdateMsg,
 ) {
     let idx = response_stream_index(stream_id, publishers.len());
-    let _ = publishers[idx].publish(msg);
+    let mut sequenced = *msg;
+    if let Some(seq) = sequences.get_mut(idx) {
+        *seq += 1;
+        sequenced.sequence = *seq;
+    }
+    let _ = publishers[idx].publish(&sequenced);
 }
 
 fn env_core_at(name: &str, index: usize) -> Option<usize> {
@@ -148,6 +154,7 @@ fn spawn_symbol_thread(
                         })
                 })
                 .collect();
+            let mut ou_seqs = vec![0_u64; ou_pubs.len()];
             let mut trade_pub =
                 AeronTradePublisher::new(client.clone(), &trade_channel(), TRADE_STREAM)
                     .unwrap_or_else(|e| panic!("[{}] trade_pub: {}", symbol, e));
@@ -238,6 +245,7 @@ fn spawn_symbol_thread(
                                 );
                                 publish_order_update(
                                     &mut ou_pubs,
+                                    &mut ou_seqs,
                                     response_stream_id,
                                     &OrderUpdateMsg::rejected(
                                         client_order_id,
@@ -264,6 +272,7 @@ fn spawn_symbol_thread(
                             if quantity_lots <= 0 {
                                 publish_order_update(
                                     &mut ou_pubs,
+                                    &mut ou_seqs,
                                     response_stream_id,
                                     &OrderUpdateMsg::rejected(
                                         req.client_order_id,
@@ -299,6 +308,7 @@ fn spawn_symbol_thread(
                                     // }
                                     publish_order_update(
                                         &mut ou_pubs,
+                                        &mut ou_seqs,
                                         response_stream_id,
                                         &OrderUpdateMsg::rejected(
                                             req.client_order_id,
@@ -408,7 +418,12 @@ fn spawn_symbol_thread(
                                         };
                                         let _ = trade_pub.publish(&trade);
                                     }
-                                    publish_order_update(&mut ou_pubs, response_stream_id, &update);
+                                    publish_order_update(
+                                        &mut ou_pubs,
+                                        &mut ou_seqs,
+                                        response_stream_id,
+                                        &update,
+                                    );
                                     // if let Some(ref t) = tracer {
                                     //     t.record_sym(
                                     //         MS_AERON_UPDATE_SEND,
@@ -433,6 +448,7 @@ fn spawn_symbol_thread(
                                         .unwrap_or((req.participant_id, request_stream_id));
                                     publish_order_update(
                                         &mut ou_pubs,
+                                        &mut ou_seqs,
                                         response_stream_id,
                                         &OrderUpdateMsg::cancelled(
                                             req.order_id,
@@ -451,6 +467,7 @@ fn spawn_symbol_thread(
                                     if participant_id != 0 {
                                         publish_order_update(
                                             &mut ou_pubs,
+                                            &mut ou_seqs,
                                             request_stream_id,
                                             &OrderUpdateMsg::cancelled(
                                                 req.order_id,

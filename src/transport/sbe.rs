@@ -281,16 +281,16 @@ pub fn encode_order_update(
         return Err(());
     }
 
-    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_UPDATE, 64));
+    buf[0..8].copy_from_slice(&encode_header(TEMPLATE_ORDER_UPDATE, 72));
     let msg_bytes = unsafe {
         std::slice::from_raw_parts(
             msg as *const crate::transport::OrderUpdateMsg as *const u8,
-            64,
+            72,
         )
     };
-    buf[8..72].copy_from_slice(msg_bytes);
+    buf[8..80].copy_from_slice(msg_bytes);
 
-    Ok(72)
+    Ok(80)
 }
 
 // ============================================================================
@@ -328,7 +328,7 @@ pub fn decode_cancel_order(buf: &[u8]) -> Option<CancelOrderRequest> {
 }
 
 pub fn decode_order_update(buf: &[u8]) -> Option<crate::transport::OrderUpdateMsg> {
-    if buf.len() < 8 + 64 {
+    if buf.len() < 8 + 72 {
         return None;
     }
     unsafe {

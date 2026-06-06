@@ -12,6 +12,10 @@ pub struct RiskEngine {
     // symbol → user_ids with open positions (for mark-price scan in Phase 3).
     // HashSet for O(1) insert/remove in on_fill (hot recv-spin path).
     pub symbol_position_index: DashMap<[u8; 16], std::collections::HashSet<i64>>,
+    /// Gross open interest per symbol in lots: Σ qty_lots over every open
+    /// position. Maintained incrementally by on_fill (O(1)); read by the
+    /// order-entry OI cap check.
+    pub symbol_oi_lots: DashMap<[u8; 16], AtomicI64>,
     /// Insurance fund balance in cents.  Positive = surplus absorbed from profitable
     /// liquidations; negative = fund debt from socialised losses.
     pub insurance_fund_cents: AtomicI64,
@@ -24,6 +28,7 @@ impl RiskEngine {
             positions: DashMap::new(),
             mark_prices: DashMap::new(),
             symbol_position_index: DashMap::new(),
+            symbol_oi_lots: DashMap::new(),
             insurance_fund_cents: AtomicI64::new(0),
         })
     }
@@ -77,6 +82,60 @@ impl RiskEngine {
     /// Hot path: lock-free reserve using CAS on `available_margin`.
     /// Uses `accounts.get()` (shared shard read-lock) so concurrent
     /// `release_order_margin` calls on other users in the same shard never block.
+    /// Gross open interest for a symbol in lots. O(1).
+    pub fn symbol_open_interest_lots(&self, symbol: &[u8; 16]) -> i64 {
+        self.symbol_oi_lots
+            .get(symbol)
+            .map(|v| v.load(Ordering::Relaxed).max(0))
+            .unwrap_or(0)
+    }
+
+    /// Per-user-per-symbol position cap. `max_position_lots == 0` disables.
+    /// O(1): one DashMap read. Conservative: counts the existing position
+    /// plus the full new order quantity (a closing order may be rejected
+    /// near the cap — acceptable, the user can close in smaller clips).
+    pub fn check_position_limit(
+        &self,
+        user_id: i64,
+        symbol: &[u8; 16],
+        additional_lots: i64,
+        max_position_lots: i64,
+    ) -> Result<(), &'static str> {
+        if max_position_lots <= 0 {
+            return Ok(());
+        }
+        let current = self
+            .positions
+            .get(&(user_id, *symbol))
+            .map(|p| p.qty_lots)
+            .unwrap_or(0);
+        if current.saturating_add(additional_lots) > max_position_lots {
+            return Err("Position limit exceeded");
+        }
+        Ok(())
+    }
+
+    /// Market-wide gross open interest cap for a symbol.
+    /// `max_oi_lots == 0` disables. O(1).
+    pub fn check_symbol_oi_limit(
+        &self,
+        symbol: &[u8; 16],
+        additional_lots: i64,
+        max_oi_lots: i64,
+    ) -> Result<(), &'static str> {
+        if max_oi_lots <= 0 {
+            return Ok(());
+        }
+        if self
+            .symbol_open_interest_lots(symbol)
+            .saturating_add(additional_lots)
+            > max_oi_lots
+        {
+            return Err("Symbol open interest limit exceeded");
+        }
+        Ok(())
+    }
+
     pub fn check_and_reserve_margin(
         &self,
         user_id: i64,
@@ -163,11 +222,11 @@ impl RiskEngine {
         };
 
         // Compute new position state without holding shard locks.
-        let (old_unrealized_pnl, old_maintenance_margin) = self
+        let (old_unrealized_pnl, old_maintenance_margin, old_qty_lots) = self
             .positions
             .get(&key)
-            .map(|p| (p.unrealized_pnl, p.maintenance_margin))
-            .unwrap_or((0, 0));
+            .map(|p| (p.unrealized_pnl, p.maintenance_margin, p.qty_lots))
+            .unwrap_or((0, 0, 0));
 
         let (new_pos, released_used_margin, realized_pnl_cents) = {
             let existing = self.positions.get(&key);
@@ -197,6 +256,17 @@ impl RiskEngine {
             None => {
                 self.positions.remove(&key);
             }
+        }
+
+        // Incremental gross open interest: delta of this user's position
+        // size on this symbol. O(1) atomic add; clamping handled at read.
+        let new_qty_lots = new_pos.as_ref().map(|p| p.qty_lots).unwrap_or(0);
+        let oi_delta = new_qty_lots - old_qty_lots;
+        if oi_delta != 0 {
+            self.symbol_oi_lots
+                .entry(symbol)
+                .or_insert_with(|| AtomicI64::new(0))
+                .fetch_add(oi_delta, Ordering::Relaxed);
         }
 
         // Insurance fund accounting for liquidation closes.
@@ -754,6 +824,61 @@ mod tests {
         let (engine, uid) = make_engine_with_account(balance_cents);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
         (engine, uid)
+    }
+
+    #[test]
+    fn open_interest_tracks_position_lifecycle() {
+        let (engine, uid) = setup_with_reserved(10_000_000);
+        let sym = btc_sym();
+        assert_eq!(engine.symbol_open_interest_lots(&sym), 0);
+
+        // Open long 100k lots → OI 100k.
+        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        assert_eq!(engine.symbol_open_interest_lots(&sym), QTY_LOTS);
+
+        // Add 50k → OI 150k.
+        engine.check_and_reserve_margin(uid, MARGIN_CENTS / 2).unwrap();
+        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS / 2, MARGIN_CENTS / 2,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        assert_eq!(engine.symbol_open_interest_lots(&sym), QTY_LOTS + QTY_LOTS / 2);
+
+        // Close 50k (sell) → OI back to 100k.
+        engine.on_fill(uid, sym, 1, PRICE_TICKS, QTY_LOTS / 2, 0,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        assert_eq!(engine.symbol_open_interest_lots(&sym), QTY_LOTS);
+
+        // Close fully → OI 0.
+        engine.on_fill(uid, sym, 1, PRICE_TICKS, QTY_LOTS, 0,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        assert_eq!(engine.symbol_open_interest_lots(&sym), 0);
+    }
+
+    #[test]
+    fn position_and_oi_limits_enforced_o1() {
+        let (engine, uid) = setup_with_reserved(10_000_000);
+        let sym = btc_sym();
+
+        // Disabled limits always pass.
+        assert!(engine.check_position_limit(uid, &sym, i64::MAX / 2, 0).is_ok());
+        assert!(engine.check_symbol_oi_limit(&sym, i64::MAX / 2, 0).is_ok());
+
+        // No position yet: order up to the cap passes, beyond fails.
+        assert!(engine.check_position_limit(uid, &sym, 100, 100).is_ok());
+        assert!(engine.check_position_limit(uid, &sym, 101, 100).is_err());
+
+        // Open 100k lots, cap 150k: 50k more ok, 50k+1 rejected.
+        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        assert!(engine.check_position_limit(uid, &sym, QTY_LOTS / 2, QTY_LOTS + QTY_LOTS / 2).is_ok());
+        assert!(engine.check_position_limit(uid, &sym, QTY_LOTS / 2 + 1, QTY_LOTS + QTY_LOTS / 2).is_err());
+
+        // Market-wide OI cap counts everyone's positions.
+        assert!(engine.check_symbol_oi_limit(&sym, QTY_LOTS, 2 * QTY_LOTS).is_ok());
+        assert!(engine.check_symbol_oi_limit(&sym, QTY_LOTS + 1, 2 * QTY_LOTS).is_err());
+
+        // Saturating add: no overflow panic at extreme values.
+        assert!(engine.check_position_limit(uid, &sym, i64::MAX, 1).is_err());
     }
 
     #[test]

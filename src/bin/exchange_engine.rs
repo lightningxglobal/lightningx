@@ -109,6 +109,64 @@ fn outside_price_band(
     }
 }
 
+/// Trading-halt circuit breaker, O(1) per trade and per order.
+///
+/// Tracks the first trade price of a rolling window; if any trade within
+/// the window deviates more than `threshold_bps` from the window-open
+/// price, the symbol enters cancel-only mode for `cooldown_ns`. New orders
+/// are rejected (reject_reason 10) while halted; cancels always pass so
+/// participants can pull quotes. `threshold_bps == 0` disables.
+struct CircuitBreaker {
+    threshold_bps: u32,
+    window_ns: u64,
+    cooldown_ns: u64,
+    window_start_ns: u64,
+    window_open_ticks: i64,
+    halted_until_ns: u64,
+}
+
+impl CircuitBreaker {
+    fn new(threshold_bps: u32, window_ns: u64, cooldown_ns: u64) -> Self {
+        Self {
+            threshold_bps,
+            window_ns,
+            cooldown_ns,
+            window_start_ns: 0,
+            window_open_ticks: 0,
+            halted_until_ns: 0,
+        }
+    }
+
+    #[inline]
+    fn is_halted(&self, now_ns: u64) -> bool {
+        now_ns < self.halted_until_ns
+    }
+
+    /// Record a trade. Returns true when this trade newly trips the breaker.
+    fn on_trade(&mut self, now_ns: u64, price_ticks: i64) -> bool {
+        if self.threshold_bps == 0 || price_ticks <= 0 {
+            return false;
+        }
+        if self.window_open_ticks <= 0 || now_ns.saturating_sub(self.window_start_ns) > self.window_ns
+        {
+            self.window_start_ns = now_ns;
+            self.window_open_ticks = price_ticks;
+            return false;
+        }
+        let open = self.window_open_ticks as i128;
+        let dev = (price_ticks as i128 - open).abs() * 10_000;
+        if dev > open * self.threshold_bps as i128 {
+            self.halted_until_ns = now_ns + self.cooldown_ns;
+            // Re-anchor so post-halt trading measures from the halt price,
+            // not the pre-crash level (which would re-trip instantly).
+            self.window_start_ns = now_ns;
+            self.window_open_ticks = price_ticks;
+            return true;
+        }
+        false
+    }
+}
+
 /// Per-order size limits, O(1). `max_lots`/`max_notional` of 0 disable the
 /// respective check. Notional is in ticks×lots units (i128, overflow-free).
 /// Market orders (price 0) are only bounded by lots.
@@ -280,6 +338,48 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_trips_on_extreme_move_and_recovers() {
+        const MS: u64 = 1_000_000;
+        // 10% threshold, 10s window, 60s cooldown.
+        let mut cb = CircuitBreaker::new(1_000, 10_000 * MS, 60_000 * MS);
+
+        // First trade anchors the window; no trip.
+        assert!(!cb.on_trade(0, 100));
+        // 9.99% move within window: no trip.
+        assert!(!cb.on_trade(1_000 * MS, 109));
+        assert!(!cb.is_halted(1_001 * MS));
+        // 11% move within window: trip.
+        assert!(cb.on_trade(2_000 * MS, 111));
+        assert!(cb.is_halted(2_001 * MS));
+        assert!(cb.is_halted(2_000 * MS + 59_999 * MS));
+        // Cooldown elapsed: trading resumes.
+        assert!(!cb.is_halted(2_000 * MS + 60_000 * MS));
+        // Post-halt anchor is the halt price (111): a return to 100 (~9.9%)
+        // does NOT instantly re-trip.
+        assert!(!cb.on_trade(63_000 * MS, 100));
+    }
+
+    #[test]
+    fn circuit_breaker_window_expiry_reanchors() {
+        const MS: u64 = 1_000_000;
+        let mut cb = CircuitBreaker::new(1_000, 10_000 * MS, 60_000 * MS);
+        assert!(!cb.on_trade(0, 100));
+        // 50% move but AFTER the window expired → re-anchor, no trip.
+        // (Slow drifts are legitimate; the breaker targets sudden moves.)
+        assert!(!cb.on_trade(20_000 * MS, 150));
+        // Now a fast 11% move from the new anchor trips.
+        assert!(cb.on_trade(21_000 * MS, 167));
+    }
+
+    #[test]
+    fn circuit_breaker_disabled_never_trips() {
+        let mut cb = CircuitBreaker::new(0, 1, 1);
+        assert!(!cb.on_trade(0, 100));
+        assert!(!cb.on_trade(1, 100_000));
+        assert!(!cb.is_halted(2));
+    }
+
+    #[test]
     fn order_limits_enforce_lots_and_notional() {
         // Disabled limits pass everything.
         assert!(!exceeds_order_limits(1_000_000, 1_000_000, 0, 0));
@@ -402,10 +502,28 @@ fn spawn_symbol_thread(
             };
             let mut idle_iters: u32 = 0;
             let mut idle_sleep_us: u64 = 1;
+            // Band width: per-symbol rules value, overridable engine-wide
+            // via ENGINE_PRICE_BAND_BPS.
             let price_band_bps = std::env::var("ENGINE_PRICE_BAND_BPS")
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(rules.price_band_bps);
+            // Circuit breaker: halt (cancel-only) on extreme intra-window
+            // moves. ENGINE_CB_BPS=0 (default) disables.
+            let cb_bps = std::env::var("ENGINE_CB_BPS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            let cb_window_ms = std::env::var("ENGINE_CB_WINDOW_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(10_000);
+            let cb_cooldown_ms = std::env::var("ENGINE_CB_COOLDOWN_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60_000);
+            let mut breaker =
+                CircuitBreaker::new(cb_bps, cb_window_ms * 1_000_000, cb_cooldown_ms * 1_000_000);
             // Per-order / per-participant limits. 0 disables a limit.
             let max_order_lots = std::env::var("ENGINE_MAX_ORDER_LOTS")
                 .ok()
@@ -497,6 +615,22 @@ fn spawn_symbol_thread(
                                         req.client_order_id,
                                         req.participant_id,
                                         2,
+                                        ts,
+                                    ),
+                                );
+                                continue;
+                            }
+                            if breaker.is_halted(ts) {
+                                // Cancel-only mode: reject new orders during
+                                // the cooldown; cancels are handled below.
+                                publish_order_update(
+                                    &mut ou_pubs,
+                                    &mut ou_seqs,
+                                    response_stream_id,
+                                    &OrderUpdateMsg::rejected(
+                                        req.client_order_id,
+                                        req.participant_id,
+                                        10,
                                         ts,
                                     ),
                                 );
@@ -710,6 +844,12 @@ fn spawn_symbol_thread(
                                     {
                                         trade_seq += 1;
                                         last_trade_ticks = fill_price_ticks;
+                                        if breaker.on_trade(ts, fill_price_ticks) {
+                                            tracing::warn!(
+                                                "[{}] CIRCUIT BREAKER tripped at {} ticks — cancel-only for {}ms",
+                                                symbol, fill_price_ticks, cb_cooldown_ms,
+                                            );
+                                        }
                                         let fill_price = rules.ticks_to_price(fill_price_ticks);
                                         let fill_qty = rules.lots_to_quantity(fill_qty_lots);
                                         let trade = TradeNotification {

@@ -912,6 +912,23 @@ async fn handle_client_message(
                 } else {
                     None
                 };
+                // Position / open-interest caps (both O(1); 0 in rules = disabled).
+                let sym16 = crate::transport::pack_str16(&symbol);
+                if let Err(reason) = state.risk_engine.check_position_limit(
+                    user_id,
+                    &sym16,
+                    fixed_shape.quantity_lots,
+                    rules.max_position_lots,
+                ) {
+                    return Some(ws_sbe::encode_order_rejected(0, reason));
+                }
+                if let Err(reason) = state.risk_engine.check_symbol_oi_limit(
+                    &sym16,
+                    fixed_shape.quantity_lots,
+                    rules.max_symbol_oi_lots,
+                ) {
+                    return Some(ws_sbe::encode_order_rejected(0, reason));
+                }
                 if let Err(reason) = state
                     .risk_engine
                     .check_and_reserve_margin(user_id, initial_margin_cents)

@@ -1897,6 +1897,26 @@ async fn async_main() -> anyhow::Result<()> {
                                     }
                                 };
 
+                                // Position / OI caps mirror the direct WS path (O(1)).
+                                let fwd_rules =
+                                    lightning_exchange::symbol_rules::SymbolRules::for_symbol(sym);
+                                if let Err(reason) = risk_engine_send.check_position_limit(
+                                    user_id,
+                                    &symbol,
+                                    req.quantity_lots,
+                                    fwd_rules.max_position_lots,
+                                ) {
+                                    reject(reason);
+                                    continue;
+                                }
+                                if let Err(reason) = risk_engine_send.check_symbol_oi_limit(
+                                    &symbol,
+                                    req.quantity_lots,
+                                    fwd_rules.max_symbol_oi_lots,
+                                ) {
+                                    reject(reason);
+                                    continue;
+                                }
                                 if let Err(reason) = risk_engine_send.check_and_reserve_margin(user_id, initial_margin_cents) {
                                     reject(reason);
                                     continue;

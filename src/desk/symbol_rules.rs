@@ -19,6 +19,14 @@ pub struct SymbolRules {
     pub maintenance_rate_bps: i64,
     /// Margin call threshold in basis points (75 = 0.75%)
     pub margin_call_rate_bps: i64,
+    /// Price-band width in bps around the reference price; orders priced
+    /// more aggressively than ref±band are rejected at the engine.
+    /// ENGINE_PRICE_BAND_BPS (if set) overrides for the whole engine.
+    pub price_band_bps: u32,
+    /// Per-user position cap in lots. 0 disables.
+    pub max_position_lots: i64,
+    /// Market-wide gross open-interest cap in lots. 0 disables.
+    pub max_symbol_oi_lots: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +83,9 @@ impl SymbolRules {
                 default_leverage: 10,
                 maintenance_rate_bps: 50,
                 margin_call_rate_bps: 75,
+                price_band_bps: 10_000,
+                max_position_lots: 0,
+                max_symbol_oi_lots: 0,
             },
             "ETH_USDT" => Self {
                 price_tick: 0.01,
@@ -86,6 +97,9 @@ impl SymbolRules {
                 default_leverage: 10,
                 maintenance_rate_bps: 50,
                 margin_call_rate_bps: 75,
+                price_band_bps: 10_000,
+                max_position_lots: 0,
+                max_symbol_oi_lots: 0,
             },
             "SOL_USDT" => Self {
                 price_tick: 0.001,
@@ -97,6 +111,9 @@ impl SymbolRules {
                 default_leverage: 10,
                 maintenance_rate_bps: 50,
                 margin_call_rate_bps: 75,
+                price_band_bps: 10_000,
+                max_position_lots: 0,
+                max_symbol_oi_lots: 0,
             },
             _ => Self {
                 price_tick: 0.01,
@@ -108,6 +125,9 @@ impl SymbolRules {
                 default_leverage: 10,
                 maintenance_rate_bps: 50,
                 margin_call_rate_bps: 75,
+                price_band_bps: 10_000,
+                max_position_lots: 0,
+                max_symbol_oi_lots: 0,
             },
         }
     }

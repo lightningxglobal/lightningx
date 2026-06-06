@@ -481,3 +481,32 @@ mod tests {
         assert!(true);
     }
 }
+
+/// Shared fuzzing/robustness entry point: run EVERY wire decoder against
+/// one buffer. Used by tests/sbe_robustness.rs (deterministic, in CI) and
+/// fuzz/fuzz_targets/decode_all.rs (coverage-guided, nightly, offline).
+/// Keep this list in sync when adding decoders.
+pub fn fuzz_exercise_decoders(buf: &[u8]) {
+    let _ = sbe::decode_header(buf);
+    let _ = sbe::decode_new_order(buf);
+    let _ = sbe::decode_cancel_order(buf);
+    let _ = sbe::decode_order_update(buf);
+    let _ = persist_event::PersistFrame::from_bytes(buf);
+    let _ = ws_sbe::decode_msg_type(buf);
+    let _ = ws_sbe::decode_order_update(buf);
+    let _ = ws_sbe::decode_order_accepted(buf);
+    let _ = ws_sbe::decode_order_rejected(buf);
+    let _ = ws_sbe::decode_order_submitted(buf);
+    let _ = ws_sbe::decode_symbol_from_depth(buf);
+    let _ = ws_sbe::decode_symbol_from_trade(buf);
+    let _ = ws_sbe::decode_symbol_from_ticker(buf);
+    let _ = ws_sbe::decode_symbol_from_kline(buf);
+    let _ = ws_sbe::decode_symbol_from_agg_trade(buf);
+    let _ = ws_sbe::decode_depth_for_rest(buf);
+    let _ = ws_sbe::decode_ticker_for_rest(buf);
+    let _ = ws_sbe::decode_best_price(buf, true);
+    let _ = ws_sbe::decode_best_price(buf, false);
+    let _ = ws_sbe::decode_client_place_order(buf);
+    let _ = ws_sbe::decode_client_cancel_order(buf);
+    let _ = ws_sbe::decode_broadcast_symbol(buf);
+}

@@ -150,6 +150,9 @@ enum ClientMsg {
     },
     ApiKeyAuth {
         api_key: String,
+        /// Present together → signed auth (HMAC-SHA256(secret, timestamp)).
+        timestamp: Option<String>,
+        signature: Option<String>,
     },
     Subscribe {
         channels: Vec<String>,
@@ -204,6 +207,14 @@ impl ClientMsg {
             }),
             "auth_key" => Some(ClientMsg::ApiKeyAuth {
                 api_key: v.get("api_key")?.as_str()?.to_owned(),
+                timestamp: v
+                    .get("timestamp")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned),
+                signature: v
+                    .get("signature")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_owned),
             }),
             "subscribe" => {
                 let channels = v
@@ -614,8 +625,20 @@ async fn handle_client_message(
             Err(e) => Some(ws_sbe::encode_auth_error(&e.to_string())),
         },
 
-        ClientMsg::ApiKeyAuth { api_key } => {
-            match user_service::verify_api_key(&state.db, &api_key).await {
+        ClientMsg::ApiKeyAuth {
+            api_key,
+            timestamp,
+            signature,
+        } => {
+            // Signed flow when both fields are present; bare flow only
+            // works for legacy keys without a signing secret.
+            let verified = match (&timestamp, &signature) {
+                (Some(ts), Some(sig)) => {
+                    user_service::verify_api_key_signed(&state.db, &api_key, ts, sig).await
+                }
+                _ => user_service::verify_api_key(&state.db, &api_key).await,
+            };
+            match verified {
                 Ok(user_id) => {
                     session.user_id = Some(user_id);
                     state.user_tx.register(user_id, personal_tx.clone());

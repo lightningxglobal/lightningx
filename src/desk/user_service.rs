@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::OnceLock;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
 /// Dev-only fallback signing key. NEVER valid in production: startup
 /// aborts if EXCHANGE_ENV=production and EXCHANGE_JWT_SECRET is missing
 /// or weak (see resolve_jwt_secret).
@@ -163,8 +168,30 @@ pub fn verify_token(token: &str) -> Result<Claims> {
     Ok(data.claims)
 }
 
+/// Access-token TTL. Default keeps the historical 7 days so existing
+/// clients/bots are unaffected; production should set
+/// EXCHANGE_JWT_ACCESS_TTL_SECS=900 (15 min) and rely on /api/auth/refresh.
+fn access_ttl_secs() -> i64 {
+    static TTL: OnceLock<i64> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("EXCHANGE_JWT_ACCESS_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&t| t > 0)
+            .unwrap_or(7 * 24 * 3600)
+    })
+}
+
+/// Re-issue a token for already-verified claims (refresh endpoint).
+/// Sliding expiry: each refresh grants a fresh TTL window. Revocation
+/// (deny-list in Redis) is tracked in the roadmap.
+pub fn refresh_token(claims: &Claims) -> Result<String> {
+    make_token(claims.sub, &claims.email)
+}
+
 fn make_token(user_id: i64, email: &str) -> Result<String> {
-    let exp = (chrono::Utc::now() + chrono::Duration::days(7)).timestamp() as usize;
+    let exp = (chrono::Utc::now() + chrono::Duration::seconds(access_ttl_secs())).timestamp()
+        as usize;
     let claims = Claims {
         sub: user_id,
         email: email.to_owned(),
@@ -178,13 +205,117 @@ fn make_token(user_id: i64, email: &str) -> Result<String> {
     .map_err(|e| anyhow!("Token encode error: {}", e))
 }
 
-/// Look up user_id by static API key.
+/// Look up user_id by bare API key. Allowed ONLY for legacy keys without
+/// a signing secret; once a key has a secret, bare auth is rejected and
+/// the signed flow (verify_api_key_signed) is mandatory.
 pub async fn verify_api_key(pool: &PgPool, api_key: &str) -> Result<i64> {
-    sqlx::query_scalar::<_, i64>("SELECT user_id FROM api_keys WHERE api_key = $1")
-        .bind(api_key)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow!("Invalid API key"))
+    let row: Option<(i64, Option<String>)> =
+        sqlx::query_as("SELECT user_id, secret FROM api_keys WHERE api_key = $1")
+            .bind(api_key)
+            .fetch_optional(pool)
+            .await?;
+    match row {
+        None => Err(anyhow!("Invalid API key")),
+        Some((_, Some(_))) => Err(anyhow!("API key requires signed authentication")),
+        Some((user_id, None)) => Ok(user_id),
+    }
+}
+
+/// Max allowed clock skew between client timestamp and server time.
+pub const API_SIGNATURE_WINDOW_SECS: i64 = 30;
+
+/// Compute the hex HMAC-SHA256 signature for a timestamp (the WS session
+/// auth payload). Exposed so clients/tests share one definition.
+pub fn compute_api_signature(secret: &str, timestamp: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(timestamp.as_bytes());
+    let out = mac.finalize().into_bytes();
+    let mut hex = String::with_capacity(out.len() * 2);
+    for b in out {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// Pure verification rule (unit-testable without DB or wall clock):
+/// timestamp parses, |now − ts| ≤ window, constant-time signature match.
+pub fn check_api_signature(
+    secret: &str,
+    timestamp: &str,
+    signature_hex: &str,
+    now_unix: i64,
+) -> Result<()> {
+    let ts: i64 = timestamp
+        .parse()
+        .map_err(|_| anyhow!("invalid timestamp"))?;
+    if (now_unix - ts).abs() > API_SIGNATURE_WINDOW_SECS {
+        return Err(anyhow!("timestamp outside allowed window"));
+    }
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| anyhow!("bad secret"))?;
+    mac.update(timestamp.as_bytes());
+    let sig = decode_hex(signature_hex).ok_or_else(|| anyhow!("invalid signature encoding"))?;
+    // Mac::verify_slice is constant-time.
+    mac.verify_slice(&sig)
+        .map_err(|_| anyhow!("signature mismatch"))
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
+/// Signed API-key session auth: requires the key to have a secret.
+pub async fn verify_api_key_signed(
+    pool: &PgPool,
+    api_key: &str,
+    timestamp: &str,
+    signature_hex: &str,
+) -> Result<i64> {
+    let row: Option<(i64, Option<String>)> =
+        sqlx::query_as("SELECT user_id, secret FROM api_keys WHERE api_key = $1")
+            .bind(api_key)
+            .fetch_optional(pool)
+            .await?;
+    let (user_id, secret) = row.ok_or_else(|| anyhow!("Invalid API key"))?;
+    let secret = secret.ok_or_else(|| anyhow!("API key has no signing secret"))?;
+    check_api_signature(
+        &secret,
+        timestamp,
+        signature_hex,
+        chrono::Utc::now().timestamp(),
+    )?;
+    Ok(user_id)
+}
+
+/// Best-effort append to the audit log. Failures are logged, never block
+/// the authenticated action itself.
+pub async fn audit(
+    pool: &PgPool,
+    actor_user_id: Option<i64>,
+    action: &str,
+    ip: Option<&str>,
+    detail: serde_json::Value,
+) {
+    let res = sqlx::query(
+        "INSERT INTO audit_log (actor_user_id, action, ip, detail) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(actor_user_id)
+    .bind(action)
+    .bind(ip)
+    .bind(detail)
+    .execute(pool)
+    .await;
+    if let Err(e) = res {
+        tracing::warn!("audit log write failed (action={action}): {e}");
+    }
 }
 
 /// Ensure the robot account exists and has the given API key registered.
@@ -257,6 +388,49 @@ mod tests {
             resolve_jwt_secret(None, Some("dev".into())).unwrap(),
             DEV_JWT_SECRET
         );
+    }
+
+    #[test]
+    fn api_signature_roundtrip_and_rejections() {
+        let secret = "k".repeat(32);
+        let ts = "1750000000";
+        let sig = compute_api_signature(&secret, ts);
+        let now: i64 = 1_750_000_000;
+
+        // Valid signature within window.
+        check_api_signature(&secret, ts, &sig, now).expect("valid");
+        check_api_signature(&secret, ts, &sig, now + API_SIGNATURE_WINDOW_SECS).expect("edge ok");
+
+        // Replay: timestamp outside the window — same signature, rejected.
+        let err = check_api_signature(&secret, ts, &sig, now + API_SIGNATURE_WINDOW_SECS + 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("window"), "{err}");
+
+        // Wrong secret / tampered signature / tampered timestamp.
+        assert!(check_api_signature("wrong-secret-wrong-secret-wrong!", ts, &sig, now).is_err());
+        let mut bad = sig.clone();
+        let flipped = if bad.ends_with('0') { '1' } else { '0' };
+        bad.pop();
+        bad.push(flipped);
+        assert!(check_api_signature(&secret, ts, &bad, now).is_err());
+        assert!(check_api_signature(&secret, "1750000001", &sig, now).is_err());
+
+        // Hostile encodings must error, not panic.
+        assert!(check_api_signature(&secret, ts, "zz", now).is_err());
+        assert!(check_api_signature(&secret, ts, "abc", now).is_err()); // odd length
+        assert!(check_api_signature(&secret, "not_a_number", &sig, now).is_err());
+        assert!(check_api_signature(&secret, ts, "", now).is_err());
+    }
+
+    #[test]
+    fn refresh_reissues_token_for_same_subject() {
+        let token = make_token(42, "user@example.com").expect("sign");
+        let claims = verify_token(&token).expect("verify");
+        let refreshed = refresh_token(&claims).expect("refresh");
+        let claims2 = verify_token(&refreshed).expect("verify refreshed");
+        assert_eq!(claims2.sub, 42);
+        assert_eq!(claims2.email, "user@example.com");
+        assert!(claims2.exp >= claims.exp, "sliding expiry must not shrink");
     }
 
     #[test]

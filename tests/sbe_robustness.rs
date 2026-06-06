@@ -30,31 +30,10 @@ impl Lcg {
     }
 }
 
-/// Run every decoder against one buffer. Passing == not panicking;
-/// return values are intentionally ignored.
+/// Run every decoder against one buffer (shared with the cargo-fuzz
+/// harness — single source of truth in the library).
 fn exercise_all_decoders(buf: &[u8]) {
-    let _ = sbe::decode_header(buf);
-    let _ = sbe::decode_new_order(buf);
-    let _ = sbe::decode_cancel_order(buf);
-    let _ = sbe::decode_order_update(buf);
-    let _ = PersistFrame::from_bytes(buf);
-    let _ = ws_sbe::decode_msg_type(buf);
-    let _ = ws_sbe::decode_order_update(buf);
-    let _ = ws_sbe::decode_order_accepted(buf);
-    let _ = ws_sbe::decode_order_rejected(buf);
-    let _ = ws_sbe::decode_order_submitted(buf);
-    let _ = ws_sbe::decode_symbol_from_depth(buf);
-    let _ = ws_sbe::decode_symbol_from_trade(buf);
-    let _ = ws_sbe::decode_symbol_from_ticker(buf);
-    let _ = ws_sbe::decode_symbol_from_kline(buf);
-    let _ = ws_sbe::decode_symbol_from_agg_trade(buf);
-    let _ = ws_sbe::decode_depth_for_rest(buf);
-    let _ = ws_sbe::decode_ticker_for_rest(buf);
-    let _ = ws_sbe::decode_best_price(buf, true);
-    let _ = ws_sbe::decode_best_price(buf, false);
-    let _ = ws_sbe::decode_client_place_order(buf);
-    let _ = ws_sbe::decode_client_cancel_order(buf);
-    let _ = ws_sbe::decode_broadcast_symbol(buf);
+    lightning_exchange::transport::fuzz_exercise_decoders(buf);
 }
 
 #[test]

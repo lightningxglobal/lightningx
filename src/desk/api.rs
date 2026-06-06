@@ -272,6 +272,7 @@ pub fn router(state: AppState) -> Router {
         // Auth
         .route("/api/auth/register", post(handle_register))
         .route("/api/auth/login", post(handle_login))
+        .route("/api/auth/refresh", post(handle_refresh))
         // User profile & KYC
         .route(
             "/api/user/profile",
@@ -341,8 +342,16 @@ async fn handle_register(
         .or_else(|| headers.get("x-forwarded-for"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
-    match user_service::register(&s.db, req, ip).await {
+    match user_service::register(&s.db, req, ip.clone()).await {
         Ok(resp) => {
+            user_service::audit(
+                &s.db,
+                Some(resp.user.id),
+                "register",
+                ip.as_deref(),
+                json!({"email": resp.user.email}),
+            )
+            .await;
             // Warm account_cache so the user's first order doesn't trip
             // try_freeze_cache's cache-miss path.
             warm_account_cache_for(&s, resp.user.id).await;
@@ -364,15 +373,49 @@ async fn handle_login(
     State(s): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    let email = req.email.clone();
     match user_service::login(&s.db, req).await {
         Ok(resp) => {
+            user_service::audit(
+                &s.db,
+                Some(resp.user.id),
+                "login_ok",
+                None,
+                json!({"email": email}),
+            )
+            .await;
             warm_account_cache_for(&s, resp.user.id).await;
             (StatusCode::OK, Json(json!(resp)))
         }
+        Err(e) => {
+            user_service::audit(&s.db, None, "login_failed", None, json!({"email": email}))
+                .await;
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    }
+}
+
+/// Re-issue an access token from a still-valid one (sliding expiry).
+/// Production pairs this with a short EXCHANGE_JWT_ACCESS_TTL_SECS.
+async fn handle_refresh(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let claims = match auth_claims(&headers) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match user_service::refresh_token(&claims) {
+        Ok(token) => {
+            user_service::audit(&s.db, Some(claims.sub), "token_refresh", None, json!({}))
+                .await;
+            (StatusCode::OK, Json(json!({"token": token}))).into_response()
+        }
         Err(e) => (
-            StatusCode::UNAUTHORIZED,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
-        ),
+        )
+            .into_response(),
     }
 }
 

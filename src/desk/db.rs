@@ -139,6 +139,18 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         include_str!("../../migrations/015_persist_checkpoints.sql"),
     )
     .await?;
+    apply_migration(
+        pool,
+        "016_api_key_secrets",
+        include_str!("../../migrations/016_api_key_secrets.sql"),
+    )
+    .await?;
+    apply_migration(
+        pool,
+        "017_audit_log",
+        include_str!("../../migrations/017_audit_log.sql"),
+    )
+    .await?;
     Ok(())
 }
 

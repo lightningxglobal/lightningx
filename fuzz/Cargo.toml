@@ -1,0 +1,26 @@
+# cargo-fuzz harness (coverage-guided, nightly toolchain):
+#   cargo +nightly fuzz run decode_all
+# Excluded from the main workspace; CI runs the deterministic in-tree
+# robustness suite (tests/sbe_robustness.rs) on every build, this harness
+# runs longer offline campaigns over the same entry-point list.
+[package]
+name = "lightning-exchange-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lightning-exchange = { path = ".." }
+
+[[bin]]
+name = "decode_all"
+path = "fuzz_targets/decode_all.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

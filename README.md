@@ -230,11 +230,14 @@ all buffers are pre-allocated (`SmallVec`, arena SkipList, rtrb ring buffers).
 
 Measured from the moment the server **receives** the client's WS frame to the moment the response WS frame **has been written to the socket** — the complete exchange-side processing, network transit excluded. Captured via beacon / HDR histogram tracing (`TRACER_ENABLED=1`) on an Apple M4 MacBook Pro at 40K concurrent WebSocket connections (4 desks × 10K, `DESK_SPIN=true`).
 
-| Metric | P50 | P90 | P99 |
-|---|---|---|---|
-| **Internal processing (40K conns, M4 14-core)** | **20 µs** | **74 µs** | **709 µs** |
+| Metric | P50 | P90 | P99 | P999 |
+|---|---|---|---|---|
+| **Apple M4 MacBook Pro (40K conns, 14-core)** | **20 µs** | **74 µs** | **709 µs** | — |
+| **AMD Ryzen 9 7945HX Ubuntu (40K conns, isolated CPUs)** | **42 µs** | **68 µs** | **129 µs** | **239 µs** |
 
 > Internet RTT (20–200 ms typical) is not included. User-perceived latency is dominated by network, not by exchange processing.
+>
+> AMD p50 is ~2× M4 due to Infinity Fabric overhead on Aeron IPC shared memory (~0.8 µs per hop × 2 hops). AMD p99/p999 is significantly better because dedicated isolated spin threads (`isolcpus`) eliminate OS scheduler jitter.
 
 Stage-by-stage breakdown (steady-state):
 

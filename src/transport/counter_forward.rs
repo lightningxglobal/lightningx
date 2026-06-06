@@ -239,7 +239,10 @@ mod tests {
         let frame = CounterForwardNewOrder::new(1, req, meta);
         assert_eq!({ frame.kind }, COUNTER_FORWARD_KIND_NEW_ORDER);
         assert_eq!({ frame.ingress_desk_id }, 1);
-        assert_eq!({ frame.req.response_stream_id }, crate::aeron_channels::order_update_stream_for_desk(owner_desk));
+        assert_eq!(
+            { frame.req.response_stream_id },
+            crate::aeron_channels::order_update_stream_for_desk(owner_desk)
+        );
         assert_eq!({ frame.meta.user_id }, 42);
         assert_eq!(frame.meta.client_order_id_string(), "c-99");
     }
@@ -257,6 +260,9 @@ mod tests {
         assert_eq!({ frame.kind }, COUNTER_FORWARD_KIND_CANCEL);
         assert_eq!({ frame.ingress_desk_id }, 0);
         assert_eq!({ frame.req.order_id }, 77);
-        assert_eq!({ frame.req.response_stream_id }, crate::aeron_channels::order_update_stream_for_desk(owner_desk));
+        assert_eq!(
+            { frame.req.response_stream_id },
+            crate::aeron_channels::order_update_stream_for_desk(owner_desk)
+        );
     }
 }

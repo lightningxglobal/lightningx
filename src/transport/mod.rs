@@ -12,7 +12,7 @@ pub mod ws_sbe;
 /// 用于屏蔽实际Aeron实现，通过trait定义来实现解耦和测试隔离
 pub use self::sbe::{CancelOrderRequest, NewOrderRequest, TradeNotification};
 use crate::market_data::{Depth50SnapshotEvent, DepthSnapshotEvent, Level2SnapshotEvent};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 // ============================================================================
 // WS fast-path: Aeron command sent from async WS handler to Aeron spin thread
@@ -210,6 +210,11 @@ impl OrderUpdateMsg {
             remaining_qty: 0.0,
             timestamp: ts,
         }
+    }
+
+    pub fn with_sequence(mut self, sequence: u64) -> Self {
+        self.sequence = sequence;
+        self
     }
 }
 
@@ -413,7 +418,7 @@ mod tests {
         let req = NewOrderRequest {
             client_order_id: 1,
             participant_id: 456,
-            price_ticks: 10_050,    // 100.5 at tick=0.01
+            price_ticks: 10_050,       // 100.5 at tick=0.01
             quantity_lots: 10_000_000, // 10.0 at step=1e-6
             side: 0,
             time_in_force: 0,

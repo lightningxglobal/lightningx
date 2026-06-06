@@ -155,12 +155,7 @@ pub fn encode_cancel_submitted(order_id: u64, ts: u64) -> Vec<u8> {
 
 /// BALANCE_UPDATE = 8  [asset:u8×8][balance:f64][available:f64][frozen:f64]  → 33 B
 #[inline]
-pub fn encode_balance_update(
-    asset: &str,
-    balance: f64,
-    available: f64,
-    frozen: f64,
-) -> Vec<u8> {
+pub fn encode_balance_update(asset: &str, balance: f64, available: f64, frozen: f64) -> Vec<u8> {
     let mut v = Vec::with_capacity(33);
     v.push(BALANCE_UPDATE);
     v.extend_from_slice(&pack8(asset));
@@ -298,12 +293,7 @@ pub fn encode_trade(price: f64, qty: f64, side: u8, ts: u64, symbol: &str) -> Ve
 /// [ts:u64][symbol:u8×8][num_bids:u16][num_asks:u16][_pad:4]
 /// [[price:f64][qty:f64]]×(nb+na)
 #[inline]
-pub fn encode_depth(
-    ts: u64,
-    symbol: &str,
-    bids: &[(f64, f64)],
-    asks: &[(f64, f64)],
-) -> Vec<u8> {
+pub fn encode_depth(ts: u64, symbol: &str, bids: &[(f64, f64)], asks: &[(f64, f64)]) -> Vec<u8> {
     let nb = bids.len().min(u16::MAX as usize) as u16;
     let na = asks.len().min(u16::MAX as usize) as u16;
     let header = 1 + 8 + 8 + 2 + 2 + 4;
@@ -580,13 +570,15 @@ pub fn decode_ticker_for_rest(buf: &[u8]) -> Option<serde_json::Value> {
         return None;
     }
     let symbol = sym8_to_str(&buf[1..9]).to_owned();
-    let last   = f64::from_le_bytes(buf[9..17].try_into().ok()?);
+    let last = f64::from_le_bytes(buf[9..17].try_into().ok()?);
     let change = f64::from_le_bytes(buf[17..25].try_into().ok()?);
-    let high   = f64::from_le_bytes(buf[25..33].try_into().ok()?);
-    let low    = f64::from_le_bytes(buf[33..41].try_into().ok()?);
+    let high = f64::from_le_bytes(buf[25..33].try_into().ok()?);
+    let low = f64::from_le_bytes(buf[33..41].try_into().ok()?);
     let volume = f64::from_le_bytes(buf[41..49].try_into().ok()?);
-    Some(serde_json::json!({ "symbol": symbol, "last": last, "change": change,
-                             "high": high, "low": low, "volume": volume }))
+    Some(
+        serde_json::json!({ "symbol": symbol, "last": last, "change": change,
+                             "high": high, "low": low, "volume": volume }),
+    )
 }
 
 /// Return the best bid or best ask price from a DEPTH_MSG frame.
@@ -600,11 +592,15 @@ pub fn decode_best_price(buf: &[u8], want_ask: bool) -> Option<f64> {
     if want_ask {
         // asks start after the bid levels
         let off = 25 + nb * 16;
-        if na == 0 || buf.len() < off + 8 { return None; }
+        if na == 0 || buf.len() < off + 8 {
+            return None;
+        }
         Some(f64::from_le_bytes(buf[off..off + 8].try_into().ok()?))
     } else {
         // first bid is right after the header
-        if nb == 0 || buf.len() < 33 { return None; }
+        if nb == 0 || buf.len() < 33 {
+            return None;
+        }
         Some(f64::from_le_bytes(buf[25..33].try_into().ok()?))
     }
 }
@@ -708,7 +704,7 @@ mod tests {
         let buf = encode_client_place_order(99, "ETH_USDT", 1, 1, 0, 500);
         let (_, _, _, tif, pt, ql) = decode_client_place_order(&buf).unwrap();
         assert_eq!(tif, 1); // IOC
-        assert_eq!(pt, 0);  // market order
+        assert_eq!(pt, 0); // market order
         assert_eq!(ql, 500);
     }
 

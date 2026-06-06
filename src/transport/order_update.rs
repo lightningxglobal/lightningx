@@ -43,7 +43,14 @@ impl OrderUpdateEvent {
         }
     }
 
-    pub fn filled(order_id: u64, client_order_id: u64, participant_id: u64, price: f64, qty: f64, ts: u64) -> Self {
+    pub fn filled(
+        order_id: u64,
+        client_order_id: u64,
+        participant_id: u64,
+        price: f64,
+        qty: f64,
+        ts: u64,
+    ) -> Self {
         Self {
             kind: kind::FILLED,
             reject_reason: 0,
@@ -58,7 +65,15 @@ impl OrderUpdateEvent {
         }
     }
 
-    pub fn partial_fill(order_id: u64, client_order_id: u64, participant_id: u64, price: f64, filled: f64, remaining: f64, ts: u64) -> Self {
+    pub fn partial_fill(
+        order_id: u64,
+        client_order_id: u64,
+        participant_id: u64,
+        price: f64,
+        filled: f64,
+        remaining: f64,
+        ts: u64,
+    ) -> Self {
         Self {
             kind: kind::PARTIAL_FILL,
             reject_reason: 0,
@@ -73,7 +88,13 @@ impl OrderUpdateEvent {
         }
     }
 
-    pub fn cancelled(order_id: u64, client_order_id: u64, participant_id: u64, cancelled_qty: f64, ts: u64) -> Self {
+    pub fn cancelled(
+        order_id: u64,
+        client_order_id: u64,
+        participant_id: u64,
+        cancelled_qty: f64,
+        ts: u64,
+    ) -> Self {
         Self {
             kind: kind::CANCELLED,
             reject_reason: 0,
@@ -88,7 +109,13 @@ impl OrderUpdateEvent {
         }
     }
 
-    pub fn rejected(order_id: u64, client_order_id: u64, participant_id: u64, reason: u8, ts: u64) -> Self {
+    pub fn rejected(
+        order_id: u64,
+        client_order_id: u64,
+        participant_id: u64,
+        reason: u8,
+        ts: u64,
+    ) -> Self {
         Self {
             kind: kind::REJECTED,
             reject_reason: reason,

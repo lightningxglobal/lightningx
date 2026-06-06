@@ -8,23 +8,23 @@ use crate::market_data::{Depth50SnapshotEvent, DepthSnapshotEvent, Level2Snapsho
 /// - Stream 3: 出站成交 (TradeNotification)
 /// - Stream 4: 出站行情 (DepthSnapshot/Depth50/Level2)
 use crate::sbe::{
-    self, CancelOrderRequest, NewOrderRequest, TradeNotification, TEMPLATE_ORDER_UPDATE,
-    TEMPLATE_TRADE_NOTIFICATION,
+    self, CancelOrderRequest, NewOrderRequest, TEMPLATE_ORDER_UPDATE, TEMPLATE_TRADE_NOTIFICATION,
+    TradeNotification,
+};
+use crate::transport::counter_forward::{
+    COUNTER_FORWARD_KIND_CANCEL, COUNTER_FORWARD_KIND_NEW_ORDER, COUNTER_FORWARD_KIND_WS_FRAME,
+    CounterForwardCancel, CounterForwardMsg, CounterForwardNewOrder, CounterForwardWsFrame,
 };
 use crate::transport::{
     InboundMsg, MarketDataPublisher, OrderSubscriber, OrderUpdateMsg, OrderUpdatePublisher,
     TradePublisher, TransportError,
 };
-use crate::transport::counter_forward::{
-    CounterForwardCancel, CounterForwardMsg, CounterForwardNewOrder, CounterForwardWsFrame,
-    COUNTER_FORWARD_KIND_CANCEL, COUNTER_FORWARD_KIND_NEW_ORDER, COUNTER_FORWARD_KIND_WS_FRAME,
-};
 
 use aeron_wrapper::{AeronClient, Error as AeronError, NoopLifecycle, PollCallback, Pub};
 use parking_lot::Mutex;
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_BACKPRESSURE_SPINS: u32 = 100_000;
 // Bumped to 5 M each so even sustained 100 K msg/s × 50 s pile-ups don't
@@ -402,7 +402,10 @@ impl CounterForwardPublisher {
         self.client.do_work();
     }
 
-    pub fn publish_new_order(&mut self, msg: &CounterForwardNewOrder) -> Result<(), TransportError> {
+    pub fn publish_new_order(
+        &mut self,
+        msg: &CounterForwardNewOrder,
+    ) -> Result<(), TransportError> {
         publish_pod(&mut self.publisher, msg)
     }
 
@@ -439,31 +442,25 @@ impl PollCallback for CounterForwardCallback {
         let msg = match kind {
             COUNTER_FORWARD_KIND_NEW_ORDER
                 if data.len() >= std::mem::size_of::<CounterForwardNewOrder>() =>
-            {
-                unsafe {
-                    Some(CounterForwardMsg::NewOrder(std::ptr::read_unaligned(
-                        data.as_ptr() as *const CounterForwardNewOrder,
-                    )))
-                }
-            }
+            unsafe {
+                Some(CounterForwardMsg::NewOrder(std::ptr::read_unaligned(
+                    data.as_ptr() as *const CounterForwardNewOrder,
+                )))
+            },
             COUNTER_FORWARD_KIND_CANCEL
                 if data.len() >= std::mem::size_of::<CounterForwardCancel>() =>
-            {
-                unsafe {
-                    Some(CounterForwardMsg::Cancel(std::ptr::read_unaligned(
-                        data.as_ptr() as *const CounterForwardCancel,
-                    )))
-                }
-            }
+            unsafe {
+                Some(CounterForwardMsg::Cancel(std::ptr::read_unaligned(
+                    data.as_ptr() as *const CounterForwardCancel,
+                )))
+            },
             COUNTER_FORWARD_KIND_WS_FRAME
                 if data.len() >= std::mem::size_of::<CounterForwardWsFrame>() =>
-            {
-                unsafe {
-                    Some(CounterForwardMsg::WsFrame(std::ptr::read_unaligned(
-                        data.as_ptr() as *const CounterForwardWsFrame,
-                    )))
-                }
-            }
+            unsafe {
+                Some(CounterForwardMsg::WsFrame(std::ptr::read_unaligned(
+                    data.as_ptr() as *const CounterForwardWsFrame,
+                )))
+            },
             _ => None,
         };
         if let Some(msg) = msg {
@@ -902,15 +899,21 @@ impl DeskDepthSubscriber {
         let r = self.poll_counter % 3;
         self.poll_counter = self.poll_counter.wrapping_add(1);
         match r {
-            0 => self.depth_rx.pop()
-                    .or_else(|_| self.depth50_rx.pop())
-                    .or_else(|_| self.level2_rx.pop()),
-            1 => self.depth50_rx.pop()
-                    .or_else(|_| self.level2_rx.pop())
-                    .or_else(|_| self.depth_rx.pop()),
-            _ => self.level2_rx.pop()
-                    .or_else(|_| self.depth_rx.pop())
-                    .or_else(|_| self.depth50_rx.pop()),
+            0 => self
+                .depth_rx
+                .pop()
+                .or_else(|_| self.depth50_rx.pop())
+                .or_else(|_| self.level2_rx.pop()),
+            1 => self
+                .depth50_rx
+                .pop()
+                .or_else(|_| self.level2_rx.pop())
+                .or_else(|_| self.depth_rx.pop()),
+            _ => self
+                .level2_rx
+                .pop()
+                .or_else(|_| self.depth_rx.pop())
+                .or_else(|_| self.depth50_rx.pop()),
         }
         .ok()
     }
@@ -924,7 +927,7 @@ impl DeskDepthSubscriber {
 // PersistEvent — desk-server → redis-writer / pg-writer
 // ============================================================================
 
-use crate::transport::persist_event::{PersistFrame, FRAME_SIZE as PERSIST_FRAME_SIZE};
+use crate::transport::persist_event::{FRAME_SIZE as PERSIST_FRAME_SIZE, PersistFrame};
 
 const PERSIST_RING: usize = 16 * 1024;
 
@@ -1054,8 +1057,8 @@ mod tests {
         let req = NewOrderRequest {
             client_order_id: 42,
             participant_id: 7,
-            price_ticks: 10_125,  // 101.25 at tick=0.01
-            quantity_lots: 3_500_000,  // 3.5 at step=1e-6
+            price_ticks: 10_125,      // 101.25 at tick=0.01
+            quantity_lots: 3_500_000, // 3.5 at step=1e-6
             side: 0,
             time_in_force: 0,
             response_stream_id: 200,

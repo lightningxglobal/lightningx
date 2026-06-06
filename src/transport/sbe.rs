@@ -48,9 +48,9 @@ impl SbeHeader {
 pub struct NewOrderRequest {
     pub client_order_id: u64,
     pub participant_id: u64,
-    pub price_ticks: i64,    // integer price in symbol tick units; 0 = market order
-    pub quantity_lots: i64,  // integer quantity in symbol lot units
-    pub side: u8,          // 0=Buy, 1=Sell
+    pub price_ticks: i64, // integer price in symbol tick units; 0 = market order
+    pub quantity_lots: i64, // integer quantity in symbol lot units
+    pub side: u8,         // 0=Buy, 1=Sell
     pub time_in_force: u8, // 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
     pub response_stream_id: i32,
     pub _pad: [u8; 10],

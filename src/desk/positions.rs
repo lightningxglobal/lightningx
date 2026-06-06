@@ -80,25 +80,20 @@ pub fn all_positions_in_memory(
 /// Build a Position row for one base asset (PG fallback path — used by
 /// position_update_msg below for the WS push). Slower than the cached
 /// path; only called from the WS settle handler.
-pub async fn position_for_user_asset(
-    pool: &PgPool,
-    user_id: i64,
-    asset: &str,
-) -> Option<Position> {
+pub async fn position_for_user_asset(pool: &PgPool, user_id: i64, asset: &str) -> Option<Position> {
     if asset == "USDT" {
         return None;
     }
     let symbol = format!("{}_USDT", asset);
 
-    let (balance, frozen): (f64, f64) = sqlx::query_as(
-        "SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset=$2",
-    )
-    .bind(user_id)
-    .bind(asset)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()?;
+    let (balance, frozen): (f64, f64) =
+        sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset=$2")
+            .bind(user_id)
+            .bind(asset)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
 
     let available = balance - frozen;
 

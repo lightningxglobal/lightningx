@@ -1,5 +1,5 @@
-use crate::transport::order_update_kind;
 use crate::OrderStatus;
+use crate::transport::order_update_kind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

@@ -6,7 +6,6 @@
 /// - 订单前资金/持仓验证
 /// - 成交时更新资金/持仓
 /// - 冻结/解冻资金和持仓
-
 use std::collections::HashMap;
 
 /// 账户ID类型
@@ -101,8 +100,12 @@ impl Account {
 
     /// 获取持仓（如果不存在则创建空持仓）
     pub fn get_position_mut(&mut self, symbol: &str) -> &mut Position {
-        self.positions.entry(symbol.to_string())
-            .or_insert(Position { quantity: 0.0, frozen: 0.0 })
+        self.positions
+            .entry(symbol.to_string())
+            .or_insert(Position {
+                quantity: 0.0,
+                frozen: 0.0,
+            })
     }
 
     /// 获取持仓（只读）
@@ -136,18 +139,26 @@ impl AccountManager {
 
     /// 获取账户（可变）
     pub fn get_account_mut(&mut self, id: AccountId) -> Result<&mut Account, String> {
-        self.accounts.get_mut(&id)
+        self.accounts
+            .get_mut(&id)
             .ok_or_else(|| format!("Account {} not found", id))
     }
 
     /// 获取账户（只读）
     pub fn get_account(&self, id: AccountId) -> Result<&Account, String> {
-        self.accounts.get(&id)
+        self.accounts
+            .get(&id)
             .ok_or_else(|| format!("Account {} not found", id))
     }
 
     /// 验证买单资金
-    pub fn validate_buy_order(&self, account_id: AccountId, symbol: &str, price: f64, quantity: f64) -> Result<(), String> {
+    pub fn validate_buy_order(
+        &self,
+        account_id: AccountId,
+        symbol: &str,
+        price: f64,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account(account_id)?;
         let required_balance = price * quantity;
 
@@ -165,9 +176,15 @@ impl AccountManager {
     }
 
     /// 验证卖单持仓
-    pub fn validate_sell_order(&self, account_id: AccountId, symbol: &str, quantity: f64) -> Result<(), String> {
+    pub fn validate_sell_order(
+        &self,
+        account_id: AccountId,
+        symbol: &str,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account(account_id)?;
-        let position = account.get_position(symbol)
+        let position = account
+            .get_position(symbol)
             .ok_or_else(|| format!("No position in {}", symbol))?;
 
         if position.available() < quantity {
@@ -182,7 +199,12 @@ impl AccountManager {
     }
 
     /// 冻结买单资金
-    pub fn freeze_buy_order(&mut self, account_id: AccountId, price: f64, quantity: f64) -> Result<(), String> {
+    pub fn freeze_buy_order(
+        &mut self,
+        account_id: AccountId,
+        price: f64,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account_mut(account_id)?;
         let required_balance = price * quantity;
 
@@ -195,7 +217,12 @@ impl AccountManager {
     }
 
     /// 冻结卖单持仓
-    pub fn freeze_sell_order(&mut self, account_id: AccountId, symbol: &str, quantity: f64) -> Result<(), String> {
+    pub fn freeze_sell_order(
+        &mut self,
+        account_id: AccountId,
+        symbol: &str,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account_mut(account_id)?;
         let position = account.get_position_mut(symbol);
 
@@ -206,7 +233,13 @@ impl AccountManager {
     }
 
     /// 执行买单成交（扣钱加仓位）
-    pub fn execute_buy(&mut self, account_id: AccountId, symbol: &str, price: f64, quantity: f64) -> Result<(), String> {
+    pub fn execute_buy(
+        &mut self,
+        account_id: AccountId,
+        symbol: &str,
+        price: f64,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account_mut(account_id)?;
         let cost = price * quantity;
 
@@ -223,7 +256,13 @@ impl AccountManager {
     }
 
     /// 执行卖单成交（扣仓位加钱）
-    pub fn execute_sell(&mut self, account_id: AccountId, symbol: &str, price: f64, quantity: f64) -> Result<(), String> {
+    pub fn execute_sell(
+        &mut self,
+        account_id: AccountId,
+        symbol: &str,
+        price: f64,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account_mut(account_id)?;
         let proceeds = price * quantity;
 
@@ -239,7 +278,12 @@ impl AccountManager {
     }
 
     /// 取消订单（释放冻结资金/持仓）
-    pub fn cancel_buy_order(&mut self, account_id: AccountId, price: f64, quantity: f64) -> Result<(), String> {
+    pub fn cancel_buy_order(
+        &mut self,
+        account_id: AccountId,
+        price: f64,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account_mut(account_id)?;
         let cost = price * quantity;
         account.frozen_balance = (account.frozen_balance - cost).max(0.0);
@@ -247,7 +291,12 @@ impl AccountManager {
     }
 
     /// 取消卖单（释放冻结持仓）
-    pub fn cancel_sell_order(&mut self, account_id: AccountId, symbol: &str, quantity: f64) -> Result<(), String> {
+    pub fn cancel_sell_order(
+        &mut self,
+        account_id: AccountId,
+        symbol: &str,
+        quantity: f64,
+    ) -> Result<(), String> {
         let account = self.get_account_mut(account_id)?;
         let position = account.get_position_mut(symbol);
         position.unfreeze(quantity);
@@ -266,7 +315,10 @@ mod tests {
 
     #[test]
     fn test_position_operations() {
-        let mut pos = Position { quantity: 100.0, frozen: 0.0 };
+        let mut pos = Position {
+            quantity: 100.0,
+            frozen: 0.0,
+        };
 
         assert_eq!(pos.available(), 100.0);
         assert!(pos.freeze(30.0));

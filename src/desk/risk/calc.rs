@@ -5,7 +5,9 @@ pub fn calc_notional_cents(price_ticks: i64, qty_lots: i64, notional_scale: i64)
 }
 
 pub fn calc_initial_margin_cents(notional_cents: i64, leverage: u8) -> i64 {
-    if leverage == 0 { return 0; }
+    if leverage == 0 {
+        return 0;
+    }
     notional_cents / leverage as i64
 }
 
@@ -19,7 +21,9 @@ pub fn calc_liquidation_price_ticks(
     maintenance_rate_bps: i64,
     side: PositionSide,
 ) -> i64 {
-    if leverage == 0 { return 0; }
+    if leverage == 0 {
+        return 0;
+    }
     let lev = leverage as i128;
     let entry = entry_ticks as i128;
     let rate = maintenance_rate_bps as i128;
@@ -61,8 +65,8 @@ pub fn calc_unrealized_pnl_cents(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::PositionSide;
+    use super::*;
 
     // BTC_USDT: price_tick=0.01, qty_step=0.000001
     // notional_scale = 1_000_000
@@ -145,26 +149,16 @@ mod tests {
         // pnl = (51000 - 50000) * 1000 / 1_000_000 = 1_000_000 / 1_000_000 = 1000000/1000000
         // entry_ticks=5_000_000, mark_ticks=5_100_000, qty_lots=1000
         // diff = 100_000, pnl = 100_000 * 1000 / 1_000_000 = 100 cents = $1
-        let pnl = calc_unrealized_pnl_cents(
-            PositionSide::Long,
-            1000,
-            5_000_000,
-            5_100_000,
-            BTC_SCALE,
-        );
+        let pnl =
+            calc_unrealized_pnl_cents(PositionSide::Long, 1000, 5_000_000, 5_100_000, BTC_SCALE);
         assert_eq!(pnl, 100);
     }
 
     #[test]
     fn unrealized_pnl_long_negative() {
         // mark < entry → negative pnl
-        let pnl = calc_unrealized_pnl_cents(
-            PositionSide::Long,
-            1000,
-            5_100_000,
-            5_000_000,
-            BTC_SCALE,
-        );
+        let pnl =
+            calc_unrealized_pnl_cents(PositionSide::Long, 1000, 5_100_000, 5_000_000, BTC_SCALE);
         assert_eq!(pnl, -100);
     }
 

@@ -27,10 +27,10 @@ pub struct AccountRiskState {
     pub user_id: i64,
     pub equity: i64,
     pub available_margin: AtomicI64,
-    pub order_margin:     AtomicI64,
-    pub used_margin:      i64,
+    pub order_margin: AtomicI64,
+    pub used_margin: i64,
     pub maintenance_margin: i64,
-    pub unrealized_pnl:   i64,
+    pub unrealized_pnl: i64,
     pub status: RiskStatus,
 }
 
@@ -40,7 +40,7 @@ impl AccountRiskState {
             user_id,
             equity: usdt_balance_cents,
             available_margin: AtomicI64::new(usdt_balance_cents),
-            order_margin:     AtomicI64::new(0),
+            order_margin: AtomicI64::new(0),
             used_margin: 0,
             maintenance_margin: 0,
             unrealized_pnl: 0,

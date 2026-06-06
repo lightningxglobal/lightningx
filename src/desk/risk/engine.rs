@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::calc;
 use super::types::{AccountRiskState, PositionRiskState, PositionSide, RiskStatus};
@@ -92,11 +92,19 @@ impl RiskEngine {
             if cur < initial_margin_cents {
                 return Err("Insufficient margin");
             }
-            if entry.available_margin
-                .compare_exchange_weak(cur, cur - initial_margin_cents, Ordering::AcqRel, Ordering::Relaxed)
+            if entry
+                .available_margin
+                .compare_exchange_weak(
+                    cur,
+                    cur - initial_margin_cents,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
-                entry.order_margin.fetch_add(initial_margin_cents, Ordering::Relaxed);
+                entry
+                    .order_margin
+                    .fetch_add(initial_margin_cents, Ordering::Relaxed);
                 return Ok(initial_margin_cents);
             }
         }
@@ -108,8 +116,12 @@ impl RiskEngine {
     pub fn release_order_margin(&self, user_id: i64, initial_margin_cents: i64) {
         use std::sync::atomic::Ordering;
         if let Some(entry) = self.accounts.get(&user_id) {
-            entry.available_margin.fetch_add(initial_margin_cents, Ordering::Relaxed);
-            entry.order_margin.fetch_sub(initial_margin_cents, Ordering::Relaxed);
+            entry
+                .available_margin
+                .fetch_add(initial_margin_cents, Ordering::Relaxed);
+            entry
+                .order_margin
+                .fetch_sub(initial_margin_cents, Ordering::Relaxed);
         }
     }
 
@@ -197,7 +209,8 @@ impl RiskEngine {
                 // sell close (long liq): fill > liq → (fill - liq) * qty / scale > 0
                 // buy  close (short liq): liq > fill → (liq - fill) * qty / scale > 0
                 let sign: i64 = if order_side == 1 { 1 } else { -1 }; // sell=+1, buy=-1
-                ((fill_price_ticks - liq_price_ticks) as i128 * sign as i128
+                ((fill_price_ticks - liq_price_ticks) as i128
+                    * sign as i128
                     * fill_qty_lots as i128
                     / notional_scale as i128) as i64
             } else {
@@ -233,7 +246,8 @@ impl RiskEngine {
         if let Some(mut acct) = self.accounts.get_mut(&user_id) {
             use std::sync::atomic::Ordering::Relaxed;
             let old_om = acct.order_margin.load(Relaxed);
-            acct.order_margin.store((old_om - fill_margin_cents).max(0), Relaxed);
+            acct.order_margin
+                .store((old_om - fill_margin_cents).max(0), Relaxed);
             if released_used_margin > 0 {
                 // Closing (or closing+flipping): release old position's used_margin and credit pnl.
                 acct.used_margin = (acct.used_margin - released_used_margin).max(0);
@@ -241,7 +255,9 @@ impl RiskEngine {
                 acct.used_margin += flip_margin;
                 let old_av = acct.available_margin.load(Relaxed);
                 acct.available_margin.store(
-                    (old_av + fill_margin_cents + released_used_margin + realized_pnl_cents - flip_margin).max(0),
+                    (old_av + fill_margin_cents + released_used_margin + realized_pnl_cents
+                        - flip_margin)
+                        .max(0),
                     Relaxed,
                 );
                 // After forced liquidation close, let run_risk_tick re-evaluate status.
@@ -253,8 +269,7 @@ impl RiskEngine {
                 acct.used_margin += fill_margin_cents;
             }
             acct.unrealized_pnl += unrealized_pnl_delta;
-            acct.maintenance_margin =
-                (acct.maintenance_margin + maintenance_margin_delta).max(0);
+            acct.maintenance_margin = (acct.maintenance_margin + maintenance_margin_delta).max(0);
             acct.equity = acct.available_margin.load(Relaxed)
                 + acct.order_margin.load(Relaxed)
                 + acct.used_margin
@@ -272,7 +287,10 @@ impl RiskEngine {
             .map(|p| p.qty_lots > 0)
             .unwrap_or(false);
         if has_open {
-            self.symbol_position_index.entry(symbol).or_default().insert(user_id);
+            self.symbol_position_index
+                .entry(symbol)
+                .or_default()
+                .insert(user_id);
         } else if let Some(mut idx) = self.symbol_position_index.get_mut(&symbol) {
             idx.remove(&user_id);
         }
@@ -400,7 +418,11 @@ impl RiskEngine {
                     RiskStatus::Normal
                 };
 
-                Some(Update { user_id: acct.user_id, old_status: acct.status, new_status })
+                Some(Update {
+                    user_id: acct.user_id,
+                    old_status: acct.status,
+                    new_status,
+                })
             })
             .collect();
 
@@ -471,8 +493,7 @@ fn compute_position_update(
             maintenance_rate_bps,
             fill_side,
         );
-        let bkrpt =
-            calc::calc_bankruptcy_price_ticks(fill_price_ticks, leverage, fill_side);
+        let bkrpt = calc::calc_bankruptcy_price_ticks(fill_price_ticks, leverage, fill_side);
         return (
             Some(PositionRiskState {
                 user_id,
@@ -511,15 +532,18 @@ fn compute_position_update(
     }
 
     // Opposite side — reducing or closing the position.
-    let sign: i128 = if pos.side == PositionSide::Long { 1 } else { -1 };
+    let sign: i128 = if pos.side == PositionSide::Long {
+        1
+    } else {
+        -1
+    };
 
     if fill_qty_lots >= pos.qty_lots {
         // Close (and possibly flip).
         let close_qty = pos.qty_lots;
-        let realized_pnl = sign
-            * (fill_price_ticks - pos.entry_price_ticks) as i128
-            * close_qty as i128
-            / notional_scale as i128;
+        let realized_pnl =
+            sign * (fill_price_ticks - pos.entry_price_ticks) as i128 * close_qty as i128
+                / notional_scale as i128;
         let released_margin = pos.initial_margin;
 
         let remaining_qty = fill_qty_lots - close_qty;
@@ -559,10 +583,9 @@ fn compute_position_update(
     } else {
         // Partial close.
         let close_qty = fill_qty_lots;
-        let realized_pnl = sign
-            * (fill_price_ticks - pos.entry_price_ticks) as i128
-            * close_qty as i128
-            / notional_scale as i128;
+        let realized_pnl =
+            sign * (fill_price_ticks - pos.entry_price_ticks) as i128 * close_qty as i128
+                / notional_scale as i128;
         let released_margin = pos.initial_margin * close_qty / pos.qty_lots;
 
         updated.qty_lots = pos.qty_lots - close_qty;
@@ -574,9 +597,12 @@ fn compute_position_update(
 }
 
 /// Recompute maintenance_margin, liquidation_price, bankruptcy_price from current qty/entry.
-fn refresh_risk_fields(pos: &mut PositionRiskState, notional_scale: i64, maintenance_rate_bps: i64) {
-    let notional =
-        calc::calc_notional_cents(pos.entry_price_ticks, pos.qty_lots, notional_scale);
+fn refresh_risk_fields(
+    pos: &mut PositionRiskState,
+    notional_scale: i64,
+    maintenance_rate_bps: i64,
+) {
+    let notional = calc::calc_notional_cents(pos.entry_price_ticks, pos.qty_lots, notional_scale);
     pos.maintenance_margin = calc::calc_maintenance_margin_cents(notional, maintenance_rate_bps);
     pos.liquidation_price_ticks = calc::calc_liquidation_price_ticks(
         pos.entry_price_ticks,
@@ -733,7 +759,18 @@ mod tests {
     #[test]
     fn on_fill_opens_long_position() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.qty_lots, QTY_LOTS);
@@ -750,7 +787,18 @@ mod tests {
     #[test]
     fn on_fill_opens_short_position() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            1,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.side, PositionSide::Short);
@@ -761,12 +809,34 @@ mod tests {
     fn on_fill_adds_to_existing_long_vwap() {
         let (engine, uid) = make_engine_with_account(500_000);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Second fill at $55,000 for same qty
         let price2 = 5_500_000i64;
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, price2, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            price2,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.qty_lots, QTY_LOTS * 2);
@@ -780,12 +850,34 @@ mod tests {
         let (engine, uid) = make_engine_with_account(500_000);
         // Open long at $50,000
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Close at $55,000: profit = ($55,000 - $50,000) * 0.1 BTC = $500 = 50_000 cents
         let close_price = 5_500_000i64;
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, close_price, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            1,
+            close_price,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Position should be gone
         assert!(engine.positions.get(&(uid, btc_sym())).is_none());
@@ -805,13 +897,35 @@ mod tests {
     fn on_fill_partial_close_reduces_position() {
         let (engine, uid) = make_engine_with_account(500_000);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Close half at $50,000 (no PnL)
         let half_qty = QTY_LOTS / 2;
         let half_margin = MARGIN_CENTS / 2;
         engine.check_and_reserve_margin(uid, half_margin).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, half_qty, half_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            1,
+            PRICE_TICKS,
+            half_qty,
+            half_margin,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.qty_lots, half_qty);
@@ -826,7 +940,18 @@ mod tests {
     #[test]
     fn on_fill_symbol_position_index_maintained() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Should be in index
         let idx = engine.symbol_position_index.get(&btc_sym()).unwrap();
@@ -835,7 +960,18 @@ mod tests {
 
         // Close: index entry removed
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            1,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let idx = engine.symbol_position_index.get(&btc_sym());
         assert!(idx.map(|v| !v.contains(&uid)).unwrap_or(true));
@@ -844,7 +980,18 @@ mod tests {
     #[test]
     fn on_fill_liquidation_price_set_on_open() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         // liq_price_long = entry * (10*10000 - 10000 + 50) / (10*10000) = 5_000_000 * 90050 / 100000 = 4_502_500
         assert_eq!(pos.liquidation_price_ticks, 4_502_500);
@@ -857,7 +1004,18 @@ mod tests {
     fn update_mark_price_sets_ewma_and_upnl() {
         let (engine, uid) = setup_with_reserved(500_000);
         // Open long: 0.1 BTC at $50,000, margin $500
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Mark price jumps to $51,000 (price_ticks = 5_100_000).
         // First update: EWMA = (5_100_000 + 9 * 5_000_000) / 10 = 5_010_000
@@ -879,13 +1037,35 @@ mod tests {
         let (engine, uid) = make_engine_with_account(1_000_000);
 
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let eth_price = 300_000i64;
         let eth_qty = 100_000i64;
         let eth_margin = 3_000i64;
         engine.check_and_reserve_margin(uid, eth_margin).unwrap();
-        engine.on_fill(uid, eth_sym(), 0, eth_price, eth_qty, eth_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            eth_sym(),
+            0,
+            eth_price,
+            eth_qty,
+            eth_margin,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         engine.update_mark_price(btc_sym(), 5_100_000, NOTIONAL_SCALE);
         engine.update_mark_price(eth_sym(), 310_000, NOTIONAL_SCALE);
@@ -906,7 +1086,18 @@ mod tests {
     #[test]
     fn update_mark_price_ignores_zero() {
         let (engine, uid) = setup_with_reserved(200_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
         engine.update_mark_price(btc_sym(), 0, NOTIONAL_SCALE);
         let pos = engine.positions.get(&(uid, btc_sym())).unwrap();
         assert_eq!(pos.mark_price_ticks, PRICE_TICKS); // unchanged
@@ -915,7 +1106,18 @@ mod tests {
     #[test]
     fn risk_tick_normal_when_margin_healthy() {
         let (engine, uid) = setup_with_reserved(500_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
         let events = engine.run_risk_tick();
         assert!(events.is_empty());
         let acct = engine.accounts.get(&uid).unwrap();
@@ -935,10 +1137,12 @@ mod tests {
 
         let events = engine.run_risk_tick();
         assert!(events.is_empty());
-        assert!(engine
-            .accounts
-            .iter()
-            .all(|acct| acct.status == RiskStatus::Normal));
+        assert!(
+            engine
+                .accounts
+                .iter()
+                .all(|acct| acct.status == RiskStatus::Normal)
+        );
     }
 
     #[test]
@@ -946,7 +1150,18 @@ mod tests {
         let (engine, uid) = setup_with_reserved(500_000);
         // notional = 5_000_000 * 100_000 / 1_000_000 = 500_000 cents
         // maintenance_margin = 500_000 * 50 / 10_000 = 2_500 cents
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.maintenance_margin, 2_500);
     }
@@ -956,13 +1171,35 @@ mod tests {
         let (engine, uid) = make_engine_with_account(1_000_000);
 
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let eth_price = 300_000i64;
         let eth_qty = 100_000i64;
         let eth_margin = 3_000i64;
         engine.check_and_reserve_margin(uid, eth_margin).unwrap();
-        engine.on_fill(uid, eth_sym(), 0, eth_price, eth_qty, eth_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            eth_sym(),
+            0,
+            eth_price,
+            eth_qty,
+            eth_margin,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         {
             let acct = engine.accounts.get(&uid).unwrap();
@@ -970,7 +1207,18 @@ mod tests {
         }
 
         engine.check_and_reserve_margin(uid, eth_margin).unwrap();
-        engine.on_fill(uid, eth_sym(), 1, eth_price, eth_qty, eth_margin, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            eth_sym(),
+            1,
+            eth_price,
+            eth_qty,
+            eth_margin,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.maintenance_margin, 2_500);
@@ -980,7 +1228,18 @@ mod tests {
     fn risk_tick_triggers_liquidation_pending_when_equity_below_maintenance() {
         let (engine, uid) = make_engine_with_account(500_000);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Maintenance margin at open = 500_000 * 50 / 10_000 = 2_500 cents ($25).
         // Force equity below maintenance via unrealized PnL.
@@ -988,7 +1247,10 @@ mod tests {
         if let Some(mut acct) = engine.accounts.get_mut(&uid) {
             acct.unrealized_pnl = -497_501;
             use std::sync::atomic::Ordering::Relaxed;
-            acct.equity = acct.available_margin.load(Relaxed) + acct.order_margin.load(Relaxed) + acct.used_margin + acct.unrealized_pnl;
+            acct.equity = acct.available_margin.load(Relaxed)
+                + acct.order_margin.load(Relaxed)
+                + acct.used_margin
+                + acct.unrealized_pnl;
         }
 
         let events = engine.run_risk_tick();
@@ -1012,7 +1274,18 @@ mod tests {
     fn integration_mark_price_triggers_liquidation() {
         let (engine, uid) = make_engine_with_account(52_600);
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
         // After open: available=2_600, used=50_000, maintenance=2_500
         // mark converges to $44,000: after ~18 calls equity drops below maintenance.
         // Each call: mark = (4_400_000 + 9 * old) / 10  (EWMA α=0.1)
@@ -1026,7 +1299,10 @@ mod tests {
                 break;
             }
         }
-        assert!(triggered, "equity should drop below maintenance after repeated mark price updates");
+        assert!(
+            triggered,
+            "equity should drop below maintenance after repeated mark price updates"
+        );
 
         let events = engine.run_risk_tick();
         assert_eq!(events.len(), 1, "should emit one liquidation event");
@@ -1042,7 +1318,18 @@ mod tests {
     #[test]
     fn integration_healthy_account_no_liquidation_events() {
         let (engine, uid) = setup_with_reserved(1_000_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Mark price moves +1% — well within margin.
         engine.update_mark_price(btc_sym(), PRICE_TICKS + 50_000, NOTIONAL_SCALE);
@@ -1066,7 +1353,18 @@ mod tests {
     fn insurance_fund_gains_on_profitable_liquidation_close() {
         let (engine, uid) = setup_with_reserved(500_000);
         // Open long at $50,000; margin = 50_000 cents
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Simulate the account being set to Liquidating (done by the tick task).
         if let Some(mut acct) = engine.accounts.get_mut(&uid) {
@@ -1076,7 +1374,18 @@ mod tests {
         // System close at $51,000 (profit $100 = 10_000 cents).
         // No margin was pre-reserved (system bypass), so fill_margin_cents = 0.
         let close_price_ticks = 5_100_000i64;
-        engine.on_fill(uid, btc_sym(), 1, close_price_ticks, QTY_LOTS, 0, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            1,
+            close_price_ticks,
+            QTY_LOTS,
+            0,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // After the forced close, on_fill resets status to Normal so run_risk_tick
         // can re-evaluate on the next tick (H3 fix: Liquidated was a terminal sink).
@@ -1103,11 +1412,22 @@ mod tests {
 
         // Open long BTC at $50,000 (entry_price_ticks = 5_000_000, qty = 0.1 BTC = 100_000 lots)
         let entry_ticks = 5_000_000i64; // $50,000 at $0.01/tick
-        let qty_lots = 100_000i64;       // 0.1 BTC at 1e-6 lot size
+        let qty_lots = 100_000i64; // 0.1 BTC at 1e-6 lot size
         let open_notional = entry_ticks * qty_lots / SCALE; // = 500_000 cents = $5,000
         let open_margin = open_notional / 10; // 10x → 50_000 cents = $500
         engine.check_and_reserve_margin(uid, open_margin).unwrap();
-        engine.on_fill(uid, btc_sym(), 0, entry_ticks, qty_lots, open_margin, SCALE, 10, 50, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            entry_ticks,
+            qty_lots,
+            open_margin,
+            SCALE,
+            10,
+            50,
+            0,
+        );
 
         // Risk tick decides to liquidate; liq_price = $49,000 (below mark, more aggressive)
         let liq_ticks = 4_900_000i64; // $49,000
@@ -1118,7 +1438,18 @@ mod tests {
         }
 
         // System close: sell order at liq_price (IOC limit), fills at $49,800.
-        engine.on_fill(uid, btc_sym(), 1, fill_ticks, qty_lots, 0, SCALE, 10, 50, liq_ticks);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            1,
+            fill_ticks,
+            qty_lots,
+            0,
+            SCALE,
+            10,
+            50,
+            liq_ticks,
+        );
 
         // Account settled at liq_price ($49,000), not fill price ($49,800).
         // After forced close, status → Normal so run_risk_tick can re-evaluate (H3 fix).
@@ -1135,11 +1466,33 @@ mod tests {
     #[test]
     fn insurance_fund_unchanged_on_normal_close() {
         let (engine, uid) = setup_with_reserved(500_000);
-        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            0,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         // Normal user close at same price (no PnL, account stays Normal).
         engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
-        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS, NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        engine.on_fill(
+            uid,
+            btc_sym(),
+            1,
+            PRICE_TICKS,
+            QTY_LOTS,
+            MARGIN_CENTS,
+            NOTIONAL_SCALE,
+            LEVERAGE,
+            MAINT_BPS,
+            0,
+        );
 
         assert_eq!(engine.insurance_fund(), 0);
     }
@@ -1170,12 +1523,12 @@ mod tests {
         // lot_size   = 0.000001 BTC  →  0.1 BTC = 100_000 lots
         // notional_scale = 1_000_000
         const SCALE: i64 = 1_000_000;
-        const LEV:    u8  = 10;
-        const MBPS:  i64  = 50;    // maintenance rate in basis points
+        const LEV: u8 = 10;
+        const MBPS: i64 = 50; // maintenance rate in basis points
 
         // Entry fill at $50,000 for 0.1 BTC
         const ENTRY_TICKS: i64 = 5_000_000;
-        const QTY_LOTS:    i64 = 100_000;
+        const QTY_LOTS: i64 = 100_000;
 
         // Derived:
         //   notional  = 5_000_000 * 100_000 / 1_000_000 = 500_000 cents ($5,000)
@@ -1184,11 +1537,11 @@ mod tests {
         //   liq_price = 5_000_000 * (10*10000-10000+50)/(10*10000)
         //             = 5_000_000 * 90050 / 100000 = 4_502_500 ticks ($45,025)
         //   bkrpt     = 5_000_000 * 9 / 10         = 4_500_000 ticks ($45,000)
-        const NOTIONAL:   i64 = 500_000;
-        const IM:         i64 = 50_000;
-        const MM:         i64 = 2_500;
-        const LIQ_TICKS:  i64 = 4_502_500;
-        const BKRPT_TICKS:i64 = 4_500_000;
+        const NOTIONAL: i64 = 500_000;
+        const IM: i64 = 50_000;
+        const MM: i64 = 2_500;
+        const LIQ_TICKS: i64 = 4_502_500;
+        const BKRPT_TICKS: i64 = 4_500_000;
 
         // Taker balance chosen tight so liquidation triggers after ~20 mark-price
         // EWMA updates toward $44,000.
@@ -1218,7 +1571,10 @@ mod tests {
         // Buy 100_000 lots at $50,000 — fully fills against ask1.
         let taker_buy = Order::new(201, Side::Buy, ENTRY_TICKS, QTY_LOTS, TimeInForce::GTC, 0);
         let result = me.place_order(taker_buy).unwrap();
-        assert_eq!(result.filled_lots, QTY_LOTS, "taker order should be fully filled");
+        assert_eq!(
+            result.filled_lots, QTY_LOTS,
+            "taker order should be fully filled"
+        );
         assert_eq!(result.fills.len(), 1, "should have one fill leg");
         let (_maker_oid, fill_ticks, fill_lots) = result.fills[0];
         assert_eq!(fill_ticks, ENTRY_TICKS);
@@ -1229,22 +1585,35 @@ mod tests {
         // submitting the order, so margin is already reserved when the fill arrives.
         risk.check_and_reserve_margin(TAKER_ID, IM).unwrap();
         // Taker is the buyer (side=0=Long).
-        risk.on_fill(TAKER_ID, btc_sym(), 0, fill_ticks as i64, fill_lots as i64, IM, SCALE, LEV, MBPS, 0);
+        risk.on_fill(
+            TAKER_ID,
+            btc_sym(),
+            0,
+            fill_ticks as i64,
+            fill_lots as i64,
+            IM,
+            SCALE,
+            LEV,
+            MBPS,
+            0,
+        );
 
         // ── CHECK A: positions and balances after open ────────────────────────
         // In production this state is also persisted to PostgreSQL via pg-writer
         // (PersistEvent::BatchSettleTrade). Here we verify the in-memory source of truth.
         {
-            let pos = risk.positions.get(&(TAKER_ID, btc_sym()))
+            let pos = risk
+                .positions
+                .get(&(TAKER_ID, btc_sym()))
                 .expect("Phase 3: position must exist");
-            assert_eq!(pos.side,                 PositionSide::Long,  "long position");
-            assert_eq!(pos.qty_lots,             QTY_LOTS,            "qty");
-            assert_eq!(pos.entry_price_ticks,    ENTRY_TICKS,         "entry price");
-            assert_eq!(pos.initial_margin,       IM,                  "initial margin");
-            assert_eq!(pos.maintenance_margin,   MM,                  "maintenance margin");
-            assert_eq!(pos.liquidation_price_ticks, LIQ_TICKS,        "liq price");
-            assert_eq!(pos.bankruptcy_price_ticks,  BKRPT_TICKS,      "bankruptcy price");
-            assert_eq!(pos.unrealized_pnl,       0,                   "upnl=0 at open (mark=entry)");
+            assert_eq!(pos.side, PositionSide::Long, "long position");
+            assert_eq!(pos.qty_lots, QTY_LOTS, "qty");
+            assert_eq!(pos.entry_price_ticks, ENTRY_TICKS, "entry price");
+            assert_eq!(pos.initial_margin, IM, "initial margin");
+            assert_eq!(pos.maintenance_margin, MM, "maintenance margin");
+            assert_eq!(pos.liquidation_price_ticks, LIQ_TICKS, "liq price");
+            assert_eq!(pos.bankruptcy_price_ticks, BKRPT_TICKS, "bankruptcy price");
+            assert_eq!(pos.unrealized_pnl, 0, "upnl=0 at open (mark=entry)");
             drop(pos);
 
             let acct = risk.accounts.get(&TAKER_ID).unwrap();
@@ -1252,13 +1621,21 @@ mod tests {
             //   available = TAKER_BALANCE - IM = 55_000 - 50_000 = 5_000
             //   order_margin = 0 (consumed by on_fill: moved to used)
             //   used_margin  = IM = 50_000
-            assert_eq!(acct.available_margin.load(Relaxed), TAKER_BALANCE - IM, "available after open");
-            assert_eq!(acct.order_margin.load(Relaxed),     0,                  "order_margin after fill");
-            assert_eq!(acct.used_margin,                    IM,                 "used_margin = IM");
-            assert_eq!(acct.unrealized_pnl,                 0,                  "upnl=0");
-            assert_eq!(acct.maintenance_margin,             MM,                 "account MM");
-            assert_eq!(acct.equity,                         TAKER_BALANCE,      "equity = full balance at open");
-            assert_eq!(acct.status,                         RiskStatus::Normal, "status Normal");
+            assert_eq!(
+                acct.available_margin.load(Relaxed),
+                TAKER_BALANCE - IM,
+                "available after open"
+            );
+            assert_eq!(
+                acct.order_margin.load(Relaxed),
+                0,
+                "order_margin after fill"
+            );
+            assert_eq!(acct.used_margin, IM, "used_margin = IM");
+            assert_eq!(acct.unrealized_pnl, 0, "upnl=0");
+            assert_eq!(acct.maintenance_margin, MM, "account MM");
+            assert_eq!(acct.equity, TAKER_BALANCE, "equity = full balance at open");
+            assert_eq!(acct.status, RiskStatus::Normal, "status Normal");
         }
 
         // ── Phase 4: drive mark price toward $44,000 ─────────────────────────
@@ -1270,27 +1647,39 @@ mod tests {
             risk.update_mark_price(btc_sym(), 4_400_000, SCALE);
             let acct = risk.accounts.get(&TAKER_ID).unwrap();
             if acct.equity <= acct.maintenance_margin {
-                mark_at_trigger  = *risk.mark_prices.get(&btc_sym()).unwrap();
+                mark_at_trigger = *risk.mark_prices.get(&btc_sym()).unwrap();
                 equity_at_trigger = acct.equity;
                 break;
             }
         }
-        assert!(mark_at_trigger > 0, "mark price should have dropped enough to trigger liquidation");
+        assert!(
+            mark_at_trigger > 0,
+            "mark price should have dropped enough to trigger liquidation"
+        );
 
         // ── CHECK B: account state just before risk tick ──────────────────────
         {
             let acct = risk.accounts.get(&TAKER_ID).unwrap();
-            let pos  = risk.positions.get(&(TAKER_ID, btc_sym())).unwrap();
+            let pos = risk.positions.get(&(TAKER_ID, btc_sym())).unwrap();
 
             // Mark price is below liq_price — position is underwater.
-            assert!(mark_at_trigger < LIQ_TICKS,
-                "mark {} should be below liq {} when liquidation triggers", mark_at_trigger, LIQ_TICKS);
+            assert!(
+                mark_at_trigger < LIQ_TICKS,
+                "mark {} should be below liq {} when liquidation triggers",
+                mark_at_trigger,
+                LIQ_TICKS
+            );
             // unrealized_pnl is negative and dragged equity below MM.
-            assert!(acct.unrealized_pnl < 0,       "upnl must be negative");
-            assert!(pos.unrealized_pnl  < 0,        "position upnl matches");
-            assert!(equity_at_trigger <= MM,         "equity {} <= MM {}", equity_at_trigger, MM);
+            assert!(acct.unrealized_pnl < 0, "upnl must be negative");
+            assert!(pos.unrealized_pnl < 0, "position upnl matches");
+            assert!(
+                equity_at_trigger <= MM,
+                "equity {} <= MM {}",
+                equity_at_trigger,
+                MM
+            );
             // used_margin still intact (position not yet closed).
-            assert_eq!(acct.used_margin, IM,         "used_margin unchanged while holding");
+            assert_eq!(acct.used_margin, IM, "used_margin unchanged while holding");
             // Status still Normal — risk tick is what changes it.
             assert_eq!(acct.status, RiskStatus::Normal);
         }
@@ -1299,15 +1688,17 @@ mod tests {
         let events = risk.run_risk_tick();
         assert_eq!(events.len(), 1, "should emit exactly one liquidation event");
         let evt = &events[0];
-        assert_eq!(evt.user_id,        TAKER_ID,          "event user_id");
-        assert_eq!(evt.symbol,         btc_sym(),          "event symbol");
-        assert_eq!(evt.side,           PositionSide::Long, "event side");
-        assert_eq!(evt.qty_lots,       QTY_LOTS,           "event qty");
+        assert_eq!(evt.user_id, TAKER_ID, "event user_id");
+        assert_eq!(evt.symbol, btc_sym(), "event symbol");
+        assert_eq!(evt.side, PositionSide::Long, "event side");
+        assert_eq!(evt.qty_lots, QTY_LOTS, "event qty");
         // The liq_price_ticks in the event is what the system computed at open
         // and stored on the position — it should match our formula.
-        assert_eq!(evt.liq_price_ticks, LIQ_TICKS,
+        assert_eq!(
+            evt.liq_price_ticks, LIQ_TICKS,
             "liq_price_ticks in event: expected {}  ($45,025), got {}",
-            LIQ_TICKS, evt.liq_price_ticks);
+            LIQ_TICKS, evt.liq_price_ticks
+        );
 
         {
             let acct = risk.accounts.get(&TAKER_ID).unwrap();
@@ -1337,25 +1728,45 @@ mod tests {
         //   = (4_600_000 - 4_502_500) × 100_000 / 1_000_000
         //   = 97_500 × 100 = 9_750 cents  ($97.50)
         let expected_insurance: i64 = (actual_fill_ticks - liq_price_ticks) * QTY_LOTS / SCALE;
-        assert_eq!(expected_insurance, 9_750, "pre-computed insurance fund credit");
+        assert_eq!(
+            expected_insurance, 9_750,
+            "pre-computed insurance fund credit"
+        );
 
         // fill_margin = 0: no margin was reserved for the system-generated liquidation order.
-        risk.on_fill(TAKER_ID, btc_sym(), 1, actual_fill_ticks, QTY_LOTS, 0, SCALE, LEV, MBPS, liq_price_ticks);
+        risk.on_fill(
+            TAKER_ID,
+            btc_sym(),
+            1,
+            actual_fill_ticks,
+            QTY_LOTS,
+            0,
+            SCALE,
+            LEV,
+            MBPS,
+            liq_price_ticks,
+        );
 
         // ── CHECK C: post-liquidation state ───────────────────────────────────
         // In production, pg-writer persists the closed position and updated balance.
         {
             // Position must be gone.
-            assert!(risk.positions.get(&(TAKER_ID, btc_sym())).is_none(),
-                "position should be removed after liquidation close");
+            assert!(
+                risk.positions.get(&(TAKER_ID, btc_sym())).is_none(),
+                "position should be removed after liquidation close"
+            );
 
             let acct = risk.accounts.get(&TAKER_ID).unwrap();
 
             // Status resets to Normal so run_risk_tick can re-evaluate on next tick.
-            assert_eq!(acct.status, RiskStatus::Normal, "status reset to Normal after liq close");
+            assert_eq!(
+                acct.status,
+                RiskStatus::Normal,
+                "status reset to Normal after liq close"
+            );
 
             // No open position → no used margin, no unrealized PnL.
-            assert_eq!(acct.used_margin,  0, "used_margin = 0 after close");
+            assert_eq!(acct.used_margin, 0, "used_margin = 0 after close");
             assert_eq!(acct.unrealized_pnl, 0, "upnl = 0 after close");
 
             // available = prev_available + fill_margin(0) + released_used_margin(IM) + realized_pnl
@@ -1366,7 +1777,9 @@ mod tests {
             assert_eq!(
                 acct.available_margin.load(Relaxed),
                 expected_available.max(0),
-                "available_margin after liq: expected {} (${})", expected_available, expected_available / 100
+                "available_margin after liq: expected {} (${})",
+                expected_available,
+                expected_available / 100
             );
 
             // Equity = available + 0 + 0 + 0 = 5_250.
@@ -1377,9 +1790,12 @@ mod tests {
 
             // Insurance fund captures the fill-vs-liq-price spread.
             assert_eq!(
-                risk.insurance_fund(), expected_insurance,
+                risk.insurance_fund(),
+                expected_insurance,
                 "insurance fund: expected {} ({} fill - {} liq) × qty / scale",
-                expected_insurance, actual_fill_ticks, liq_price_ticks
+                expected_insurance,
+                actual_fill_ticks,
+                liq_price_ticks
             );
         }
     }

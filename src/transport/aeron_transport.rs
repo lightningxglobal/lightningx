@@ -96,32 +96,21 @@ impl PollCallback for OrderInboundCallback {
 
         match template_id {
             1 => {
-                // NewOrderRequest: header(8) + body(64) = 72字节
-                if data.len() >= 72 {
-                    unsafe {
-                        let req = std::ptr::read_unaligned(
-                            &data[8] as *const u8 as *const NewOrderRequest,
-                        );
-                        if let Err(rtrb::PushError::Full(_)) =
-                            self.tx.push(InboundMsg::NewOrder(req))
-                        {
-                            self.dropped.fetch_add(1, Ordering::Relaxed);
-                        }
+                // Single audited decode path (covered by the hostile-input
+                // robustness suite) instead of a local unsafe read.
+                if let Some(req) = crate::transport::sbe::decode_new_order(data) {
+                    if let Err(rtrb::PushError::Full(_)) = self.tx.push(InboundMsg::NewOrder(req))
+                    {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
             2 => {
-                // CancelOrderRequest: header(8) + body(24) = 32 bytes
-                if data.len() >= 32 {
-                    unsafe {
-                        let req = std::ptr::read_unaligned(
-                            &data[8] as *const u8 as *const CancelOrderRequest,
-                        );
-                        if let Err(rtrb::PushError::Full(_)) =
-                            self.tx.push(InboundMsg::CancelOrder(req))
-                        {
-                            self.dropped.fetch_add(1, Ordering::Relaxed);
-                        }
+                if let Some(req) = crate::transport::sbe::decode_cancel_order(data) {
+                    if let Err(rtrb::PushError::Full(_)) =
+                        self.tx.push(InboundMsg::CancelOrder(req))
+                    {
+                        self.dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }

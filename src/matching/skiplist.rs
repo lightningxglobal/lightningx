@@ -3,7 +3,8 @@ use crate::order::{PriceTicks, QuantityLots};
 use crate::orderbook::{OrderBook, PriceLevel as OrderBookPriceLevel};
 
 const MAX_LEVEL: usize = 12;
-const PROMOTION_PROBABILITY: f64 = 0.25;
+// Level promotion probability is 1/4, implemented as a 2-bit draw in
+// random_level (deterministic xorshift64*).
 
 /// 跳表节点 - 使用原始指针支持多级链接
 #[repr(C)]
@@ -53,6 +54,12 @@ pub struct SkipList {
     arena: Vec<Box<SkipListNode>>,
     /// Unlinked price-level nodes available for reuse.
     free_nodes: Vec<*mut SkipListNode>,
+    /// Deterministic xorshift64* state for level promotion. Seeded with a
+    /// fixed constant so replaying the same insert sequence reproduces the
+    /// identical internal structure — a prerequisite for bit-exact
+    /// primary/standby replay verification. Promotion quality only affects
+    /// performance, never matching results.
+    rng_state: u64,
     /// 缓存最优价格
     best_price: Option<PriceTicks>,
 }
@@ -77,6 +84,7 @@ impl SkipList {
             level: 0,
             count: 0,
             order,
+            rng_state: 0x9E37_79B9_7F4A_7C15,
             list_pool: ListNodePool::new(pool_capacity),
             arena,
             free_nodes: Vec::new(),
@@ -85,10 +93,22 @@ impl SkipList {
     }
 
     /// 生成随机层级
-    fn random_level() -> usize {
+    /// Deterministic level draw (replaces rand::random): xorshift64*,
+    /// consuming 2 bits per level for the p = 0.25 promotion probability.
+    fn random_level(&mut self) -> usize {
+        // xorshift64* — fast, never zero-locked with a non-zero seed.
+        let mut x = self.rng_state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng_state = x;
+        let mut bits = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+
         let mut lv = 0;
-        while lv < MAX_LEVEL - 1 && rand::random::<f64>() < PROMOTION_PROBABILITY {
+        // promote while the next two bits are 00 (probability 1/4).
+        while lv < MAX_LEVEL - 1 && bits & 0b11 == 0 {
             lv += 1;
+            bits >>= 2;
         }
         lv
     }
@@ -221,7 +241,7 @@ impl SkipList {
             return Err("Price level already exists".to_string());
         }
 
-        let new_level = Self::random_level();
+        let new_level = self.random_level();
 
         unsafe {
             // 查找所有级别的前驱节点
@@ -690,6 +710,54 @@ impl OrderBook for SkipList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_insert_sequences_build_identical_structure() {
+        // Replay determinism: same inputs → bit-identical internal shape
+        // (node levels included), across two independent instances.
+        let mut a = SkipList::new_with_pool(SortOrder::Ascending, 4096);
+        let mut b = SkipList::new_with_pool(SortOrder::Ascending, 4096);
+        // Insert/remove pattern with enough churn to exercise node reuse.
+        for i in 0..500i64 {
+            let price = (i * 37) % 251 + 1;
+            let _ = a.insert_level(price);
+            let _ = b.insert_level(price);
+            if i % 7 == 0 {
+                let victim = (i * 11) % 251 + 1;
+                let _ = a.remove_level(victim);
+                let _ = b.remove_level(victim);
+            }
+        }
+        assert_eq!(a.count(), b.count());
+        for price in 1..=251i64 {
+            match (a.get_node_at_price(price), b.get_node_at_price(price)) {
+                (Some(na), Some(nb)) => {
+                    assert_eq!(na.level, nb.level, "node level diverged at {price}");
+                }
+                (None, None) => {}
+                _ => panic!("presence diverged at {price}"),
+            }
+        }
+    }
+
+    #[test]
+    fn random_level_distribution_is_sane() {
+        // The deterministic draw must still look like p=0.25 promotion:
+        // roughly 3/4 of draws are level 0 and levels stay within bounds.
+        let mut sl = SkipList::new_with_pool(SortOrder::Ascending, 16);
+        let mut histogram = [0usize; MAX_LEVEL];
+        for _ in 0..40_000 {
+            let lv = sl.random_level();
+            assert!(lv < MAX_LEVEL);
+            histogram[lv] += 1;
+        }
+        let level0_share = histogram[0] as f64 / 40_000.0;
+        assert!(
+            (0.72..=0.78).contains(&level0_share),
+            "level-0 share {level0_share} out of expected band"
+        );
+        assert!(histogram[1] > histogram[2], "monotone decay expected");
+    }
 
     #[test]
     fn test_insert_and_find() {

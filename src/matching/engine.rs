@@ -1809,6 +1809,65 @@ mod tests {
         assert_eq!(asks[0].0, 100, "only ask@100 should remain");
     }
 
+    /// Replay determinism: two engines fed the identical pseudo-random
+    /// order sequence must produce identical fills AND identical book
+    /// state — the precondition for primary/standby replay verification.
+    /// (The skiplist RNG is seeded, so even internal structure matches;
+    /// see skiplist::tests::identical_insert_sequences_build_identical_structure.)
+    #[test]
+    fn identical_order_sequences_produce_identical_results() {
+        let mut a = MatchingEngine::new(PoolConfig::default()).unwrap();
+        let mut b = MatchingEngine::new(PoolConfig::default()).unwrap();
+
+        // Deterministic LCG-driven mixed workload.
+        let mut x: u64 = 0x5EED_0123_4567_89AB;
+        let mut next = move || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x >> 16
+        };
+        for i in 0..2_000u64 {
+            let side = if next() % 2 == 0 { Side::Buy } else { Side::Sell };
+            let price = 90 + (next() % 21) as i64; // 90..=110
+            let qty = 1 + (next() % 50) as i64;
+            let tif = match next() % 4 {
+                0 => TimeInForce::GTC,
+                1 => TimeInForce::IOC,
+                2 => TimeInForce::FOK,
+                _ => TimeInForce::PostOnly,
+            };
+            let order_a = Order::new(i + 1, side, price, qty, tif, i);
+            let order_b = Order::new(i + 1, side, price, qty, tif, i);
+            let ra = a.place_order(order_a);
+            let rb = b.place_order(order_b);
+            match (ra, rb) {
+                (Ok(ra), Ok(rb)) => {
+                    assert_eq!(ra.status, rb.status, "status diverged at order {i}");
+                    assert_eq!(ra.filled_lots, rb.filled_lots, "fills diverged at {i}");
+                    assert_eq!(ra.fills, rb.fills, "fill list diverged at {i}");
+                }
+                (Err(_), Err(_)) => {}
+                _ => panic!("result kind diverged at order {i}"),
+            }
+            // Periodic cancels keep the books churning identically.
+            if i % 13 == 0 && i > 0 {
+                let victim = 1 + next() % i;
+                let ca = a.cancel_order(victim);
+                let cb = b.cancel_order(victim);
+                assert_eq!(ca.is_ok(), cb.is_ok(), "cancel diverged at {i}");
+            }
+        }
+        assert_eq!(
+            a.get_top_levels(50, true),
+            b.get_top_levels(50, true),
+            "bid book diverged"
+        );
+        assert_eq!(
+            a.get_top_levels(50, false),
+            b.get_top_levels(50, false),
+            "ask book diverged"
+        );
+    }
+
     /// The stale-cache scenario that caused the real-world negative-spread bug:
     /// sell_book cache = 74,333.90 after a previous match; maker then adds
     /// ask@74,309.70.  Next buy@74,333.80 MUST match at 74,309.70, not skip.

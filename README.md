@@ -255,13 +255,15 @@ The table below is a **connection load test**, not a latency benchmark. Its purp
 
 Test machine: Ubuntu 26.04, AMD Ryzen 9 7945HX (16C/32T, 5.2 GHz boost, 55 W TDP), 64 GB DDR5. Loopback interface with 32 source IP aliases (`127.0.0.2`–`.33`). `isolcpus=0-11` reserved for aeronmd (CPU 0), exchange-engine (CPU 2), and desk spin threads (CPU 4, 6, 8, 10, 3, 1, 5, 7, 9, 11). 2 MB huge pages enabled (`vm.nr_hugepages=512`, 1 GB reserved) with `AERON_USE_HUGE_PAGES=1` to reduce TLB pressure on Aeron IPC shared-memory buffers.
 
-| Connections | Desks | Conns/desk | Conn success | Order OK% | Client p50 | Client p99 |
-|---|---|---:|---:|---:|---:|---:|
-| **40K**  | 4  | 10K | **100%** | **100%** | **93 µs** | **244 µs** |
-| **100K** | 4  | 25K | **100%** | **100%** | **112 µs** | **1.2 ms** |
-| **200K** | 8  | 25K | **100%** | **100%** | **291 µs** | **4.7 ms** |
+| Connections | Desks | Conns/desk | Conn success | Order OK% | Client p50 | Client p90 | Client p99 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **40K**  | 4  | 10K | **100%** | **100%** | **93 µs**  | **154 µs** | **244 µs** |
+| **100K** | 4  | 25K | **100%** | **100%** | **112 µs** | **205 µs** | **1.2 ms** |
+| **200K** | 8  | 25K | **100%** | **100%** | **291 µs** | **947 µs** | **4.7 ms** |
 
 Client latency = loopback RTT (place order → acknowledgement received by pressure client). Internal server-side latency is lower; see "Internal Processing Latency" above.
+
+> **200K note:** 8 desk-servers exhaust the 10 isolated CPUs on this laptop (2 desks share SMT pairs with the engine and aeronmd cores). The higher p90/p99 reflects CPU contention on this constrained test machine, not a design ceiling. A production server with 64+ dedicated cores would scale linearly.
 
 ---
 

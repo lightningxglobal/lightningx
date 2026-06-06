@@ -24,6 +24,35 @@ use redis::AsyncCommands;
 use sqlx::PgPool;
 
 pub const KEY_ACTIVE_ORDERS: &str = "active_orders";
+/// HASH publisher_id → last applied persist seq (redis-writer checkpoint).
+pub const KEY_PERSIST_FLOORS: &str = "persist:floors";
+
+/// Load redis-writer checkpoint floors (HASH field = publisher_id).
+pub async fn load_persist_floors(
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> anyhow::Result<std::collections::HashMap<u16, u64>> {
+    let raw: std::collections::HashMap<String, u64> = conn.hgetall(KEY_PERSIST_FLOORS).await?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(k, v)| k.parse::<u16>().ok().map(|id| (id, v)))
+        .collect())
+}
+
+/// Persist all floors in one HSET (called periodically, not per frame).
+pub async fn store_persist_floors(
+    conn: &mut redis::aio::MultiplexedConnection,
+    floors: &std::collections::HashMap<u16, u64>,
+) -> anyhow::Result<()> {
+    if floors.is_empty() {
+        return Ok(());
+    }
+    let items: Vec<(String, u64)> = floors
+        .iter()
+        .map(|(&id, &seq)| (id.to_string(), seq))
+        .collect();
+    let _: () = conn.hset_multiple(KEY_PERSIST_FLOORS, &items).await?;
+    Ok(())
+}
 
 pub fn key_order(id: i64) -> String {
     format!("order:{id}")

@@ -165,11 +165,65 @@ pub struct PgWriteBatch {
     matching_events: Vec<MatchingEventRow>,
     skipped: u64,
     skip_counts: SkipCounts,
+    /// Checkpoint floor per publisher: frames with seq <= floor were
+    /// already applied in a committed transaction and are dropped as
+    /// duplicates (exactly-once across restarts and Aeron replays).
+    applied_seq: std::collections::HashMap<u16, u64>,
+    /// Max seq per publisher accumulated in the CURRENT batch; written to
+    /// persist_checkpoints inside the same flush transaction, promoted to
+    /// applied_seq only after COMMIT succeeds.
+    pending_max_seq: std::collections::HashMap<u16, u64>,
+    /// Duplicate frames discarded by the checkpoint (replay/restart).
+    pub duplicate_seq_frames: u64,
+    /// Sequence holes observed (frames lost upstream of this consumer).
+    pub seq_gap_frames: u64,
+    /// Huge forward jumps (publisher restarted with a fresh clock-seeded
+    /// sequence) — informational, not data loss.
+    pub publisher_restarts: u64,
 }
 
 impl PgWriteBatch {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Seed the checkpoint floors from persist_checkpoints (call once at
+    /// startup, after migrations).
+    pub fn set_applied_floors(&mut self, floors: std::collections::HashMap<u16, u64>) {
+        self.applied_seq = floors;
+    }
+
+    /// Frame admission control: returns false if the frame is a duplicate
+    /// (seq at or below the committed checkpoint / already pending).
+    /// Sequence accounting for gap/restart diagnostics happens here too.
+    /// Unsequenced frames (seq == 0) always pass.
+    fn admit_seq(&mut self, publisher_id: u16, seq: u64) -> bool {
+        if seq == 0 {
+            return true;
+        }
+        let floor = self.applied_seq.get(&publisher_id).copied().unwrap_or(0);
+        let pending = self
+            .pending_max_seq
+            .get(&publisher_id)
+            .copied()
+            .unwrap_or(floor);
+        if seq <= pending {
+            self.duplicate_seq_frames += 1;
+            return false;
+        }
+        let jump = seq - pending;
+        if pending > 0 && jump > 1 {
+            // Clock-seeded restart sequences jump by ~nanoseconds-of-downtime;
+            // anything that large is a restart, not frame loss.
+            const RESTART_JUMP: u64 = 1 << 40;
+            if jump > RESTART_JUMP {
+                self.publisher_restarts += 1;
+            } else {
+                self.seq_gap_frames += jump - 1;
+            }
+        }
+        self.pending_max_seq.insert(publisher_id, seq);
+        true
     }
 
     pub fn len(&self) -> usize {
@@ -204,11 +258,18 @@ impl PgWriteBatch {
         self.accounts.clear();
         self.trades.clear();
         self.matching_events.clear();
+        // Dropped frames were never applied — the checkpoint must not
+        // advance past them (redelivery will re-admit; at-least-once on
+        // the explicit poison-drop path).
+        self.pending_max_seq.clear();
     }
 
     /// Accept one frame into the batch. Returns false when the frame is
     /// malformed and was skipped (still safe to keep batching).
     pub fn push(&mut self, frame: &PersistFrame) -> bool {
+        if !self.admit_seq(frame.publisher_id, frame.seq) {
+            return false;
+        }
         match frame.kind() {
             Some(PersistKind::OrderUpsert) => match frame.as_order_upsert() {
                 Some(p) => self.push_upsert(&p),
@@ -546,7 +607,18 @@ impl PgWriteBatch {
         if !self.matching_events.is_empty() {
             total += flush_matching_events(&mut *tx, &self.matching_events).await?;
         }
+        if !self.pending_max_seq.is_empty() {
+            flush_checkpoints(&mut tx, &self.pending_max_seq).await?;
+        }
         tx.commit().await?;
+
+        // COMMIT succeeded → promote the batch's checkpoint into the floor.
+        for (publisher_id, seq) in self.pending_max_seq.drain() {
+            let floor = self.applied_seq.entry(publisher_id).or_insert(0);
+            if seq > *floor {
+                *floor = seq;
+            }
+        }
 
         self.upserts.clear();
         self.deletes.clear();
@@ -861,6 +933,49 @@ async fn flush_trades(conn: &mut PgConnection, rows: &[TradeRow]) -> anyhow::Res
     .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)
+}
+
+/// Upsert per-publisher checkpoints inside the data transaction.
+/// GREATEST guards against another writer instance having advanced further.
+async fn flush_checkpoints(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    pending: &std::collections::HashMap<u16, u64>,
+) -> anyhow::Result<()> {
+    let mut ids = Vec::with_capacity(pending.len());
+    let mut seqs = Vec::with_capacity(pending.len());
+    for (&publisher_id, &seq) in pending {
+        ids.push(publisher_id as i32);
+        seqs.push(seq as i64);
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO persist_checkpoints (publisher_id, last_seq, updated_at)
+        SELECT t.publisher_id, t.last_seq, NOW()
+          FROM UNNEST($1::int[], $2::bigint[]) AS t(publisher_id, last_seq)
+        ON CONFLICT (publisher_id) DO UPDATE SET
+            last_seq   = GREATEST(persist_checkpoints.last_seq, EXCLUDED.last_seq),
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&ids)
+    .bind(&seqs)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Load committed checkpoint floors (startup).
+pub async fn load_checkpoints(
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<std::collections::HashMap<u16, u64>> {
+    let rows: Vec<(i32, i64)> =
+        sqlx::query_as("SELECT publisher_id, last_seq FROM persist_checkpoints")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, seq)| (id as u16, seq.max(0) as u64))
+        .collect())
 }
 
 async fn flush_matching_events(

@@ -7,7 +7,8 @@
 //! processes (independent restart / crash isolation) and translate events
 //! into Redis HASH updates and batched PG writes.
 //!
-//! Wire format: fixed 144 bytes (8-byte header + 136-byte payload union).
+//! Wire format: fixed 152 bytes (16-byte header incl. publisher_id + seq,
+//! 136-byte payload union).
 //! POD/Copy struct, sent via Aeron as raw bytes — same pattern as
 //! `OrderUpdateMsg` / `TradeNotification`.
 //!
@@ -148,21 +149,33 @@ const _: () = {
 #[derive(Clone, Copy)]
 pub struct PersistFrame {
     pub kind: u8,
-    pub _pad: [u8; 7],
+    pub _pad: u8,
+    /// Identifies the publishing process (desk_id). Together with `seq`
+    /// forms the consumer-checkpoint key: writers persist "applied up to
+    /// (publisher_id, seq)" and skip duplicates on replay/restart.
+    pub publisher_id: u16,
+    pub _pad2: [u8; 4],
+    /// Per-publisher monotonically increasing sequence, assigned by the
+    /// single drain thread right before the Aeron publish. 0 = unsequenced
+    /// (legacy producers/tests); such frames bypass checkpoint dedup.
+    pub seq: u64,
     pub payload: [u8; MAX_PAYLOAD],
 }
 
 pub const FRAME_SIZE: usize = size_of::<PersistFrame>();
 
 const _: () = {
-    assert!(FRAME_SIZE == 8 + MAX_PAYLOAD);
+    assert!(FRAME_SIZE == 16 + MAX_PAYLOAD);
 };
 
 impl PersistFrame {
     pub fn zero() -> Self {
         Self {
             kind: 0,
-            _pad: [0; 7],
+            _pad: 0,
+            publisher_id: 0,
+            _pad2: [0; 4],
+            seq: 0,
             payload: [0; MAX_PAYLOAD],
         }
     }
@@ -325,8 +338,19 @@ mod tests {
 
     #[test]
     fn frame_size_known() {
-        // 8-byte header + 136-byte payload = 144 bytes; document it.
-        assert_eq!(FRAME_SIZE, 144);
+        // 16-byte header (kind + publisher_id + seq) + 136-byte payload.
+        assert_eq!(FRAME_SIZE, 152);
+    }
+
+    #[test]
+    fn frame_seq_header_roundtrips() {
+        let mut f = PersistFrame::order_delete(OrderDeletePayload { id: 9 });
+        f.publisher_id = 3;
+        f.seq = 0xDEAD_BEEF_CAFE;
+        let back = PersistFrame::from_bytes(f.as_bytes()).expect("parse");
+        assert_eq!({ back.publisher_id }, 3);
+        assert_eq!({ back.seq }, 0xDEAD_BEEF_CAFE);
+        assert_eq!({ back.as_order_delete().unwrap().id }, 9);
     }
 
     #[test]

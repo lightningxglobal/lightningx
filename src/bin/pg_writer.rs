@@ -19,7 +19,7 @@ use aeron_wrapper::AeronClient;
 use anyhow::Context;
 use crossbeam_queue::ArrayQueue;
 use lightning_exchange::db;
-use lightning_exchange::desk::pg_store::{PgWriteBatch, backfill_from_redis};
+use lightning_exchange::desk::pg_store::{PgWriteBatch, backfill_from_redis, load_checkpoints};
 use lightning_exchange::desk::reconcile;
 use lightning_exchange::transport::aeron_channels::{PERSIST_CHANNEL, PERSIST_STREAM, aeron_dir};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
@@ -160,6 +160,17 @@ async fn main() -> anyhow::Result<()> {
         .context("spawn pg-writer-aeron thread")?;
 
     let mut batch = PgWriteBatch::new();
+    // Exactly-once: resume from committed checkpoints — frames at or below
+    // the floor are duplicates from replay/restart and are dropped.
+    match load_checkpoints(&pg).await {
+        Ok(floors) => {
+            if !floors.is_empty() {
+                info!("persist checkpoints loaded: {:?}", floors);
+            }
+            batch.set_applied_floors(floors);
+        }
+        Err(e) => warn!("failed to load persist checkpoints: {e} — starting at zero"),
+    }
     let mut last_flush = Instant::now();
     let mut total_applied: u64 = 0;
     let mut total_flushes: u64 = 0;
@@ -202,7 +213,8 @@ async fn main() -> anyhow::Result<()> {
                 "pg-writer: applied={} flushes={} skipped={} bridge_dropped={} queue_depth={} \
                  [unknown_kind={} upsert_bad_status={} upsert_bad_ts={} upsert_empty_str={} \
                  fill_bad_status={} account_empty_asset={} trade_empty_symbol={} \
-                 trade_bad_ts={} matching_empty_symbol={} matching_bad_ts={} decode_failed={}]",
+                 trade_bad_ts={} matching_empty_symbol={} matching_bad_ts={} decode_failed={}] \
+                 ckpt[dup={} gap={} restarts={}]",
                 total_applied,
                 total_flushes,
                 batch.skipped(),
@@ -219,6 +231,9 @@ async fn main() -> anyhow::Result<()> {
                 sc.matching_empty_symbol,
                 sc.matching_bad_timestamp,
                 sc.payload_decode_failed,
+                batch.duplicate_seq_frames,
+                batch.seq_gap_frames,
+                batch.publisher_restarts,
             );
             last_log = Instant::now();
         }

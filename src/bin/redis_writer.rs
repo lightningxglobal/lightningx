@@ -120,7 +120,20 @@ async fn main() -> anyhow::Result<()> {
         PERSIST_CHANNEL, PERSIST_STREAM
     );
 
+    // Per-publisher checkpoint floors, persisted in Redis. Frames at or
+    // below the floor are duplicates (replay/restart) and are skipped.
+    // Redis apply is idempotent HSETs, so at-least-once checkpointing
+    // (apply, then advance) is sufficient here — unlike PG where the
+    // checkpoint commits transactionally with the data.
+    let mut floors: std::collections::HashMap<u16, u64> =
+        redis_store::load_persist_floors(&mut conn).await.unwrap_or_default();
+    if !floors.is_empty() {
+        info!("persist checkpoints loaded: {:?}", floors);
+    }
     let mut applied: u64 = 0;
+    let mut duplicates: u64 = 0;
+    let mut floors_dirty = false;
+    let mut last_ckpt = Instant::now();
     let mut last_log = Instant::now();
     loop {
         aeron.do_work();
@@ -128,16 +141,37 @@ async fn main() -> anyhow::Result<()> {
         let mut did_work = false;
         while let Some(frame) = sub.poll() {
             did_work = true;
+            let publisher_id: u16 = frame.publisher_id;
+            let seq: u64 = frame.seq;
+            if seq != 0 && seq <= floors.get(&publisher_id).copied().unwrap_or(0) {
+                duplicates += 1;
+                continue;
+            }
             if let Err(e) = redis_store::apply_frame(&mut conn, &frame).await {
                 tracing::error!("apply_frame failed: {e}");
             } else {
                 applied += 1;
+                if seq != 0 {
+                    floors.insert(publisher_id, seq);
+                    floors_dirty = true;
+                }
             }
+        }
+        // Persist floors periodically (1s), not per frame: a stale floor
+        // only causes some duplicate idempotent re-applies after restart.
+        if floors_dirty && last_ckpt.elapsed() >= Duration::from_secs(1) {
+            if let Err(e) = redis_store::store_persist_floors(&mut conn, &floors).await {
+                tracing::warn!("checkpoint store failed: {e}");
+            } else {
+                floors_dirty = false;
+            }
+            last_ckpt = Instant::now();
         }
         if last_log.elapsed() >= Duration::from_secs(30) {
             info!(
-                "redis-writer: {applied} frames applied (dropped {})",
-                sub.dropped_frames()
+                "redis-writer: {applied} frames applied (dropped {} dup {})",
+                sub.dropped_frames(),
+                duplicates,
             );
             last_log = Instant::now();
         }

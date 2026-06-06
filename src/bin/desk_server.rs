@@ -1479,11 +1479,29 @@ async fn async_main() -> anyhow::Result<()> {
             .spawn(move || {
                 pin_current_thread_to_core("DESK_PERSIST_CORE", &thread_name_persist);
                 let mut idle_us: u64 = 10;
+                // Per-publisher monotonic sequence, assigned here — the single
+                // drain point — so consumers can checkpoint (publisher_id, seq)
+                // and dedup on replay/restart.
+                //
+                // Seeded from wall-clock nanos so a restarted desk always
+                // resumes ABOVE its previous range (frames/sec << ns/sec by
+                // many orders of magnitude): a fresh process can never emit
+                // sequences the consumers' checkpoints would discard as dups.
+                // Consumers treat a huge forward jump as a publisher restart,
+                // not a loss gap.
+                let mut persist_seq: u64 = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(1);
                 loop {
                     let mut did_work = false;
                     while let Some(frame) = persist_rx.pop() {
                         did_work = true;
-                        let _ = persist_publisher.publish(&frame);
+                        persist_seq += 1;
+                        let mut sequenced = frame;
+                        sequenced.publisher_id = desk_id as u16;
+                        sequenced.seq = persist_seq;
+                        let _ = persist_publisher.publish(&sequenced);
                     }
                     if !did_work {
                         if persist_spin {

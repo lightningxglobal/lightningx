@@ -9,7 +9,6 @@
 ///   [0-21]    : sequence (22 bits → 4M 个 ID/毫秒/Desk)
 ///
 /// 性能：~50ns per ID generation (无锁)
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 

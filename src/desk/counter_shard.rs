@@ -32,7 +32,10 @@ pub fn is_user_owned_by_desk(user_id: i64, desk_id: u16) -> bool {
 /// desk 0 owns BTC, desk 1 owns ETH, desks 2/3 split the remaining symbols.
 #[inline]
 pub fn symbol_route_desk_id(symbol: &str) -> u16 {
-    let base = symbol.split_once('_').map(|(base, _)| base).unwrap_or(symbol);
+    let base = symbol
+        .split_once('_')
+        .map(|(base, _)| base)
+        .unwrap_or(symbol);
     match base {
         "BTC" => 0,
         "ETH" => 1,

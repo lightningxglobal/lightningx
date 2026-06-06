@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use lightning_exchange::{
     account_repository::AccountRepository,
-    api::{router, AppState, AccountCache, UserTxRegistry},
+    api::{AccountCache, AppState, UserTxRegistry, router},
     db,
     engine::{MatchingEngine, PoolConfig},
     models::DbOrder,
@@ -10,8 +10,8 @@ use lightning_exchange::{
     ws_handler::market_data_broadcaster,
 };
 use sqlx::PgPool;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -19,19 +19,19 @@ use tower_http::cors::{Any, CorsLayer};
 /// Idempotent: skips a symbol if it already has any trades in the DB.
 /// Does NOT place limit orders — the market-maker provides all live orderbook liquidity.
 async fn seed_demo_if_empty(pool: &PgPool) {
-    let eth_has_trades: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trades WHERE symbol='ETH_USDT' LIMIT 1",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0) > 0;
+    let eth_has_trades: bool =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trades WHERE symbol='ETH_USDT' LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0)
+            > 0;
 
-    let btc_has_trades: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM trades WHERE symbol='BTC_USDT' LIMIT 1",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0) > 0;
+    let btc_has_trades: bool =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trades WHERE symbol='BTC_USDT' LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0)
+            > 0;
 
     if eth_has_trades && btc_has_trades {
         tracing::info!("Demo trade history already present, skipping seed");
@@ -130,7 +130,11 @@ async fn main() -> anyhow::Result<()> {
     // Upsert configured symbols into DB so data_server can discover them.
     for sym in &symbols {
         let parts: Vec<&str> = sym.split('_').collect();
-        let (base, quote): (&str, &str) = if parts.len() == 2 { (parts[0], parts[1]) } else { (sym, "") };
+        let (base, quote): (&str, &str) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            (sym, "")
+        };
         let _ = sqlx::query(
             "INSERT INTO symbols (symbol, base_asset, quote_asset) VALUES ($1, $2, $3)
              ON CONFLICT (symbol) DO NOTHING",
@@ -167,16 +171,22 @@ async fn main() -> anyhow::Result<()> {
                 if side == "sell" {
                     let _ = repo.release_frozen(*user_id, base_asset, remaining).await;
                 } else if *per_unit_price > 0.0 {
-                    let _ = repo.release_frozen(*user_id, quote_asset, per_unit_price * remaining).await;
+                    let _ = repo
+                        .release_frozen(*user_id, quote_asset, per_unit_price * remaining)
+                        .await;
                 }
             }
-            let _ = sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
-                .bind(id)
-                .execute(&pool)
-                .await;
+            let _ =
+                sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
         }
         if !bot_stale.is_empty() {
-            tracing::warn!("Canceled {} stale bot orders (market-maker + demo) from previous session", bot_stale.len());
+            tracing::warn!(
+                "Canceled {} stale bot orders (market-maker + demo) from previous session",
+                bot_stale.len()
+            );
         }
     }
 
@@ -201,7 +211,9 @@ async fn main() -> anyhow::Result<()> {
         let mut skipped = 0usize;
         for db_order in &rows {
             let order_id = db_order.id as u64;
-            if order_id > max_id { max_id = order_id; }
+            if order_id > max_id {
+                max_id = order_id;
+            }
 
             // Market orders (and IOC orders missing a price) can never rest in the
             // book — they were left in PENDING by a crash mid-flight. Skip them
@@ -214,9 +226,15 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let remaining = db_order.quantity - db_order.filled;
-            if remaining <= 0.0 { continue; }
+            if remaining <= 0.0 {
+                continue;
+            }
 
-            let side = if db_order.side == "buy" { Side::Buy } else { Side::Sell };
+            let side = if db_order.side == "buy" {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
             let rules = SymbolRules::for_symbol(&db_order.symbol);
             let price_ticks = match rules.price_to_ticks(db_order.price.unwrap_or(0.0)) {
                 Ok(v) => v,
@@ -298,16 +316,17 @@ async fn main() -> anyhow::Result<()> {
                         })
                     };
                     if let Some(p) = resolved_price {
-                        let _ = repo.release_frozen(user_id, quote_asset, p * remaining).await;
+                        let _ = repo
+                            .release_frozen(user_id, quote_asset, p * remaining)
+                            .await;
                     }
                 }
             }
-            let _ = sqlx::query(
-                "UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1",
-            )
-            .bind(id)
-            .execute(&pool)
-            .await;
+            let _ =
+                sqlx::query("UPDATE orders SET status='CANCELED', updated_at=NOW() WHERE id=$1")
+                    .bind(id)
+                    .execute(&pool)
+                    .await;
             cleaned += 1;
         }
         if cleaned > 0 {

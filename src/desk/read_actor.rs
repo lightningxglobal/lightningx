@@ -12,7 +12,7 @@ use crate::desk::write_actor::WsCtrl;
 use crate::ws_sbe;
 use dashmap::DashMap;
 use fastwebsockets::WebSocketRead;
-use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use std::collections::HashSet;

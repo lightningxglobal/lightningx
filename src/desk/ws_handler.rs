@@ -1,31 +1,31 @@
 use crate::account_repository::AccountRepository;
 use crate::api::AppState;
-use crate::desk::money::{AccountBalance, AmountAtoms};
 use crate::desk::counter_shard::owner_shard_for_user_id;
+use crate::desk::money::{AccountBalance, AmountAtoms};
 use crate::desk::read_actor::{ConnMarketInfo, ReadConn};
-use dashmap::DashMap as ActorConnMap;
 use crate::engine::{MatchingEngine, OrderStatus};
 use crate::order::{Order, Side, TimeInForce};
 use crate::order_state::{
     db_status_from_engine, maker_ws_status_from_db_status, ws_status_from_engine,
 };
+use crate::transport::counter_forward::{
+    CounterForwardCancel, CounterForwardMsg, CounterForwardNewOrder, CounterForwardOrderMeta,
+};
 use crate::user_service;
 use crate::ws_sbe;
 use axum::extract::{Request, State};
 use axum::response::Response;
+use dashmap::DashMap as ActorConnMap;
 use dashmap::DashMap;
-use fastwebsockets::{upgrade, Frame, OpCode};
-use std::time::Duration;
-use tokio::io as tio;
+use fastwebsockets::{Frame, OpCode, upgrade};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io as tio;
 use tokio::sync::mpsc;
-use crate::transport::counter_forward::{
-    CounterForwardCancel, CounterForwardMsg, CounterForwardNewOrder, CounterForwardOrderMeta,
-};
 
 fn try_freeze_cache(
     cache: &crate::api::AccountCache,
@@ -286,7 +286,8 @@ impl ClientMsg {
                     0 => "buy",
                     1 => "sell",
                     _ => return None,
-                }.to_owned();
+                }
+                .to_owned();
                 let (order_type, time_in_force) = match tif_byte {
                     0 => ("limit".to_owned(), None),
                     1 => ("ioc".to_owned(), None),
@@ -297,7 +298,11 @@ impl ClientMsg {
                 // Convert ticks/lots back to f64 so the shared PlaceOrder handler
                 // can validate + route. The round-trip is lossless for tick-aligned values.
                 let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
-                let price = if price_ticks == 0 { None } else { Some(rules.ticks_to_price(price_ticks)) };
+                let price = if price_ticks == 0 {
+                    None
+                } else {
+                    Some(rules.ticks_to_price(price_ticks))
+                };
                 let qty = rules.lots_to_quantity(quantity_lots);
                 Some(ClientMsg::PlaceOrder {
                     client_order_id: coid.to_string(),
@@ -429,11 +434,14 @@ pub async fn ws_handler(State(state): State<AppState>, mut req: Request) -> Resp
                 socket.set_auto_pong(false);
 
                 let (ws_read, ws_write) = socket.split(tio::split);
-                let (personal_tx, ctrl_tx) =
-                    match state.write_pool.register(ws_write, ws_personal_queue_cap(), state.tracer.clone()) {
-                        Some(v) => v,
-                        None => return,
-                    };
+                let (personal_tx, ctrl_tx) = match state.write_pool.register(
+                    ws_write,
+                    ws_personal_queue_cap(),
+                    state.tracer.clone(),
+                ) {
+                    Some(v) => v,
+                    None => return,
+                };
                 let subscriptions = Arc::new(RwLock::new(HashSet::new()));
                 state.read_pool.register(ReadConn {
                     conn_id,
@@ -457,7 +465,14 @@ pub async fn read_conn_loop(
     actor_conns: Arc<ActorConnMap<u64, ConnMarketInfo>>,
     actor_sub_count: Arc<std::sync::atomic::AtomicUsize>,
 ) {
-    let ReadConn { conn_id, mut ws_read, state, personal_tx, ctrl_tx, subscriptions } = conn;
+    let ReadConn {
+        conn_id,
+        mut ws_read,
+        state,
+        personal_tx,
+        ctrl_tx,
+        subscriptions,
+    } = conn;
 
     // send_fn: required by WebSocketRead::read_frame API but never called
     // because auto_close=false and auto_pong=false suppress all auto-sends.
@@ -612,7 +627,9 @@ async fn handle_client_message(
 
         ClientMsg::Subscribe { channels } => {
             if !state.public_market_data_enabled {
-                return Some(ws_sbe::encode_error("Public market data is served by market-data-gateway"));
+                return Some(ws_sbe::encode_error(
+                    "Public market data is served by market-data-gateway",
+                ));
             }
             // Collect depth + ticker symbols before moving `channels` into the
             // subscribed set, so we can push an immediate snapshot for each.
@@ -688,9 +705,7 @@ async fn handle_client_message(
                 qty,
             ) {
                 Ok(shape) => shape,
-                Err(reason) => {
-                    return Some(ws_sbe::encode_order_rejected(0, &reason))
-                }
+                Err(reason) => return Some(ws_sbe::encode_order_rejected(0, &reason)),
             };
 
             let engine_side = match side.as_str() {
@@ -723,7 +738,10 @@ async fn handle_client_message(
                 .and_then(|m| m.get(&symbol).map(|e| e.value().clone()));
             // In standalone mode, reject unknown symbols up front.
             if state.engines.is_some() && engine_opt.is_none() {
-                return Some(ws_sbe::encode_order_rejected(0, &format!("Unknown symbol: {}", symbol)));
+                return Some(ws_sbe::encode_order_rejected(
+                    0,
+                    &format!("Unknown symbol: {}", symbol),
+                ));
             }
 
             // Parse base/quote assets from symbol (e.g. "BTC_USDT" → "BTC", "USDT").
@@ -763,7 +781,7 @@ async fn handle_client_message(
             if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
                 use crate::tracer::MS_WS_ORDER_RECV;
-                use crate::transport::{pack_str16, AeronCmd, OrderMeta};
+                use crate::transport::{AeronCmd, OrderMeta, pack_str16};
 
                 // PERF DIAG (off by default): sample ~1/256 PlaceOrders per-section timing.
                 // Enable via WS_PLACE_PROFILE=1 env on desk-server.
@@ -784,7 +802,10 @@ async fn handle_client_message(
                 // so clients don't track phantom orders waiting for a response that
                 // arrives as order_rejected after the pending entry is gone.
                 if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
-                    return Some(ws_sbe::encode_order_rejected(0, &format!("No engine for symbol: {}", symbol)));
+                    return Some(ws_sbe::encode_order_rejected(
+                        0,
+                        &format!("No engine for symbol: {}", symbol),
+                    ));
                 }
 
                 // Futures margin model: freeze initial_margin (notional / leverage) in USDT.
@@ -792,7 +813,10 @@ async fn handle_client_message(
                     fixed_shape.price_ticks.unwrap()
                 } else {
                     if freeze_price_val <= 0.0 {
-                        return Some(ws_sbe::encode_order_rejected(0, "Unable to determine buy reservation price"));
+                        return Some(ws_sbe::encode_order_rejected(
+                            0,
+                            "Unable to determine buy reservation price",
+                        ));
                     }
                     (freeze_price_val / rules.price_tick).round() as i64
                 };
@@ -803,13 +827,19 @@ async fn handle_client_message(
                         fixed_shape.quantity_lots,
                         rules.notional_scale,
                     );
-                    crate::desk::risk::calc::calc_initial_margin_cents(notional_cents, rules.default_leverage)
+                    crate::desk::risk::calc::calc_initial_margin_cents(
+                        notional_cents,
+                        rules.default_leverage,
+                    )
                 } else {
                     0
                 };
 
                 if initial_margin_cents <= 0 {
-                    return Some(ws_sbe::encode_order_rejected(0, "Unable to determine margin requirement"));
+                    return Some(ws_sbe::encode_order_rejected(
+                        0,
+                        "Unable to determine margin requirement",
+                    ));
                 }
 
                 if !is_local_owner {
@@ -841,7 +871,9 @@ async fn handle_client_message(
                         quantity_lots: fixed_shape.quantity_lots,
                         side: side_byte,
                         time_in_force: tif_byte,
-                        response_stream_id: crate::aeron_channels::order_update_stream_for_desk(owner_desk_id),
+                        response_stream_id: crate::aeron_channels::order_update_stream_for_desk(
+                            owner_desk_id,
+                        ),
                         _pad: [0; 10],
                         symbol: sym_bytes,
                     };
@@ -865,7 +897,11 @@ async fn handle_client_message(
                         return Some(ws_sbe::encode_order_rejected(0, "system busy"));
                     }
                     return if ws_inline_order_submitted_enabled() {
-                        Some(ws_sbe::encode_order_submitted(order_id, order_id, unix_now()))
+                        Some(ws_sbe::encode_order_submitted(
+                            order_id,
+                            order_id,
+                            unix_now(),
+                        ))
                     } else {
                         None
                     };
@@ -876,13 +912,18 @@ async fn handle_client_message(
                 } else {
                     None
                 };
-                if let Err(reason) = state.risk_engine.check_and_reserve_margin(user_id, initial_margin_cents) {
+                if let Err(reason) = state
+                    .risk_engine
+                    .check_and_reserve_margin(user_id, initial_margin_cents)
+                {
                     return Some(ws_sbe::encode_order_rejected(0, reason));
                 }
 
                 let margin_usdt = initial_margin_cents as f64 / 100.0;
                 if !try_freeze_cache(&state.account_cache, user_id, quote_asset, margin_usdt) {
-                    state.risk_engine.release_order_margin(user_id, initial_margin_cents);
+                    state
+                        .risk_engine
+                        .release_order_margin(user_id, initial_margin_cents);
                     return Some(ws_sbe::encode_order_rejected(0, "Insufficient balance"));
                 }
                 let (freeze_asset, freeze_amount): (&str, f64) = (quote_asset, margin_usdt);
@@ -898,9 +939,15 @@ async fn handle_client_message(
                             let bal = snapshot.balance();
                             let frz = snapshot.frozen();
                             if let Some(tx) = state.user_tx.get(user_id) {
-                                let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                    freeze_asset, bal, bal - frz, frz,
-                                ), 0));
+                                let _ = tx.try_send((
+                                    ws_sbe::encode_balance_update(
+                                        freeze_asset,
+                                        bal,
+                                        bal - frz,
+                                        frz,
+                                    ),
+                                    0,
+                                ));
                             }
                         }
                     }
@@ -961,7 +1008,9 @@ async fn handle_client_message(
                 if queue_too_deep || aeron_cmd_tx.push(AeronCmd::NewOrder(sbe_req)).is_err() {
                     // ArrayQueue full — apply backpressure to the client.
                     state.pending_meta.remove(&order_id);
-                    state.risk_engine.release_order_margin(user_id, initial_margin_cents);
+                    state
+                        .risk_engine
+                        .release_order_margin(user_id, initial_margin_cents);
                     release_cache_frozen(
                         &state.account_cache,
                         user_id,
@@ -980,7 +1029,11 @@ async fn handle_client_message(
                 };
 
                 let reply = if ws_inline_order_submitted_enabled() {
-                    Some(ws_sbe::encode_order_submitted(order_id, order_id, unix_now()))
+                    Some(ws_sbe::encode_order_submitted(
+                        order_id,
+                        order_id,
+                        unix_now(),
+                    ))
                 } else {
                     None
                 };
@@ -1021,7 +1074,10 @@ async fn handle_client_message(
             let engine = match engine_opt {
                 Some(e) => e,
                 None => {
-                    return Some(ws_sbe::encode_order_rejected(0, "No matching engine configured"))
+                    return Some(ws_sbe::encode_order_rejected(
+                        0,
+                        "No matching engine configured",
+                    ));
                 }
             };
 
@@ -1045,7 +1101,10 @@ async fn handle_client_message(
             .await;
 
             if let Err(e) = db_result {
-                return Some(ws_sbe::encode_order_rejected(0, &format!("DB error: {}", e)));
+                return Some(ws_sbe::encode_order_rejected(
+                    0,
+                    &format!("DB error: {}", e),
+                ));
             }
             let fixed_order = match crate::symbol_rules::FixedOrderInput::from_order_fields(
                 db_order_id as u64,
@@ -1058,9 +1117,7 @@ async fn handle_client_message(
                 now_ns,
             ) {
                 Ok(order) => order,
-                Err(reason) => {
-                    return Some(ws_sbe::encode_order_rejected(0, &reason))
-                }
+                Err(reason) => return Some(ws_sbe::encode_order_rejected(0, &reason)),
             };
             let engine_order = if fixed_order.is_market {
                 Order::new_market(
@@ -1115,12 +1172,15 @@ async fn handle_client_message(
                             .or_insert_with(std::collections::HashMap::new)
                             .insert(frozen_asset.to_string(), snapshot);
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                frozen_asset,
-                                snapshot.balance(),
-                                snapshot.available(),
-                                snapshot.frozen(),
-                            ), 0));
+                            let _ = tx.try_send((
+                                ws_sbe::encode_balance_update(
+                                    frozen_asset,
+                                    snapshot.balance(),
+                                    snapshot.available(),
+                                    snapshot.frozen(),
+                                ),
+                                0,
+                            ));
                         }
                     }
                     Ok(_) => {} // no-op freeze (zero amount)
@@ -1179,7 +1239,10 @@ async fn handle_client_message(
                 } else {
                     let _ = repo.release_frozen(user_id, base_asset, qty).await;
                 }
-                return Some(ws_sbe::encode_order_rejected(0, "Rejected by matching engine"));
+                return Some(ws_sbe::encode_order_rejected(
+                    0,
+                    "Rejected by matching engine",
+                ));
             }
 
             let ts = unix_now();
@@ -1252,9 +1315,15 @@ async fn handle_client_message(
                             for asset in [m_debit, m_credit] {
                                 if let Ok(acc) = repo.get_account(maker_id, asset).await {
                                     if let Some(tx) = state.user_tx.get(maker_id) {
-                                        let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                            asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                                        ), 0));
+                                        let _ = tx.try_send((
+                                            ws_sbe::encode_balance_update(
+                                                asset,
+                                                acc.balance,
+                                                acc.balance - acc.frozen,
+                                                acc.frozen,
+                                            ),
+                                            0,
+                                        ));
                                     }
                                 }
                             }
@@ -1266,9 +1335,14 @@ async fn handle_client_message(
                             .await
                             {
                                 if let Some(tx) = state.user_tx.get(maker_id) {
-                                    let _ = tx.try_send((ws_sbe::encode_position_update(
-                                        base_asset, pos.quantity, pos.entry_price,
-                                    ), 0));
+                                    let _ = tx.try_send((
+                                        ws_sbe::encode_position_update(
+                                            base_asset,
+                                            pos.quantity,
+                                            pos.entry_price,
+                                        ),
+                                        0,
+                                    ));
                                 }
                             }
                         }
@@ -1295,9 +1369,17 @@ async fn handle_client_message(
                         let ws_maker_status = maker_ws_status_from_db_status(new_status.as_str());
                         let status_byte = ws_status_to_byte(ws_maker_status);
                         if let Some(tx) = state.user_tx.get(maker_id) {
-                            let _ = tx.try_send((ws_sbe::encode_order_update(
-                                maker_order_id as u64, 0, status_byte, new_filled, fp, ts,
-                            ), 0));
+                            let _ = tx.try_send((
+                                ws_sbe::encode_order_update(
+                                    maker_order_id as u64,
+                                    0,
+                                    status_byte,
+                                    new_filled,
+                                    fp,
+                                    ts,
+                                ),
+                                0,
+                            ));
                         }
                     }
 
@@ -1345,7 +1427,11 @@ async fn handle_client_message(
 
                 let side_byte: u8 = if side == "buy" { 0 } else { 1 };
                 let _ = state.market_fanout.send_owned(ws_sbe::encode_trade(
-                    fill_price, total_filled, side_byte, ts, &symbol,
+                    fill_price,
+                    total_filled,
+                    side_byte,
+                    ts,
+                    &symbol,
                 ));
 
                 // Live ticker/kline/agg updates are produced from trade events,
@@ -1354,11 +1440,20 @@ async fn handle_client_message(
                 broadcast_depth_pub(state, &symbol);
 
                 // Push order_update + balance_update to this user's personal channel.
-                let ws_status_byte = ws_status_to_byte(ws_status_from_engine(result.status, filled_qty > 0.0));
+                let ws_status_byte =
+                    ws_status_to_byte(ws_status_from_engine(result.status, filled_qty > 0.0));
                 if let Some(tx) = state.user_tx.get(user_id) {
-                    let _ = tx.try_send((ws_sbe::encode_order_update(
-                        db_order_id as u64, 0, ws_status_byte, total_filled, fill_price, ts,
-                    ), 0));
+                    let _ = tx.try_send((
+                        ws_sbe::encode_order_update(
+                            db_order_id as u64,
+                            0,
+                            ws_status_byte,
+                            total_filled,
+                            fill_price,
+                            ts,
+                        ),
+                        0,
+                    ));
                 }
 
                 // Send balance_update so frontend can refresh balances.
@@ -1370,21 +1465,36 @@ async fn handle_client_message(
                 for asset in [debit_asset, credit_asset] {
                     if let Ok(acc) = repo.get_account(user_id, asset).await {
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                            ), 0));
+                            let _ = tx.try_send((
+                                ws_sbe::encode_balance_update(
+                                    asset,
+                                    acc.balance,
+                                    acc.balance - acc.frozen,
+                                    acc.frozen,
+                                ),
+                                0,
+                            ));
                         }
                     }
                 }
 
                 // Position update for the base asset whose holdings just changed.
                 if let Some(pos) = crate::positions::position_for_user_asset(
-                    state.db.as_ref(), user_id, base_asset,
-                ).await {
+                    state.db.as_ref(),
+                    user_id,
+                    base_asset,
+                )
+                .await
+                {
                     if let Some(tx) = state.user_tx.get(user_id) {
-                        let _ = tx.try_send((ws_sbe::encode_position_update(
-                            base_asset, pos.quantity, pos.entry_price,
-                        ), 0));
+                        let _ = tx.try_send((
+                            ws_sbe::encode_position_update(
+                                base_asset,
+                                pos.quantity,
+                                pos.entry_price,
+                            ),
+                            0,
+                        ));
                     }
                 }
             } else if result.status == OrderStatus::Accepted {
@@ -1392,9 +1502,17 @@ async fn handle_client_message(
                 // until it fills or the user cancels — releasing here would
                 // double-spend when the maker fills later.
                 if let Some(tx) = state.user_tx.get(user_id) {
-                    let _ = tx.try_send((ws_sbe::encode_order_update(
-                        db_order_id as u64, 0, ws_sbe::WS_STATUS_OPEN, 0.0, 0.0, ts,
-                    ), 0));
+                    let _ = tx.try_send((
+                        ws_sbe::encode_order_update(
+                            db_order_id as u64,
+                            0,
+                            ws_sbe::WS_STATUS_OPEN,
+                            0.0,
+                            0.0,
+                            ts,
+                        ),
+                        0,
+                    ));
                 }
                 // New resting order changes the book — push depth so the
                 // frontend reflects it without waiting for the 2s tick.
@@ -1414,18 +1532,32 @@ async fn handle_client_message(
 
                 // Notify user the order is CANCELED so frontend can drop it from openOrders.
                 if let Some(tx) = state.user_tx.get(user_id) {
-                    let _ = tx.try_send((ws_sbe::encode_order_update(
-                        db_order_id as u64, 0, ws_sbe::WS_STATUS_CANCELED, 0.0, 0.0, ts,
-                    ), 0));
+                    let _ = tx.try_send((
+                        ws_sbe::encode_order_update(
+                            db_order_id as u64,
+                            0,
+                            ws_sbe::WS_STATUS_CANCELED,
+                            0.0,
+                            0.0,
+                            ts,
+                        ),
+                        0,
+                    ));
                 }
 
                 // Refresh frontend balance for the released asset (frozen → available).
                 if rel_amount > 0.0 {
                     if let Ok(acc) = repo.get_account(user_id, rel_asset).await {
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                rel_asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                            ), 0));
+                            let _ = tx.try_send((
+                                ws_sbe::encode_balance_update(
+                                    rel_asset,
+                                    acc.balance,
+                                    acc.balance - acc.frozen,
+                                    acc.frozen,
+                                ),
+                                0,
+                            ));
                         }
                     }
                 }
@@ -1433,7 +1565,13 @@ async fn handle_client_message(
 
             let side_byte: u8 = if side == "buy" { 0 } else { 1 };
             Some(ws_sbe::encode_order_accepted(
-                db_order_id as u64, 0, price.unwrap_or(0.0), qty, side_byte, &symbol, ts,
+                db_order_id as u64,
+                0,
+                price.unwrap_or(0.0),
+                qty,
+                side_byte,
+                &symbol,
+                ts,
             ))
         }
 
@@ -1500,7 +1638,9 @@ async fn handle_client_message(
                         let cancel_req = crate::sbe::CancelOrderRequest {
                             order_id: order_id as u64,
                             participant_id: user_id as u64,
-                            response_stream_id: crate::aeron_channels::order_update_stream_for_desk(owner_desk_id),
+                            response_stream_id: crate::aeron_channels::order_update_stream_for_desk(
+                                owner_desk_id,
+                            ),
                             _pad: [0; 4],
                         };
                         let msg = CounterForwardMsg::Cancel(CounterForwardCancel::new(
@@ -1545,12 +1685,11 @@ async fn handle_client_message(
             .fetch_optional(state.db.as_ref())
             .await;
 
-            let order_row =
-                match order_row {
-                    Ok(Some(r)) => r,
-                    Ok(None) => return Some(ws_sbe::encode_error("Order not found or already closed")),
-                    Err(e) => return Some(ws_sbe::encode_error(&e.to_string())),
-                };
+            let order_row = match order_row {
+                Ok(Some(r)) => r,
+                Ok(None) => return Some(ws_sbe::encode_error("Order not found or already closed")),
+                Err(e) => return Some(ws_sbe::encode_error(&e.to_string())),
+            };
 
             use sqlx::Row;
             let symbol: String = order_row.get("symbol");
@@ -1609,18 +1748,35 @@ async fn handle_client_message(
             // Push balance_update so the frontend OrderForm reflects freed-up funds.
             for asset in [
                 released_asset,
-                if released_asset == base_asset { quote_asset } else { base_asset },
+                if released_asset == base_asset {
+                    quote_asset
+                } else {
+                    base_asset
+                },
             ] {
                 if let Ok(acc) = repo.get_account(user_id, asset).await {
                     if let Some(tx) = state.user_tx.get(user_id) {
-                        let _ = tx.try_send((ws_sbe::encode_balance_update(
-                            &acc.asset, acc.balance, acc.balance - acc.frozen, acc.frozen,
-                        ), 0));
+                        let _ = tx.try_send((
+                            ws_sbe::encode_balance_update(
+                                &acc.asset,
+                                acc.balance,
+                                acc.balance - acc.frozen,
+                                acc.frozen,
+                            ),
+                            0,
+                        ));
                     }
                 }
             }
 
-            Some(ws_sbe::encode_order_update(order_id as u64, 0, ws_sbe::WS_STATUS_CANCELED, 0.0, 0.0, unix_now()))
+            Some(ws_sbe::encode_order_update(
+                order_id as u64,
+                0,
+                ws_sbe::WS_STATUS_CANCELED,
+                0.0,
+                0.0,
+                unix_now(),
+            ))
         }
 
         ClientMsg::PlaceOrders { batch_id, orders } => {
@@ -1648,7 +1804,7 @@ async fn handle_client_message(
             // write so the engine sees the full batch before the next 10ms depth snapshot.
             if state.aeron_cmd_tx.is_some() {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
-                use crate::transport::{pack_str16, OrderMeta};
+                use crate::transport::{OrderMeta, pack_str16};
 
                 struct V {
                     order_id: u64,
@@ -1656,7 +1812,7 @@ async fn handle_client_message(
                     freeze_amount: f64,
                     initial_margin_cents: i64,
                     sbe_req: SbeNewOrder,
-                    meta: OrderMeta,  // used for pending_meta.insert on freeze success
+                    meta: OrderMeta, // used for pending_meta.insert on freeze success
                 }
 
                 // (client_order_id_num, order_id, status_byte): collected in order for encode_orders_placed
@@ -1671,7 +1827,11 @@ async fn handle_client_message(
                         .to_owned();
 
                     macro_rules! rej {
-                        ($r:expr) => {{ let _ = $r; sbe_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED)); continue; }};
+                        ($r:expr) => {{
+                            let _ = $r;
+                            sbe_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED));
+                            continue;
+                        }};
                     }
 
                     let symbol = match order_val.get("symbol").and_then(|v| v.as_str()) {
@@ -1723,7 +1883,8 @@ async fn handle_client_message(
                         rej!(format!("No engine for symbol: {}", symbol));
                     }
 
-                    let (_base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                    let (_base_asset, quote_asset) =
+                        symbol.split_once('_').unwrap_or(("BTC", "USDT"));
                     let batch_rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
 
                     let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
@@ -1733,7 +1894,12 @@ async fn handle_client_message(
                         0.0
                     };
 
-                    let batch_fixed_shape = match crate::symbol_rules::normalize_order_shape(&symbol, &order_type, price, qty) {
+                    let batch_fixed_shape = match crate::symbol_rules::normalize_order_shape(
+                        &symbol,
+                        &order_type,
+                        price,
+                        qty,
+                    ) {
                         Ok(shape) => shape,
                         Err(reason) => rej!(reason),
                     };
@@ -1754,7 +1920,10 @@ async fn handle_client_message(
                             batch_fixed_shape.quantity_lots,
                             batch_rules.notional_scale,
                         );
-                        crate::desk::risk::calc::calc_initial_margin_cents(n, batch_rules.default_leverage)
+                        crate::desk::risk::calc::calc_initial_margin_cents(
+                            n,
+                            batch_rules.default_leverage,
+                        )
                     } else {
                         0
                     };
@@ -1814,23 +1983,34 @@ async fn handle_client_message(
                 let mut aeron_batch: smallvec::SmallVec<[SbeNewOrder; 32]> =
                     smallvec::SmallVec::new();
                 for v in validated {
-                    let margin_reserved = state.risk_engine
+                    let margin_reserved = state
+                        .risk_engine
                         .check_and_reserve_margin(user_id, v.initial_margin_cents)
                         .is_ok();
-                    if margin_reserved && try_freeze_cache(
-                        &state.account_cache,
-                        user_id,
-                        &v.freeze_asset,
-                        v.freeze_amount,
-                    ) {
+                    if margin_reserved
+                        && try_freeze_cache(
+                            &state.account_cache,
+                            user_id,
+                            &v.freeze_asset,
+                            v.freeze_amount,
+                        )
+                    {
                         if let Some(user_assets) = state.account_cache.get(&user_id) {
-                            if let Some(snapshot) = user_assets.get(v.freeze_asset.as_str()).copied() {
+                            if let Some(snapshot) =
+                                user_assets.get(v.freeze_asset.as_str()).copied()
+                            {
                                 let bal = snapshot.balance();
                                 let frz = snapshot.frozen();
                                 if let Some(tx) = state.user_tx.get(user_id) {
-                                    let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                        &v.freeze_asset, bal, bal - frz, frz,
-                                    ), 0));
+                                    let _ = tx.try_send((
+                                        ws_sbe::encode_balance_update(
+                                            &v.freeze_asset,
+                                            bal,
+                                            bal - frz,
+                                            frz,
+                                        ),
+                                        0,
+                                    ));
                                 }
                             }
                         }
@@ -1840,7 +2020,9 @@ async fn handle_client_message(
                         aeron_batch.push(v.sbe_req);
                     } else {
                         if margin_reserved {
-                            state.risk_engine.release_order_margin(user_id, v.initial_margin_cents);
+                            state
+                                .risk_engine
+                                .release_order_margin(user_id, v.initial_margin_cents);
                         }
                         sbe_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED));
                     }
@@ -1855,7 +2037,9 @@ async fn handle_client_message(
                             // Bounded mpsc full → reject the whole batch.
                             // Better to refuse here than to drop silently
                             // and leave the client expecting acks.
-                            return Some(ws_sbe::encode_error("system busy — aeron command queue full"));
+                            return Some(ws_sbe::encode_error(
+                                "system busy — aeron command queue full",
+                            ));
                         }
                     }
                 }
@@ -1873,7 +2057,11 @@ async fn handle_client_message(
                     .unwrap_or("")
                     .to_owned();
                 macro_rules! sa_rej {
-                    ($r:expr) => {{ let _ = ($r, &coid); sa_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED)); continue; }};
+                    ($r:expr) => {{
+                        let _ = ($r, &coid);
+                        sa_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED));
+                        continue;
+                    }};
                 }
                 let symbol = match order_val.get("symbol").and_then(|v| v.as_str()) {
                     Some(s) => s.to_owned(),
@@ -2016,17 +2204,21 @@ async fn handle_client_message(
                 let repo = AccountRepository::new(state.db.as_ref());
                 let freeze_result = if side == "buy" {
                     let freeze_amount = freeze_price_val * qty;
-                    if freeze_amount > 0.0 {
-                        repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
-                            .await
-                    } else {
-                        Ok(AccountBalance::default())
-                    }
+                if freeze_amount > 0.0 {
+                    repo.freeze_for_buy(user_id, quote_asset, freeze_amount)
+                        .await
+                } else {
+                    Ok(AccountBalance::default())
+                }
                 } else {
                     repo.freeze_for_sell(user_id, base_asset, qty).await
                 };
 
-                let frozen_asset = if side == "buy" { quote_asset } else { base_asset };
+                let frozen_asset = if side == "buy" {
+                    quote_asset
+                } else {
+                    base_asset
+                };
                 match freeze_result {
                     Err(_e) => {
                         let _ = sqlx::query("DELETE FROM orders WHERE id=$1")
@@ -2043,12 +2235,15 @@ async fn handle_client_message(
                             .or_insert_with(std::collections::HashMap::new)
                             .insert(frozen_asset.to_string(), snapshot);
                         if let Some(tx) = state.user_tx.get(user_id) {
-                            let _ = tx.try_send((ws_sbe::encode_balance_update(
-                                frozen_asset,
-                                snapshot.balance(),
-                                snapshot.available(),
-                                snapshot.frozen(),
-                            ), 0));
+                            let _ = tx.try_send((
+                                ws_sbe::encode_balance_update(
+                                    frozen_asset,
+                                    snapshot.balance(),
+                                    snapshot.available(),
+                                    snapshot.frozen(),
+                                ),
+                                0,
+                            ));
                         }
                     }
                     Ok(_) => {}
@@ -2102,7 +2297,11 @@ async fn handle_client_message(
                     continue;
                 }
 
-                sa_results.push((db_order_id as u64, db_order_id as u64, ws_sbe::WS_STATUS_OPEN));
+                sa_results.push((
+                    db_order_id as u64,
+                    db_order_id as u64,
+                    ws_sbe::WS_STATUS_OPEN,
+                ));
             }
 
             Some(ws_sbe::encode_orders_placed(&batch_id, &sa_results))
@@ -2233,9 +2432,17 @@ async fn batch_cancel_by_ids(
             let _ = repo.release_frozen(user_id, base_asset, remaining).await;
         }
 
-        let _ = personal_tx.try_send((ws_sbe::encode_order_update(
-            order.id as u64, 0, ws_sbe::WS_STATUS_CANCELED, order.filled, 0.0, ts,
-        ), 0));
+        let _ = personal_tx.try_send((
+            ws_sbe::encode_order_update(
+                order.id as u64,
+                0,
+                ws_sbe::WS_STATUS_CANCELED,
+                order.filled,
+                0.0,
+                ts,
+            ),
+            0,
+        ));
     }
 
     count
@@ -2348,9 +2555,17 @@ async fn bulk_cancel(
         }
 
         // Push order_update to the caller's personal channel.
-        let _ = personal_tx.try_send((ws_sbe::encode_order_update(
-            order.id as u64, 0, ws_sbe::WS_STATUS_CANCELED, order.filled, 0.0, ts,
-        ), 0));
+        let _ = personal_tx.try_send((
+            ws_sbe::encode_order_update(
+                order.id as u64,
+                0,
+                ws_sbe::WS_STATUS_CANCELED,
+                order.filled,
+                0.0,
+                ts,
+            ),
+            0,
+        ));
     }
 
     count
@@ -2475,7 +2690,7 @@ pub async fn market_data_broadcaster(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_depth_json, ClientMsg};
+    use super::{ClientMsg, build_depth_json};
     use crate::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
     use serde_json::Value;
     use std::sync::Mutex;

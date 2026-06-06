@@ -2,16 +2,16 @@
 /// Serves tickers, klines, orders, trades, and account balances from PostgreSQL.
 /// No matching engine, no WebSocket, no fund mutation.
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use jsonwebtoken::{DecodingKey, Validation, decode};
 use lightning_exchange::{account_repository::AccountRepository, db, positions};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -134,12 +134,12 @@ async fn handle_klines(
 
     // Map frontend interval codes to PostgreSQL date_bin durations (whitelist).
     let bin_width = match interval {
-        "5m"  => "5 minutes",
+        "5m" => "5 minutes",
         "15m" => "15 minutes",
-        "1h"  => "1 hour",
-        "4h"  => "4 hours",
-        "1d"  => "1 day",
-        _     => "1 minute",
+        "1h" => "1 hour",
+        "4h" => "4 hours",
+        "1d" => "1 day",
+        _ => "1 minute",
     };
 
     let sql = format!(
@@ -159,10 +159,10 @@ async fn handle_klines(
     );
 
     let rows = sqlx::query(&sql)
-    .bind(&params.symbol)
-    .bind(limit)
-    .fetch_all(s.db.as_ref())
-    .await;
+        .bind(&params.symbol)
+        .bind(limit)
+        .fetch_all(s.db.as_ref())
+        .await;
 
     match rows {
         Ok(rows) => {
@@ -210,38 +210,42 @@ async fn handle_orders(
 
     // Translate frontend virtual status aliases to DB status values.
     let status_filter: Option<Vec<&str>> = match q.status.as_deref() {
-        Some("open")    => Some(vec!["PENDING", "TRADING"]),
+        Some("open") => Some(vec!["PENDING", "TRADING"]),
         Some("history") => Some(vec!["COMPLETED", "CANCELED", "REJECTED"]),
-        Some(s)         => Some(vec![s]),
-        None            => None,
+        Some(s) => Some(vec![s]),
+        None => None,
     };
 
     use lightning_exchange::models::DbOrder;
     let orders = match status_filter {
-        Some(statuses) => sqlx::query_as::<_, DbOrder>(
-            "SELECT * FROM orders
+        Some(statuses) => {
+            sqlx::query_as::<_, DbOrder>(
+                "SELECT * FROM orders
              WHERE user_id = $1
                AND ($2::text IS NULL OR symbol = $2)
                AND status = ANY($3)
              ORDER BY created_at DESC LIMIT $4",
-        )
-        .bind(user_id)
-        .bind(&q.symbol)
-        .bind(&statuses)
-        .bind(limit)
-        .fetch_all(s.db.as_ref())
-        .await,
-        None => sqlx::query_as::<_, DbOrder>(
-            "SELECT * FROM orders
+            )
+            .bind(user_id)
+            .bind(&q.symbol)
+            .bind(&statuses)
+            .bind(limit)
+            .fetch_all(s.db.as_ref())
+            .await
+        }
+        None => {
+            sqlx::query_as::<_, DbOrder>(
+                "SELECT * FROM orders
              WHERE user_id = $1
                AND ($2::text IS NULL OR symbol = $2)
              ORDER BY created_at DESC LIMIT $3",
-        )
-        .bind(user_id)
-        .bind(&q.symbol)
-        .bind(limit)
-        .fetch_all(s.db.as_ref())
-        .await,
+            )
+            .bind(user_id)
+            .bind(&q.symbol)
+            .bind(limit)
+            .fetch_all(s.db.as_ref())
+            .await
+        }
     };
 
     match orders {
@@ -265,13 +269,11 @@ async fn handle_order(
     };
 
     use lightning_exchange::models::DbOrder;
-    let row = sqlx::query_as::<_, DbOrder>(
-        "SELECT * FROM orders WHERE id = $1 AND user_id = $2",
-    )
-    .bind(order_id)
-    .bind(user_id)
-    .fetch_optional(s.db.as_ref())
-    .await;
+    let row = sqlx::query_as::<_, DbOrder>("SELECT * FROM orders WHERE id = $1 AND user_id = $2")
+        .bind(order_id)
+        .bind(user_id)
+        .fetch_optional(s.db.as_ref())
+        .await;
 
     match row {
         Ok(Some(order)) => (StatusCode::OK, Json(json!(order))).into_response(),
@@ -329,9 +331,9 @@ async fn handle_agg_trades(
 
     // Whitelist the interval — interpolated into SQL, must not be user-controlled.
     let bin_width = match interval {
-        "5s"  => "5 seconds",
+        "5s" => "5 seconds",
         "30s" => "30 seconds",
-        _     => "1 second",
+        _ => "1 second",
     };
 
     let sql = format!(
@@ -430,19 +432,17 @@ async fn handle_trades(
             let out: Vec<Value> = rows
                 .iter()
                 .map(|r| {
-                    {
-                        let price = r.get::<f64, _>("price");
-                        let quantity = r.get::<f64, _>("quantity");
-                        json!({
-                            "id": r.get::<i64, _>("id"),
-                            "symbol": r.get::<String, _>("symbol"),
-                            "price": price,
-                            "quantity": quantity,
-                            "value": price * quantity,
-                            "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
-                            "side": r.get::<String, _>("side"),
-                        })
-                    }
+                    let price = r.get::<f64, _>("price");
+                    let quantity = r.get::<f64, _>("quantity");
+                    json!({
+                        "id": r.get::<i64, _>("id"),
+                        "symbol": r.get::<String, _>("symbol"),
+                        "price": price,
+                        "quantity": quantity,
+                        "value": price * quantity,
+                        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                        "side": r.get::<String, _>("side"),
+                    })
                 })
                 .collect();
             (StatusCode::OK, Json(json!(out))).into_response()
@@ -469,12 +469,10 @@ async fn handle_symbols(State(s): State<AppState>) -> impl IntoResponse {
         Ok(v) if !v.is_empty() => v,
         _ => {
             // Fall back to order history for older deployments.
-            sqlx::query_scalar::<_, String>(
-                "SELECT DISTINCT symbol FROM orders ORDER BY symbol",
-            )
-            .fetch_all(s.db.as_ref())
-            .await
-            .unwrap_or_default()
+            sqlx::query_scalar::<_, String>("SELECT DISTINCT symbol FROM orders ORDER BY symbol")
+                .fetch_all(s.db.as_ref())
+                .await
+                .unwrap_or_default()
         }
     };
 
@@ -510,13 +508,15 @@ async fn handle_market_trades(
             use sqlx::Row;
             let out: Vec<Value> = rows
                 .iter()
-                .map(|r| json!({
-                    "id":    r.get::<i64, _>("id"),
-                    "price": r.get::<f64, _>("price"),
-                    "qty":   r.get::<f64, _>("quantity"),
-                    "side":  r.get::<String, _>("side"),
-                    "ts":    r.get::<i64, _>("ts_us"),
-                }))
+                .map(|r| {
+                    json!({
+                        "id":    r.get::<i64, _>("id"),
+                        "price": r.get::<f64, _>("price"),
+                        "qty":   r.get::<f64, _>("quantity"),
+                        "side":  r.get::<String, _>("side"),
+                        "ts":    r.get::<i64, _>("ts_us"),
+                    })
+                })
                 .collect();
             (StatusCode::OK, Json(json!(out))).into_response()
         }

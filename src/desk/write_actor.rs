@@ -8,13 +8,13 @@
 /// wakes 8 write actors instead of 20K handler tasks — 2500× fewer scheduler
 /// round-trips for the write path.
 use crate::transport::tracer::{ExchangeTracer, MS_WS_RESPONSE_SENT};
-use std::sync::Arc;
 use fastwebsockets::{Frame, OpCode, Payload, WebSocketWrite};
-use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::WriteHalf;
 use tokio::sync::mpsc;
 

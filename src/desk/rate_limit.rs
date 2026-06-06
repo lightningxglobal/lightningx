@@ -5,7 +5,6 @@
 /// - 按客户端ID限流
 /// - 支持配置每秒限额
 /// - 检查和更新配额
-
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -79,8 +78,7 @@ impl TokenBucket {
         let elapsed = (now - self.last_update) as f64;
         let tokens_to_add = elapsed * self.policy.requests_per_second as f64;
 
-        self.tokens = (self.tokens + tokens_to_add)
-            .min(self.policy.burst_capacity as f64);
+        self.tokens = (self.tokens + tokens_to_add).min(self.policy.burst_capacity as f64);
         self.last_update = now;
     }
 
@@ -126,12 +124,14 @@ impl RateLimiter {
 
     /// 检查限流（不消费令牌）
     pub fn check_limit(&mut self, client_id: &str) -> Result<(), String> {
-        let policy = self.custom_policies
+        let policy = self
+            .custom_policies
             .get(client_id)
             .copied()
             .unwrap_or(self.default_policy);
 
-        let bucket = self.buckets
+        let bucket = self
+            .buckets
             .entry(client_id.to_string())
             .or_insert_with(|| TokenBucket::new(policy));
 
@@ -149,12 +149,14 @@ impl RateLimiter {
 
     /// 消费令牌（限流）
     pub fn consume(&mut self, client_id: &str, tokens: u32) -> Result<(), String> {
-        let policy = self.custom_policies
+        let policy = self
+            .custom_policies
             .get(client_id)
             .copied()
             .unwrap_or(self.default_policy);
 
-        let bucket = self.buckets
+        let bucket = self
+            .buckets
             .entry(client_id.to_string())
             .or_insert_with(|| TokenBucket::new(policy));
 
@@ -170,12 +172,14 @@ impl RateLimiter {
 
     /// 获取客户端当前令牌数（用于监控）
     pub fn get_tokens(&mut self, client_id: &str) -> f64 {
-        let policy = self.custom_policies
+        let policy = self
+            .custom_policies
             .get(client_id)
             .copied()
             .unwrap_or(self.default_policy);
 
-        let bucket = self.buckets
+        let bucket = self
+            .buckets
             .entry(client_id.to_string())
             .or_insert_with(|| TokenBucket::new(policy));
 

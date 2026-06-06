@@ -123,6 +123,36 @@ impl AmountAtoms {
     pub fn to_f64(self) -> f64 {
         self.0 as f64 / AMOUNT_SCALE as f64
     }
+
+    /// Integer-domain product of two atom-scaled values (e.g. price × quantity
+    /// → quote cost). Computed in i128 and divided back by the scale with
+    /// round-half-up, so no float arithmetic is involved. Rejects negative
+    /// inputs: money amounts on the settle path are always non-negative.
+    pub fn checked_mul_scaled(self, rhs: AmountAtoms) -> Result<AmountAtoms> {
+        if self.0 < 0 || rhs.0 < 0 {
+            return Err(anyhow!("negative amount in scaled multiply"));
+        }
+        let wide = self.0 as i128 * rhs.0 as i128;
+        let scaled = (wide + AMOUNT_SCALE_I128 / 2) / AMOUNT_SCALE_I128;
+        if scaled > i64::MAX as i128 {
+            return Err(anyhow!("amount overflows i64 atoms"));
+        }
+        Ok(AmountAtoms(scaled as i64))
+    }
+
+    pub fn checked_add(self, rhs: AmountAtoms) -> Result<AmountAtoms> {
+        self.0
+            .checked_add(rhs.0)
+            .map(AmountAtoms)
+            .ok_or_else(|| anyhow!("amount overflows i64 atoms"))
+    }
+
+    pub fn checked_sub(self, rhs: AmountAtoms) -> Result<AmountAtoms> {
+        self.0
+            .checked_sub(rhs.0)
+            .map(AmountAtoms)
+            .ok_or_else(|| anyhow!("amount overflows i64 atoms"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -224,6 +254,64 @@ mod tests {
         let amount = AmountAtoms::from_f64_round(0.1 + 0.2).unwrap();
         assert_eq!(amount.atoms(), 30_000_000);
         assert_eq!(amount.to_decimal_string(), "0.3");
+    }
+
+    #[test]
+    fn scaled_multiply_stays_in_integer_domain() {
+        let price = AmountAtoms::from_decimal_str("75893.61").unwrap();
+        let qty = AmountAtoms::from_decimal_str("0.00123456").unwrap();
+        // 75893.61 × 0.00123456 = 93.6952151616 → round-half-up at 1e-8
+        let cost = price.checked_mul_scaled(qty).unwrap();
+        assert_eq!(cost.atoms(), 9_369_521_516);
+
+        // Values that lose precision in f64 must stay exact here.
+        let big_price = AmountAtoms::from_decimal_str("90071992.54740993").unwrap();
+        let one = AmountAtoms::from_decimal_str("1").unwrap();
+        assert_eq!(
+            big_price.checked_mul_scaled(one).unwrap().atoms(),
+            big_price.atoms()
+        );
+
+        assert!(
+            AmountAtoms::from_atoms(-1)
+                .checked_mul_scaled(one)
+                .is_err()
+        );
+        assert!(
+            AmountAtoms::from_atoms(i64::MAX)
+                .checked_mul_scaled(AmountAtoms::from_atoms(i64::MAX))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn settle_math_conserves_funds() {
+        // Conservation invariant: buyer pays cost + buy_fee, seller receives
+        // cost - sell_fee, exchange keeps buy_fee + sell_fee. Net quote delta
+        // across all three parties must be exactly zero in atoms.
+        let cases = [
+            ("75893.61", "0.00123456", "0.09369505", "0.04684753"),
+            ("0.00000001", "0.00000001", "0", "0"),
+            ("123456.789", "987.654321", "121.93", "60.96"),
+            ("1", "1", "0.001", "0.001"),
+        ];
+        for (price, qty, buy_fee, sell_fee) in cases {
+            let price = AmountAtoms::from_decimal_str(price).unwrap();
+            let qty = AmountAtoms::from_decimal_str(qty).unwrap();
+            let buy_fee = AmountAtoms::from_decimal_str(buy_fee).unwrap();
+            let sell_fee = AmountAtoms::from_decimal_str(sell_fee).unwrap();
+
+            let cost = price.checked_mul_scaled(qty).unwrap();
+            let buyer_debit = cost.checked_add(buy_fee).unwrap();
+            let seller_credit = cost.checked_sub(sell_fee).unwrap();
+            let fee_revenue = buy_fee.checked_add(sell_fee).unwrap();
+
+            assert_eq!(
+                buyer_debit.atoms(),
+                seller_credit.atoms() + fee_revenue.atoms(),
+                "quote conservation violated for price={price:?} qty={qty:?}"
+            );
+        }
     }
 
     #[test]

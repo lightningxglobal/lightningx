@@ -1,7 +1,6 @@
 pub mod engine;
 pub mod error;
 pub mod event;
-pub mod float_ext;
 pub mod list_pool;
 pub mod market_data;
 pub mod order;

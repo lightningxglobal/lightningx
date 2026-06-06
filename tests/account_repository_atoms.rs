@@ -141,3 +141,106 @@ async fn repository_freeze_release_and_settle_keep_atoms_in_sync() {
 
     cleanup(&pg, &[buyer, seller]).await;
 }
+
+#[tokio::test]
+async fn settle_trade_atoms_is_exact_and_conserves_quote() {
+    let Some(pg) = try_pg().await else {
+        eprintln!("skip: no PG");
+        return;
+    };
+    let Some(buyer) = make_user(&pg).await else {
+        eprintln!("skip: cannot make buyer");
+        return;
+    };
+    let Some(seller) = make_user(&pg).await else {
+        eprintln!("skip: cannot make seller");
+        cleanup(&pg, &[buyer]).await;
+        return;
+    };
+
+    // Price/qty chosen so the product is NOT exactly representable in f64:
+    // 75893.61 × 0.00123456 = 93.6952151616 → 9_369_521_516 atoms (half-up).
+    let price = AmountAtoms::from_decimal_str("75893.61").unwrap();
+    let qty = AmountAtoms::from_decimal_str("0.00123456").unwrap();
+    let buy_fee = AmountAtoms::from_decimal_str("0.09369522").unwrap();
+    let sell_fee = AmountAtoms::from_decimal_str("0.04684761").unwrap();
+    let cost_atoms: i64 = 9_369_521_516;
+
+    seed_account(&pg, buyer, "USDT", "1000", "0").await;
+    seed_account(&pg, seller, "BTC", "1", "0").await;
+
+    let repo = AccountRepository::new(&pg);
+    repo.freeze_atoms(
+        buyer,
+        "USDT",
+        AmountAtoms::from_atoms(cost_atoms + buy_fee.atoms()),
+    )
+    .await
+    .expect("freeze buyer quote");
+    repo.freeze_atoms(seller, "BTC", qty)
+        .await
+        .expect("freeze seller base");
+
+    repo.settle_trade_atoms(buyer, seller, "BTC", "USDT", price, qty, buy_fee, sell_fee)
+        .await
+        .expect("settle trade atoms");
+
+    let buyer_quote = account_amounts(&pg, buyer, "USDT").await;
+    let buyer_base = account_amounts(&pg, buyer, "BTC").await;
+    let seller_base = account_amounts(&pg, seller, "BTC").await;
+    let seller_quote = account_amounts(&pg, seller, "USDT").await;
+
+    // Exact atom-level expectations — no epsilon anywhere.
+    let buyer_debit = cost_atoms + buy_fee.atoms();
+    assert_eq!(buyer_quote.2, 100_000_000_000 - buyer_debit);
+    assert_eq!(buyer_quote.3, 0);
+    assert_eq!(buyer_base.2, qty.atoms());
+    assert_eq!(seller_base.2, 100_000_000 - qty.atoms());
+    assert_eq!(seller_base.3, 0);
+    assert_eq!(seller_quote.2, cost_atoms - sell_fee.atoms());
+
+    // Quote conservation: buyer's loss = seller's gain + exchange fee revenue.
+    let buyer_loss = 100_000_000_000 - buyer_quote.2;
+    let seller_gain = seller_quote.2;
+    let fee_revenue = buy_fee.atoms() + sell_fee.atoms();
+    assert_eq!(buyer_loss, seller_gain + fee_revenue);
+
+    // Base conservation: seller's loss = buyer's gain (no base-side fee).
+    assert_eq!(100_000_000 - seller_base.2, buyer_base.2);
+
+    cleanup(&pg, &[buyer, seller]).await;
+}
+
+#[tokio::test]
+async fn freeze_atoms_rejects_negative_and_over_available() {
+    let Some(pg) = try_pg().await else {
+        eprintln!("skip: no PG");
+        return;
+    };
+    let Some(user) = make_user(&pg).await else {
+        eprintln!("skip: cannot make user");
+        return;
+    };
+
+    seed_account(&pg, user, "USDT", "10", "0").await;
+    let repo = AccountRepository::new(&pg);
+
+    assert!(
+        repo.freeze_atoms(user, "USDT", AmountAtoms::from_atoms(-1))
+            .await
+            .is_err(),
+        "negative freeze must be rejected"
+    );
+    assert!(
+        repo.freeze_atoms(user, "USDT", AmountAtoms::from_decimal_str("10.00000001").unwrap())
+            .await
+            .is_err(),
+        "freeze over available must be rejected"
+    );
+    // Exactly available must succeed.
+    repo.freeze_atoms(user, "USDT", AmountAtoms::from_decimal_str("10").unwrap())
+        .await
+        .expect("freeze exactly available");
+
+    cleanup(&pg, &[user]).await;
+}

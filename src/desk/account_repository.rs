@@ -1,5 +1,11 @@
 /// Persistent account operations backed by PostgreSQL.
 /// Mirrors the in-memory AccountManager semantics with DB atomicity.
+///
+/// All monetary arithmetic happens in fixed-point atoms (i64, 1e-8). The
+/// `*_atoms` methods are the canonical API; the f64 variants are thin
+/// boundary wrappers kept for legacy callers and perform exactly one
+/// conversion at entry. Legacy float8 `balance`/`frozen` column writes are
+/// derived FROM the atom values so the two representations cannot diverge.
 use crate::desk::money::{AccountBalance, AmountAtoms};
 use crate::models::DbAccount;
 use anyhow::{Result, anyhow};
@@ -47,43 +53,39 @@ impl<'a> AccountRepository<'a> {
     }
 
     /// Freeze funds for a buy order atomically. Returns fixed-point balance after update.
+    /// Legacy f64 boundary wrapper around [`Self::freeze_atoms`].
     pub async fn freeze_for_buy(
         &self,
         user_id: i64,
         asset: &str,
         amount: f64,
     ) -> Result<AccountBalance> {
-        let amount_atoms = AmountAtoms::from_f64_round(amount)?.atoms();
-        let row: Option<(i64, i64)> = sqlx::query_as(
-            "UPDATE accounts SET
-                frozen = frozen + $1,
-                frozen_atoms = frozen_atoms + $2,
-                updated_at = NOW()
-             WHERE user_id = $3 AND asset = $4
-               AND (balance_atoms - frozen_atoms) >= $2
-             RETURNING balance_atoms, frozen_atoms",
-        )
-        .bind(amount)
-        .bind(amount_atoms)
-        .bind(user_id)
-        .bind(asset)
-        .fetch_optional(self.pool)
-        .await?;
-
-        row.map(|(balance_atoms, frozen_atoms)| {
-            AccountBalance::from_atoms(balance_atoms, frozen_atoms)
-        })
-        .ok_or_else(|| anyhow!("Insufficient {} balance to freeze {}", asset, amount))
+        self.freeze_atoms(user_id, asset, AmountAtoms::from_f64_round(amount)?)
+            .await
     }
 
     /// Freeze position for a sell order atomically. Returns fixed-point balance after update.
+    /// Legacy f64 boundary wrapper around [`Self::freeze_atoms`].
     pub async fn freeze_for_sell(
         &self,
         user_id: i64,
         asset: &str,
         qty: f64,
     ) -> Result<AccountBalance> {
-        let qty_atoms = AmountAtoms::from_f64_round(qty)?.atoms();
+        self.freeze_atoms(user_id, asset, AmountAtoms::from_f64_round(qty)?)
+            .await
+    }
+
+    /// Freeze an atom amount against available (balance - frozen) atomically.
+    pub async fn freeze_atoms(
+        &self,
+        user_id: i64,
+        asset: &str,
+        amount: AmountAtoms,
+    ) -> Result<AccountBalance> {
+        if amount.atoms() < 0 {
+            return Err(anyhow!("cannot freeze a negative amount"));
+        }
         let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
                 frozen = frozen + $1,
@@ -93,8 +95,8 @@ impl<'a> AccountRepository<'a> {
                AND (balance_atoms - frozen_atoms) >= $2
              RETURNING balance_atoms, frozen_atoms",
         )
-        .bind(qty)
-        .bind(qty_atoms)
+        .bind(amount.to_f64())
+        .bind(amount.atoms())
         .bind(user_id)
         .bind(asset)
         .fetch_optional(self.pool)
@@ -103,17 +105,37 @@ impl<'a> AccountRepository<'a> {
         row.map(|(balance_atoms, frozen_atoms)| {
             AccountBalance::from_atoms(balance_atoms, frozen_atoms)
         })
-        .ok_or_else(|| anyhow!("Insufficient {} position to freeze {}", asset, qty))
+        .ok_or_else(|| {
+            anyhow!(
+                "Insufficient {} balance to freeze {}",
+                asset,
+                amount.to_decimal_string()
+            )
+        })
     }
 
     /// Release frozen funds (on order cancel). Returns fixed-point balance after update.
+    /// Legacy f64 boundary wrapper around [`Self::release_frozen_atoms`].
     pub async fn release_frozen(
         &self,
         user_id: i64,
         asset: &str,
         amount: f64,
     ) -> Result<AccountBalance> {
-        let amount_atoms = AmountAtoms::from_f64_round(amount)?.atoms();
+        self.release_frozen_atoms(user_id, asset, AmountAtoms::from_f64_round(amount)?)
+            .await
+    }
+
+    /// Release frozen atoms (on order cancel). Clamps at zero.
+    pub async fn release_frozen_atoms(
+        &self,
+        user_id: i64,
+        asset: &str,
+        amount: AmountAtoms,
+    ) -> Result<AccountBalance> {
+        if amount.atoms() < 0 {
+            return Err(anyhow!("cannot release a negative amount"));
+        }
         let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
                 frozen = GREATEST(frozen - $1, 0),
@@ -122,8 +144,8 @@ impl<'a> AccountRepository<'a> {
              WHERE user_id = $3 AND asset = $4
              RETURNING balance_atoms, frozen_atoms",
         )
-        .bind(amount)
-        .bind(amount_atoms)
+        .bind(amount.to_f64())
+        .bind(amount.atoms())
         .bind(user_id)
         .bind(asset)
         .fetch_optional(self.pool)
@@ -137,8 +159,9 @@ impl<'a> AccountRepository<'a> {
             .unwrap_or_default())
     }
 
-    /// Settle a fill: debit quote asset from buyer, credit base asset; debit base from seller, credit quote.
-    /// All four account updates run in a single transaction.
+    /// Settle a fill. Legacy f64 boundary wrapper: converts once at entry,
+    /// then all arithmetic (cost = price × quantity, fee legs) runs in the
+    /// integer domain inside [`Self::settle_trade_atoms`].
     pub async fn settle_trade(
         &self,
         buyer_id: i64,
@@ -150,20 +173,48 @@ impl<'a> AccountRepository<'a> {
         buy_fee: f64,
         sell_fee: f64,
     ) -> Result<()> {
-        let cost = price * quantity;
-        let cost_atoms = AmountAtoms::from_f64_round(cost)?.atoms();
-        let buy_fee_atoms = AmountAtoms::from_f64_round(buy_fee)?.atoms();
-        let sell_fee_atoms = AmountAtoms::from_f64_round(sell_fee)?.atoms();
-        let quantity_atoms = AmountAtoms::from_f64_round(quantity)?.atoms();
-        let buyer_debit_atoms = cost_atoms
-            .checked_add(buy_fee_atoms)
-            .ok_or_else(|| anyhow!("buyer debit amount overflow"))?;
-        let seller_credit_atoms = cost_atoms
-            .checked_sub(sell_fee_atoms)
-            .ok_or_else(|| anyhow!("seller credit amount overflow"))?;
+        self.settle_trade_atoms(
+            buyer_id,
+            seller_id,
+            base_asset,
+            quote_asset,
+            AmountAtoms::from_f64_round(price)?,
+            AmountAtoms::from_f64_round(quantity)?,
+            AmountAtoms::from_f64_round(buy_fee)?,
+            AmountAtoms::from_f64_round(sell_fee)?,
+        )
+        .await
+    }
+
+    /// Settle a fill: debit quote asset from buyer, credit base asset; debit base
+    /// from seller, credit quote. All four account updates run in a single
+    /// transaction; cost/fee arithmetic is integer-only (i128 intermediate,
+    /// round-half-up on the price × quantity scale division).
+    ///
+    /// Quote conservation holds by construction:
+    ///   buyer_debit = cost + buy_fee = (cost - sell_fee) + (buy_fee + sell_fee)
+    ///               = seller_credit + fee_revenue.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_trade_atoms(
+        &self,
+        buyer_id: i64,
+        seller_id: i64,
+        base_asset: &str,
+        quote_asset: &str,
+        price: AmountAtoms,
+        quantity: AmountAtoms,
+        buy_fee: AmountAtoms,
+        sell_fee: AmountAtoms,
+    ) -> Result<()> {
+        let cost = price.checked_mul_scaled(quantity)?;
+        let buyer_debit = cost.checked_add(buy_fee)?;
+        let seller_credit = cost.checked_sub(sell_fee)?;
+        if seller_credit.atoms() < 0 {
+            return Err(anyhow!("sell fee exceeds trade cost"));
+        }
         let mut tx = self.pool.begin().await?;
 
-        // Buyer: deduct frozen USDT (cost + fee), credit BTC
+        // Buyer: deduct frozen quote (cost + fee), credit base
         sqlx::query(
             "UPDATE accounts SET
                 balance = balance - $1,
@@ -173,12 +224,13 @@ impl<'a> AccountRepository<'a> {
                 updated_at = NOW()
              WHERE user_id = $3 AND asset = $4",
         )
-        .bind(cost + buy_fee)
-        .bind(buyer_debit_atoms)
+        .bind(buyer_debit.to_f64())
+        .bind(buyer_debit.atoms())
         .bind(buyer_id)
         .bind(quote_asset)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| anyhow!("settle stmt-1: {e}"))?;
 
         sqlx::query(
             "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
@@ -190,12 +242,13 @@ impl<'a> AccountRepository<'a> {
         )
         .bind(buyer_id)
         .bind(base_asset)
-        .bind(quantity)
-        .bind(quantity_atoms)
+        .bind(quantity.to_f64())
+        .bind(quantity.atoms())
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| anyhow!("settle stmt-2: {e}"))?;
 
-        // Seller: deduct frozen BTC, credit USDT (proceeds - fee)
+        // Seller: deduct frozen base, credit quote (proceeds - fee)
         sqlx::query(
             "UPDATE accounts SET
                 balance = balance - $1,
@@ -205,12 +258,13 @@ impl<'a> AccountRepository<'a> {
                 updated_at = NOW()
              WHERE user_id = $3 AND asset = $4",
         )
-        .bind(quantity)
-        .bind(quantity_atoms)
+        .bind(quantity.to_f64())
+        .bind(quantity.atoms())
         .bind(seller_id)
         .bind(base_asset)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| anyhow!("settle stmt-3: {e}"))?;
 
         sqlx::query(
             "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
@@ -222,10 +276,11 @@ impl<'a> AccountRepository<'a> {
         )
         .bind(seller_id)
         .bind(quote_asset)
-        .bind(cost - sell_fee)
-        .bind(seller_credit_atoms)
+        .bind(seller_credit.to_f64())
+        .bind(seller_credit.atoms())
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| anyhow!("settle stmt-4: {e}"))?;
 
         tx.commit().await?;
         Ok(())

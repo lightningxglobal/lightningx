@@ -14,7 +14,6 @@ pub mod util;
 pub use matching::engine;
 pub use matching::error;
 pub use matching::event;
-pub use matching::float_ext;
 pub use matching::list_pool;
 pub use matching::market_data;
 pub use matching::order;

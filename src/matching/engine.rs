@@ -779,8 +779,11 @@ impl MatchingEngine {
                 let order_remaining = order.quantity_lots - filled;
                 let counter_remaining = counter_order.remaining_lots();
 
-                // Safety guard: float accumulation can leave counter_remaining as noise
-                // (e.g. 1e-17) even though is_filled() was false. Force-remove the ghost.
+                // Defensive guard: remaining_lots() is pure integer arithmetic
+                // (quantity_lots - filled_lots), so this can only trip if a bug
+                // elsewhere left filled_lots >= quantity_lots while the order is
+                // still resting in the book. Remove the inconsistent entry
+                // rather than matching against a zero/negative quantity.
                 if counter_remaining <= 0 {
                     let opp = match order.side {
                         Side::Buy => &mut self.sell_book,

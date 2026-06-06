@@ -7,10 +7,11 @@
 /// Run with:
 ///   cargo run --release --example liq_integration
 use lightning_exchange::desk::risk::{
-    calc, types::{PositionSide, RiskStatus},
-    RiskEngine,
+    RiskEngine, calc,
+    types::{PositionSide, RiskStatus},
 };
 use lightning_exchange::desk::symbol_rules::SymbolRules;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -28,9 +29,9 @@ fn print_account(label: &str, engine: &RiskEngine, user_id: i64) {
             "  [{}] equity={:.2} avail={:.2} used={:.2} order={:.2} upnl={:.2} mm={:.2} status={:?}",
             label,
             a.equity as f64 / 100.0,
-            a.available_margin as f64 / 100.0,
+            a.available_margin.load(Relaxed) as f64 / 100.0,
             a.used_margin as f64 / 100.0,
-            a.order_margin as f64 / 100.0,
+            a.order_margin.load(Relaxed) as f64 / 100.0,
             a.unrealized_pnl as f64 / 100.0,
             a.maintenance_margin as f64 / 100.0,
             a.status,
@@ -79,13 +80,29 @@ fn scenario_long_liquidation() {
     let notional = calc::calc_notional_cents(entry_ticks, qty_lots, rules.notional_scale);
     let initial_margin = calc::calc_initial_margin_cents(notional, rules.default_leverage);
 
-    println!("\n▶ Open long: 0.1 BTC @ ${:.0}, notional=${:.0}, margin=${:.2}",
-        entry_price, notional as f64 / 100.0, initial_margin as f64 / 100.0);
+    println!(
+        "\n▶ Open long: 0.1 BTC @ ${:.0}, notional=${:.0}, margin=${:.2}",
+        entry_price,
+        notional as f64 / 100.0,
+        initial_margin as f64 / 100.0
+    );
 
     let t_open = Instant::now();
-    engine.check_and_reserve_margin(user_id, initial_margin).unwrap();
-    engine.on_fill(user_id, btc, 0, entry_ticks, qty_lots, initial_margin,
-        rules.notional_scale, rules.default_leverage, rules.maintenance_rate_bps, 0);
+    engine
+        .check_and_reserve_margin(user_id, initial_margin)
+        .unwrap();
+    engine.on_fill(
+        user_id,
+        btc,
+        0,
+        entry_ticks,
+        qty_lots,
+        initial_margin,
+        rules.notional_scale,
+        rules.default_leverage,
+        rules.maintenance_rate_bps,
+        0,
+    );
     let open_ns = t_open.elapsed().as_nanos();
     print_account("after open", &engine, user_id);
     print_position("after open", &engine, user_id, btc);
@@ -109,8 +126,11 @@ fn scenario_long_liquidation() {
     }
     let mark_ns = t_mark.elapsed().as_nanos();
     let mark_ticks = engine.mark_prices.get(&btc).map(|v| *v).unwrap_or(0);
-    println!("\n▶ Mark price driven to ${:.2} after {} EWMA iterations",
-        mark_ticks as f64 * rules.price_tick, iters);
+    println!(
+        "\n▶ Mark price driven to ${:.2} after {} EWMA iterations",
+        mark_ticks as f64 * rules.price_tick,
+        iters
+    );
     print_account("after mark drop", &engine, user_id);
 
     // ── Step 3: run_risk_tick → LiquidationEvent ─────────────────────────────
@@ -118,12 +138,19 @@ fn scenario_long_liquidation() {
     let events = engine.run_risk_tick();
     let tick_ns = t_tick.elapsed().as_nanos();
 
-    assert!(!events.is_empty(), "Expected at least one liquidation event");
+    assert!(
+        !events.is_empty(),
+        "Expected at least one liquidation event"
+    );
     let evt = &events[0];
     println!("\n▶ run_risk_tick emitted {} event(s):", events.len());
-    println!("  user_id={} qty_lots={} liq_price_ticks={} (${:.2})",
-        evt.user_id, evt.qty_lots, evt.liq_price_ticks,
-        evt.liq_price_ticks as f64 * rules.price_tick);
+    println!(
+        "  user_id={} qty_lots={} liq_price_ticks={} (${:.2})",
+        evt.user_id,
+        evt.qty_lots,
+        evt.liq_price_ticks,
+        evt.liq_price_ticks as f64 * rules.price_tick
+    );
     print_account("after tick", &engine, user_id);
 
     // Simulate tick task setting account to Liquidating
@@ -137,13 +164,26 @@ fn scenario_long_liquidation() {
     let fill_price = 44_000.0f64;
     let fill_ticks = (fill_price / rules.price_tick).round() as i64;
 
-    println!("\n▶ Liq fill: sell {} lots @ ${:.0}  (user settled at liq_price ${:.2})",
-        evt.qty_lots, fill_price, evt.liq_price_ticks as f64 * rules.price_tick);
+    println!(
+        "\n▶ Liq fill: sell {} lots @ ${:.0}  (user settled at liq_price ${:.2})",
+        evt.qty_lots,
+        fill_price,
+        evt.liq_price_ticks as f64 * rules.price_tick
+    );
 
     let t_fill = Instant::now();
-    engine.on_fill(user_id, btc, 1, fill_ticks, evt.qty_lots, 0,
-        rules.notional_scale, rules.default_leverage, rules.maintenance_rate_bps,
-        evt.liq_price_ticks);
+    engine.on_fill(
+        user_id,
+        btc,
+        1,
+        fill_ticks,
+        evt.qty_lots,
+        0,
+        rules.notional_scale,
+        rules.default_leverage,
+        rules.maintenance_rate_bps,
+        evt.liq_price_ticks,
+    );
     let fill_ns = t_fill.elapsed().as_nanos();
 
     print_account("after liq fill", &engine, user_id);
@@ -154,26 +194,36 @@ fn scenario_long_liquidation() {
 
     // Expected: exchange pockets (fill - liq) × qty / scale on a sell close
     // = (4_400_000 - liq_ticks) × qty_lots / scale  [sell sign = +1]
-    let expected_ins = ((fill_ticks - evt.liq_price_ticks) as i128
-        * qty_lots as i128 / rules.notional_scale as i128) as i64;
+    let expected_ins = ((fill_ticks - evt.liq_price_ticks) as i128 * qty_lots as i128
+        / rules.notional_scale as i128) as i64;
     println!("  Expected: ${:.2}", expected_ins as f64 / 100.0);
 
     // ── Step 5: status should be Normal so next tick re-evaluates ────────────
     let final_status = engine.accounts.get(&user_id).unwrap().status;
     println!("\n▶ Final account status: {:?}", final_status);
-    assert_eq!(final_status, RiskStatus::Normal, "Account should reset to Normal after liq close");
+    assert_eq!(
+        final_status,
+        RiskStatus::Normal,
+        "Account should reset to Normal after liq close"
+    );
 
     // ── Latency report ────────────────────────────────────────────────────────
     println!("\n┌─────────────────────────────────────────────────┐");
     println!("│  Latency report — Scenario 1                    │");
     println!("├──────────────────────────────┬──────────────────┤");
     println!("│  on_fill (open position)     │ {:>10} ns     │", open_ns);
-    println!("│  {} × update_mark_price     │ {:>10} ns     │", iters, mark_ns);
+    println!(
+        "│  {} × update_mark_price     │ {:>10} ns     │",
+        iters, mark_ns
+    );
     println!("│  run_risk_tick               │ {:>10} ns     │", tick_ns);
     println!("│  on_fill (liq close)         │ {:>10} ns     │", fill_ns);
     println!("├──────────────────────────────┼──────────────────┤");
     let total_liq_path = tick_ns + fill_ns;
-    println!("│  tick → fill (hot path)      │ {:>10} ns     │", total_liq_path);
+    println!(
+        "│  tick → fill (hot path)      │ {:>10} ns     │",
+        total_liq_path
+    );
     println!("└──────────────────────────────┴──────────────────┘");
 
     println!("  ✓ Scenario 1 PASSED");
@@ -200,18 +250,42 @@ fn scenario_multi_symbol_upnl() {
     let btc_qty = btc_rules.quantity_to_lots(0.1).unwrap();
     let btc_notional = calc::calc_notional_cents(btc_ticks, btc_qty, btc_rules.notional_scale);
     let btc_margin = calc::calc_initial_margin_cents(btc_notional, btc_rules.default_leverage);
-    engine.check_and_reserve_margin(user_id, btc_margin).unwrap();
-    engine.on_fill(user_id, btc, 0, btc_ticks, btc_qty, btc_margin,
-        btc_rules.notional_scale, btc_rules.default_leverage, btc_rules.maintenance_rate_bps, 0);
+    engine
+        .check_and_reserve_margin(user_id, btc_margin)
+        .unwrap();
+    engine.on_fill(
+        user_id,
+        btc,
+        0,
+        btc_ticks,
+        btc_qty,
+        btc_margin,
+        btc_rules.notional_scale,
+        btc_rules.default_leverage,
+        btc_rules.maintenance_rate_bps,
+        0,
+    );
 
     // Open ETH long
     let eth_ticks = (3_000.0 / eth_rules.price_tick).round() as i64;
     let eth_qty = eth_rules.quantity_to_lots(1.0).unwrap();
     let eth_notional = calc::calc_notional_cents(eth_ticks, eth_qty, eth_rules.notional_scale);
     let eth_margin = calc::calc_initial_margin_cents(eth_notional, eth_rules.default_leverage);
-    engine.check_and_reserve_margin(user_id, eth_margin).unwrap();
-    engine.on_fill(user_id, eth, 0, eth_ticks, eth_qty, eth_margin,
-        eth_rules.notional_scale, eth_rules.default_leverage, eth_rules.maintenance_rate_bps, 0);
+    engine
+        .check_and_reserve_margin(user_id, eth_margin)
+        .unwrap();
+    engine.on_fill(
+        user_id,
+        eth,
+        0,
+        eth_ticks,
+        eth_qty,
+        eth_margin,
+        eth_rules.notional_scale,
+        eth_rules.default_leverage,
+        eth_rules.maintenance_rate_bps,
+        0,
+    );
 
     // Move BTC up +$1,000
     let btc_new = (51_000.0 / btc_rules.price_tick).round() as i64;
@@ -225,12 +299,16 @@ fn scenario_multi_symbol_upnl() {
     // BTC upnl = (51000 - 50000) × 0.1 = $100
     // ETH upnl = (3100 - 3000) × 1 = $100 → total = $200
     let total_upnl_cents = acct.unrealized_pnl;
-    println!("\n  BTC +$1000 + ETH +$100 → account unrealized PnL = ${:.2}",
-        total_upnl_cents as f64 / 100.0);
+    println!(
+        "\n  BTC +$1000 + ETH +$100 → account unrealized PnL = ${:.2}",
+        total_upnl_cents as f64 / 100.0
+    );
 
     // The exact upnl depends on EWMA convergence but must be positive and non-zero
-    assert!(total_upnl_cents > 0,
-        "Both positions are profitable — total upnl must be positive (C2 regression check)");
+    assert!(
+        total_upnl_cents > 0,
+        "Both positions are profitable — total upnl must be positive (C2 regression check)"
+    );
     println!("  ✓ Multi-symbol PnL accumulates correctly (C2 not regressed)");
 
     println!("  ✓ Scenario 2 PASSED");
@@ -256,29 +334,66 @@ fn scenario_flip_accounting() {
     let notional = calc::calc_notional_cents(price_ticks, qty_lots, rules.notional_scale);
     let margin = calc::calc_initial_margin_cents(notional, rules.default_leverage);
     engine.check_and_reserve_margin(user_id, margin).unwrap();
-    engine.on_fill(user_id, btc, 0, price_ticks, qty_lots, margin,
-        rules.notional_scale, rules.default_leverage, rules.maintenance_rate_bps, 0);
+    engine.on_fill(
+        user_id,
+        btc,
+        0,
+        price_ticks,
+        qty_lots,
+        margin,
+        rules.notional_scale,
+        rules.default_leverage,
+        rules.maintenance_rate_bps,
+        0,
+    );
 
     // Flip: sell 0.2 BTC (closes 0.1 long + opens 0.1 short)
     let flip_qty = rules.quantity_to_lots(0.2).unwrap();
     let flip_notional = calc::calc_notional_cents(price_ticks, flip_qty, rules.notional_scale);
     let flip_margin = calc::calc_initial_margin_cents(flip_notional, rules.default_leverage);
-    engine.check_and_reserve_margin(user_id, flip_margin).unwrap();
-    engine.on_fill(user_id, btc, 1, price_ticks, flip_qty, flip_margin,
-        rules.notional_scale, rules.default_leverage, rules.maintenance_rate_bps, 0);
+    engine
+        .check_and_reserve_margin(user_id, flip_margin)
+        .unwrap();
+    engine.on_fill(
+        user_id,
+        btc,
+        1,
+        price_ticks,
+        flip_qty,
+        flip_margin,
+        rules.notional_scale,
+        rules.default_leverage,
+        rules.maintenance_rate_bps,
+        0,
+    );
 
     let acct = engine.accounts.get(&user_id).unwrap();
     let pos = engine.positions.get(&(user_id, btc)).unwrap();
 
-    println!("\n  After flip: pos.side={:?} qty={} used_margin={}",
-        pos.side, pos.qty_lots, acct.used_margin);
+    println!(
+        "\n  After flip: pos.side={:?} qty={} used_margin={}",
+        pos.side, pos.qty_lots, acct.used_margin
+    );
 
     // The new short position has qty=0.1, so used_margin should equal one lot's margin
     // (not double-charged)
-    assert_eq!(pos.side, PositionSide::Short, "New position should be Short");
-    assert!(acct.used_margin > 0, "used_margin must be > 0 (new short has margin)");
-    assert!(acct.order_margin == 0, "order_margin should be 0 after fill completes");
-    assert!(acct.used_margin < flip_margin, "used_margin must be < flip_margin (only half opened)");
+    assert_eq!(
+        pos.side,
+        PositionSide::Short,
+        "New position should be Short"
+    );
+    assert!(
+        acct.used_margin > 0,
+        "used_margin must be > 0 (new short has margin)"
+    );
+    assert!(
+        acct.order_margin.load(Relaxed) == 0,
+        "order_margin should be 0 after fill completes"
+    );
+    assert!(
+        acct.used_margin < flip_margin,
+        "used_margin must be < flip_margin (only half opened)"
+    );
 
     println!("  ✓ Flip accounting correct (C1 not regressed)");
     println!("  ✓ Scenario 3 PASSED");
@@ -302,8 +417,15 @@ fn scenario_rejected_liq() {
 
     // run_risk_tick should NOT emit new events for Liquidating accounts
     let events = engine.run_risk_tick();
-    println!("\n  run_risk_tick on Liquidating account emits {} events (expected 0)", events.len());
-    assert_eq!(events.len(), 0, "Liquidating accounts must not generate duplicate events");
+    println!(
+        "\n  run_risk_tick on Liquidating account emits {} events (expected 0)",
+        events.len()
+    );
+    assert_eq!(
+        events.len(),
+        0,
+        "Liquidating accounts must not generate duplicate events"
+    );
 
     // Simulate: liq order REJECTED → desk-server should reset to LiquidationPending
     // (In the real system this happens in desk_server.rs REJECTED handler.
@@ -316,8 +438,11 @@ fn scenario_rejected_liq() {
 
     let status = engine.accounts.get(&user_id).unwrap().status;
     println!("  After simulated REJECTED: status = {:?}", status);
-    assert_eq!(status, RiskStatus::LiquidationPending,
-        "Account must be LiquidationPending so next tick can retry");
+    assert_eq!(
+        status,
+        RiskStatus::LiquidationPending,
+        "Account must be LiquidationPending so next tick can retry"
+    );
 
     println!("  ✓ Scenario 4 PASSED");
 }
@@ -332,8 +457,14 @@ fn scenario_zero_leverage() {
     // Should not panic
     let margin = calc::calc_initial_margin_cents(100_000, 0);
     let liq = calc::calc_liquidation_price_ticks(5_000_000, 0, 50, PositionSide::Long);
-    println!("\n  calc_initial_margin_cents(100000, 0) = {} (expected 0)", margin);
-    println!("  calc_liquidation_price_ticks(5M, 0, 50, Long) = {} (expected 0)", liq);
+    println!(
+        "\n  calc_initial_margin_cents(100000, 0) = {} (expected 0)",
+        margin
+    );
+    println!(
+        "  calc_liquidation_price_ticks(5M, 0, 50, Long) = {} (expected 0)",
+        liq
+    );
     assert_eq!(margin, 0);
     assert_eq!(liq, 0);
 
@@ -360,13 +491,26 @@ fn scenario_pass3_cas() {
     let notional = calc::calc_notional_cents(price_ticks, qty_lots, rules.notional_scale);
     let margin = calc::calc_initial_margin_cents(notional, rules.default_leverage);
     engine.check_and_reserve_margin(user_id, margin).unwrap();
-    engine.on_fill(user_id, btc, 0, price_ticks, qty_lots, margin,
-        rules.notional_scale, rules.default_leverage, rules.maintenance_rate_bps, 0);
+    engine.on_fill(
+        user_id,
+        btc,
+        0,
+        price_ticks,
+        qty_lots,
+        margin,
+        rules.notional_scale,
+        rules.default_leverage,
+        rules.maintenance_rate_bps,
+        0,
+    );
 
     // Force LiquidationPending via equity manipulation
     if let Some(mut acct) = engine.accounts.get_mut(&user_id) {
         acct.unrealized_pnl = -(acct.equity - acct.maintenance_margin + 1);
-        acct.equity = acct.available_margin + acct.order_margin + acct.used_margin + acct.unrealized_pnl;
+        acct.equity = acct.available_margin.load(Relaxed)
+            + acct.order_margin.load(Relaxed)
+            + acct.used_margin
+            + acct.unrealized_pnl;
     }
 
     // Pass 1 should compute old_status = Normal, new_status = LiquidationPending
@@ -386,7 +530,10 @@ fn scenario_pass3_cas() {
     let _ = engine.run_risk_tick();
 
     let status = engine.accounts.get(&user_id).unwrap().status;
-    println!("\n  After liq tick + second risk tick: status = {:?}", status);
+    println!(
+        "\n  After liq tick + second risk tick: status = {:?}",
+        status
+    );
     println!("  (Liquidating should be preserved by CAS guard)");
     // If C3 bug were present, the second tick would overwrite Liquidating with Normal/MarginCall
     // The exact outcome depends on current equity, but Liquidating must not be erased
@@ -413,7 +560,10 @@ fn main() {
 
     let total_ms = t_total.elapsed().as_millis();
     println!("\n╔═══════════════════════════════════════════════════════════════╗");
-    println!("║  ALL SCENARIOS PASSED  ·  total wall time: {}ms{}║",
-        total_ms, " ".repeat(21usize.saturating_sub(total_ms.to_string().len())));
+    println!(
+        "║  ALL SCENARIOS PASSED  ·  total wall time: {}ms{}║",
+        total_ms,
+        " ".repeat(21usize.saturating_sub(total_ms.to_string().len()))
+    );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 }

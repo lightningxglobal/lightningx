@@ -194,6 +194,11 @@ struct RiskAccountRow {
 
 #[derive(Default)]
 pub struct PgWriteBatch {
+    /// At most ONE funding settlement per batch, and it must be the only
+    /// margin-relevant content: the caller flushes the running batch
+    /// BEFORE pushing a FundingSettled frame so the settlement sees
+    /// exactly the positions as of its sequence point (S3.3 ordering).
+    pending_funding: Option<crate::transport::persist_event::FundingSettledPayload>,
     upserts: Vec<UpsertRow>,
     deletes: Vec<i64>,
     fills: Vec<FillRow>,
@@ -274,6 +279,10 @@ impl PgWriteBatch {
             + self.accounts.len()
             + self.trades.len()
             + self.matching_events.len()
+            + self.position_ops.len()
+            + self.risk_accounts.len()
+            + usize::from(self.insurance_fund_atoms.is_some())
+            + usize::from(self.pending_funding.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -424,6 +433,20 @@ impl PgWriteBatch {
                         order_margin_atoms: p.order_margin_atoms,
                         status,
                     });
+                    true
+                }
+                None => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    false
+                }
+            },
+            Some(PersistKind::FundingSettled) => match frame.as_funding_settled() {
+                Some(p) => {
+                    // The caller (pg-writer main loop) guarantees batch
+                    // isolation; a second funding in one batch is a bug.
+                    debug_assert!(self.pending_funding.is_none());
+                    self.pending_funding = Some(p);
                     true
                 }
                 None => {
@@ -747,6 +770,9 @@ impl PgWriteBatch {
             .await?;
             total += 1;
         }
+        if let Some(f) = self.pending_funding.take() {
+            total += apply_funding_settlement(&mut tx, &f).await?;
+        }
         if !self.pending_max_seq.is_empty() {
             flush_checkpoints(&mut tx, &self.pending_max_seq).await?;
         }
@@ -769,6 +795,7 @@ impl PgWriteBatch {
         self.position_ops.clear();
         self.risk_accounts.clear();
         self.insurance_fund_atoms = None;
+        self.pending_funding = None;
 
         Ok(total)
     }
@@ -962,6 +989,116 @@ async fn flush_fills(conn: &mut PgConnection, rows: &[FillRow]) -> anyhow::Resul
     .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)
+}
+
+/// Whether the batch holds a funding settlement (callers flush before
+/// AND after pushing one — see PgWriteBatch::pending_funding ordering).
+impl PgWriteBatch {
+    pub fn has_pending_funding(&self) -> bool {
+        self.pending_funding.is_some()
+    }
+}
+
+/// S3.3: apply one funding settlement inside the flush transaction.
+/// Reads the symbol's positions (as of this transaction = exactly the
+/// frames applied before this one), derives every delta through the
+/// SAME funding::compute_settlement the desk mirrors in memory, then:
+/// account deltas, truncation residue → insurance fund, history row,
+/// schedule advance. All-or-nothing with the checkpoint floor.
+async fn apply_funding_settlement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    f: &crate::transport::persist_event::FundingSettledPayload,
+) -> anyhow::Result<usize> {
+    use crate::desk::funding::compute_settlement;
+    use crate::desk::risk::PositionSide;
+    let symbol = crate::transport::persist_event::unpack_str(&f.symbol).to_string();
+
+    let rows: Vec<(i64, String, i64)> = sqlx::query_as(
+        "SELECT user_id, side, qty_lots FROM positions WHERE symbol = $1",
+    )
+    .bind(&symbol)
+    .fetch_all(&mut **tx)
+    .await?;
+    let positions = rows.iter().filter_map(|(uid, side, qty)| {
+        let side = match side.as_str() {
+            "long" => PositionSide::Long,
+            "short" => PositionSide::Short,
+            _ => return None,
+        };
+        Some((*uid, side, *qty))
+    });
+    let (rate, mark, scale) = (f.rate_e9, f.mark_price_ticks, f.notional_scale);
+    let settlement = compute_settlement(positions, mark, scale, rate);
+
+    let mut total = 0usize;
+    if !settlement.deltas.is_empty() {
+        let users: Vec<i64> = settlement.deltas.iter().map(|d| d.user_id).collect();
+        let deltas: Vec<i64> = settlement.deltas.iter().map(|d| d.equity_delta_atoms).collect();
+        let res = sqlx::query(
+            r#"
+            UPDATE risk_accounts r
+               SET equity_atoms = r.equity_atoms + d.delta,
+                   updated_at = NOW()
+              FROM UNNEST($1::bigint[], $2::bigint[]) AS d(user_id, delta)
+             WHERE r.user_id = d.user_id
+            "#,
+        )
+        .bind(&users)
+        .bind(&deltas)
+        .execute(&mut **tx)
+        .await?;
+        anyhow::ensure!(
+            res.rows_affected() as usize == settlement.deltas.len(),
+            "funding settlement touched {} accounts but {} have rows —              a position without a risk_accounts row breaks conservation",
+            res.rows_affected(),
+            settlement.deltas.len()
+        );
+        total += res.rows_affected() as usize;
+    }
+    if settlement.residue_atoms != 0 {
+        sqlx::query(
+            "UPDATE insurance_fund SET balance_atoms = balance_atoms + $1, updated_at = NOW()
+              WHERE id = 1",
+        )
+        .bind(settlement.residue_atoms)
+        .execute(&mut **tx)
+        .await?;
+        total += 1;
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO funding_history
+            (symbol, rate_e9, mark_price_ticks, settled_at,
+             long_paid_atoms, short_received_atoms, fund_residue_atoms)
+        VALUES ($1, $2, $3, to_timestamp($4::double precision / 1000.0), $5, $6, $7)
+        "#,
+    )
+    .bind(&symbol)
+    .bind(f.rate_e9)
+    .bind(f.mark_price_ticks)
+    .bind(f.settled_at_ms)
+    .bind(settlement.long_paid_atoms)
+    .bind(settlement.short_received_atoms)
+    .bind(settlement.residue_atoms)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO funding_state (symbol, next_settlement_at, last_rate_e9, updated_at)
+        VALUES ($1, to_timestamp($2::double precision / 1000.0), $3, NOW())
+        ON CONFLICT (symbol) DO UPDATE SET
+            next_settlement_at = EXCLUDED.next_settlement_at,
+            last_rate_e9 = EXCLUDED.last_rate_e9,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&symbol)
+    .bind(f.next_settlement_at_ms)
+    .bind(f.rate_e9)
+    .execute(&mut **tx)
+    .await?;
+    total += 2;
+    Ok(total)
 }
 
 /// Apply position ops in batch. Keep-last-by-(user,symbol) dedup first:

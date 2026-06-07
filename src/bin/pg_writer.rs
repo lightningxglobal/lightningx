@@ -277,7 +277,33 @@ async fn main() -> anyhow::Result<()> {
         // Drain frames from the bridge queue.
         while let Some(frame) = queue.pop() {
             did_work = true;
+            // S3.3 ordering: a funding settlement must see exactly the
+            // positions as of its sequence point — flush everything
+            // before it, give it its own batch/transaction, then flush
+            // immediately so later fills can't slip underneath it.
+            let is_funding = frame.kind()
+                == Some(lightning_exchange::transport::persist_event::PersistKind::FundingSettled);
+            if is_funding && batch.len() > 0 {
+                match flush_now(&pg, &mut batch).await {
+                    Ok(n) => {
+                        total_applied += n as u64;
+                        total_flushes += 1;
+                        last_flush = Instant::now();
+                    }
+                    Err(e) => tracing::error!("flush before funding failed: {e}"),
+                }
+            }
             let _ = batch.push(&frame);
+            if is_funding {
+                match flush_now(&pg, &mut batch).await {
+                    Ok(n) => {
+                        total_applied += n as u64;
+                        total_flushes += 1;
+                        last_flush = Instant::now();
+                    }
+                    Err(e) => tracing::error!("funding settlement flush failed: {e}"),
+                }
+            }
             if batch.len() >= max_batch {
                 match flush_now(&pg, &mut batch).await {
                     Ok(n) => {

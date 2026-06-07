@@ -46,6 +46,12 @@ pub enum PersistKind {
     RiskAccountSet = 9,
     /// Insurance-fund balance absolute (the single global row).
     InsuranceFundSet = 10,
+    /// One funding-period settlement for a symbol. pg-writer applies the
+    /// WHOLE settlement (account deltas from the positions table, residue
+    /// → fund, history row, schedule advance) inside its flush
+    /// transaction — single-frame atomicity, exactly-once via the seq
+    /// floor (S3.3).
+    FundingSettled = 11,
 }
 
 impl PersistKind {
@@ -61,6 +67,7 @@ impl PersistKind {
             8 => Some(Self::PositionDelete),
             9 => Some(Self::RiskAccountSet),
             10 => Some(Self::InsuranceFundSet),
+            11 => Some(Self::FundingSettled),
             _ => None,
         }
     }
@@ -194,6 +201,23 @@ pub struct InsuranceFundSetPayload {
     pub balance_atoms: i64,
 }
 
+/// One funding settlement (S3.3). The desk's in-memory apply and
+/// pg-writer's durable apply both derive every account delta from this
+/// frame + the position set at this frame's sequence point, through the
+/// SAME funding::compute_settlement function. 48 bytes.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct FundingSettledPayload {
+    pub symbol: [u8; 16], // null-padded
+    pub rate_e9: i64,
+    pub mark_price_ticks: i64,
+    pub notional_scale: i64,
+    pub settled_at_ms: i64,
+    /// Next period boundary, decided by the desk (schedule owner);
+    /// pg-writer just writes it into funding_state.
+    pub next_settlement_at_ms: i64,
+}
+
 /// Largest payload size. Anything new must fit here or the union grows.
 pub const MAX_PAYLOAD: usize = 136;
 
@@ -209,6 +233,7 @@ const _: () = {
     assert!(size_of::<PositionDeletePayload>() <= MAX_PAYLOAD);
     assert!(size_of::<RiskAccountSetPayload>() <= MAX_PAYLOAD);
     assert!(size_of::<InsuranceFundSetPayload>() <= MAX_PAYLOAD);
+    assert!(size_of::<FundingSettledPayload>() <= MAX_PAYLOAD);
 };
 
 #[repr(C, packed)]
@@ -458,6 +483,28 @@ impl PersistFrame {
         }
         Some(unsafe {
             std::ptr::read_unaligned(self.payload.as_ptr() as *const RiskAccountSetPayload)
+        })
+    }
+
+    pub fn funding_settled(p: FundingSettledPayload) -> Self {
+        let mut f = Self::zero();
+        f.kind = PersistKind::FundingSettled as u8;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &p as *const _ as *const u8,
+                size_of::<FundingSettledPayload>(),
+            )
+        };
+        f.payload[..bytes.len()].copy_from_slice(bytes);
+        f
+    }
+
+    pub fn as_funding_settled(&self) -> Option<FundingSettledPayload> {
+        if self.kind() != Some(PersistKind::FundingSettled) {
+            return None;
+        }
+        Some(unsafe {
+            std::ptr::read_unaligned(self.payload.as_ptr() as *const FundingSettledPayload)
         })
     }
 

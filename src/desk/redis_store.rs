@@ -170,7 +170,8 @@ pub async fn apply_frame(
         Some(PersistKind::PositionUpsert)
         | Some(PersistKind::PositionDelete)
         | Some(PersistKind::RiskAccountSet)
-        | Some(PersistKind::InsuranceFundSet) => {
+        | Some(PersistKind::InsuranceFundSet)
+        | Some(PersistKind::FundingSettled) => {
             // Swap margin state lives in PG only (S1): the desk hydrates it
             // straight from PG on startup, so an L1 copy would just be a
             // second thing to reconcile. pg-writer owns these frames.

@@ -632,9 +632,47 @@ fn spawn_symbol_thread(
                 if replay_sub.is_none() {
                     if let Some(rec) = journal_pending.pop_front() {
                         let replayer = journal_replayer.as_mut().expect("replayer");
-                        match replayer
-                            .replay_bounded(&rec, &orders_channel(), journal_replay_stream)
-                        {
+                        // Hand-off boundary: if this recording's session is
+                        // STILL ACTIVE, the live subscription also receives
+                        // its frames from the image's join position onward.
+                        // Replay must stop AT the join position — replaying
+                        // to max-recorded would apply the overlap twice
+                        // (caught by the Gate-2 engine chaos drill). Wait
+                        // for the session's image to join so the boundary
+                        // is known; on timeout (publication vanished since
+                        // listing) fall back to a full replay — nothing
+                        // live overlaps a dead publication.
+                        let upper = if rec.stopped_at_ms().is_none() {
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            let mut join = None;
+                            while join.is_none() && std::time::Instant::now() < deadline {
+                                client.do_work();
+                                join = subscriber
+                                    .image_joins()
+                                    .into_iter()
+                                    .find(|(s, _)| *s == rec.session_id)
+                                    .map(|(_, pos)| pos);
+                                if join.is_none() {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                            }
+                            if join.is_none() {
+                                tracing::warn!(
+                                    "[{}] journal: active recording {} session {} never joined live — full replay",
+                                    symbol, rec.recording_id, rec.session_id
+                                );
+                            }
+                            join
+                        } else {
+                            None
+                        };
+                        match replayer.replay_bounded_to(
+                            &rec,
+                            upper,
+                            &orders_channel(),
+                            journal_replay_stream,
+                        ) {
                             Ok(Some(r)) => {
                                 tracing::info!(
                                     "[{}] journal: replaying recording {} ({} bytes)",

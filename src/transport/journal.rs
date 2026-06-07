@@ -208,10 +208,30 @@ impl JournalReplayer {
         replay_channel: &str,
         replay_stream_id: i32,
     ) -> Result<Option<JournalReplay>, String> {
-        let bounded_to = self
+        self.replay_bounded_to(recording, None, replay_channel, replay_stream_id)
+    }
+
+    /// Like [`Self::replay_bounded`], but with an explicit upper bound.
+    ///
+    /// `upper` is the live-image JOIN POSITION of the same session: frames
+    /// recorded at/after it are delivered by the live subscription, so
+    /// replaying past it would apply them TWICE (the bug the Gate-2 engine
+    /// drill caught). `None` keeps the max-recorded bound (correct for
+    /// recordings whose publication is gone — nothing live overlaps).
+    pub fn replay_bounded_to(
+        &mut self,
+        recording: &RecordingSummary,
+        upper: Option<i64>,
+        replay_channel: &str,
+        replay_stream_id: i32,
+    ) -> Result<Option<JournalReplay>, String> {
+        let mut bounded_to = self
             .archive
             .max_recorded_position(recording.recording_id)
             .map_err(|e| format!("max recorded position: {e}"))?;
+        if let Some(upper) = upper {
+            bounded_to = bounded_to.min(upper);
+        }
         if bounded_to <= recording.start_position {
             return Ok(None);
         }

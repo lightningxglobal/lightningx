@@ -127,6 +127,7 @@ pub struct AeronOrderSubscriber {
     client: Arc<AeronClient>,
     image_live: Arc<std::sync::atomic::AtomicI64>,
     image_ever: Arc<AtomicU64>,
+    image_joins: Arc<Mutex<Vec<(i32, i64)>>>,
 }
 
 impl AeronOrderSubscriber {
@@ -135,6 +136,7 @@ impl AeronOrderSubscriber {
         let dropped = Arc::new(AtomicU64::new(0));
         let live = Arc::new(std::sync::atomic::AtomicI64::new(0));
         let ever = Arc::new(AtomicU64::new(0));
+        let joins: Arc<Mutex<Vec<(i32, i64)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let subscriber = client
             .add_subscription(
@@ -148,6 +150,7 @@ impl AeronOrderSubscriber {
                 ImageTracker {
                     live: live.clone(),
                     ever: ever.clone(),
+                    joins: joins.clone(),
                 },
             )
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
@@ -168,6 +171,7 @@ impl AeronOrderSubscriber {
             client,
             image_live: live,
             image_ever: ever,
+            image_joins: joins,
         })
     }
 
@@ -175,6 +179,12 @@ impl AeronOrderSubscriber {
     pub fn replay_image_closed(&self) -> bool {
         self.image_ever.load(Ordering::Relaxed) > 0
             && self.image_live.load(Ordering::Relaxed) <= 0
+    }
+
+    /// (session_id, join_position) of every live image seen so far — the
+    /// per-session replay upper bound (see ImageTracker docs).
+    pub fn image_joins(&self) -> Vec<(i32, i64)> {
+        self.image_joins.lock().clone()
     }
 
     pub fn dropped_messages(&self) -> u64 {
@@ -988,6 +998,7 @@ pub struct PersistSubscriber {
     client: Arc<AeronClient>,
     image_live: Arc<std::sync::atomic::AtomicI64>,
     image_ever: Arc<AtomicU64>,
+    image_joins: Arc<Mutex<Vec<(i32, i64)>>>,
 }
 
 /// Lifecycle hook counting live images. A bounded archive replay closes its
@@ -997,12 +1008,24 @@ pub struct PersistSubscriber {
 pub struct ImageTracker {
     live: Arc<std::sync::atomic::AtomicI64>,
     ever: Arc<AtomicU64>,
+    /// session_id → join position of every image seen on this
+    /// subscription. The journal replay boundary: frames recorded BEFORE a
+    /// session's join position must come from replay, frames at/after it
+    /// arrive via the live image — no overlap, no gap.
+    joins: Arc<Mutex<Vec<(i32, i64)>>>,
 }
 
 impl aeron_wrapper::LifecycleCallbacks for ImageTracker {
-    fn on_image_available(&mut self, _image: *mut aeron_wrapper::bindings::aeron::aeron_image_t) {
+    fn on_image_available(&mut self, image: *mut aeron_wrapper::bindings::aeron::aeron_image_t) {
         self.live.fetch_add(1, Ordering::Relaxed);
         self.ever.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            let mut c: aeron_wrapper::bindings::aeron::aeron_image_constants_t =
+                std::mem::zeroed();
+            if aeron_wrapper::bindings::aeron::aeron_image_constants(image, &mut c) == 0 {
+                self.joins.lock().push((c.session_id, c.join_position));
+            }
+        }
     }
     fn on_image_unavailable(
         &mut self,
@@ -1018,6 +1041,7 @@ impl PersistSubscriber {
         let dropped = Arc::new(AtomicU64::new(0));
         let live = Arc::new(std::sync::atomic::AtomicI64::new(0));
         let ever = Arc::new(AtomicU64::new(0));
+        let joins: Arc<Mutex<Vec<(i32, i64)>>> = Arc::new(Mutex::new(Vec::new()));
         let subscriber = client
             .add_subscription(
                 channel,
@@ -1030,6 +1054,7 @@ impl PersistSubscriber {
                 ImageTracker {
                     live: live.clone(),
                     ever: ever.clone(),
+                    joins: joins.clone(),
                 },
             )
             .map_err(|e| format!("Failed to add persist subscription: {:?}", e))?;
@@ -1042,7 +1067,13 @@ impl PersistSubscriber {
             client,
             image_live: live,
             image_ever: ever,
+            image_joins: joins,
         })
+    }
+
+    /// (session_id, join_position) of every live image seen (see ImageTracker).
+    pub fn image_joins(&self) -> Vec<(i32, i64)> {
+        self.image_joins.lock().clone()
     }
 
     /// Bounded-replay completion: an image appeared and every image is gone

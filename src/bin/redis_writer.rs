@@ -120,6 +120,78 @@ async fn main() -> anyhow::Result<()> {
         PERSIST_CHANNEL, PERSIST_STREAM
     );
 
+    // Journal catch-up (same contract as pg-writer): when
+    // EXCHANGE_ARCHIVE_CONTROL is set, replay every recording of the
+    // persist stream BEFORE going live — frames missed while this writer
+    // was down (or dropped by its ring) are re-delivered; the floor below
+    // dedups what was already applied. The live subscription above was
+    // created first, so frames arriving during the replay wait in its
+    // image buffer (gap-free hand-off). This thread drives the client's
+    // conductor — archive threading contract satisfied.
+    if let Some(cfg) = lightning_exchange::transport::journal::archive_config_from_env() {
+        use lightning_exchange::transport::journal::{JournalReplayer, PERSIST_REPLAY_STREAM};
+        // A dedicated replay stream id per consumer would let pg-writer and
+        // redis-writer catch up simultaneously; +1 keeps them disjoint.
+        let replay_stream = PERSIST_REPLAY_STREAM + 1;
+        let mut replayer = JournalReplayer::connect(&aeron, &cfg)
+            .map_err(|e| anyhow::anyhow!("journal replay requested but connect failed: {e}"))?;
+        let recordings = replayer
+            .recordings("ipc", PERSIST_STREAM)
+            .map_err(|e| anyhow::anyhow!("list journal recordings: {e}"))?;
+        info!("journal: {} recording(s) to replay", recordings.len());
+        // Pre-load floors so replayed duplicates are skipped on apply.
+        let pre_floors: std::collections::HashMap<u16, u64> =
+            redis_store::load_persist_floors(&mut conn).await.unwrap_or_default();
+        let mut catchup_floors = pre_floors.clone();
+        for rec in &recordings {
+            let Some(replay) = replayer
+                .replay_bounded(rec, PERSIST_CHANNEL, replay_stream)
+                .map_err(|e| anyhow::anyhow!("start journal replay: {e}"))?
+            else {
+                continue;
+            };
+            let mut replay_sub =
+                PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, replay_stream)
+                    .map_err(anyhow::Error::msg)
+                    .context("create replay subscriber")?;
+            let mut replayed = 0u64;
+            loop {
+                aeron.do_work();
+                replay_sub.do_work();
+                let mut got = false;
+                while let Some(frame) = replay_sub.poll() {
+                    got = true;
+                    let publisher_id: u16 = frame.publisher_id;
+                    let seq: u64 = frame.seq;
+                    if seq != 0 && seq <= catchup_floors.get(&publisher_id).copied().unwrap_or(0)
+                    {
+                        continue; // already applied in a previous life
+                    }
+                    if redis_store::apply_frame(&mut conn, &frame).await.is_ok() {
+                        replayed += 1;
+                        if seq != 0 {
+                            catchup_floors.insert(publisher_id, seq);
+                        }
+                    }
+                }
+                if !got {
+                    if replay_sub.replay_image_closed() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            info!(
+                "journal: recording {} replayed {} frame(s)",
+                replay.recording_id, replayed
+            );
+        }
+        if let Err(e) = redis_store::store_persist_floors(&mut conn, &catchup_floors).await {
+            tracing::warn!("journal: floor persist after catch-up failed: {e}");
+        }
+        info!("journal: catch-up complete, switching to live stream");
+    }
+
     // Per-publisher checkpoint floors, persisted in Redis. Frames at or
     // below the floor are duplicates (replay/restart) and are skipped.
     // Redis apply is idempotent HSETs, so at-least-once checkpointing

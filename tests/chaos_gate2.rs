@@ -99,6 +99,7 @@ async fn killed_writers_lose_nothing_and_double_nothing() {
         .unwrap_or(6);
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
 
     // ── Publisher thread: record + stream all frames, paced ──────────────
     let published = Arc::new(AtomicU64::new(0));

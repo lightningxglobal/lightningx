@@ -225,6 +225,7 @@ async fn both_writers_killed_pg_redis_journal_agree() {
         .unwrap_or(8);
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
 
     // Frame kind per seq (mutually exclusive priority: position > risk >
     // account > trade) and expected last-write values per user.

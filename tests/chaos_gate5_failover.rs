@@ -89,6 +89,7 @@ async fn standby_takes_over_within_rto_and_preserves_state() {
     };
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
 
     // Everything below runs on a blocking thread: Aeron polling + archive
     // contract + process control are synchronous.

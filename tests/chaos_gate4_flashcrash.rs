@@ -80,6 +80,7 @@ async fn flash_crash_trips_breaker_cancel_only_then_recovers() {
     };
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
 
     tokio::task::spawn_blocking(move || {
         let client = wait_for("media driver", Duration::from_secs(20), || {

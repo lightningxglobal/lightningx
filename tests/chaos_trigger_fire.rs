@@ -182,6 +182,7 @@ async fn triggers_fire_on_mark_cross_and_survive_kill9() {
     };
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
     // Clean residue on our symbol.
     for sql in [
         "DELETE FROM trigger_orders WHERE symbol = $1",
@@ -365,5 +366,26 @@ async fn triggers_fire_on_mark_cross_and_survive_kill9() {
     .await
     .expect("owner position");
     eprintln!("CHAOS-TRIG PASS: T1 fired+traded, T2 survived kill -9 and fired+traded (owner pos: {pos:?})");
+
+    // Test hygiene: drop this run's accounts so account_reconcile's
+    // top-100 hanging-frozen check isn't crowded out by drill residue.
+    let _ = sqlx::query(
+        "DELETE FROM positions WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_trig_{run}_%"))
+    .execute(&pg)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM accounts WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_trig_{run}_%"))
+    .execute(&pg)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM orders WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_trig_{run}_%"))
+    .execute(&pg)
+    .await;
     drop(desk);
 }

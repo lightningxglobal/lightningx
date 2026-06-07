@@ -186,6 +186,7 @@ async fn positions_survive_desk_kill9_and_remain_closable() {
     };
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
 
     // Residue from earlier runs of THIS suite (positions/funding rows on
     // our symbol) would distort funding totals and the orphan guard —
@@ -350,5 +351,26 @@ async fn positions_survive_desk_kill9_and_remain_closable() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     eprintln!("CHAOS-POS PASS: positions survived kill -9 and closed through the reborn desk");
+
+    // Test hygiene: drop this run's accounts so account_reconcile's
+    // top-100 hanging-frozen check isn't crowded out by drill residue.
+    let _ = sqlx::query(
+        "DELETE FROM positions WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_pos_{run}_%"))
+    .execute(&pg)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM accounts WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_pos_{run}_%"))
+    .execute(&pg)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM orders WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_pos_{run}_%"))
+    .execute(&pg)
+    .await;
     drop(desk);
 }

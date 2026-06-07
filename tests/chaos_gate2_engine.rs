@@ -92,6 +92,7 @@ async fn engine_killed_repeatedly_reconverges_to_reference_book() {
     };
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
     let kills: u32 = std::env::var("CHAOS_KILLS_ENGINE")
         .ok()
         .and_then(|s| s.parse().ok())

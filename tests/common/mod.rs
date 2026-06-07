@@ -148,3 +148,50 @@ impl Lcg {
         lo + self.next() % (hi - lo + 1)
     }
 }
+
+/// Cross-process serialization for the heavy full-topology drills: each
+/// spawns a JVM driver + engine + pg-writer + desk and needs real
+/// wall-clock timing, so running 5-6 of them concurrently (cargo runs
+/// test BINARIES in parallel) starves them and causes spurious timeouts.
+/// This flock-style guard (O_EXCL lockfile + stale-steal) lets only one
+/// heavy drill run at a time; drop releases it. Acquire AFTER the
+/// infra-availability skip checks so skipped drills don't serialize.
+pub struct DrillGuard {
+    path: std::path::PathBuf,
+}
+
+impl DrillGuard {
+    pub fn acquire() -> Self {
+        let path = std::env::temp_dir().join("lightning-heavy-drill.lock");
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path },
+                Err(_) => {
+                    // Steal a stale lock (a panicked drill that never
+                    // released): older than 5 min can't be a live drill.
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if let Ok(modified) = meta.modified() {
+                            if modified.elapsed().map(|e| e > Duration::from_secs(300)).unwrap_or(false) {
+                                let _ = std::fs::remove_file(&path);
+                                continue;
+                            }
+                        }
+                    }
+                    assert!(Instant::now() < deadline, "timed out waiting for the heavy-drill lock");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DrillGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}

@@ -157,6 +157,7 @@ async fn tiered_liquidation_survives_kill9_between_rounds() {
     };
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
+    let _drill_guard = common::DrillGuard::acquire();
     for sql in [
         "DELETE FROM positions WHERE symbol = $1",
         "DELETE FROM trigger_orders WHERE symbol = $1",
@@ -296,5 +297,26 @@ async fn tiered_liquidation_survives_kill9_between_rounds() {
     // No over-liquidation: the victim is flat, not flipped.
     assert_eq!(victim_qty(&pg, victim_uid).await, None);
     eprintln!("CHAOS-LIQ PASS: 50% tranche → kill -9 → hydrate → final tranche, flat, no double-close");
+
+    // Test hygiene: drop this run's accounts so account_reconcile's
+    // top-100 hanging-frozen check isn't crowded out by drill residue.
+    let _ = sqlx::query(
+        "DELETE FROM positions WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_liq_{run}_%"))
+    .execute(&pg)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM accounts WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_liq_{run}_%"))
+    .execute(&pg)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM orders WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_liq_{run}_%"))
+    .execute(&pg)
+    .await;
     drop(desk);
 }

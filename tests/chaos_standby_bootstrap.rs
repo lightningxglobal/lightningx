@@ -81,6 +81,7 @@ async fn fresh_machine_bootstraps_book_from_peer_archive() {
     };
     let (m1_dir, m1_ctl) = (m1.aeron_dir.clone(), m1.control_channel.clone());
     let (m2_dir, m2_ctl) = (m2.aeron_dir.clone(), m2.control_channel.clone());
+    let _drill_guard = common::DrillGuard::acquire();
 
     tokio::task::spawn_blocking(move || {
         let resp_stream = order_update_stream_for_desk(0);

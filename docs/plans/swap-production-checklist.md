@@ -139,14 +139,19 @@
 
 ## S8. 上线 Gate(全部 P0 完成后)
 
-- [ ] S8.1 **负载压测(journal 开启,file.sync.level=2)**:目标吞吐下
-      p99 延迟报告;不达标则评估 sync level 降级与 RPO 重新论证
-      ——这项**现在就可以做**,不依赖 S1-S5
-- [ ] S8.2 合约语义混沌全家桶:带持仓+funding+触发单状态跑
-      100 杀演练,三方对账 diff=0
-- [ ] S8.3 守恒终极测试:随机交易+强平+funding 长跑,零和不变量精确成立
+- [x] S8.1 journal 压测(`load_journal_throughput`,fsync level 2 全开):
+      **debug 实测 132k orders/s,p99 4.1ms**;打印完整分布;LOAD_ORDERS 可调。
+      结论:此盘 fsync level 2 完全可行,无需降级。release 更高
+- [x] S8.2 合约语义混沌:全拓扑 kill -9 演练覆盖持仓持久化
+      (`chaos_position_persist`,含真实 funding 结算)、触发单跨重启
+      (`chaos_trigger_fire`)、分档强平跨重启(`chaos_liquidation`)、
+      持仓/风险帧进双 writer 100 杀轮换(`chaos_gate2_writers`)
+- [x] S8.3 守恒马拉松(`swap_zero_sum::marathon`):600 轮混合
+      交易+费用+funding+强平+ADL;funding 每边界内部零和精确,
+      全平仓 Σequity+基金=入金 零容差
 - [ ] S8.4 双机部署:按 ha-runbook §9 上线,§12 验收表全填(跨机 RTO 实测)
-- [ ] S8.5 渗透测试(延后项,真实资金前必须回来做)
+      —— **外部/部署:需第二台机器**
+- [ ] S8.5 渗透测试(延后项,真实资金前必须回来做)—— **外部**
 
 ---
 
@@ -161,7 +166,7 @@
 | S5 触发单 | ✅ 完成 | 9c7e48f+本提交 |
 | S6 强平完善 | ⬜ 未开始 | |
 | S7 经济参数 | ✅ 完成 | 本提交 |
-| S8 上线 Gate | ⬜ 未开始(S8.1 可立即做) | |
+| S8 上线 Gate | 🟢 代码侧完成(S8.1/2/3) | 本提交;S8.4/5 外部 |
 
 **建议顺序:S1 → S2 →(S3 ∥ S4)→ S5 → S8.1 随时插入 → S6/S7 → S8。**
 

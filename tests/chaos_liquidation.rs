@@ -234,12 +234,14 @@ async fn tiered_liquidation_survives_kill9_between_rounds() {
     eprintln!("chaos-liq: victim long 1 BTC at 10x durable — squeezing");
 
     // ── Round 1: force the mark so equity ∈ (0, maintenance] ───────────
-    // equity $10k, 1 BTC long from $50k: mark $40,000.10 → uPnL ≈ −$9,999
-    // → equity ≈ $1, maintenance ≈ $200 → LiquidationPending (not
-    // Bankruptcy — that's the ADL path, unit-tested separately).
+    // equity ≈ $9,975 (10k − $25 taker fee on the 1-BTC entry), 1 BTC
+    // long from $50k. At mark M: equity = M − 40025, maintenance =
+    // 0.005·M → LiquidationPending window is M ∈ (40025, 40226]. Pick
+    // $40,150 (equity ≈ $125 ≤ maintenance ≈ $201) — NOT Bankruptcy,
+    // which would route to ADL instead of the tranche path under test.
     let mut reduced = None;
     for _ in 0..40 {
-        force_mark(&http, 40_000.10).await;
+        force_mark(&http, 40_150.0).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         match victim_qty(&pg, victim_uid).await {
             Some(q) if q < 1_000_000 => {
@@ -277,9 +279,9 @@ async fn tiered_liquidation_survives_kill9_between_rounds() {
     // price down 7% per probe until flat.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut last = after_r1;
-    let mut px = 40_000.0_f64;
+    let mut px = 40_150.0_f64;
     loop {
-        px *= 0.93;
+        px *= 0.97; // gentler walk: each tranche rescues, deeper marks finish
         force_mark(&http, px).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
         match victim_qty(&pg, victim_uid).await {

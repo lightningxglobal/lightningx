@@ -346,8 +346,22 @@ async fn both_writers_killed_pg_redis_journal_agree() {
         assert!(pgw.is_running(), "final pg-writer died");
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let floors = load_checkpoints(&pg).await.expect("floors");
-    assert_eq!(floors.get(&PUBLISHER_ID), Some(&TOTAL_FRAMES), "PG floor at last seq");
+    // The trade count converging does NOT imply the final frame flushed
+    // (the last seq may be a position/account frame in a later batch) —
+    // poll the floor instead of asserting a snapshot.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let floors = load_checkpoints(&pg).await.expect("floors");
+        if floors.get(&PUBLISHER_ID) == Some(&TOTAL_FRAMES) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PG floor never reached the last seq: {:?}",
+            floors.get(&PUBLISHER_ID)
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 
     // ── PG accounts equal the last AccountSet per user ─────────────────────
     for (&user, &expect_atoms) in &last_set {

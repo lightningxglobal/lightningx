@@ -26,7 +26,7 @@ pub struct CounterForwardOrderMeta {
     pub price: f64,
     pub qty: f64,
     pub freeze_price: f64,
-    pub initial_margin_cents: i64,
+    pub initial_margin_atoms: i64,
     pub client_order_id_len: u8,
     pub _pad2: [u8; 7],
     pub client_order_id: [u8; COUNTER_FORWARD_MAX_CLIENT_ID],
@@ -92,7 +92,7 @@ impl CounterForwardOrderMeta {
         price: Option<f64>,
         qty: f64,
         freeze_price: f64,
-        initial_margin_cents: i64,
+        initial_margin_atoms: i64,
         client_order_id: &str,
     ) -> Self {
         let (client_order_id_len, client_order_id) = pack_client_order_id(client_order_id);
@@ -105,7 +105,7 @@ impl CounterForwardOrderMeta {
             price: price.unwrap_or(0.0),
             qty,
             freeze_price,
-            initial_margin_cents,
+            initial_margin_atoms,
             client_order_id_len,
             _pad2: [0; 7],
             client_order_id,
@@ -193,7 +193,7 @@ mod tests {
         );
         assert_eq!(meta.client_order_id_string(), "client-order-1");
         assert_eq!({ meta.user_id }, 42);
-        assert_eq!({ meta.initial_margin_cents }, 65000);
+        assert_eq!({ meta.initial_margin_atoms }, 65000);
     }
 
     #[test]

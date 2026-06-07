@@ -77,8 +77,8 @@ fn scenario_long_liquidation() {
     let entry_price = 50_000.0f64;
     let entry_ticks = (entry_price / rules.price_tick).round() as i64;
     let qty_lots = rules.quantity_to_lots(0.1).unwrap();
-    let notional = calc::calc_notional_cents(entry_ticks, qty_lots, rules.notional_scale);
-    let initial_margin = calc::calc_initial_margin_cents(notional, rules.default_leverage);
+    let notional = calc::calc_notional_atoms(entry_ticks, qty_lots, rules.notional_scale);
+    let initial_margin = calc::calc_initial_margin_atoms(notional, rules.default_leverage);
 
     println!(
         "\n▶ Open long: 0.1 BTC @ ${:.0}, notional=${:.0}, margin=${:.2}",
@@ -248,8 +248,8 @@ fn scenario_multi_symbol_upnl() {
     // Open BTC long
     let btc_ticks = (50_000.0 / btc_rules.price_tick).round() as i64;
     let btc_qty = btc_rules.quantity_to_lots(0.1).unwrap();
-    let btc_notional = calc::calc_notional_cents(btc_ticks, btc_qty, btc_rules.notional_scale);
-    let btc_margin = calc::calc_initial_margin_cents(btc_notional, btc_rules.default_leverage);
+    let btc_notional = calc::calc_notional_atoms(btc_ticks, btc_qty, btc_rules.notional_scale);
+    let btc_margin = calc::calc_initial_margin_atoms(btc_notional, btc_rules.default_leverage);
     engine
         .check_and_reserve_margin(user_id, btc_margin)
         .unwrap();
@@ -269,8 +269,8 @@ fn scenario_multi_symbol_upnl() {
     // Open ETH long
     let eth_ticks = (3_000.0 / eth_rules.price_tick).round() as i64;
     let eth_qty = eth_rules.quantity_to_lots(1.0).unwrap();
-    let eth_notional = calc::calc_notional_cents(eth_ticks, eth_qty, eth_rules.notional_scale);
-    let eth_margin = calc::calc_initial_margin_cents(eth_notional, eth_rules.default_leverage);
+    let eth_notional = calc::calc_notional_atoms(eth_ticks, eth_qty, eth_rules.notional_scale);
+    let eth_margin = calc::calc_initial_margin_atoms(eth_notional, eth_rules.default_leverage);
     engine
         .check_and_reserve_margin(user_id, eth_margin)
         .unwrap();
@@ -331,8 +331,8 @@ fn scenario_flip_accounting() {
     // Open long: 0.1 BTC @ $50,000
     let price_ticks = (50_000.0 / rules.price_tick).round() as i64;
     let qty_lots = rules.quantity_to_lots(0.1).unwrap();
-    let notional = calc::calc_notional_cents(price_ticks, qty_lots, rules.notional_scale);
-    let margin = calc::calc_initial_margin_cents(notional, rules.default_leverage);
+    let notional = calc::calc_notional_atoms(price_ticks, qty_lots, rules.notional_scale);
+    let margin = calc::calc_initial_margin_atoms(notional, rules.default_leverage);
     engine.check_and_reserve_margin(user_id, margin).unwrap();
     engine.on_fill(
         user_id,
@@ -349,8 +349,8 @@ fn scenario_flip_accounting() {
 
     // Flip: sell 0.2 BTC (closes 0.1 long + opens 0.1 short)
     let flip_qty = rules.quantity_to_lots(0.2).unwrap();
-    let flip_notional = calc::calc_notional_cents(price_ticks, flip_qty, rules.notional_scale);
-    let flip_margin = calc::calc_initial_margin_cents(flip_notional, rules.default_leverage);
+    let flip_notional = calc::calc_notional_atoms(price_ticks, flip_qty, rules.notional_scale);
+    let flip_margin = calc::calc_initial_margin_atoms(flip_notional, rules.default_leverage);
     engine
         .check_and_reserve_margin(user_id, flip_margin)
         .unwrap();
@@ -455,10 +455,10 @@ fn scenario_zero_leverage() {
     println!("═══════════════════════════════════════════════════════════════");
 
     // Should not panic
-    let margin = calc::calc_initial_margin_cents(100_000, 0);
+    let margin = calc::calc_initial_margin_atoms(100_000, 0);
     let liq = calc::calc_liquidation_price_ticks(5_000_000, 0, 50, PositionSide::Long);
     println!(
-        "\n  calc_initial_margin_cents(100000, 0) = {} (expected 0)",
+        "\n  calc_initial_margin_atoms(100000, 0) = {} (expected 0)",
         margin
     );
     println!(
@@ -488,8 +488,8 @@ fn scenario_pass3_cas() {
     // Open a small long
     let price_ticks = (50_000.0 / rules.price_tick).round() as i64;
     let qty_lots = rules.quantity_to_lots(0.001).unwrap();
-    let notional = calc::calc_notional_cents(price_ticks, qty_lots, rules.notional_scale);
-    let margin = calc::calc_initial_margin_cents(notional, rules.default_leverage);
+    let notional = calc::calc_notional_atoms(price_ticks, qty_lots, rules.notional_scale);
+    let margin = calc::calc_initial_margin_atoms(notional, rules.default_leverage);
     engine.check_and_reserve_margin(user_id, margin).unwrap();
     engine.on_fill(
         user_id,

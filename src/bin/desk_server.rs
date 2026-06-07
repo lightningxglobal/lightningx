@@ -393,9 +393,9 @@ struct OrderRuntimeMeta {
     /// Non-zero for forced-liquidation orders. Passed to RiskEngine::on_fill
     /// so the user is settled at this price; spread → insurance fund.
     liq_price_ticks: i64,
-    /// Margin reserved by check_and_reserve_margin for this order (cents).
+    /// Margin reserved by check_and_reserve_margin for this order (atoms).
     /// Stored so the else/CANCELLED path (ws_meta=None) can release it.
-    initial_margin_cents: i64,
+    initial_margin_atoms: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -407,7 +407,7 @@ fn remember_runtime_order(
     quantity: f64,
     side: u8,
     symbol: [u8; 16],
-    initial_margin_cents: i64,
+    initial_margin_atoms: i64,
 ) {
     cache.insert(
         order_id,
@@ -419,7 +419,7 @@ fn remember_runtime_order(
             side,
             symbol,
             liq_price_ticks: 0,
-            initial_margin_cents,
+            initial_margin_atoms,
         },
     );
 }
@@ -494,7 +494,7 @@ fn order_meta_from_forward(
     let price = meta.price;
     let qty = meta.qty;
     let freeze_price = meta.freeze_price;
-    let initial_margin_cents = meta.initial_margin_cents;
+    let initial_margin_atoms = meta.initial_margin_atoms;
     lightning_exchange::transport::OrderMeta {
         user_id: meta.user_id,
         symbol,
@@ -504,7 +504,7 @@ fn order_meta_from_forward(
         qty,
         client_order_id: meta.client_order_id_string(),
         freeze_price,
-        initial_margin_cents,
+        initial_margin_atoms,
         liq_price_ticks: 0,
     }
 }
@@ -1034,12 +1034,12 @@ fn process_db_cmd(
                     continue;
                 }
                 let maker_side = 1 - e.side; // opposite of the taker
-                let notional = lightning_exchange::desk::risk::calc::calc_notional_cents(
+                let notional = lightning_exchange::desk::risk::calc::calc_notional_atoms(
                     fp_ticks,
                     fq_lots,
                     rules.notional_scale,
                 );
-                let fill_margin = lightning_exchange::desk::risk::calc::calc_initial_margin_cents(
+                let fill_margin = lightning_exchange::desk::risk::calc::calc_initial_margin_atoms(
                     notional,
                     rules.default_leverage,
                 );
@@ -1481,7 +1481,7 @@ async fn async_main() -> anyhow::Result<()> {
                     side: side_byte,
                     symbol: sym_bytes,
                     liq_price_ticks: 0,
-                    initial_margin_cents: 0, // pre-existing open orders: margin state unknown after restart
+                    initial_margin_atoms: 0, // pre-existing open orders: margin state unknown after restart
                 },
             );
         }
@@ -1811,12 +1811,13 @@ async fn async_main() -> anyhow::Result<()> {
     let risk_engine = lightning_exchange::desk::risk::RiskEngine::new();
     for entry in account_cache.iter() {
         let user_id = *entry.key();
-        let usdt_cents = entry
+        // S2: the risk engine speaks atoms — seed the ledger value verbatim.
+        let usdt_atoms = entry
             .value()
             .get("USDT")
-            .map(|amount| (amount.balance_atoms + 500_000) / 1_000_000)
+            .map(|amount| amount.balance_atoms)
             .unwrap_or(0);
-        risk_engine.initialize_account(user_id, usdt_cents);
+        risk_engine.initialize_account(user_id, usdt_atoms);
     }
     tracing::info!(
         "Risk engine initialized ({} accounts)",
@@ -1847,7 +1848,7 @@ async fn async_main() -> anyhow::Result<()> {
             "Risk engine hydrated: {} accounts, {} positions, insurance fund {} cents",
             stats.accounts,
             stats.positions,
-            stats.insurance_fund_cents
+            stats.insurance_fund_atoms
         ),
         Err(e) => panic!("risk hydrate failed — refusing to trade blind: {e}"),
     }
@@ -2094,8 +2095,8 @@ async fn async_main() -> anyhow::Result<()> {
                                     .unwrap_or("")
                                     .trim_end_matches('\0');
                                 let (_, quote_asset) = sym.split_once('_').unwrap_or(("BTC", "USDT"));
-                                let initial_margin_cents = meta.initial_margin_cents;
-                                let margin_usdt = initial_margin_cents as f64 / 100.0;
+                                let initial_margin_atoms = meta.initial_margin_atoms;
+                                let margin_usdt = initial_margin_atoms as f64 / 100.0;
                                 let mut reject = |reason: &str| {
                                     if let Some(frame) = CounterForwardWsFrame::new(
                                         user_id,
@@ -2133,12 +2134,12 @@ async fn async_main() -> anyhow::Result<()> {
                                     reject(reason);
                                     continue;
                                 }
-                                if let Err(reason) = risk_engine_send.check_and_reserve_margin(user_id, initial_margin_cents) {
+                                if let Err(reason) = risk_engine_send.check_and_reserve_margin(user_id, initial_margin_atoms) {
                                     reject(reason);
                                     continue;
                                 }
                                 if !try_freeze_cache(&account_cache_send, user_id, quote_asset, margin_usdt) {
-                                    risk_engine_send.release_order_margin(user_id, initial_margin_cents);
+                                    risk_engine_send.release_order_margin(user_id, initial_margin_atoms);
                                     reject("Insufficient balance");
                                     continue;
                                 }
@@ -2150,7 +2151,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     meta.qty,
                                     req.side,
                                     symbol,
-                                    initial_margin_cents,
+                                    initial_margin_atoms,
                                 );
                                 pending_meta.insert(order_id, order_meta_from_forward(meta));
                                 forward_origin_send.insert(order_id, ingress_desk_id);
@@ -2159,7 +2160,7 @@ async fn async_main() -> anyhow::Result<()> {
                                         pending_meta.remove(&order_id);
                                         forward_origin_send.remove(&order_id);
                                         remove_runtime_order(&order_meta_cache, order_id, order_id);
-                                        risk_engine_send.release_order_margin(user_id, initial_margin_cents);
+                                        risk_engine_send.release_order_margin(user_id, initial_margin_atoms);
                                         release_cache_frozen(&account_cache_send, user_id, quote_asset, margin_usdt);
                                         log_counter_forward_publish_failure(
                                             &counter_forward_publish_failures,
@@ -2171,7 +2172,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     pending_meta.remove(&order_id);
                                     forward_origin_send.remove(&order_id);
                                     remove_runtime_order(&order_meta_cache, order_id, order_id);
-                                    risk_engine_send.release_order_margin(user_id, initial_margin_cents);
+                                    risk_engine_send.release_order_margin(user_id, initial_margin_atoms);
                                     release_cache_frozen(&account_cache_send, user_id, quote_asset, margin_usdt);
                                     reject(&format!("No engine for symbol: {}", sym));
                                 }
@@ -2857,7 +2858,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     meta_ref.qty,
                                     meta_ref.side,
                                     meta_ref.symbol,
-                                    meta_ref.initial_margin_cents,
+                                    meta_ref.initial_margin_atoms,
                                 );
                                 // remember_runtime_order always zeros liq_price_ticks;
                                 // restore it so on_fill settles the user at the correct price.
@@ -2879,7 +2880,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 filled: 0.0,
                                 side: m.side,
                                 symbol: m.symbol,
-                                initial_margin_cents: m.initial_margin_cents,
+                                initial_margin_atoms: m.initial_margin_atoms,
                                 liq_price_ticks: m.liq_price_ticks,
                             })
                             .or_else(|| runtime_meta(&order_meta_cache, order_id))
@@ -3007,20 +3008,20 @@ async fn async_main() -> anyhow::Result<()> {
                                 // Revert account_cache and risk_engine; no DB write needed.
                                 let symbol = unpack_str16(&meta.symbol).unwrap_or("BTC_USDT");
                                 let (_, quote) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
-                                let rel_amount = if meta.initial_margin_cents > 0 {
-                                    meta.initial_margin_cents as f64 / 100.0
+                                let rel_amount = if meta.initial_margin_atoms > 0 {
+                                    meta.initial_margin_atoms as f64 / 100.0
                                 } else if meta.side == 0 {
                                     meta.freeze_price * meta.qty
                                 } else {
                                     meta.qty
                                 };
-                                let asset = if meta.side == 0 || meta.initial_margin_cents > 0 {
+                                let asset = if meta.side == 0 || meta.initial_margin_atoms > 0 {
                                     quote
                                 } else {
                                     symbol.split_once('_').map(|(b, _)| b).unwrap_or("BTC")
                                 };
-                                if meta.initial_margin_cents > 0 {
-                                    risk_engine.release_order_margin(meta.user_id, meta.initial_margin_cents);
+                                if meta.initial_margin_atoms > 0 {
+                                    risk_engine.release_order_margin(meta.user_id, meta.initial_margin_atoms);
                                 }
                                 // If this was a liquidation order that got rejected,
                                 // unblock the account so run_risk_tick can retry.
@@ -3047,8 +3048,8 @@ async fn async_main() -> anyhow::Result<()> {
                                     }
                                 }
                             } else if kind == order_update_kind::CANCELLED {
-                                if meta.initial_margin_cents > 0 {
-                                    risk_engine.release_order_margin(meta.user_id, meta.initial_margin_cents);
+                                if meta.initial_margin_atoms > 0 {
+                                    risk_engine.release_order_margin(meta.user_id, meta.initial_margin_atoms);
                                 }
                                 process_db_cmd(DbCmd::ReleaseReservation {
                                     user_id: meta.user_id,
@@ -3077,8 +3078,8 @@ async fn async_main() -> anyhow::Result<()> {
                                 // This path handles GTC ACCEPTED→CANCELLED: pending_meta
                                 // was consumed on ACCEPTED so ws_meta is None above.
                                 if let Some(m) = runtime_meta(&order_meta_cache, order_id) {
-                                    if m.initial_margin_cents > 0 {
-                                        risk_engine.release_order_margin(m.user_id, m.initial_margin_cents);
+                                    if m.initial_margin_atoms > 0 {
+                                        risk_engine.release_order_margin(m.user_id, m.initial_margin_atoms);
                                     }
                                 }
                                 let entry = runtime_meta(&order_meta_cache, order_id)
@@ -3251,7 +3252,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 let fq_lots = rules.quantity_to_lots(fill_qty).unwrap_or(0);
                                 if fq_lots > 0 {
                                     let notional =
-                                        lightning_exchange::desk::risk::calc::calc_notional_cents(
+                                        lightning_exchange::desk::risk::calc::calc_notional_atoms(
                                             fp_ticks, fq_lots, rules.notional_scale,
                                         );
                                     // Liquidation orders have no reserved order_margin (the close
@@ -3265,7 +3266,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     let fill_margin = if meta.liq_price_ticks != 0 {
                                         0
                                     } else {
-                                        lightning_exchange::desk::risk::calc::calc_initial_margin_cents(
+                                        lightning_exchange::desk::risk::calc::calc_initial_margin_atoms(
                                             notional, rules.default_leverage,
                                         )
                                     };
@@ -3439,7 +3440,7 @@ async fn async_main() -> anyhow::Result<()> {
                     // Notional and margin for fill accounting on the close.
                     let mark_ticks = risk_engine_tick.mark_price_ticks(&evt.symbol).unwrap_or(0);
                     let notional = if mark_ticks > 0 {
-                        lightning_exchange::desk::risk::calc::calc_notional_cents(
+                        lightning_exchange::desk::risk::calc::calc_notional_atoms(
                             mark_ticks,
                             evt.qty_lots,
                             rules.notional_scale,
@@ -3447,8 +3448,8 @@ async fn async_main() -> anyhow::Result<()> {
                     } else {
                         0
                     };
-                    let margin_cents =
-                        lightning_exchange::desk::risk::calc::calc_initial_margin_cents(
+                    let margin_atoms =
+                        lightning_exchange::desk::risk::calc::calc_initial_margin_atoms(
                             notional,
                             rules.default_leverage,
                         );
@@ -3467,7 +3468,7 @@ async fn async_main() -> anyhow::Result<()> {
                             qty: rules.lots_to_quantity(evt.qty_lots),
                             client_order_id: format!("liq-{}", order_id),
                             freeze_price: 0.0,
-                            initial_margin_cents: margin_cents,
+                            initial_margin_atoms: margin_atoms,
                             liq_price_ticks: evt.liq_price_ticks,
                         },
                     );

@@ -853,21 +853,21 @@ async fn handle_client_message(
                     (freeze_price_val / rules.price_tick).round() as i64
                 };
 
-                let initial_margin_cents = if effective_price_ticks > 0 {
-                    let notional_cents = crate::desk::risk::calc::calc_notional_cents(
+                let initial_margin_atoms = if effective_price_ticks > 0 {
+                    let notional_atoms = crate::desk::risk::calc::calc_notional_atoms(
                         effective_price_ticks,
                         fixed_shape.quantity_lots,
                         rules.notional_scale,
                     );
-                    crate::desk::risk::calc::calc_initial_margin_cents(
-                        notional_cents,
+                    crate::desk::risk::calc::calc_initial_margin_atoms(
+                        notional_atoms,
                         rules.default_leverage,
                     )
                 } else {
                     0
                 };
 
-                if initial_margin_cents <= 0 {
+                if initial_margin_atoms <= 0 {
                     return Some(ws_sbe::encode_order_rejected(
                         0,
                         "Unable to determine margin requirement",
@@ -917,7 +917,7 @@ async fn handle_client_message(
                         price,
                         qty,
                         freeze_price_val,
-                        initial_margin_cents,
+                        initial_margin_atoms,
                         &client_order_id,
                     );
                     let msg = CounterForwardMsg::NewOrder(CounterForwardNewOrder::new(
@@ -963,16 +963,16 @@ async fn handle_client_message(
                 }
                 if let Err(reason) = state
                     .risk_engine
-                    .check_and_reserve_margin(user_id, initial_margin_cents)
+                    .check_and_reserve_margin(user_id, initial_margin_atoms)
                 {
                     return Some(ws_sbe::encode_order_rejected(0, reason));
                 }
 
-                let margin_usdt = initial_margin_cents as f64 / 100.0;
+                let margin_usdt = initial_margin_atoms as f64 / 100.0;
                 if !try_freeze_cache(&state.account_cache, user_id, quote_asset, margin_usdt) {
                     state
                         .risk_engine
-                        .release_order_margin(user_id, initial_margin_cents);
+                        .release_order_margin(user_id, initial_margin_atoms);
                     return Some(ws_sbe::encode_order_rejected(0, "Insufficient balance"));
                 }
                 let (freeze_asset, freeze_amount): (&str, f64) = (quote_asset, margin_usdt);
@@ -1046,7 +1046,7 @@ async fn handle_client_message(
                         qty,
                         client_order_id: client_order_id.clone(),
                         freeze_price: freeze_price_val,
-                        initial_margin_cents,
+                        initial_margin_atoms,
                         liq_price_ticks: 0,
                     },
                 );
@@ -1059,7 +1059,7 @@ async fn handle_client_message(
                     state.pending_meta.remove(&order_id);
                     state
                         .risk_engine
-                        .release_order_margin(user_id, initial_margin_cents);
+                        .release_order_margin(user_id, initial_margin_atoms);
                     release_cache_frozen(
                         &state.account_cache,
                         user_id,
@@ -1888,7 +1888,7 @@ async fn handle_client_message(
                     order_id: u64,
                     freeze_asset: String,
                     freeze_amount: f64,
-                    initial_margin_cents: i64,
+                    initial_margin_atoms: i64,
                     sbe_req: SbeNewOrder,
                     meta: OrderMeta, // used for pending_meta.insert on freeze success
                 }
@@ -1992,13 +1992,13 @@ async fn handle_client_message(
                         (freeze_price_val / batch_rules.price_tick).round() as i64
                     };
 
-                    let batch_initial_margin_cents = if batch_price_ticks > 0 {
-                        let n = crate::desk::risk::calc::calc_notional_cents(
+                    let batch_initial_margin_atoms = if batch_price_ticks > 0 {
+                        let n = crate::desk::risk::calc::calc_notional_atoms(
                             batch_price_ticks,
                             batch_fixed_shape.quantity_lots,
                             batch_rules.notional_scale,
                         );
-                        crate::desk::risk::calc::calc_initial_margin_cents(
+                        crate::desk::risk::calc::calc_initial_margin_atoms(
                             n,
                             batch_rules.default_leverage,
                         )
@@ -2006,11 +2006,11 @@ async fn handle_client_message(
                         0
                     };
 
-                    if batch_initial_margin_cents <= 0 {
+                    if batch_initial_margin_atoms <= 0 {
                         rej!("Unable to determine margin requirement");
                     }
 
-                    let margin_usdt = batch_initial_margin_cents as f64 / 100.0;
+                    let margin_usdt = batch_initial_margin_atoms as f64 / 100.0;
 
                     let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
                     let mut sym_bytes = [0u8; 16];
@@ -2033,7 +2033,7 @@ async fn handle_client_message(
                         qty,
                         client_order_id: coid.clone(),
                         freeze_price: freeze_price_val,
-                        initial_margin_cents: batch_initial_margin_cents,
+                        initial_margin_atoms: batch_initial_margin_atoms,
                         liq_price_ticks: 0,
                     };
                     let sbe_req = SbeNewOrder {
@@ -2051,7 +2051,7 @@ async fn handle_client_message(
                         order_id,
                         freeze_asset: quote_asset.to_owned(),
                         freeze_amount: margin_usdt,
-                        initial_margin_cents: batch_initial_margin_cents,
+                        initial_margin_atoms: batch_initial_margin_atoms,
                         sbe_req,
                         meta,
                     });
@@ -2063,7 +2063,7 @@ async fn handle_client_message(
                 for v in validated {
                     let margin_reserved = state
                         .risk_engine
-                        .check_and_reserve_margin(user_id, v.initial_margin_cents)
+                        .check_and_reserve_margin(user_id, v.initial_margin_atoms)
                         .is_ok();
                     if margin_reserved
                         && try_freeze_cache(
@@ -2100,7 +2100,7 @@ async fn handle_client_message(
                         if margin_reserved {
                             state
                                 .risk_engine
-                                .release_order_margin(user_id, v.initial_margin_cents);
+                                .release_order_margin(user_id, v.initial_margin_atoms);
                         }
                         sbe_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED));
                     }

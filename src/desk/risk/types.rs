@@ -1,4 +1,5 @@
-// All monetary values in "cents" (0.01 USDT = 1 unit). Prices in ticks. Quantities in lots.
+// All monetary values in ATOMS (1e-8 USDT = 1 unit, ledger-wide since S2).
+// Prices in ticks. Quantities in lots.
 
 use std::sync::atomic::AtomicI64;
 
@@ -114,11 +115,11 @@ impl PositionSide {
 }
 
 impl AccountRiskState {
-    pub fn new(user_id: i64, usdt_balance_cents: i64) -> Self {
+    pub fn new(user_id: i64, usdt_balance_atoms: i64) -> Self {
         Self {
             user_id,
-            equity: usdt_balance_cents,
-            available_margin: AtomicI64::new(usdt_balance_cents),
+            equity: usdt_balance_atoms,
+            available_margin: AtomicI64::new(usdt_balance_atoms),
             order_margin: AtomicI64::new(0),
             used_margin: 0,
             maintenance_margin: 0,

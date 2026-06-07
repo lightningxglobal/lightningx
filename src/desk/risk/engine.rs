@@ -18,7 +18,7 @@ pub struct RiskEngine {
     pub symbol_oi_lots: DashMap<[u8; 16], AtomicI64>,
     /// Insurance fund balance in cents.  Positive = surplus absorbed from profitable
     /// liquidations; negative = fund debt from socialised losses.
-    pub insurance_fund_cents: AtomicI64,
+    pub insurance_fund_atoms: AtomicI64,
 }
 
 impl RiskEngine {
@@ -29,18 +29,18 @@ impl RiskEngine {
             mark_prices: DashMap::new(),
             symbol_position_index: DashMap::new(),
             symbol_oi_lots: DashMap::new(),
-            insurance_fund_cents: AtomicI64::new(0),
+            insurance_fund_atoms: AtomicI64::new(0),
         })
     }
 
     /// Returns the current insurance fund balance in cents.
     pub fn insurance_fund(&self) -> i64 {
-        self.insurance_fund_cents.load(Ordering::Relaxed)
+        self.insurance_fund_atoms.load(Ordering::Relaxed)
     }
 
-    pub fn initialize_account(&self, user_id: i64, usdt_balance_cents: i64) {
+    pub fn initialize_account(&self, user_id: i64, usdt_balance_atoms: i64) {
         self.accounts
-            .insert(user_id, AccountRiskState::new(user_id, usdt_balance_cents));
+            .insert(user_id, AccountRiskState::new(user_id, usdt_balance_atoms));
     }
 
     pub fn account_count(&self) -> usize {
@@ -139,7 +139,7 @@ impl RiskEngine {
     pub fn check_and_reserve_margin(
         &self,
         user_id: i64,
-        initial_margin_cents: i64,
+        initial_margin_atoms: i64,
     ) -> Result<i64, &'static str> {
         use std::sync::atomic::Ordering;
         let entry = self.accounts.get(&user_id).ok_or("Account not found")?;
@@ -148,14 +148,14 @@ impl RiskEngine {
         }
         loop {
             let cur = entry.available_margin.load(Ordering::Relaxed);
-            if cur < initial_margin_cents {
+            if cur < initial_margin_atoms {
                 return Err("Insufficient margin");
             }
             if entry
                 .available_margin
                 .compare_exchange_weak(
                     cur,
-                    cur - initial_margin_cents,
+                    cur - initial_margin_atoms,
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
@@ -163,8 +163,8 @@ impl RiskEngine {
             {
                 entry
                     .order_margin
-                    .fetch_add(initial_margin_cents, Ordering::Relaxed);
-                return Ok(initial_margin_cents);
+                    .fetch_add(initial_margin_atoms, Ordering::Relaxed);
+                return Ok(initial_margin_atoms);
             }
         }
     }
@@ -172,22 +172,22 @@ impl RiskEngine {
     /// Hot path (recv-spin): lock-free release using fetch_add/fetch_sub.
     /// Uses `accounts.get()` (shared shard read-lock) — never blocks concurrent
     /// `check_and_reserve_margin` on other users in the same shard.
-    pub fn release_order_margin(&self, user_id: i64, initial_margin_cents: i64) {
+    pub fn release_order_margin(&self, user_id: i64, initial_margin_atoms: i64) {
         use std::sync::atomic::Ordering;
         if let Some(entry) = self.accounts.get(&user_id) {
             entry
                 .available_margin
-                .fetch_add(initial_margin_cents, Ordering::Relaxed);
+                .fetch_add(initial_margin_atoms, Ordering::Relaxed);
             entry
                 .order_margin
-                .fetch_sub(initial_margin_cents, Ordering::Relaxed);
+                .fetch_sub(initial_margin_atoms, Ordering::Relaxed);
         }
     }
 
     /// Called on every FILLED or PARTIAL_FILL event.
     ///
     /// order_side: 0=buy (long), 1=sell (short) — same encoding as SBE/OrderRuntimeMeta.
-    /// fill_margin_cents: proportional initial margin for this fill (caller computes from
+    /// fill_margin_atoms: proportional initial margin for this fill (caller computes from
     ///   original order margin × fill_qty / order_qty).
     pub fn on_fill(
         &self,
@@ -196,7 +196,7 @@ impl RiskEngine {
         order_side: u8,
         fill_price_ticks: i64,
         fill_qty_lots: i64,
-        fill_margin_cents: i64,
+        fill_margin_atoms: i64,
         notional_scale: i64,
         leverage: u8,
         maintenance_rate_bps: i64,
@@ -237,7 +237,7 @@ impl RiskEngine {
                 fill_side,
                 settlement_price_ticks,
                 fill_qty_lots,
-                fill_margin_cents,
+                fill_margin_atoms,
                 notional_scale,
                 leverage,
                 maintenance_rate_bps,
@@ -279,9 +279,12 @@ impl RiskEngine {
                 // sell close (long liq): fill > liq → (fill - liq) * qty / scale > 0
                 // buy  close (short liq): liq > fill → (liq - fill) * qty / scale > 0
                 let sign: i64 = if order_side == 1 { 1 } else { -1 }; // sell=+1, buy=-1
+                // ×1e6: ticks×lots/scale yields cents; the engine books
+                // ATOMS (S2). Same convention as calc::calc_notional_atoms.
                 ((fill_price_ticks - liq_price_ticks) as i128
                     * sign as i128
                     * fill_qty_lots as i128
+                    * 1_000_000
                     / notional_scale as i128) as i64
             } else {
                 let is_liquidating = self
@@ -299,7 +302,7 @@ impl RiskEngine {
             0
         };
         if insurance_delta != 0 {
-            self.insurance_fund_cents
+            self.insurance_fund_atoms
                 .fetch_add(insurance_delta, Ordering::Relaxed);
         }
 
@@ -317,7 +320,7 @@ impl RiskEngine {
             use std::sync::atomic::Ordering::Relaxed;
             let old_om = acct.order_margin.load(Relaxed);
             acct.order_margin
-                .store((old_om - fill_margin_cents).max(0), Relaxed);
+                .store((old_om - fill_margin_atoms).max(0), Relaxed);
             if released_used_margin > 0 {
                 // Closing (or closing+flipping): release old position's used_margin and credit pnl.
                 acct.used_margin = (acct.used_margin - released_used_margin).max(0);
@@ -325,7 +328,7 @@ impl RiskEngine {
                 acct.used_margin += flip_margin;
                 let old_av = acct.available_margin.load(Relaxed);
                 acct.available_margin.store(
-                    (old_av + fill_margin_cents + released_used_margin + realized_pnl_cents
+                    (old_av + fill_margin_atoms + released_used_margin + realized_pnl_cents
                         - flip_margin)
                         .max(0),
                     Relaxed,
@@ -336,7 +339,7 @@ impl RiskEngine {
                 }
             } else {
                 // Opening: move order_margin → used_margin.
-                acct.used_margin += fill_margin_cents;
+                acct.used_margin += fill_margin_atoms;
             }
             acct.unrealized_pnl += unrealized_pnl_delta;
             acct.maintenance_margin = (acct.maintenance_margin + maintenance_margin_delta).max(0);
@@ -406,7 +409,7 @@ impl RiskEngine {
                     continue;
                 };
                 let old_upnl = pos.unrealized_pnl;
-                let new_upnl = calc::calc_unrealized_pnl_cents(
+                let new_upnl = calc::calc_unrealized_pnl_atoms(
                     pos.side,
                     pos.qty_lots,
                     pos.entry_price_ticks,
@@ -548,15 +551,15 @@ fn compute_position_update(
     fill_side: PositionSide,
     fill_price_ticks: i64,
     fill_qty_lots: i64,
-    fill_margin_cents: i64,
+    fill_margin_atoms: i64,
     notional_scale: i64,
     leverage: u8,
     maintenance_rate_bps: i64,
 ) -> (Option<PositionRiskState>, i64, i64) {
     let Some(pos) = existing else {
         // No existing position — open new.
-        let notional = calc::calc_notional_cents(fill_price_ticks, fill_qty_lots, notional_scale);
-        let maint = calc::calc_maintenance_margin_cents(notional, maintenance_rate_bps);
+        let notional = calc::calc_notional_atoms(fill_price_ticks, fill_qty_lots, notional_scale);
+        let maint = calc::calc_maintenance_margin_atoms(notional, maintenance_rate_bps);
         let liq = calc::calc_liquidation_price_ticks(
             fill_price_ticks,
             leverage,
@@ -573,7 +576,7 @@ fn compute_position_update(
                 entry_price_ticks: fill_price_ticks,
                 mark_price_ticks: fill_price_ticks,
                 unrealized_pnl: 0,
-                initial_margin: fill_margin_cents,
+                initial_margin: fill_margin_atoms,
                 maintenance_margin: maint,
                 liquidation_price_ticks: liq,
                 bankruptcy_price_ticks: bkrpt,
@@ -595,7 +598,7 @@ fn compute_position_update(
             + fill_price_ticks as i128 * fill_qty_lots as i128)
             / new_qty as i128) as i64;
         updated.qty_lots = new_qty;
-        updated.initial_margin += fill_margin_cents;
+        updated.initial_margin += fill_margin_atoms;
         refresh_risk_fields(&mut updated, notional_scale, maintenance_rate_bps);
         refresh_unrealized_pnl(&mut updated, notional_scale);
         return (Some(updated), 0, 0);
@@ -611,8 +614,10 @@ fn compute_position_update(
     if fill_qty_lots >= pos.qty_lots {
         // Close (and possibly flip).
         let close_qty = pos.qty_lots;
+        // ×1e6 → atoms (S2), matching calc::calc_unrealized_pnl_atoms.
         let realized_pnl =
             sign * (fill_price_ticks - pos.entry_price_ticks) as i128 * close_qty as i128
+                * 1_000_000
                 / notional_scale as i128;
         let released_margin = pos.initial_margin;
 
@@ -622,9 +627,9 @@ fn compute_position_update(
         }
 
         // Flipped to opposite side.
-        let flip_margin = fill_margin_cents * remaining_qty / fill_qty_lots;
-        let notional = calc::calc_notional_cents(fill_price_ticks, remaining_qty, notional_scale);
-        let maint = calc::calc_maintenance_margin_cents(notional, maintenance_rate_bps);
+        let flip_margin = fill_margin_atoms * remaining_qty / fill_qty_lots;
+        let notional = calc::calc_notional_atoms(fill_price_ticks, remaining_qty, notional_scale);
+        let maint = calc::calc_maintenance_margin_atoms(notional, maintenance_rate_bps);
         let liq = calc::calc_liquidation_price_ticks(
             fill_price_ticks,
             leverage,
@@ -653,8 +658,10 @@ fn compute_position_update(
     } else {
         // Partial close.
         let close_qty = fill_qty_lots;
+        // ×1e6 → atoms (S2), matching calc::calc_unrealized_pnl_atoms.
         let realized_pnl =
             sign * (fill_price_ticks - pos.entry_price_ticks) as i128 * close_qty as i128
+                * 1_000_000
                 / notional_scale as i128;
         let released_margin = pos.initial_margin * close_qty / pos.qty_lots;
 
@@ -672,8 +679,8 @@ fn refresh_risk_fields(
     notional_scale: i64,
     maintenance_rate_bps: i64,
 ) {
-    let notional = calc::calc_notional_cents(pos.entry_price_ticks, pos.qty_lots, notional_scale);
-    pos.maintenance_margin = calc::calc_maintenance_margin_cents(notional, maintenance_rate_bps);
+    let notional = calc::calc_notional_atoms(pos.entry_price_ticks, pos.qty_lots, notional_scale);
+    pos.maintenance_margin = calc::calc_maintenance_margin_atoms(notional, maintenance_rate_bps);
     pos.liquidation_price_ticks = calc::calc_liquidation_price_ticks(
         pos.entry_price_ticks,
         pos.leverage,
@@ -685,7 +692,7 @@ fn refresh_risk_fields(
 }
 
 fn refresh_unrealized_pnl(pos: &mut PositionRiskState, notional_scale: i64) {
-    pos.unrealized_pnl = calc::calc_unrealized_pnl_cents(
+    pos.unrealized_pnl = calc::calc_unrealized_pnl_atoms(
         pos.side,
         pos.qty_lots,
         pos.entry_price_ticks,
@@ -723,48 +730,51 @@ mod tests {
     const NOTIONAL_SCALE: i64 = 1_000_000;
     const LEVERAGE: u8 = 10;
     const MAINT_BPS: i64 = 50;
+    /// Atoms per cent — S2 moved the engine to atoms; tests keep their
+    /// historical cent-denominated economics readable by scaling with A.
+    const A: i64 = 1_000_000;
 
     #[test]
     fn initialize_account_sets_available_margin() {
-        let (engine, user_id) = make_engine_with_account(100_000);
+        let (engine, user_id) = make_engine_with_account(100_000 * A);
         let state = engine.accounts.get(&user_id).unwrap();
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(state.available_margin.load(Relaxed), 100_000);
+        assert_eq!(state.available_margin.load(Relaxed), 100_000 * A);
         assert_eq!(state.order_margin.load(Relaxed), 0);
         assert_eq!(state.used_margin, 0);
-        assert_eq!(state.equity, 100_000);
+        assert_eq!(state.equity, 100_000 * A);
     }
 
     #[test]
     fn reserve_margin_succeeds_when_sufficient() {
-        let (engine, user_id) = make_engine_with_account(100_000);
-        let result = engine.check_and_reserve_margin(user_id, 10_000);
-        assert_eq!(result, Ok(10_000));
+        let (engine, user_id) = make_engine_with_account(100_000 * A);
+        let result = engine.check_and_reserve_margin(user_id, 10_000 * A);
+        assert_eq!(result, Ok(10_000 * A));
         let state = engine.accounts.get(&user_id).unwrap();
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(state.available_margin.load(Relaxed), 90_000);
-        assert_eq!(state.order_margin.load(Relaxed), 10_000);
+        assert_eq!(state.available_margin.load(Relaxed), 90_000 * A);
+        assert_eq!(state.order_margin.load(Relaxed), 10_000 * A);
     }
 
     #[test]
     fn reserve_margin_fails_when_insufficient() {
-        let (engine, user_id) = make_engine_with_account(5_000);
-        let result = engine.check_and_reserve_margin(user_id, 10_000);
+        let (engine, user_id) = make_engine_with_account(5_000 * A);
+        let result = engine.check_and_reserve_margin(user_id, 10_000 * A);
         assert!(result.is_err());
         let state = engine.accounts.get(&user_id).unwrap();
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(state.available_margin.load(Relaxed), 5_000);
+        assert_eq!(state.available_margin.load(Relaxed), 5_000 * A);
         assert_eq!(state.order_margin.load(Relaxed), 0);
     }
 
     #[test]
     fn release_restores_available_margin() {
-        let (engine, user_id) = make_engine_with_account(100_000);
-        engine.check_and_reserve_margin(user_id, 10_000).unwrap();
-        engine.release_order_margin(user_id, 10_000);
+        let (engine, user_id) = make_engine_with_account(100_000 * A);
+        engine.check_and_reserve_margin(user_id, 10_000 * A).unwrap();
+        engine.release_order_margin(user_id, 10_000 * A);
         let state = engine.accounts.get(&user_id).unwrap();
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(state.available_margin.load(Relaxed), 100_000);
+        assert_eq!(state.available_margin.load(Relaxed), 100_000 * A);
         assert_eq!(state.order_margin.load(Relaxed), 0);
     }
 
@@ -773,7 +783,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let engine = RiskEngine::new();
         let user_id = 7i64;
-        engine.initialize_account(user_id, 15_000);
+        engine.initialize_account(user_id, 15_000 * A);
         let engine = Arc::new(engine);
         let success = Arc::new(AtomicUsize::new(0));
         let failure = Arc::new(AtomicUsize::new(0));
@@ -782,7 +792,7 @@ mod tests {
                 let e = engine.clone();
                 let s = success.clone();
                 let f = failure.clone();
-                std::thread::spawn(move || match e.check_and_reserve_margin(user_id, 10_000) {
+                std::thread::spawn(move || match e.check_and_reserve_margin(user_id, 10_000 * A) {
                     Ok(_) => s.fetch_add(1, Ordering::Relaxed),
                     Err(_) => f.fetch_add(1, Ordering::Relaxed),
                 })
@@ -795,19 +805,19 @@ mod tests {
         assert_eq!(failure.load(Ordering::Relaxed), 1);
         let state = engine.accounts.get(&user_id).unwrap();
         use std::sync::atomic::Ordering::Relaxed;
-        assert_eq!(state.available_margin.load(Relaxed), 5_000);
-        assert_eq!(state.order_margin.load(Relaxed), 10_000);
+        assert_eq!(state.available_margin.load(Relaxed), 5_000 * A);
+        assert_eq!(state.order_margin.load(Relaxed), 10_000 * A);
     }
 
     #[test]
     fn liquidation_pending_account_rejected() {
         let engine = RiskEngine::new();
         let user_id = 99i64;
-        engine.initialize_account(user_id, 100_000);
+        engine.initialize_account(user_id, 100_000 * A);
         if let Some(mut entry) = engine.accounts.get_mut(&user_id) {
             entry.status = RiskStatus::LiquidationPending;
         }
-        assert!(engine.check_and_reserve_margin(user_id, 1_000).is_err());
+        assert!(engine.check_and_reserve_margin(user_id, 1_000 * A).is_err());
     }
 
     // ── on_fill tests ──────────────────────────────────────────────────────────
@@ -818,28 +828,28 @@ mod tests {
     // initial_margin (10x) = 50_000 cents = $500
     const PRICE_TICKS: i64 = 5_000_000;
     const QTY_LOTS: i64 = 100_000;
-    const MARGIN_CENTS: i64 = 50_000;
+    const MARGIN_ATOMS: i64 = 50_000 * A;
 
-    fn setup_with_reserved(balance_cents: i64) -> (Arc<RiskEngine>, i64) {
-        let (engine, uid) = make_engine_with_account(balance_cents);
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+    fn setup_with_reserved(balance_atoms: i64) -> (Arc<RiskEngine>, i64) {
+        let (engine, uid) = make_engine_with_account(balance_atoms);
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         (engine, uid)
     }
 
     #[test]
     fn open_interest_tracks_position_lifecycle() {
-        let (engine, uid) = setup_with_reserved(10_000_000);
+        let (engine, uid) = setup_with_reserved(10_000_000 * A);
         let sym = btc_sym();
         assert_eq!(engine.symbol_open_interest_lots(&sym), 0);
 
         // Open long 100k lots → OI 100k.
-        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS,
+        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
             NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         assert_eq!(engine.symbol_open_interest_lots(&sym), QTY_LOTS);
 
         // Add 50k → OI 150k.
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS / 2).unwrap();
-        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS / 2, MARGIN_CENTS / 2,
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS / 2).unwrap();
+        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS / 2, MARGIN_ATOMS / 2,
             NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         assert_eq!(engine.symbol_open_interest_lots(&sym), QTY_LOTS + QTY_LOTS / 2);
 
@@ -856,7 +866,7 @@ mod tests {
 
     #[test]
     fn position_and_oi_limits_enforced_o1() {
-        let (engine, uid) = setup_with_reserved(10_000_000);
+        let (engine, uid) = setup_with_reserved(10_000_000 * A);
         let sym = btc_sym();
 
         // Disabled limits always pass.
@@ -868,7 +878,7 @@ mod tests {
         assert!(engine.check_position_limit(uid, &sym, 101, 100).is_err());
 
         // Open 100k lots, cap 150k: 50k more ok, 50k+1 rejected.
-        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS, MARGIN_CENTS,
+        engine.on_fill(uid, sym, 0, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
             NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
         assert!(engine.check_position_limit(uid, &sym, QTY_LOTS / 2, QTY_LOTS + QTY_LOTS / 2).is_ok());
         assert!(engine.check_position_limit(uid, &sym, QTY_LOTS / 2 + 1, QTY_LOTS + QTY_LOTS / 2).is_err());
@@ -883,14 +893,14 @@ mod tests {
 
     #[test]
     fn on_fill_opens_long_position() {
-        let (engine, uid) = setup_with_reserved(200_000);
+        let (engine, uid) = setup_with_reserved(200_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -901,24 +911,24 @@ mod tests {
         assert_eq!(pos.qty_lots, QTY_LOTS);
         assert_eq!(pos.entry_price_ticks, PRICE_TICKS);
         assert_eq!(pos.side, PositionSide::Long);
-        assert_eq!(pos.initial_margin, MARGIN_CENTS);
+        assert_eq!(pos.initial_margin, MARGIN_ATOMS);
 
         let acct = engine.accounts.get(&uid).unwrap();
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(acct.order_margin.load(Relaxed), 0);
-        assert_eq!(acct.used_margin, MARGIN_CENTS);
+        assert_eq!(acct.used_margin, MARGIN_ATOMS);
     }
 
     #[test]
     fn on_fill_opens_short_position() {
-        let (engine, uid) = setup_with_reserved(200_000);
+        let (engine, uid) = setup_with_reserved(200_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             1,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -932,15 +942,15 @@ mod tests {
 
     #[test]
     fn on_fill_adds_to_existing_long_vwap() {
-        let (engine, uid) = make_engine_with_account(500_000);
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        let (engine, uid) = make_engine_with_account(500_000 * A);
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -949,14 +959,14 @@ mod tests {
 
         // Second fill at $55,000 for same qty
         let price2 = 5_500_000i64;
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             price2,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -967,21 +977,21 @@ mod tests {
         assert_eq!(pos.qty_lots, QTY_LOTS * 2);
         // VWAP = (5_000_000 * 100_000 + 5_500_000 * 100_000) / 200_000 = 5_250_000
         assert_eq!(pos.entry_price_ticks, 5_250_000);
-        assert_eq!(pos.initial_margin, MARGIN_CENTS * 2);
+        assert_eq!(pos.initial_margin, MARGIN_ATOMS * 2);
     }
 
     #[test]
     fn on_fill_closes_long_fully_releases_margin_and_credits_pnl() {
-        let (engine, uid) = make_engine_with_account(500_000);
+        let (engine, uid) = make_engine_with_account(500_000 * A);
         // Open long at $50,000
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -990,14 +1000,14 @@ mod tests {
 
         // Close at $55,000: profit = ($55,000 - $50,000) * 0.1 BTC = $500 = 50_000 cents
         let close_price = 5_500_000i64;
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             1,
             close_price,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1015,20 +1025,20 @@ mod tests {
         //        on_fill: order_margin → used_margin, available unchanged at 450_000
         // close: 450_000 - 50_000 (reserve) = 400_000 available, 50_000 order_margin
         //        on_fill: +50_000 (close reservation) + 50_000 (used_margin) + 50_000 (profit) = 550_000
-        assert_eq!(acct.available_margin.load(Relaxed), 550_000);
+        assert_eq!(acct.available_margin.load(Relaxed), 550_000 * A);
     }
 
     #[test]
     fn on_fill_partial_close_reduces_position() {
-        let (engine, uid) = make_engine_with_account(500_000);
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        let (engine, uid) = make_engine_with_account(500_000 * A);
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1037,7 +1047,7 @@ mod tests {
 
         // Close half at $50,000 (no PnL)
         let half_qty = QTY_LOTS / 2;
-        let half_margin = MARGIN_CENTS / 2;
+        let half_margin = MARGIN_ATOMS / 2;
         engine.check_and_reserve_margin(uid, half_margin).unwrap();
         engine.on_fill(
             uid,
@@ -1064,14 +1074,14 @@ mod tests {
 
     #[test]
     fn on_fill_symbol_position_index_maintained() {
-        let (engine, uid) = setup_with_reserved(200_000);
+        let (engine, uid) = setup_with_reserved(200_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1084,14 +1094,14 @@ mod tests {
         drop(idx);
 
         // Close: index entry removed
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             1,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1104,14 +1114,14 @@ mod tests {
 
     #[test]
     fn on_fill_liquidation_price_set_on_open() {
-        let (engine, uid) = setup_with_reserved(200_000);
+        let (engine, uid) = setup_with_reserved(200_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1127,7 +1137,7 @@ mod tests {
 
     #[test]
     fn update_mark_price_sets_ewma_and_upnl() {
-        let (engine, uid) = setup_with_reserved(500_000);
+        let (engine, uid) = setup_with_reserved(500_000 * A);
         // Open long: 0.1 BTC at $50,000, margin $500
         engine.on_fill(
             uid,
@@ -1135,7 +1145,7 @@ mod tests {
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1151,24 +1161,24 @@ mod tests {
 
         // unrealized_pnl = (5_010_000 - 5_000_000) * 100_000 / 1_000_000 = 1_000 cents = $10
         let acct = engine.accounts.get(&uid).unwrap();
-        assert_eq!(acct.unrealized_pnl, 1_000);
+        assert_eq!(acct.unrealized_pnl, 1_000 * A);
         // equity = available(450k - nothing since open moved to used) + used(50k) + upnl(1k) + order(0)
         // At open: available = 500_000 - 50_000 = 450_000, used = 50_000
-        assert_eq!(acct.equity, 450_000 + 50_000 + 1_000);
+        assert_eq!(acct.equity, (450_000 + 50_000 + 1_000) * A);
     }
 
     #[test]
     fn update_mark_price_accumulates_multi_symbol_upnl_incrementally() {
-        let (engine, uid) = make_engine_with_account(1_000_000);
+        let (engine, uid) = make_engine_with_account(1_000_000 * A);
 
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1177,7 +1187,7 @@ mod tests {
 
         let eth_price = 300_000i64;
         let eth_qty = 100_000i64;
-        let eth_margin = 3_000i64;
+        let eth_margin = 3_000i64 * A;
         engine.check_and_reserve_margin(uid, eth_margin).unwrap();
         engine.on_fill(
             uid,
@@ -1204,20 +1214,20 @@ mod tests {
 
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.unrealized_pnl, btc_upnl + eth_upnl);
-        assert_eq!(btc_upnl, 1_000);
-        assert_eq!(eth_upnl, 100);
+        assert_eq!(btc_upnl, 1_000 * A);
+        assert_eq!(eth_upnl, 100 * A);
     }
 
     #[test]
     fn update_mark_price_ignores_zero() {
-        let (engine, uid) = setup_with_reserved(200_000);
+        let (engine, uid) = setup_with_reserved(200_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1230,14 +1240,14 @@ mod tests {
 
     #[test]
     fn risk_tick_normal_when_margin_healthy() {
-        let (engine, uid) = setup_with_reserved(500_000);
+        let (engine, uid) = setup_with_reserved(500_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1272,7 +1282,7 @@ mod tests {
 
     #[test]
     fn account_maintenance_margin_aggregated_from_positions() {
-        let (engine, uid) = setup_with_reserved(500_000);
+        let (engine, uid) = setup_with_reserved(500_000 * A);
         // notional = 5_000_000 * 100_000 / 1_000_000 = 500_000 cents
         // maintenance_margin = 500_000 * 50 / 10_000 = 2_500 cents
         engine.on_fill(
@@ -1281,28 +1291,28 @@ mod tests {
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
             0,
         );
         let acct = engine.accounts.get(&uid).unwrap();
-        assert_eq!(acct.maintenance_margin, 2_500);
+        assert_eq!(acct.maintenance_margin, 2_500 * A);
     }
 
     #[test]
     fn account_maintenance_margin_updates_incrementally_across_symbols() {
-        let (engine, uid) = make_engine_with_account(1_000_000);
+        let (engine, uid) = make_engine_with_account(1_000_000 * A);
 
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1328,7 +1338,7 @@ mod tests {
 
         {
             let acct = engine.accounts.get(&uid).unwrap();
-            assert_eq!(acct.maintenance_margin, 2_500 + 150);
+            assert_eq!(acct.maintenance_margin, (2_500 + 150) * A);
         }
 
         engine.check_and_reserve_margin(uid, eth_margin).unwrap();
@@ -1346,20 +1356,20 @@ mod tests {
         );
 
         let acct = engine.accounts.get(&uid).unwrap();
-        assert_eq!(acct.maintenance_margin, 2_500);
+        assert_eq!(acct.maintenance_margin, 2_500 * A);
     }
 
     #[test]
     fn risk_tick_triggers_liquidation_pending_when_equity_below_maintenance() {
-        let (engine, uid) = make_engine_with_account(500_000);
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        let (engine, uid) = make_engine_with_account(500_000 * A);
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1370,7 +1380,7 @@ mod tests {
         // Force equity below maintenance via unrealized PnL.
         // equity = available(450_000) + used(50_000) + upnl = 2_499 → upnl = -497_501
         if let Some(mut acct) = engine.accounts.get_mut(&uid) {
-            acct.unrealized_pnl = -497_501;
+            acct.unrealized_pnl = -497_501 * A;
             use std::sync::atomic::Ordering::Relaxed;
             acct.equity = acct.available_margin.load(Relaxed)
                 + acct.order_margin.load(Relaxed)
@@ -1397,15 +1407,15 @@ mod tests {
     ///     mark converges toward 44_000 ticks; equity drops below maintenance (2_500).
     #[test]
     fn integration_mark_price_triggers_liquidation() {
-        let (engine, uid) = make_engine_with_account(52_600);
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        let (engine, uid) = make_engine_with_account(52_600 * A);
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1442,14 +1452,14 @@ mod tests {
     /// With healthy equity, run_risk_tick emits nothing and account stays Normal.
     #[test]
     fn integration_healthy_account_no_liquidation_events() {
-        let (engine, uid) = setup_with_reserved(1_000_000);
+        let (engine, uid) = setup_with_reserved(1_000_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1473,10 +1483,10 @@ mod tests {
     /// (liquidated at a price better than entry), the surplus goes to the insurance fund.
     ///
     /// Note: the system-generated liquidation order does NOT call check_and_reserve_margin
-    /// (the account is Liquidating so that would be blocked). fill_margin_cents = 0.
+    /// (the account is Liquidating so that would be blocked). fill_margin_atoms = 0.
     #[test]
     fn insurance_fund_gains_on_profitable_liquidation_close() {
-        let (engine, uid) = setup_with_reserved(500_000);
+        let (engine, uid) = setup_with_reserved(500_000 * A);
         // Open long at $50,000; margin = 50_000 cents
         engine.on_fill(
             uid,
@@ -1484,7 +1494,7 @@ mod tests {
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1497,7 +1507,7 @@ mod tests {
         }
 
         // System close at $51,000 (profit $100 = 10_000 cents).
-        // No margin was pre-reserved (system bypass), so fill_margin_cents = 0.
+        // No margin was pre-reserved (system bypass), so fill_margin_atoms = 0.
         let close_price_ticks = 5_100_000i64;
         engine.on_fill(
             uid,
@@ -1520,7 +1530,7 @@ mod tests {
         // Insurance fund should have gained the realized pnl:
         //   pnl = (5_100_000 − 5_000_000) × 100_000 / 1_000_000 = 10_000 cents
         //   (bkrpt_pnl = 0 per Phase 6 TODO, so fund gains full realized_pnl)
-        assert_eq!(engine.insurance_fund(), 10_000);
+        assert_eq!(engine.insurance_fund(), 10_000 * A);
     }
 
     /// When liq_price_ticks is set, the spread between actual fill and liq_price
@@ -1533,7 +1543,7 @@ mod tests {
     #[test]
     fn liq_price_spread_flows_to_insurance_fund() {
         const SCALE: i64 = 1_000_000; // BTC: price_ticks/tick * lots / 1_000_000 = cents
-        let (engine, uid) = setup_with_reserved(2_000_000); // $20,000 initial balance
+        let (engine, uid) = setup_with_reserved(2_000_000 * A); // $20,000 initial balance
 
         // Open long BTC at $50,000 (entry_price_ticks = 5_000_000, qty = 0.1 BTC = 100_000 lots)
         let entry_ticks = 5_000_000i64; // $50,000 at $0.01/tick
@@ -1584,20 +1594,20 @@ mod tests {
         // Exchange revenue = (fill − liq) × qty / scale (sell close, sign=+1)
         //   = (4_980_000 − 4_900_000) × 100_000 / 1_000_000
         //   = 80_000 × 100_000 / 1_000_000 = 8_000_000_000 / 1_000_000 = 8_000 cents = $80
-        assert_eq!(engine.insurance_fund(), 8_000);
+        assert_eq!(engine.insurance_fund(), 8_000 * A);
     }
 
     /// For non-Liquidating closes, insurance fund is not touched.
     #[test]
     fn insurance_fund_unchanged_on_normal_close() {
-        let (engine, uid) = setup_with_reserved(500_000);
+        let (engine, uid) = setup_with_reserved(500_000 * A);
         engine.on_fill(
             uid,
             btc_sym(),
             0,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1605,14 +1615,14 @@ mod tests {
         );
 
         // Normal user close at same price (no PnL, account stays Normal).
-        engine.check_and_reserve_margin(uid, MARGIN_CENTS).unwrap();
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
         engine.on_fill(
             uid,
             btc_sym(),
             1,
             PRICE_TICKS,
             QTY_LOTS,
-            MARGIN_CENTS,
+            MARGIN_ATOMS,
             NOTIONAL_SCALE,
             LEVERAGE,
             MAINT_BPS,
@@ -1662,9 +1672,9 @@ mod tests {
         //   liq_price = 5_000_000 * (10*10000-10000+50)/(10*10000)
         //             = 5_000_000 * 90050 / 100000 = 4_502_500 ticks ($45,025)
         //   bkrpt     = 5_000_000 * 9 / 10         = 4_500_000 ticks ($45,000)
-        const NOTIONAL: i64 = 500_000;
-        const IM: i64 = 50_000;
-        const MM: i64 = 2_500;
+        const NOTIONAL: i64 = 500_000 * 1_000_000; // atoms
+        const IM: i64 = 50_000 * 1_000_000;
+        const MM: i64 = 2_500 * 1_000_000;
         const LIQ_TICKS: i64 = 4_502_500;
         const BKRPT_TICKS: i64 = 4_500_000;
 
@@ -1674,7 +1684,7 @@ mod tests {
         //   For trigger: equity < MM  →  55_000 + upnl < 2_500
         //                upnl < -52_500  →  mark < ~4_475_000
         //   EWMA α=0.1: after ~20 calls to 4_400_000, mark converges past threshold.
-        const TAKER_BALANCE: i64 = 55_000;
+        const TAKER_BALANCE: i64 = 55_000 * 1_000_000; // atoms (A not in scope here)
 
         // ── Setup: matching engine + risk engine ─────────────────────────────
         let mut me = MatchingEngine::new(PoolConfig::default()).unwrap();
@@ -1682,7 +1692,7 @@ mod tests {
 
         const MAKER_ID: i64 = 1;
         const TAKER_ID: i64 = 2;
-        risk.initialize_account(MAKER_ID, 10_000_000); // maker has plenty
+        risk.initialize_account(MAKER_ID, 10_000_000 * 1_000_000); // maker has plenty
         risk.initialize_account(TAKER_ID, TAKER_BALANCE);
 
         // ── Phase 1: market maker places resting sell orders ─────────────────
@@ -1846,15 +1856,18 @@ mod tests {
         //   pnl = (liq_price - entry) × qty / scale
         //       = (4_502_500 - 5_000_000) × 100_000 / 1_000_000
         //       = -497_500 × 100 = -49_750 cents  (-$497.50)
-        let realized_pnl: i64 = (liq_price_ticks - ENTRY_TICKS) * QTY_LOTS / SCALE;
-        assert_eq!(realized_pnl, -49_750, "pre-computed realized PnL");
+        // ×1e6 → atoms (S2), mirroring the engine's settlement math.
+        let realized_pnl: i64 = (liq_price_ticks - ENTRY_TICKS) * QTY_LOTS / SCALE * 1_000_000;
+        assert_eq!(realized_pnl, -49_750 * 1_000_000, "pre-computed realized PnL");
 
         // Insurance fund = (actual_fill - liq_price) × qty / scale (sell side, sign=+1)
         //   = (4_600_000 - 4_502_500) × 100_000 / 1_000_000
         //   = 97_500 × 100 = 9_750 cents  ($97.50)
-        let expected_insurance: i64 = (actual_fill_ticks - liq_price_ticks) * QTY_LOTS / SCALE;
+        let expected_insurance: i64 =
+            (actual_fill_ticks - liq_price_ticks) * QTY_LOTS / SCALE * 1_000_000;
         assert_eq!(
-            expected_insurance, 9_750,
+            expected_insurance,
+            9_750 * 1_000_000,
             "pre-computed insurance fund credit"
         );
 
@@ -1904,7 +1917,7 @@ mod tests {
                 expected_available.max(0),
                 "available_margin after liq: expected {} (${})",
                 expected_available,
-                expected_available / 100
+                expected_available / 100_000_000 // atoms → USDT for the message
             );
 
             // Equity = available + 0 + 0 + 0 = 5_250.

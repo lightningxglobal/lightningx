@@ -6,10 +6,9 @@
 //! under journal replay and at-least-once delivery; "position absent" maps
 //! to PositionDelete because schema 022 defines flat as "no row".
 //!
-//! Unit boundary (checklist S2): the engine still computes in CENTS
-//! (1e-2 USDT) while the durable schema is ATOMS (1e-8 USDT). This module
-//! is the ONE place where cents→atoms happens; when S2 unifies the engine
-//! on atoms, `CENTS_TO_ATOMS` disappears and this becomes a plain copy.
+//! Units: the engine, the frames and the schema all speak ATOMS
+//! (1e-8 USDT) since S2 — this module copies values through verbatim,
+//! no conversion exists anywhere on this path.
 
 use crate::desk::risk::RiskEngine;
 use crate::transport::persist_event::{
@@ -17,24 +16,6 @@ use crate::transport::persist_event::{
     RiskAccountSetPayload,
 };
 use std::sync::atomic::Ordering;
-
-/// Exact atoms→cents for values we wrote ourselves (always *1e6 multiples);
-/// foreign/hand-edited rows truncate toward zero, which reconcile flags.
-fn atoms_to_cents(atoms: i64) -> i64 {
-    atoms / CENTS_TO_ATOMS
-}
-
-/// 1 cent = 0.01 USDT = 10^6 atoms (atoms are 1e-8 USDT).
-const CENTS_TO_ATOMS: i64 = 1_000_000;
-
-/// Saturating cents→atoms. Margins/equity are externally bounded well
-/// below i64::MAX/1e6 (≈92 billion USDT); saturation is a belt-and-braces
-/// guard so a corrupted in-memory value can never wrap into a *plausible*
-/// wrong number on disk — it pins to the rail instead, which reconcile
-/// (S1.5) flags immediately.
-fn cents_to_atoms(cents: i64) -> i64 {
-    cents.saturating_mul(CENTS_TO_ATOMS)
-}
 
 /// Snapshot the margin state touched by an event on (user, symbol) into
 /// persist frames, in apply-safe order:
@@ -62,7 +43,7 @@ pub fn margin_state_frames(
                 _pad: [0; 6],
                 qty_lots: pos.qty_lots,
                 entry_price_ticks: pos.entry_price_ticks,
-                used_margin_atoms: cents_to_atoms(pos.initial_margin),
+                used_margin_atoms: pos.initial_margin,
             }));
         }
         None => {
@@ -78,16 +59,16 @@ pub fn margin_state_frames(
     if let Some(acct) = engine.accounts.get(&user_id) {
         frames.push(PersistFrame::risk_account_set(RiskAccountSetPayload {
             user_id,
-            equity_atoms: cents_to_atoms(acct.equity),
-            used_margin_atoms: cents_to_atoms(acct.used_margin),
-            order_margin_atoms: cents_to_atoms(acct.order_margin.load(Ordering::Relaxed)),
+            equity_atoms: acct.equity,
+            used_margin_atoms: acct.used_margin,
+            order_margin_atoms: acct.order_margin.load(Ordering::Relaxed),
             status: acct.status.to_u8(),
             _pad: [0; 7],
         }));
     }
 
     frames.push(PersistFrame::insurance_fund_set(InsuranceFundSetPayload {
-        balance_atoms: cents_to_atoms(engine.insurance_fund()),
+        balance_atoms: engine.insurance_fund(),
     }));
 
     frames
@@ -127,7 +108,7 @@ pub async fn wait_for_writer_quiesce(
 pub struct HydrateStats {
     pub accounts: usize,
     pub positions: usize,
-    pub insurance_fund_cents: i64,
+    pub insurance_fund_atoms: i64,
 }
 
 /// Rebuild the margin engine's durable state from PG — S1.4, the inverse
@@ -156,9 +137,9 @@ pub async fn hydrate_from_pg(
     .await?;
     for row in rows {
         let user_id: i64 = row.get("user_id");
-        let equity = atoms_to_cents(row.get::<i64, _>("equity_atoms"));
-        let used = atoms_to_cents(row.get::<i64, _>("used_margin_atoms"));
-        let order = atoms_to_cents(row.get::<i64, _>("order_margin_atoms"));
+        let equity = row.get::<i64, _>("equity_atoms");
+        let used = row.get::<i64, _>("used_margin_atoms");
+        let order = row.get::<i64, _>("order_margin_atoms");
         let status_s: String = row.get("status");
         let Some(status) = RiskStatus::from_db_str(&status_s) else {
             anyhow::bail!("risk_accounts user {user_id}: unknown status '{status_s}'");
@@ -207,12 +188,12 @@ pub async fn hydrate_from_pg(
         let qty_lots: i64 = row.get("qty_lots");
         let entry: i64 = row.get("entry_price_ticks");
         let leverage: u8 = row.get::<i16, _>("leverage") as u8;
-        let margin_cents = atoms_to_cents(row.get::<i64, _>("used_margin_atoms"));
+        let margin_atoms: i64 = row.get("used_margin_atoms");
 
         // Recompute derived prices with the SAME calc path as on_fill.
         let rules = crate::desk::symbol_rules::SymbolRules::for_symbol(&symbol_s);
-        let notional = calc::calc_notional_cents(entry, qty_lots, rules.notional_scale);
-        let maint = calc::calc_maintenance_margin_cents(notional, rules.maintenance_rate_bps);
+        let notional = calc::calc_notional_atoms(entry, qty_lots, rules.notional_scale);
+        let maint = calc::calc_maintenance_margin_atoms(notional, rules.maintenance_rate_bps);
         let liq =
             calc::calc_liquidation_price_ticks(entry, leverage, rules.maintenance_rate_bps, side);
         let bkrpt = calc::calc_bankruptcy_price_ticks(entry, leverage, side);
@@ -227,7 +208,7 @@ pub async fn hydrate_from_pg(
                 entry_price_ticks: entry,
                 mark_price_ticks: entry, // corrected by the first mark tick
                 unrealized_pnl: 0,
-                initial_margin: margin_cents,
+                initial_margin: margin_atoms,
                 maintenance_margin: maint,
                 liquidation_price_ticks: liq,
                 bankruptcy_price_ticks: bkrpt,
@@ -258,10 +239,10 @@ pub async fn hydrate_from_pg(
         sqlx::query_scalar("SELECT balance_atoms FROM insurance_fund WHERE id = 1")
             .fetch_one(pool)
             .await?;
-    stats.insurance_fund_cents = atoms_to_cents(fund_atoms);
+    stats.insurance_fund_atoms = fund_atoms;
     engine
-        .insurance_fund_cents
-        .store(stats.insurance_fund_cents, Ordering::Relaxed);
+        .insurance_fund_atoms
+        .store(stats.insurance_fund_atoms, Ordering::Relaxed);
 
     Ok(stats)
 }
@@ -276,14 +257,14 @@ mod tests {
 
     fn engine_with_fill() -> std::sync::Arc<RiskEngine> {
         let engine = RiskEngine::new();
-        engine.initialize_account(7, 1_000_000); // 10,000 USDT in cents
+        engine.initialize_account(7, 1_000_000); // atoms (0.01 USDT — unit-agnostic test)
         // Real order sequence: reserve order margin, then fill moves it
         // into the position (otherwise equity double-counts the margin —
         // equity = available + used + order + uPnL).
         engine
             .check_and_reserve_margin(7, 10_000)
             .expect("reserve margin");
-        // Open a long: 10 lots @ 50_000 ticks, margin 100_00 cents.
+        // Open a long: 10 lots @ 50_000 ticks, margin 10_000 atoms.
         engine.on_fill(7, SYM, 0, 50_000, 10, 10_000, 1_000_000, 10, 50, 0);
         engine
     }
@@ -306,8 +287,8 @@ mod tests {
         assert_eq!(side, PositionSide::Long.to_u8());
         assert_eq!(qty, 10);
         assert_eq!(entry, 50_000);
-        // cents → atoms exactly once: 10_000 cents = 100 USDT = 1e10 atoms.
-        assert_eq!(margin, 10_000 * 1_000_000);
+        // verbatim copy (S2): the engine value IS the wire value.
+        assert_eq!(margin, 10_000);
         assert_eq!(unpack_sym(&pos.symbol), "BTC_USDT");
 
         let acct = frames[1].as_risk_account_set().expect("account frame");
@@ -316,7 +297,7 @@ mod tests {
         assert_eq!(status, RiskStatus::Normal.to_u8());
         // equity is still the full deposit (no realized pnl on open).
         let eq = acct.equity_atoms;
-        assert_eq!(eq, 1_000_000 * 1_000_000);
+        assert_eq!(eq, 1_000_000);
 
         let fund = frames[2].as_insurance_fund_set().expect("fund frame");
         let bal = fund.balance_atoms;
@@ -334,11 +315,22 @@ mod tests {
         assert_eq!(uid, 8);
     }
 
+    /// S2 boundary guard: the frame must carry the engine's value
+    /// VERBATIM — any scaling reintroduced here is a unit bug.
     #[test]
-    fn saturating_conversion_never_wraps() {
-        assert_eq!(cents_to_atoms(i64::MAX), i64::MAX);
-        assert_eq!(cents_to_atoms(i64::MIN), i64::MIN);
-        assert_eq!(cents_to_atoms(-5), -5_000_000); // negative equity flows through
+    fn frames_carry_engine_values_verbatim() {
+        let engine = RiskEngine::new();
+        engine.initialize_account(9, -123); // negative equity flows through
+        engine
+            .insurance_fund_atoms
+            .store(-777, std::sync::atomic::Ordering::Relaxed);
+        let frames = margin_state_frames(&engine, 9, &SYM);
+        let acct = frames[1].as_risk_account_set().unwrap();
+        let eq = acct.equity_atoms;
+        assert_eq!(eq, -123);
+        let fund = frames[2].as_insurance_fund_set().unwrap();
+        let bal = fund.balance_atoms;
+        assert_eq!(bal, -777);
     }
 
     fn unpack_sym(sym: &[u8; 16]) -> &str {

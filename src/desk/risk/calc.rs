@@ -1,18 +1,27 @@
 use super::types::PositionSide;
 
-pub fn calc_notional_cents(price_ticks: i64, qty_lots: i64, notional_scale: i64) -> i64 {
-    ((price_ticks as i128 * qty_lots as i128) / notional_scale as i128) as i64
+/// Money flows through the risk engine in ATOMS (1e-8 USDT) — the same
+/// unit as the ledger, the persist frames and schema 022 (decision
+/// S2.2). `notional_scale` keeps its historical meaning ("divide
+/// ticks×lots to get cents"), so landing in atoms multiplies by the
+/// 1e6 atoms-per-cent factor; intermediates are i128, making overflow
+/// arithmetically impossible for any representable position
+/// (max |ticks×lots×1e6| ≪ i128::MAX).
+const ATOMS_PER_CENT: i128 = 1_000_000;
+
+pub fn calc_notional_atoms(price_ticks: i64, qty_lots: i64, notional_scale: i64) -> i64 {
+    ((price_ticks as i128 * qty_lots as i128 * ATOMS_PER_CENT) / notional_scale as i128) as i64
 }
 
-pub fn calc_initial_margin_cents(notional_cents: i64, leverage: u8) -> i64 {
+pub fn calc_initial_margin_atoms(notional_atoms: i64, leverage: u8) -> i64 {
     if leverage == 0 {
         return 0;
     }
-    notional_cents / leverage as i64
+    notional_atoms / leverage as i64
 }
 
-pub fn calc_maintenance_margin_cents(notional_cents: i64, rate_bps: i64) -> i64 {
-    ((notional_cents as i128 * rate_bps as i128) / 10_000) as i64
+pub fn calc_maintenance_margin_atoms(notional_atoms: i64, rate_bps: i64) -> i64 {
+    ((notional_atoms as i128 * rate_bps as i128) / 10_000) as i64
 }
 
 pub fn calc_liquidation_price_ticks(
@@ -49,7 +58,7 @@ pub fn calc_bankruptcy_price_ticks(entry_ticks: i64, leverage: u8, side: Positio
     }
 }
 
-pub fn calc_unrealized_pnl_cents(
+pub fn calc_unrealized_pnl_atoms(
     side: PositionSide,
     qty_lots: i64,
     entry_price_ticks: i64,
@@ -60,7 +69,7 @@ pub fn calc_unrealized_pnl_cents(
         PositionSide::Long => mark_price_ticks - entry_price_ticks,
         PositionSide::Short => entry_price_ticks - mark_price_ticks,
     };
-    ((diff as i128 * qty_lots as i128) / notional_scale as i128) as i64
+    ((diff as i128 * qty_lots as i128 * ATOMS_PER_CENT) / notional_scale as i128) as i64
 }
 
 #[cfg(test)]
@@ -72,8 +81,9 @@ mod tests {
     // notional_scale = 1_000_000
     // price = $50,000 → price_ticks = 5_000_000 (50000 / 0.01)
     // qty = 0.001 BTC → qty_lots = 1000 (0.001 / 0.000001)
-    // notional = $50 → notional_cents = 5000
+    // notional = $50 → notional_atoms = 5_000_000_000 (50 USDT × 1e8)
     const BTC_SCALE: i64 = 1_000_000;
+    const A: i64 = 1_000_000; // atoms per cent, for readable expectations
 
     #[test]
     fn notional_btc_50k_001btc() {
@@ -82,22 +92,22 @@ mod tests {
         // notional = price_ticks * qty_lots / scale = 5_000_000 * 1000 / 1_000_000 = 5000 cents = $50
         let price_ticks = 5_000_000i64;
         let qty_lots = 1000i64;
-        let notional = calc_notional_cents(price_ticks, qty_lots, BTC_SCALE);
-        assert_eq!(notional, 5000); // $50 in cents
+        let notional = calc_notional_atoms(price_ticks, qty_lots, BTC_SCALE);
+        assert_eq!(notional, 5000 * A); // $50 in atoms
     }
 
     #[test]
     fn initial_margin_10x() {
-        // notional = $50 (5000 cents), leverage = 10 → initial_margin = 500 cents = $5
-        let margin = calc_initial_margin_cents(5000, 10);
-        assert_eq!(margin, 500);
+        // notional $50, leverage 10 → initial margin $5
+        let margin = calc_initial_margin_atoms(5000 * A, 10);
+        assert_eq!(margin, 500 * A);
     }
 
     #[test]
     fn maintenance_margin_50bps() {
-        // notional = $50 (5000 cents), rate = 50bps → mm = 5000 * 50 / 10000 = 25 cents
-        let mm = calc_maintenance_margin_cents(5000, 50);
-        assert_eq!(mm, 25);
+        // notional $50, rate 50bps → mm = $0.25
+        let mm = calc_maintenance_margin_atoms(5000 * A, 50);
+        assert_eq!(mm, 25 * A);
     }
 
     #[test]
@@ -150,31 +160,45 @@ mod tests {
         // entry_ticks=5_000_000, mark_ticks=5_100_000, qty_lots=1000
         // diff = 100_000, pnl = 100_000 * 1000 / 1_000_000 = 100 cents = $1
         let pnl =
-            calc_unrealized_pnl_cents(PositionSide::Long, 1000, 5_000_000, 5_100_000, BTC_SCALE);
-        assert_eq!(pnl, 100);
+            calc_unrealized_pnl_atoms(PositionSide::Long, 1000, 5_000_000, 5_100_000, BTC_SCALE);
+        assert_eq!(pnl, 100 * A); // $1
+
     }
 
     #[test]
     fn unrealized_pnl_long_negative() {
         // mark < entry → negative pnl
         let pnl =
-            calc_unrealized_pnl_cents(PositionSide::Long, 1000, 5_100_000, 5_000_000, BTC_SCALE);
-        assert_eq!(pnl, -100);
+            calc_unrealized_pnl_atoms(PositionSide::Long, 1000, 5_100_000, 5_000_000, BTC_SCALE);
+        assert_eq!(pnl, -100 * A);
     }
 
     #[test]
     fn leverage_1_initial_margin_equals_notional() {
-        let notional = calc_notional_cents(5_000_000, 1000, BTC_SCALE);
-        let margin = calc_initial_margin_cents(notional, 1);
+        let notional = calc_notional_atoms(5_000_000, 1000, BTC_SCALE);
+        let margin = calc_initial_margin_atoms(notional, 1);
         assert_eq!(margin, notional);
     }
 
     #[test]
     fn tiny_position_no_overflow() {
-        // 1 lot at $50000 → notional = 5_000_000 * 1 / 1_000_000 = 5 cents
-        let notional = calc_notional_cents(5_000_000, 1, BTC_SCALE);
-        assert_eq!(notional, 5);
-        let margin = calc_initial_margin_cents(notional, 10);
-        assert_eq!(margin, 0); // rounds down — 5/10=0
+        // 1 lot at $50000 → notional 5 cents = 5_000_000 atoms; at 10x the
+        // margin is 500_000 atoms — atoms preserve the sub-cent precision
+        // cents used to round away.
+        let notional = calc_notional_atoms(5_000_000, 1, BTC_SCALE);
+        assert_eq!(notional, 5 * A);
+        let margin = calc_initial_margin_atoms(notional, 10);
+        assert_eq!(margin, 500_000);
+    }
+
+    /// S2 boundary guard: a position big enough to overflow naive i64
+    /// math (1000 BTC at $100k) — i128 intermediates make it exact.
+    #[test]
+    fn huge_position_no_overflow() {
+        let price_ticks = 10_000_000i64; // $100,000
+        let qty_lots = 1_000_000_000i64; // 1000 BTC
+        // naive i64: ticks*lots*1e6 = 1e22 — would wrap. i128: exact.
+        let notional = calc_notional_atoms(price_ticks, qty_lots, BTC_SCALE);
+        assert_eq!(notional, 10_000_000_000_000_000); // 100M USDT in atoms
     }
 }

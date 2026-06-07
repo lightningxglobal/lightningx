@@ -1532,7 +1532,7 @@ async fn handle_place_order(
                 qty: req.quantity,
                 client_order_id: req.client_order_id.clone().unwrap_or_default(),
                 freeze_price,
-                initial_margin_cents: 0,
+                initial_margin_atoms: 0,
                 liq_price_ticks: 0,
             },
         );
@@ -2678,7 +2678,7 @@ async fn handle_debug_mark_price(
         };
         let mark_ticks = s.risk_engine.mark_price_ticks(&evt.symbol).unwrap_or(0);
         let notional = if mark_ticks > 0 {
-            crate::desk::risk::calc::calc_notional_cents(
+            crate::desk::risk::calc::calc_notional_atoms(
                 mark_ticks,
                 evt.qty_lots,
                 liq_rules.notional_scale,
@@ -2686,7 +2686,7 @@ async fn handle_debug_mark_price(
         } else {
             0
         };
-        let margin_cents = crate::desk::risk::calc::calc_initial_margin_cents(
+        let margin_atoms = crate::desk::risk::calc::calc_initial_margin_atoms(
             notional,
             liq_rules.default_leverage,
         );
@@ -2702,7 +2702,7 @@ async fn handle_debug_mark_price(
                 qty: liq_rules.lots_to_quantity(evt.qty_lots),
                 client_order_id: format!("liq-{}", order_id),
                 freeze_price: 0.0,
-                initial_margin_cents: margin_cents,
+                initial_margin_atoms: margin_atoms,
                 liq_price_ticks: evt.liq_price_ticks,
             },
         );

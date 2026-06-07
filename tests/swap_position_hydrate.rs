@@ -72,18 +72,19 @@ async fn crashed_engine_state_roundtrips_through_pg() {
         .await;
 
     // ── Engine A: two users, opposite positions, fund debited ──────────
-    // Realistic economics (rules: scale 1e6, maint 50bps, 10x):
+    // Realistic economics in ATOMS (S2; rules: scale 1e6, maint 50bps, 10x):
     // entry $50,000 = 5_000_000 ticks; 0.1 BTC = 100_000 lots →
-    // notional 500_000 cents, initial margin 50_000 cents at 10x.
+    // notional 5_000 USDT, initial margin 500 USDT (5e10 atoms) at 10x.
+    const A: i64 = 1_000_000; // atoms per cent, keeps the numbers readable
     let a = RiskEngine::new();
-    a.initialize_account(long_user, 60_000); // $600 — thin on purpose
-    a.initialize_account(short_user, 200_000);
-    a.check_and_reserve_margin(long_user, 50_000).expect("reserve long");
-    a.on_fill(long_user, SYM, 0, 5_000_000, 100_000, 50_000, 1_000_000, 10, 50, 0);
-    a.check_and_reserve_margin(short_user, 75_000).expect("reserve short");
-    a.on_fill(short_user, SYM, 1, 5_000_000, 150_000, 75_000, 1_000_000, 10, 50, 0);
+    a.initialize_account(long_user, 60_000 * A); // $600 — thin on purpose
+    a.initialize_account(short_user, 200_000 * A);
+    a.check_and_reserve_margin(long_user, 50_000 * A).expect("reserve long");
+    a.on_fill(long_user, SYM, 0, 5_000_000, 100_000, 50_000 * A, 1_000_000, 10, 50, 0);
+    a.check_and_reserve_margin(short_user, 75_000 * A).expect("reserve short");
+    a.on_fill(short_user, SYM, 1, 5_000_000, 150_000, 75_000 * A, 1_000_000, 10, 50, 0);
     // Socialised-loss debt: fund can be negative through the round-trip.
-    a.insurance_fund_cents.store(-12_345, Ordering::Relaxed);
+    a.insurance_fund_atoms.store(-12_345, Ordering::Relaxed);
 
     // ── Crash boundary: frames → PG (what the desk publishes on fills) ─
     let mut batch = PgWriteBatch::new();
@@ -102,7 +103,7 @@ async fn crashed_engine_state_roundtrips_through_pg() {
     let b = RiskEngine::new();
     let stats = hydrate_from_pg(&b, &pg).await.expect("hydrate");
     assert!(stats.accounts >= 2, "both accounts restored");
-    assert_eq!(stats.insurance_fund_cents, -12_345, "fund debt survives");
+    assert_eq!(stats.insurance_fund_atoms, -12_345, "fund debt survives");
 
     // Position equivalence (the essentials persisted, the rest recomputed
     // through the SAME calc path on_fill uses).
@@ -165,8 +166,8 @@ async fn crashed_engine_state_roundtrips_through_pg() {
 
     // The hydrated engine is ALIVE: a mark-price move triggers its risk
     // tick exactly as a never-died engine. Dump to $44,240: the long's
-    // uPnL = -576_000 ticks × 100_000 lots / 1e6 = -57_600 cents →
-    // equity 2_400 cents, inside (0, maintenance=2_500] — the
+    // uPnL = -576_000 ticks × 100_000 lots × 1e6 / 1e6 = -57_600·A atoms →
+    // equity 2_400·A atoms, inside (0, maintenance=2_500·A] — the
     // LiquidationPending branch (deeper and it would be Bankruptcy,
     // which is a different, fund-absorbing path).
     b.update_mark_price(SYM, 4_424_000, 1_000_000);

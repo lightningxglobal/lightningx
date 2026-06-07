@@ -11,7 +11,8 @@ pub struct SymbolRules {
     /// quantity_step expressed in atoms (1e-8). Integer twin of `quantity_step`.
     pub quantity_step_atoms: i64,
     pub min_notional: f64,
-    /// notional_cents = price_ticks * qty_lots / notional_scale
+    /// Historical to-cents divisor: calc converts to ATOMS via
+    /// ticks × lots × 1e6 / notional_scale (see risk::calc, S2).
     pub notional_scale: i64,
     /// Default leverage for this symbol
     pub default_leverage: u8,

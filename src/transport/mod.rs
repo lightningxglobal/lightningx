@@ -41,7 +41,7 @@ pub struct OrderMeta {
     pub qty: f64,
     pub client_order_id: String,
     pub freeze_price: f64,
-    pub initial_margin_cents: i64,
+    pub initial_margin_atoms: i64,
     /// Non-zero only for forced-liquidation orders.
     /// The user is settled at this price; the exchange pockets the spread vs actual fill price.
     pub liq_price_ticks: i64,

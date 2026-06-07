@@ -377,6 +377,28 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => warn!("reconcile: pg↔redis sweep failed: {e}"),
                 }
             }
+            // S1.5: swap-position invariants ride the same sweep.
+            match reconcile::check_position_invariants(&pg).await {
+                Ok(report) if report.is_clean() => {}
+                Ok(report) => {
+                    for v in &report.net_violations {
+                        tracing::error!(
+                            "RECONCILE position net exposure: symbol={} net_lots={} (must be 0)",
+                            v.symbol,
+                            v.net_lots
+                        );
+                    }
+                    for m in &report.margin_mismatches {
+                        tracing::error!(
+                            "RECONCILE margin mismatch: user={} account_used={} positions_sum={}",
+                            m.user_id,
+                            m.account_used_margin_atoms,
+                            m.positions_margin_sum_atoms
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("position reconcile failed: {e}"),
+            }
             match reconcile::check_account_invariants(&pg).await {
                 Ok(report) if report.is_clean() => {
                     info!("reconcile: account invariants clean");

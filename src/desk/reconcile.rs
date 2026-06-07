@@ -19,7 +19,7 @@
 use crate::desk::money::AMOUNT_SCALE;
 use anyhow::Result;
 use redis::AsyncCommands;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 /// Atom tolerance for the legacy-float comparison. f64 keeps ~15-16
 /// significant digits, so balances up to ~1e7 quote units round-trip within
@@ -156,6 +156,89 @@ pub async fn check_pg_redis_accounts(
 }
 
 /// Run all account invariant checks. Read-only.
+/// One per-symbol net-exposure violation: in a swap venue every fill
+/// opens equal-and-opposite exposure (liquidation orders included — they
+/// trade against the book), so Σ(long lots) − Σ(short lots) per symbol
+/// MUST be zero at all times. Non-zero means lost/duplicated position
+/// frames or a unit bug — freeze-and-investigate territory.
+#[derive(Debug)]
+pub struct PositionNetRow {
+    pub symbol: String,
+    pub net_lots: i64,
+}
+
+/// risk_accounts.used_margin must equal the SUM of the user's position
+/// margins (on_fill maintains both sides of this equality in memory; the
+/// durable mirror must agree with itself).
+#[derive(Debug)]
+pub struct MarginMismatchRow {
+    pub user_id: i64,
+    pub account_used_margin_atoms: i64,
+    pub positions_margin_sum_atoms: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct PositionReport {
+    pub net_violations: Vec<PositionNetRow>,
+    pub margin_mismatches: Vec<MarginMismatchRow>,
+}
+
+impl PositionReport {
+    pub fn is_clean(&self) -> bool {
+        self.net_violations.is_empty() && self.margin_mismatches.is_empty()
+    }
+}
+
+/// S1.5 — swap-position invariants over the durable tables. Pure SQL
+/// aggregation (two statements), safe to run from pg-writer's periodic
+/// reconcile task at any frequency.
+pub async fn check_position_invariants(pool: &PgPool) -> Result<PositionReport> {
+    let mut report = PositionReport::default();
+
+    let rows = sqlx::query(
+        r#"
+        SELECT symbol,
+               SUM(CASE side WHEN 'long' THEN qty_lots ELSE -qty_lots END)::bigint AS net
+          FROM positions
+         GROUP BY symbol
+        HAVING SUM(CASE side WHEN 'long' THEN qty_lots ELSE -qty_lots END) <> 0
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        report.net_violations.push(PositionNetRow {
+            symbol: row.get("symbol"),
+            net_lots: row.get("net"),
+        });
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT r.user_id,
+               r.used_margin_atoms,
+               COALESCE(p.margin_sum, 0)::bigint AS margin_sum
+          FROM risk_accounts r
+          LEFT JOIN (
+              SELECT user_id, SUM(used_margin_atoms) AS margin_sum
+                FROM positions GROUP BY user_id
+          ) p USING (user_id)
+         WHERE r.used_margin_atoms <> COALESCE(p.margin_sum, 0)
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        report.margin_mismatches.push(MarginMismatchRow {
+            user_id: row.get("user_id"),
+            account_used_margin_atoms: row.get("used_margin_atoms"),
+            positions_margin_sum_atoms: row.get("margin_sum"),
+        });
+    }
+
+    Ok(report)
+}
+
 pub async fn check_account_invariants(pool: &PgPool) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
 

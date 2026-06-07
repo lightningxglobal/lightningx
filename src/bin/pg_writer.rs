@@ -128,6 +128,10 @@ async fn main() -> anyhow::Result<()> {
         .spawn(move || {
             let aeron =
                 Arc::new(AeronClient::new(&aeron_dir_owned).expect("AeronClient::new failed"));
+            // Live subscription is created FIRST but not polled until the
+            // journal replay (below) completes: frames arriving meanwhile
+            // wait in its image buffer, so the replay→live hand-off has no
+            // gap; the checkpoint floor drops the overlap.
             let mut sub = PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, PERSIST_STREAM)
                 .map_err(|e| anyhow::anyhow!("{e}"))
                 .expect("create PersistSubscriber");
@@ -135,6 +139,69 @@ async fn main() -> anyhow::Result<()> {
                 "[aeron] subscribed to persist stream (channel={}, stream={})",
                 PERSIST_CHANNEL, PERSIST_STREAM
             );
+
+            // Journal catch-up: when EXCHANGE_ARCHIVE_CONTROL is set, replay
+            // every recording of the persist stream into the bridge queue
+            // before going live. Duplicates are dropped by the checkpoint
+            // floor; frames the writer never received (down/ring overflow)
+            // are recovered. This thread drives its own client's conductor,
+            // satisfying the archive threading contract.
+            if let Some(cfg) = lightning_exchange::transport::journal::archive_config_from_env() {
+                use lightning_exchange::transport::journal::{
+                    JournalReplayer, PERSIST_REPLAY_STREAM,
+                };
+                let mut replayer = JournalReplayer::connect(&aeron, &cfg)
+                    .expect("journal replay requested but archive connect failed");
+                let recordings = replayer
+                    .recordings("ipc", PERSIST_STREAM)
+                    .expect("list journal recordings");
+                info!("journal: {} recording(s) to replay", recordings.len());
+                for rec in &recordings {
+                    let Some(replay) = replayer
+                        .replay_bounded(rec, PERSIST_CHANNEL, PERSIST_REPLAY_STREAM)
+                        .expect("start journal replay")
+                    else {
+                        continue;
+                    };
+                    let mut replay_sub =
+                        PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, PERSIST_REPLAY_STREAM)
+                            .map_err(|e| anyhow::anyhow!("{e}"))
+                            .expect("create replay subscriber");
+                    // Bounded replay: poll until the stream dries up — the
+                    // archive closes the replay session at bounded_to. Use a
+                    // quiet-period heuristic (no frames for 2s after at
+                    // least one poll) as the end-of-replay signal.
+                    let mut replayed: u64 = 0;
+                    let mut last_frame = Instant::now();
+                    loop {
+                        aeron.do_work();
+                        replay_sub.do_work();
+                        let mut got = false;
+                        while let Some(frame) = replay_sub.poll() {
+                            got = true;
+                            replayed += 1;
+                            while queue_tx.push(frame).is_err() {
+                                // During catch-up we must NOT drop: the whole
+                                // point is recovering frames. Brief stall is
+                                // fine, the flusher is draining concurrently.
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        if got {
+                            last_frame = Instant::now();
+                        } else if last_frame.elapsed() > Duration::from_secs(2) {
+                            break;
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    info!(
+                        "journal: recording {} replayed {} frame(s)",
+                        replay.recording_id, replayed
+                    );
+                }
+                info!("journal: catch-up complete, switching to live stream");
+            }
             loop {
                 aeron.do_work();
                 sub.do_work();

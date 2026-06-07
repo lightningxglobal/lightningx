@@ -1,6 +1,7 @@
 pub mod aeron_channels;
 pub mod aeron_transport;
 pub mod counter_forward;
+pub mod journal;
 pub mod order_update;
 pub mod persist_event;
 pub mod sbe;

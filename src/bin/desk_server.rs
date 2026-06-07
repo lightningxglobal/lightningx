@@ -1478,6 +1478,39 @@ async fn async_main() -> anyhow::Result<()> {
             .name(thread_name_persist.clone())
             .spawn(move || {
                 pin_current_thread_to_core("DESK_PERSIST_CORE", &thread_name_persist);
+                // Journal: record the persist stream on the Aeron Archive
+                // when EXCHANGE_ARCHIVE_CONTROL is set. Uses a DEDICATED
+                // AeronClient owned by this thread (repo convention: one
+                // client per thread) so the archive control session never
+                // races another thread's conductor (see aeron-wrapper
+                // archive threading contract). Control traffic happens only
+                // here at startup; the recording itself is maintained by the
+                // archive driver. The handle must stay alive.
+                let _journal_recorder =
+                    match lightning_exchange::transport::journal::archive_config_from_env() {
+                        Some(cfg) => {
+                            let journal_client = std::sync::Arc::new(
+                                aeron_wrapper::AeronClient::new(&aeron_dir())
+                                    .expect("journal AeronClient"),
+                            );
+                            match lightning_exchange::transport::journal::JournalRecorder::start(
+                                &journal_client,
+                                &cfg,
+                                PERSIST_CHANNEL,
+                                PERSIST_STREAM,
+                            ) {
+                                // Keep the dedicated client alive alongside the recorder.
+                                Ok(r) => Some((r, journal_client)),
+                                Err(e) => {
+                                    // Journaling was explicitly requested:
+                                    // silently degrading durability is worse
+                                    // than failing loudly.
+                                    panic!("journal recording requested but failed: {e}");
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                 let mut idle_us: u64 = 10;
                 // Per-publisher monotonic sequence, assigned here — the single
                 // drain point — so consumers can checkpoint (publisher_id, seq)

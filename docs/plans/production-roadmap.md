@@ -7,22 +7,20 @@
 >
 > 图例：✅ 已完成 ｜ 🟡 部分完成 ｜ ⬜ 未开始
 
-## 进度跟踪（最近评估：2026-06-07 晚，HEAD `86e0563`）
+## 进度跟踪（最近评估：2026-06-07 深夜，HEAD `d8feae9`）
 
-| 阶段 | 进度 | 本轮关键落地 |
-|------|------|-------------|
-| P1 资金定点化 | 🟢 ~90% | （稳定）仅剩 legacy 列物理下线（等 30 天观察窗口，流程约束） |
-| P2 事件日志+序列号 | 🟢 ~95% | persist 流 journal（`8fff81c`）+ **引擎输入流 journal**（`ccb0319`）：录制 orders 流，重启时静默重放**比特级重建订单簿**（300 op e2e：重建簿与崩溃前逐档一致），journal 模式跳过 PG 近似 seed。剩：recording 段清理、replay 结束改 stop-position 跟踪 |
-| P3 资金事务闭环 | 🟡 ~55% | PG↔Redis 跨存储账户对账（`fb6bc14`）。剩：双轨结算统一（依赖 journal）、冻结事件化 |
-| P4 风控补全 | 🟢 100% | 限流从"未接线"修到全入口接线 + 分桶 + Redis 持久化（`3518336`）——P4 关闭 |
-| P5 高可用 | 🟡 ~30% | **备机的核心原语已全部就绪并验证**：确定性引擎 + 输入流录制 + 重放比特级重建。剩：replay-merge 持续追赶接线 + etcd 选主 + epoch fencing + 切换演练 |
-| P6 安全加固 | 🟢 ~75% | HMAC API key、JWT refresh、append-only 审计日志、fuzz 脚手架（`86e0563`）。剩：Prometheus、fuzz 长跑、JWT 吊销表、渗透测试 |
+| 阶段 | 进度 | 状态 |
+|------|------|------|
+| P1 资金定点化 | 🟢 ~98% | **legacy float8 账户列已物理下线**（迁移 018，预上线无兼容窗口）；over-fill 升硬约束。剩：orders/trades float8 随 P2 线格式升级退役 |
+| P2 事件日志+序列号 | 🟢 100% | persist+引擎输入双 journal、exactly-once 位点、事件驱动 replay 完成检测、retention 清理（`5345f04`）。**关闭** |
+| P3 资金事务闭环 | 🟢 100% | settle+trade 单事务+全局唯一键、append-only fund_audit 全腿流水、journal-audit 三方对账工具（`87c1c55`）。**关闭** |
+| P4 风控补全 | 🟢 100% | 关闭（`3518336`） |
+| P5 高可用 | 🟢 ~80% | **PG 选主+epoch fencing+standby 引擎**（`d8feae9`）：备机=journal 重放+live 静默 apply，赢锁才发布，desk 拒旧 epoch（zombie 防护端到端）。剩：多机故障演练（RTO 实测）、PG 主从/PITR——部署工作非代码 |
+| P6 安全加固 | 🟢 ~95% | /metrics(VictoriaMetrics)、JWT 吊销（O(1) 内存+Redis 30s 传播）、fuzz 实跑 683 万次零 crash（`9c12605`）。剩：第三方渗透测试（外部） |
 
-**当前最关键缺口已解除**：`aeron-wrapper` 已支持 Archive 客户端
-（aeron-wrapper `aa9718b`：录制/重放/位置查询/截断，含真实 ArchivingMediaDriver
-端到端测试——录制 200 帧 → replay 逐字节有序比对 → truncate）。
-下一步是把它接入 exchange：录制 orders/persist 流 + 重启重放 + recording_position
-门控 ACK（P2 收尾）+ 备机 replay-merge（P5）。
+**代码侧工作面已基本清空。** 剩余四类：①混沌测试执行（Gate 2/4/5 的脚本化演练，
+基础设施已齐）；②多机部署件（PG 主从、双机 failover 演练）；③30 天观察类
+（orders/trades float8 退役随线格式升级）；④外部（渗透测试）。
 
 ### 本轮设计决定（用户拍板，已存档）
 

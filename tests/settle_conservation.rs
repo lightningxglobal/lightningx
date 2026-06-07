@@ -153,7 +153,7 @@ async fn random_settle_sequence_conserves_funds_exactly() {
             continue;
         }
 
-        repo.settle_trade_atoms(buyer, seller, "BASE", "USDT", price, qty, buy_fee, sell_fee)
+        repo.settle_trade_atoms(buyer, seller, "BASE", "USDT", price, qty, buy_fee, sell_fee, None)
             .await
             .expect("settle");
         total_fees_atoms += buy_fee.atoms() + sell_fee.atoms();

@@ -11,8 +11,39 @@ use crate::models::DbAccount;
 use anyhow::{Result, anyhow};
 use sqlx::PgPool;
 
+/// Trade row recorded atomically with the settlement legs.
+#[derive(Debug, Clone)]
+pub struct SettleTradeRecord {
+    pub symbol: String,
+    pub buy_order_id: i64,
+    pub sell_order_id: i64,
+}
+
 pub struct AccountRepository<'a> {
     pool: &'a PgPool,
+}
+
+/// Append one fund_audit row inside the caller's transaction.
+async fn fund_audit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: i64,
+    asset: &str,
+    kind: &str,
+    amount_atoms: i64,
+    ref_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fund_audit (user_id, asset, kind, amount_atoms, ref_id)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(user_id)
+    .bind(asset)
+    .bind(kind)
+    .bind(amount_atoms)
+    .bind(ref_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 impl<'a> AccountRepository<'a> {
@@ -86,6 +117,7 @@ impl<'a> AccountRepository<'a> {
         if amount.atoms() < 0 {
             return Err(anyhow!("cannot freeze a negative amount"));
         }
+        let mut tx = self.pool.begin().await?;
         let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
                 frozen_atoms = frozen_atoms + $1,
@@ -97,19 +129,19 @@ impl<'a> AccountRepository<'a> {
         .bind(amount.atoms())
         .bind(user_id)
         .bind(asset)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-
-        row.map(|(balance_atoms, frozen_atoms)| {
-            AccountBalance::from_atoms(balance_atoms, frozen_atoms)
-        })
-        .ok_or_else(|| {
-            anyhow!(
+        let Some((balance_atoms, frozen_atoms)) = row else {
+            tx.rollback().await.ok();
+            return Err(anyhow!(
                 "Insufficient {} balance to freeze {}",
                 asset,
                 amount.to_decimal_string()
-            )
-        })
+            ));
+        };
+        fund_audit(&mut tx, user_id, asset, "freeze", amount.atoms(), 0).await?;
+        tx.commit().await?;
+        Ok(AccountBalance::from_atoms(balance_atoms, frozen_atoms))
     }
 
     /// Release frozen funds (on order cancel). Returns fixed-point balance after update.
@@ -134,6 +166,7 @@ impl<'a> AccountRepository<'a> {
         if amount.atoms() < 0 {
             return Err(anyhow!("cannot release a negative amount"));
         }
+        let mut tx = self.pool.begin().await?;
         let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
                 frozen_atoms = GREATEST(frozen_atoms - $1, 0),
@@ -144,9 +177,12 @@ impl<'a> AccountRepository<'a> {
         .bind(amount.atoms())
         .bind(user_id)
         .bind(asset)
-        .fetch_optional(self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-
+        if row.is_some() {
+            fund_audit(&mut tx, user_id, asset, "release", amount.atoms(), 0).await?;
+        }
+        tx.commit().await?;
         // If no row matched (account doesn't exist), treat as a no-op.
         Ok(row
             .map(|(balance_atoms, frozen_atoms)| {
@@ -178,6 +214,7 @@ impl<'a> AccountRepository<'a> {
             AmountAtoms::from_f64_round(quantity)?,
             AmountAtoms::from_f64_round(buy_fee)?,
             AmountAtoms::from_f64_round(sell_fee)?,
+            None,
         )
         .await
     }
@@ -190,6 +227,10 @@ impl<'a> AccountRepository<'a> {
     /// Quote conservation holds by construction:
     ///   buyer_debit = cost + buy_fee = (cost - sell_fee) + (buy_fee + sell_fee)
     ///               = seller_credit + fee_revenue.
+    /// `trade`: when provided, the trade row is INSERTed in the SAME
+    /// transaction as the four account legs (idempotent via the
+    /// (buy_order_id, sell_order_id) unique pair) — settlement and trade
+    /// record commit or roll back together.
     #[allow(clippy::too_many_arguments)]
     pub async fn settle_trade_atoms(
         &self,
@@ -201,6 +242,7 @@ impl<'a> AccountRepository<'a> {
         quantity: AmountAtoms,
         buy_fee: AmountAtoms,
         sell_fee: AmountAtoms,
+        trade: Option<&SettleTradeRecord>,
     ) -> Result<()> {
         let cost = price.checked_mul_scaled(quantity)?;
         let buyer_debit = cost.checked_add(buy_fee)?;
@@ -267,6 +309,44 @@ impl<'a> AccountRepository<'a> {
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("settle stmt-4: {e}"))?;
+
+        // Trade record commits atomically with the settlement legs.
+        if let Some(t) = trade {
+            sqlx::query(
+                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity,
+                                     price_atoms, quantity_atoms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING",
+            )
+            .bind(&t.symbol)
+            .bind(t.buy_order_id)
+            .bind(t.sell_order_id)
+            .bind(price.to_f64())
+            .bind(quantity.to_f64())
+            .bind(price.atoms())
+            .bind(quantity.atoms())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| anyhow!("settle trade insert: {e}"))?;
+        }
+
+        // Fund audit: all four legs, same transaction.
+        let trade_ref = trade.map(|t| t.buy_order_id).unwrap_or(0);
+        fund_audit(&mut tx, buyer_id, quote_asset, "settle_debit", buyer_debit.atoms(), trade_ref)
+            .await?;
+        fund_audit(&mut tx, buyer_id, base_asset, "settle_credit", quantity.atoms(), trade_ref)
+            .await?;
+        fund_audit(&mut tx, seller_id, base_asset, "settle_debit", quantity.atoms(), trade_ref)
+            .await?;
+        fund_audit(
+            &mut tx,
+            seller_id,
+            quote_asset,
+            "settle_credit",
+            seller_credit.atoms(),
+            trade_ref,
+        )
+        .await?;
 
         tx.commit().await?;
         Ok(())

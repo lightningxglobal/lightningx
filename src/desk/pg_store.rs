@@ -906,6 +906,7 @@ async fn flush_trades(conn: &mut PgConnection, rows: &[TradeRow]) -> anyhow::Res
             $8::timestamptz[]
         ) AS t(symbol, buy_order_id, sell_order_id, price, quantity,
                price_atoms, quantity_atoms, created_at)
+        ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING
         "#,
     )
     .bind(&syms)

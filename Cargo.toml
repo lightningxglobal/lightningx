@@ -111,3 +111,7 @@ path = "src/bin/pg_writer.rs"
 [[bin]]
 name = "pressure-client"
 path = "src/bin/pressure_client.rs"
+
+[[bin]]
+name = "journal-audit"
+path = "src/bin/journal_audit.rs"

@@ -180,7 +180,7 @@ async fn settle_trade_atoms_is_exact_and_conserves_quote() {
         .await
         .expect("freeze seller base");
 
-    repo.settle_trade_atoms(buyer, seller, "BTC", "USDT", price, qty, buy_fee, sell_fee)
+    repo.settle_trade_atoms(buyer, seller, "BTC", "USDT", price, qty, buy_fee, sell_fee, None)
         .await
         .expect("settle trade atoms");
 
@@ -207,6 +207,101 @@ async fn settle_trade_atoms_is_exact_and_conserves_quote() {
     // Base conservation: seller's loss = buyer's gain (no base-side fee).
     assert_eq!(100_000_000 - seller_base.2, buyer_base.2);
 
+    cleanup(&pg, &[buyer, seller]).await;
+}
+
+#[tokio::test]
+async fn settle_with_trade_record_is_atomic_and_idempotent() {
+    let Some(pg) = try_pg().await else {
+        eprintln!("skip: no PG");
+        return;
+    };
+    let (Some(buyer), Some(seller)) = (make_user(&pg).await, make_user(&pg).await) else {
+        eprintln!("skip: cannot make users");
+        return;
+    };
+    seed_account(&pg, buyer, "USDT", "1000", "0").await;
+    seed_account(&pg, seller, "BTC", "1", "0").await;
+    let repo = AccountRepository::new(&pg);
+
+    let price = AmountAtoms::from_decimal_str("100").unwrap();
+    let qty = AmountAtoms::from_decimal_str("0.5").unwrap();
+    repo.freeze_atoms(buyer, "USDT", AmountAtoms::from_decimal_str("50").unwrap())
+        .await
+        .expect("freeze buyer");
+    repo.freeze_atoms(seller, "BTC", qty).await.expect("freeze seller");
+
+    let trade = lightning_exchange::account_repository::SettleTradeRecord {
+        symbol: "BTC_USDT".into(),
+        buy_order_id: 955_000_001,
+        sell_order_id: 955_000_002,
+    };
+    repo.settle_trade_atoms(
+        buyer, seller, "BTC", "USDT", price, qty,
+        AmountAtoms::ZERO, AmountAtoms::ZERO, Some(&trade),
+    )
+    .await
+    .expect("settle with trade");
+
+    // Trade row landed with exact atoms, in the same transaction.
+    let (p_atoms, q_atoms): (i64, i64) = sqlx::query_as(
+        "SELECT price_atoms, quantity_atoms FROM trades
+          WHERE buy_order_id = $1 AND sell_order_id = $2",
+    )
+    .bind(trade.buy_order_id)
+    .bind(trade.sell_order_id)
+    .fetch_one(&pg)
+    .await
+    .expect("trade row");
+    assert_eq!(p_atoms, price.atoms());
+    assert_eq!(q_atoms, qty.atoms());
+
+    // Fund audit: freeze ×2 + settle legs ×4, append-only.
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fund_audit WHERE user_id = ANY($1::bigint[])",
+    )
+    .bind(vec![buyer, seller])
+    .fetch_one(&pg)
+    .await
+    .expect("audit count");
+    assert_eq!(audit_rows, 6, "2 freezes + 4 settle legs audited");
+    let mutate = sqlx::query("DELETE FROM fund_audit WHERE user_id = $1")
+        .bind(buyer)
+        .execute(&pg)
+        .await;
+    assert!(mutate.is_err(), "fund_audit must be append-only");
+
+    // Idempotency: replaying the SAME trade pair is a no-op for the trades
+    // table (unique pair), regardless of which path delivers it.
+    let dup: i64 = sqlx::query_scalar(
+        "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity,
+                             price_atoms, quantity_atoms)
+         VALUES ('BTC_USDT', $1, $2, 100.0, 0.5, $3, $4)
+         ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING
+         RETURNING 1",
+    )
+    .bind(trade.buy_order_id)
+    .bind(trade.sell_order_id)
+    .bind(price.atoms())
+    .bind(qty.atoms())
+    .fetch_optional(&pg)
+    .await
+    .expect("dup insert")
+    .unwrap_or(0);
+    assert_eq!(dup, 0, "duplicate trade pair must not insert");
+    let n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE buy_order_id = $1")
+            .bind(trade.buy_order_id)
+            .fetch_one(&pg)
+            .await
+            .expect("count");
+    assert_eq!(n, 1);
+
+    // cleanup (trades row removable: no trigger there)
+    let _ = sqlx::query("DELETE FROM trades WHERE buy_order_id = $1")
+        .bind(trade.buy_order_id)
+        .execute(&pg)
+        .await;
     cleanup(&pg, &[buyer, seller]).await;
 }
 

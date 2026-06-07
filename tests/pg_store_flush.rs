@@ -250,6 +250,13 @@ async fn trade_insert_lands() {
 
     let buy_id: i64 = 980_000_200_001;
     let sell_id: i64 = 980_000_200_002;
+    // The (buy, sell) pair is now UNIQUE (migration 019): clear residue from
+    // previous runs or the idempotent insert reports 0 rows.
+    let _ = sqlx::query("DELETE FROM trades WHERE buy_order_id=$1 AND sell_order_id=$2")
+        .bind(buy_id)
+        .bind(sell_id)
+        .execute(&pg)
+        .await;
     let f = PersistFrame::trade_insert(TradeInsertPayload {
         buy_order_id: buy_id,
         sell_order_id: sell_id,

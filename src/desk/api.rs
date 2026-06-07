@@ -1232,16 +1232,30 @@ async fn handle_place_order(
                         let _ = repo.release_frozen(user_id, quote_asset, over).await;
                     }
                 }
+                // Trade row + four account legs + fund audit: ONE transaction.
+                let (buy_oid, sell_oid) = if req.side == "buy" {
+                    (result.order_id as i64, maker_order_id as i64)
+                } else {
+                    (maker_order_id as i64, result.order_id as i64)
+                };
+                let trade_rec = crate::desk::account_repository::SettleTradeRecord {
+                    symbol: req.symbol.to_string(),
+                    buy_order_id: buy_oid,
+                    sell_order_id: sell_oid,
+                };
                 let _ = repo
-                    .settle_trade(
+                    .settle_trade_atoms(
                         buyer_id,
                         seller_id,
                         base_asset,
                         quote_asset,
-                        fp,
-                        fq,
-                        0.0,
-                        0.0,
+                        crate::desk::money::AmountAtoms::from_f64_round(fp)
+                            .unwrap_or(crate::desk::money::AmountAtoms::ZERO),
+                        crate::desk::money::AmountAtoms::from_f64_round(fq)
+                            .unwrap_or(crate::desk::money::AmountAtoms::ZERO),
+                        crate::desk::money::AmountAtoms::ZERO,
+                        crate::desk::money::AmountAtoms::ZERO,
+                        Some(&trade_rec),
                     )
                     .await;
             }

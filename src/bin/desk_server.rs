@@ -742,6 +742,7 @@ fn process_db_cmd(
     user_tx: &lightning_exchange::api::UserTxRegistry,
     persist_pub: &std::sync::Arc<crossbeam_queue::ArrayQueue<PersistFrame>>,
     vwap_cache: &lightning_exchange::api::VwapCache,
+    risk_engine: &std::sync::Arc<lightning_exchange::desk::risk::RiskEngine>,
 ) {
     match cmd {
         DbCmd::UpsertOrder {
@@ -1010,6 +1011,59 @@ fn process_db_cmd(
 
         DbCmd::BatchSettleTrade { entries, count } => {
             // PR5d: in-memory settlement, no PG. Spin thread already
+            // S1.6: MAKER margin updates run over ALL maker-resolvable
+            // entries, NOT the both-sides filter below. The engine emits
+            // OrderUpdates only to the TAKER (makers learn of fills solely
+            // through this trade path), and the taker's FILLED can race
+            // ahead in the spin thread and GC the taker's runtime meta
+            // before this thread polls the trade — taker_uid=0 must not
+            // cost the maker its position update (caught by the
+            // chaos_position_persist drill, close-leg flake). Contract:
+            // taker margin → spin thread Phase 2; maker margin → here.
+            for e in entries.iter().take(count as usize) {
+                if e.maker_uid == 0 {
+                    continue;
+                }
+                let sym_end = e.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                let sym_str = std::str::from_utf8(&e.symbol[..sym_end]).unwrap_or("BTC_USDT");
+                let rules =
+                    lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(sym_str);
+                let fp_ticks = (e.price / rules.price_tick).round() as i64;
+                let fq_lots = rules.quantity_to_lots(e.qty).unwrap_or(0);
+                if fq_lots <= 0 {
+                    continue;
+                }
+                let maker_side = 1 - e.side; // opposite of the taker
+                let notional = lightning_exchange::desk::risk::calc::calc_notional_cents(
+                    fp_ticks,
+                    fq_lots,
+                    rules.notional_scale,
+                );
+                let fill_margin = lightning_exchange::desk::risk::calc::calc_initial_margin_cents(
+                    notional,
+                    rules.default_leverage,
+                );
+                risk_engine.on_fill(
+                    e.maker_uid,
+                    e.symbol,
+                    maker_side,
+                    fp_ticks,
+                    fq_lots,
+                    fill_margin,
+                    rules.notional_scale,
+                    rules.default_leverage,
+                    rules.maintenance_rate_bps,
+                    0, // makers are never the liquidation order
+                );
+                for frame in lightning_exchange::desk::risk_persist::margin_state_frames(
+                    risk_engine,
+                    e.maker_uid,
+                    &e.symbol,
+                ) {
+                    publish_frame(persist_pub, &frame);
+                }
+            }
+
             // resolved taker/maker uids; we just apply per-(user,asset)
             // net deltas to the account_cache atomically, then publish
             // TradeInsert + OrderDelete/OrderFillUpdate + AccountSet for
@@ -2406,6 +2460,9 @@ async fn async_main() -> anyhow::Result<()> {
                             runtime_user_id(&order_meta_cache_pub, taker_id as u64);
                         let maker_uid =
                             runtime_user_id(&order_meta_cache_pub, maker_id as u64);
+                        tracing::info!(
+                            "trade consumed: taker_id={taker_id} maker_id={maker_id}                              taker_uid={taker_uid} maker_uid={maker_uid} qty={qty}"
+                        );
                         let mut sym = [0u8; 16];
                         sym.copy_from_slice(&trade.symbol[..16]);
                         let sym_end = sym.iter().position(|&b| b == 0).unwrap_or(16);
@@ -2468,6 +2525,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 &user_tx_pub,
                                 &persist_pub_pub,
                                 &vwap_cache_pub,
+                                &risk_engine_pub,
                             );
                             settle_count = 0;
                         }
@@ -2487,6 +2545,7 @@ async fn async_main() -> anyhow::Result<()> {
                             &user_tx_pub,
                             &persist_pub_pub,
                             &vwap_cache_pub,
+                            &risk_engine_pub,
                         );
                         settle_count = 0;
                     }
@@ -2905,7 +2964,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchUpsertOrder {
                                             entries: accepted_batch,
                                             count: accepted_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                                     accepted_count = 0;
                                 }
                                 accepted_batch[accepted_count] = OrderInsertEntry {
@@ -2938,7 +2997,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       false,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.unwrap_or("")),
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                             }
                             // kind == FILLED here means "first event was a full fill"
                             // (market / IOC). Skip INSERT — the order is already terminal,
@@ -2997,7 +3056,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     side: meta.side,
                                     qty: meta.qty,
                                     freeze_price: meta.freeze_price,
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                             }
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).
@@ -3064,7 +3123,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchCancelConfirmed {
                                             entries: cancel_batch,
                                             count: cancel_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                                     cancel_count = 0;
                                 }
                                 cancel_batch[cancel_count] = entry;
@@ -3077,7 +3136,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchDeleteOrder {
                                             ids: delete_batch,
                                             count: delete_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                                     delete_count = 0;
                                 }
                                 delete_batch[delete_count] = order_id as i64;
@@ -3088,7 +3147,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     id:     order_id as i64,
                                     status,
                                     filled: fill_qty,
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                             }
                         }
 
@@ -3267,7 +3326,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchUpsertOrder {
                                 entries: accepted_batch,
                                 count: accepted_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                         accepted_count = 0;
                     }
 
@@ -3277,7 +3336,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchDeleteOrder {
                                 ids: delete_batch,
                                 count: delete_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                         delete_count = 0;
                     }
 
@@ -3288,7 +3347,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchCancelConfirmed {
                                 entries: cancel_batch,
                                 count: cancel_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
                         cancel_count = 0;
                     }
 

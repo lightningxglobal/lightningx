@@ -2252,15 +2252,18 @@ async fn handle_test_funds(State(s): State<AppState>, headers: HeaderMap) -> imp
         return e.into_response();
     }
 
-    // Check current USDT balance
-    let usdt_balance: Option<f64> =
-        sqlx::query_scalar("SELECT balance FROM accounts WHERE user_id = $1 AND asset = 'USDT'")
-            .bind(user_id)
-            .fetch_optional(s.db.as_ref())
-            .await
-            .unwrap_or(None);
+    // Check current USDT balance. atoms column — the float8 twin was
+    // dropped by migration 018; this endpoint had silently broken then
+    // (caught by the S1.6 chaos drill setting up funds via REST).
+    let usdt_balance_atoms: Option<i64> = sqlx::query_scalar(
+        "SELECT balance_atoms FROM accounts WHERE user_id = $1 AND asset = 'USDT'",
+    )
+    .bind(user_id)
+    .fetch_optional(s.db.as_ref())
+    .await
+    .unwrap_or(None);
 
-    if usdt_balance.unwrap_or(0.0) >= 100.0 {
+    if usdt_balance_atoms.unwrap_or(0) >= 100 * 100_000_000 {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "You already have funds. Test funds can only be claimed when USDT balance is below 100."}))).into_response();
     }
 

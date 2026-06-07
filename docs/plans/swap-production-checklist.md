@@ -48,9 +48,18 @@
 
 > 现状:risk 引擎全 cents(1e-2),账本全 atoms(1e-8),边界换算散落。
 
-- [ ] S2.1 盘点所有 cents↔atoms 换算点(grep 审计,产出清单进本文件)
-- [ ] S2.2 决策记录:risk 内部保留 cents(性能/量程)还是统一 atoms
-      (一致性)——倾向统一 atoms,i64 量程对 USDT 保证金足够(±922 亿)
+- [x] S2.1 盘点完成(2026-06-07 grep 审计,132 个 `_cents` 标识符):
+      `risk/engine.rs`(37,字段+参数+测试)、`desk_server.rs`(35,
+      meta 字段/强平路径/账户种子)、`ws_handler.rs`(21,下单保证金)、
+      `risk/calc.rs`(15,核心公式)、`risk_persist.rs`(12,边界换算)、
+      `counter_forward.rs`(4,OrderMeta 线格式字段)、`api.rs`(4,
+      展示)、`risk/types.rs`(3)、`transport/mod.rs`(1)
+- [x] S2.2 **决策:统一 atoms(1e-8 USDT)**。理由:①与账本/schema/线格式
+      同单位,换算点归零;②i64 量程 ±922 亿 USDT,保证金场景充裕;
+      ③名义价值计算改 i128 中间值(`ticks×lots×1e6/scale`),溢出免疫。
+      实施方式:calc 公式 ×1e6 落 atoms;引擎算术本身单位无关,字段/参数
+      重命名 `_cents`→`_atoms`;`risk_persist` 的双向换算删除(直拷)。
+      cents 单位自此在代码库中**消失**
 - [ ] S2.3 实施 + 换算边界守卫测试(任何残留换算点有 property 测试钉住)
 - [ ] S2.4 守恒不变量升级为合约语义:**Σ已实现 PnL + Σ手续费 +
       Σ资金费 + 保险基金变动 = 0**(零和检验,扩展 settle_conservation)

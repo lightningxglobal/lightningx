@@ -354,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let state = AppState {
+        funding_view: std::sync::Arc::new(dashmap::DashMap::new()),
         db: Arc::new(pool),
         rate_limiter: rate_limiter.clone(),
         engines: Some(Arc::new(engines)),

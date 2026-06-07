@@ -72,15 +72,20 @@
 
 ## S3. 资金费率 funding(P0,永续的锚)
 
-- [ ] S3.1 溢价指数:premium = (标记价 − 指数价)/指数价 的周期 TWAP
-      (依赖 S4 的指数价;S4 未就绪前可先用盘口中间价占位,接口隔离)
-- [ ] S3.2 费率计算:funding_rate = clamp(premium TWAP + 利率项, ±上限)
-      (参数 env 化:周期、上限、利率)
-- [ ] S3.3 结算 sweep:费率周期到点,按持仓名义价值批量划转
-      多空双方(单事务批次 + fund_audit 流水 + 幂等键防重复结算)
-- [ ] S3.4 不变量:每次 funding 结算 Σ收 = Σ付(精确到原子,集成测试)
-- [ ] S3.5 重启正确性:结算周期跨 desk 重启不丢不重(持久化下次结算时间)
-- [ ] S3.6 API/WS:当前费率与下次结算时间查询;历史费率表
+- [x] S3.1 溢价 TWAP(`c549e8e`,IndexPriceSource trait = S4 接缝,
+      占位 premium=0 → 纯利率项,正确退化行为)
+- [x] S3.2 费率 clamp(±0.75% 默认,FUNDING_* env;单测)
+- [x] S3.3 **单帧原子结算**(`64627c1`):FundingSettled 帧→pg-writer 同事务
+      (positions 表推导 deltas、余数入基金、history、推进 funding_state),
+      exactly-once 由 seq 位点;批隔离保证结算只见其序点之前的仓位。
+      顺手修复:PgWriteBatch::len() 不计 margin 内容(纯持仓批只能靠
+      定时器 flush);orphan 行卡死整管道(改跳过+告警+守恒保持)
+- [x] S3.4 Σ收=Σ付 不变量(集成:不均分割 OI+奇数 mark,零容差;
+      负费率方向镜像;重放去重)
+- [x] S3.5 跨重启(FundingScheduler 锚定 funding_state;停机补结算逐期
+      进行;调度单测 + drill 实测)
+- [x] S3.6 /api/funding(symbol 过滤;next/last_rate/premium 估计;
+      drill 内实测)+ funding_history 表
 
 ## S4. 指数价格与标记价格(P0,反操纵)
 
@@ -139,7 +144,7 @@
 |---|---|---|
 | S1 持仓持久化 | ✅ 完成 | `decfbc6..fdb7556` |
 | S2 单位制统一 | ✅ 完成 | `b5e7162..` |
-| S3 funding | ⬜ 未开始 | |
+| S3 funding | ✅ 完成 | `c549e8e..` |
 | S4 指数/标记价 | ⬜ 未开始 | |
 | S5 触发单 | ⬜ 未开始 | |
 | S6 强平完善 | ⬜ 未开始 | |

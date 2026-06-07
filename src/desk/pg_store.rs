@@ -1031,30 +1031,61 @@ async fn apply_funding_settlement(
     let settlement = compute_settlement(positions, mark, scale, rate);
 
     let mut total = 0usize;
+    let mut residue = settlement.residue_atoms;
     if !settlement.deltas.is_empty() {
         let users: Vec<i64> = settlement.deltas.iter().map(|d| d.user_id).collect();
         let deltas: Vec<i64> = settlement.deltas.iter().map(|d| d.equity_delta_atoms).collect();
-        let res = sqlx::query(
+        // RETURNING tells us exactly which accounts exist. A position
+        // without a risk_accounts row is corrupt data; ABORTING here
+        // would wedge the whole persist pipeline behind one bad row (a
+        // self-inflicted DoS — observed live in the S3 drill), so:
+        // skip the orphan (its money does not move), fold its delta out
+        // of the residue so the applied set still sums to exactly zero,
+        // and scream — the reconcile sweep flags the orphan separately.
+        let applied: Vec<i64> = sqlx::query_scalar(
             r#"
             UPDATE risk_accounts r
                SET equity_atoms = r.equity_atoms + d.delta,
                    updated_at = NOW()
               FROM UNNEST($1::bigint[], $2::bigint[]) AS d(user_id, delta)
              WHERE r.user_id = d.user_id
+             RETURNING r.user_id
             "#,
         )
         .bind(&users)
         .bind(&deltas)
-        .execute(&mut **tx)
+        .fetch_all(&mut **tx)
         .await?;
-        anyhow::ensure!(
-            res.rows_affected() as usize == settlement.deltas.len(),
-            "funding settlement touched {} accounts but {} have rows —              a position without a risk_accounts row breaks conservation",
-            res.rows_affected(),
-            settlement.deltas.len()
-        );
-        total += res.rows_affected() as usize;
+        if applied.len() != settlement.deltas.len() {
+            let applied_set: std::collections::HashSet<i64> =
+                applied.iter().copied().collect();
+            for d in &settlement.deltas {
+                if !applied_set.contains(&d.user_id) {
+                    // Two ways to get here: (a) transient ordering — the
+                    // position frame beat its RiskAccountSet sibling and
+                    // a funding boundary landed in between; the next
+                    // absolute-state account frame re-converges PG with
+                    // the desk's memory (self-healing, observed in the
+                    // S3 drill); (b) genuinely corrupt data, which the
+                    // reconcile sweep flags independently. Either way the
+                    // money does not move and conservation holds.
+                    tracing::warn!(
+                        "funding skip: user {} has a position but no risk_accounts row \
+                         (delta {} not applied; transient ordering or orphan — see comment)",
+                        d.user_id,
+                        d.equity_delta_atoms
+                    );
+                    residue += d.equity_delta_atoms;
+                }
+            }
+        }
+        total += applied.len();
     }
+    let settlement = {
+        let mut s = settlement;
+        s.residue_atoms = residue;
+        s
+    };
     if settlement.residue_atoms != 0 {
         sqlx::query(
             "UPDATE insurance_fund SET balance_atoms = balance_atoms + $1, updated_at = NOW()

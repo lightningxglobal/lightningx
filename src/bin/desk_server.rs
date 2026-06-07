@@ -1910,6 +1910,126 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // ── S3: funding scheduler/sampler task ────────────────────────────
+    // Durable schedule anchor = funding_state (advanced by pg-writer in
+    // the settlement transaction); the desk resumes from it on startup.
+    let funding_view: Arc<DashMap<String, (i64, i64, i64)>> = Arc::new(DashMap::new());
+    {
+        use lightning_exchange::desk::funding::{
+            FundingConfig, FundingScheduler, PremiumTracker, apply_in_memory,
+            compute_settlement, load_funding_schedule,
+        };
+        let cfg = FundingConfig::from_env();
+        let persisted = load_funding_schedule(&pool).await.unwrap_or_default();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let sample_secs: u64 = std::env::var("FUNDING_SAMPLE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let symbols: Vec<String> = std::env::var("SYMBOLS")
+            .unwrap_or_else(|_| "ETH_USDT,BTC_USDT,SOL_USDT".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut books: Vec<(String, [u8; 16], FundingScheduler, PremiumTracker)> = symbols
+            .iter()
+            .map(|sym| {
+                let sched = FundingScheduler::new(persisted.get(sym).copied(), now_ms, &cfg);
+                (
+                    sym.clone(),
+                    lightning_exchange::transport::persist_event::pack_str(sym),
+                    sched,
+                    PremiumTracker::default(),
+                )
+            })
+            .collect();
+        for (sym, _, sched, _) in &books {
+            funding_view.insert(sym.clone(), (sched.next_settlement_at_ms, 0, 0));
+        }
+        let view = funding_view.clone();
+        let engine_f = risk_engine.clone();
+        let persist_f = persist_pub.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_sample = std::time::Instant::now();
+            loop {
+                tick.tick().await;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let do_sample = last_sample.elapsed().as_secs() >= sample_secs;
+                if do_sample {
+                    last_sample = std::time::Instant::now();
+                }
+                for (sym, sym16, sched, tracker) in books.iter_mut() {
+                    let Some(mark) = engine_f.mark_price_ticks(sym16) else {
+                        continue; // no market yet — nothing to sample/settle
+                    };
+                    if do_sample {
+                        // Index placeholder (S4 seam): the book's own mark
+                        // → premium 0, funding = interest term only. The
+                        // IndexPriceSource aggregation replaces this line.
+                        tracker.sample(mark, mark);
+                        if let Some(mut v) = view.get_mut(sym) {
+                            v.2 = tracker.twap_e9();
+                        }
+                    }
+                    while let Some(boundary_ms) = sched.due(now_ms) {
+                        let cfg = FundingConfig::from_env();
+                        let rate_e9 = tracker.close_period(&cfg);
+                        let rules =
+                            lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(sym);
+                        // Settlement set = this engine's positions NOW;
+                        // pg-writer recomputes over the table at the same
+                        // sequence point — identical by construction.
+                        let positions: Vec<_> = engine_f
+                            .positions
+                            .iter()
+                            .filter(|e| &e.key().1 == sym16)
+                            .map(|e| (e.key().0, e.value().side, e.value().qty_lots))
+                            .collect();
+                        let settlement = compute_settlement(
+                            positions.into_iter(),
+                            mark,
+                            rules.notional_scale,
+                            rate_e9,
+                        );
+                        apply_in_memory(&engine_f, &settlement);
+                        let frame = lightning_exchange::transport::persist_event::PersistFrame::funding_settled(
+                            lightning_exchange::transport::persist_event::FundingSettledPayload {
+                                symbol: *sym16,
+                                rate_e9,
+                                mark_price_ticks: mark,
+                                notional_scale: rules.notional_scale,
+                                settled_at_ms: boundary_ms,
+                                next_settlement_at_ms: sched.next_settlement_at_ms,
+                            },
+                        );
+                        publish_frame(&persist_f, &frame);
+                        view.insert(
+                            sym.clone(),
+                            (sched.next_settlement_at_ms, rate_e9, 0),
+                        );
+                        tracing::info!(
+                            "funding settled: {} rate_e9={} users={} residue={} next={}",
+                            sym,
+                            rate_e9,
+                            settlement.deltas.len(),
+                            settlement.residue_atoms,
+                            sched.next_settlement_at_ms
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     let state = AppState {
         db: Arc::new(pool),
         rate_limiter: rate_limiter.clone(),
@@ -1933,6 +2053,7 @@ async fn async_main() -> anyhow::Result<()> {
         valid_symbols: Arc::new(valid_symbols),
         redis: redis_conn,
         persist_pub: Some(persist_pub.clone()),
+        funding_view: funding_view.clone(),
         vwap_cache: vwap_cache.clone(),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
         read_pool,

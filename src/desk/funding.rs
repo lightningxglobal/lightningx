@@ -183,6 +183,82 @@ pub fn compute_settlement(
     out
 }
 
+/// Mirror a computed settlement into the in-memory engine — the desk-side
+/// twin of pg-writer's transactional apply. Equity and available move by
+/// the same delta (funding is realized cash, not margin), the residue
+/// lands in the fund. Call ONLY with the settlement built from this
+/// engine's own positions at the same instant the frame is published.
+pub fn apply_in_memory(engine: &crate::desk::risk::RiskEngine, s: &FundingSettlement) {
+    use std::sync::atomic::Ordering;
+    for d in &s.deltas {
+        if let Some(mut acct) = engine.accounts.get_mut(&d.user_id) {
+            acct.equity += d.equity_delta_atoms;
+            acct.available_margin
+                .fetch_add(d.equity_delta_atoms, Ordering::Relaxed);
+        }
+    }
+    if s.residue_atoms != 0 {
+        engine
+            .insurance_fund_atoms
+            .fetch_add(s.residue_atoms, Ordering::Relaxed);
+    }
+}
+
+/// Per-symbol settlement schedule, desk-side. The DURABLE anchor is
+/// funding_state (advanced by pg-writer inside the settlement
+/// transaction); the desk loads it at startup and only tracks the next
+/// boundary in memory between settlements — a restart therefore resumes
+/// the schedule exactly where the last committed settlement left it
+/// (S3.5: can neither skip nor repeat).
+#[derive(Debug)]
+pub struct FundingScheduler {
+    pub next_settlement_at_ms: i64,
+    period_ms: i64,
+}
+
+impl FundingScheduler {
+    /// `persisted` = funding_state row if any; otherwise the first
+    /// settlement lands one full period from now (no retroactive charge
+    /// on a freshly listed symbol).
+    pub fn new(persisted_next_ms: Option<i64>, now_ms: i64, cfg: &FundingConfig) -> Self {
+        let period_ms = cfg.period_secs as i64 * 1000;
+        Self {
+            next_settlement_at_ms: persisted_next_ms.unwrap_or(now_ms + period_ms),
+            period_ms,
+        }
+    }
+
+    /// True when the boundary has passed; advances to the NEXT boundary
+    /// and returns the one being settled. Catch-up after long downtime
+    /// settles period-by-period (each call returns one boundary) so the
+    /// history stays honest rather than collapsing N periods into one.
+    pub fn due(&mut self, now_ms: i64) -> Option<i64> {
+        if now_ms < self.next_settlement_at_ms {
+            return None;
+        }
+        let boundary = self.next_settlement_at_ms;
+        self.next_settlement_at_ms += self.period_ms;
+        Some(boundary)
+    }
+}
+
+/// Load persisted next-settlement times for the desk's symbols.
+pub async fn load_funding_schedule(
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT symbol, (EXTRACT(EPOCH FROM next_settlement_at) * 1000)::bigint AS ms
+           FROM funding_state",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get::<String, _>("symbol"), r.get::<i64, _>("ms")))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +323,60 @@ mod tests {
         assert!(s.long_paid_atoms > 0 && s.short_received_atoms > 0);
         // The dust position pays/receives 0 and is omitted.
         assert!(s.deltas.iter().all(|d| d.equity_delta_atoms != 0));
+    }
+
+    #[test]
+    fn scheduler_resumes_from_persisted_anchor_and_catches_up() {
+        let cfg = FundingConfig {
+            period_secs: 28_800,
+            interest_e9: 0,
+            clamp_e9: 1,
+        };
+        let period = 28_800_000i64;
+        // Fresh symbol: first boundary one period out, nothing due now.
+        let mut s = FundingScheduler::new(None, 1_000_000, &cfg);
+        assert_eq!(s.due(1_000_000), None);
+        assert_eq!(s.due(1_000_000 + period), Some(1_000_000 + period));
+
+        // Restart with a persisted FUTURE anchor: must NOT settle early
+        // (the last settlement already advanced the state).
+        let mut s = FundingScheduler::new(Some(2_000_000_000), 1_999_999_999, &cfg);
+        assert_eq!(s.due(1_999_999_999), None, "no double settlement after restart");
+
+        // Restart after long downtime: catch up one period per call,
+        // every boundary accounted for.
+        let mut s = FundingScheduler::new(Some(1_000_000), 1_000_000 + 3 * period + 5, &cfg);
+        let now = 1_000_000 + 3 * period + 5;
+        assert_eq!(s.due(now), Some(1_000_000));
+        assert_eq!(s.due(now), Some(1_000_000 + period));
+        assert_eq!(s.due(now), Some(1_000_000 + 2 * period));
+        assert_eq!(s.due(now), Some(1_000_000 + 3 * period));
+        assert_eq!(s.due(now), None, "caught up");
+    }
+
+    #[test]
+    fn in_memory_apply_mirrors_settlement_and_keeps_conservation() {
+        use crate::desk::risk::RiskEngine;
+        let engine = RiskEngine::new();
+        engine.initialize_account(1, 1_000_000_000);
+        engine.initialize_account(2, 1_000_000_000);
+        let e0: i64 = engine.accounts.iter().map(|a| a.equity).sum();
+        let s = compute_settlement(
+            vec![(1, Long, 33_333), (2, Short, 33_333)].into_iter(),
+            5_000_001,
+            SCALE,
+            100_000,
+        );
+        apply_in_memory(&engine, &s);
+        let e1: i64 = engine.accounts.iter().map(|a| a.equity).sum();
+        assert_eq!(
+            e1 + engine.insurance_fund(),
+            e0,
+            "in-memory mirror preserves the conservation law exactly"
+        );
+        // Long paid: equity strictly down; short received.
+        assert!(engine.accounts.get(&1).unwrap().equity < 1_000_000_000);
+        assert!(engine.accounts.get(&2).unwrap().equity > 1_000_000_000);
     }
 
     #[test]

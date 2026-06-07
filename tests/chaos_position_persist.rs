@@ -49,8 +49,15 @@ fn spawn_pg_writer(aeron_dir: &str, control: &str) -> std::io::Result<ProcGuard>
         .env("EXCHANGE_ARCHIVE_CONTROL", control)
         .env("PG_RECONCILE_SECS", "0")
         .env("PG_WRITER_FLUSH_MS", "20")
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
+        .env("RUST_LOG", "info")
+        .stdout(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("/tmp/chaos-pgw-{}.log", std::process::id()))
+                .map(Stdio::from)
+                .unwrap_or(Stdio::null()),
+        )
         .stderr(Stdio::null());
     ProcGuard::spawn("pg-writer", &mut cmd)
 }
@@ -71,6 +78,9 @@ fn spawn_desk(aeron_dir: &str, control: &str) -> std::io::Result<ProcGuard> {
         // The trade-stream consumer (settlement + MAKER margin updates)
         // lives behind this flag — without it makers never settle.
         .env("DESK_PUBLIC_MARKET_DATA", "1")
+        // S3: fast funding so the drill sees a real settlement land.
+        .env("FUNDING_PERIOD_SECS", "2")
+        .env("FUNDING_SAMPLE_SECS", "1")
         .env("RUST_LOG", "info")
         .stdout(
             std::fs::OpenOptions::new()
@@ -177,6 +187,17 @@ async fn positions_survive_desk_kill9_and_remain_closable() {
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
 
+    // Residue from earlier runs of THIS suite (positions/funding rows on
+    // our symbol) would distort funding totals and the orphan guard —
+    // start clean. Other suites use isolated symbols.
+    for sql in [
+        "DELETE FROM positions WHERE symbol = $1",
+        "DELETE FROM funding_history WHERE symbol = $1",
+        "DELETE FROM funding_state WHERE symbol = $1",
+    ] {
+        let _ = sqlx::query(sql).bind(SYMBOL).execute(&pg).await;
+    }
+
     // Full topology, production start order.
     let _engine = spawn_engine(&aeron_dir, &control).expect("engine");
     let _pgw = spawn_pg_writer(&aeron_dir, &control).expect("pg-writer");
@@ -231,7 +252,54 @@ async fn positions_survive_desk_kill9_and_remain_closable() {
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    eprintln!("chaos-pos: positions durable in PG — SIGKILL desk");
+    eprintln!("chaos-pos: positions durable in PG");
+
+    // ── S3 end-to-end: a real funding settlement lands through the
+    //    desk task → frame → pg-writer single-tx path. With premium 0
+    //    (placeholder index) the rate is the interest term: longs pay. ──
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let row: Option<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT long_paid_atoms, short_received_atoms, fund_residue_atoms
+               FROM funding_history
+              WHERE symbol = $1 AND long_paid_atoms > 0
+              ORDER BY id DESC LIMIT 1",
+        )
+        .bind(SYMBOL)
+        .fetch_optional(&pg)
+        .await
+        .expect("funding history");
+        if let Some((paid, recv, residue)) = row {
+            assert_eq!(
+                paid,
+                recv + residue,
+                "funding conservation: paid == received + fund residue"
+            );
+            eprintln!(
+                "chaos-pos: funding settled for real (paid={paid}, recv={recv}, residue={residue})"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no funding settlement with open positions within 20s"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // The /api/funding view is live.
+    let funding: Value = http
+        .get(format!("{}/api/funding?symbol={SYMBOL}", base()))
+        .send()
+        .await
+        .expect("funding api")
+        .json()
+        .await
+        .expect("funding json");
+    assert!(
+        funding.to_string().contains(SYMBOL),
+        "funding API must expose the symbol: {funding}"
+    );
+    eprintln!("chaos-pos: /api/funding live — SIGKILL desk");
 
     // ── THE KILL ─────────────────────────────────────────────────────────
     desk.kill9();

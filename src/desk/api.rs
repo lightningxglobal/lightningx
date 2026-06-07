@@ -246,6 +246,10 @@ pub struct AppState {
     /// PersistEvent publisher (Aeron IPC stream consumed by redis-writer).
     /// None ⇒ standalone mode without Aeron — REST POST will not publish.
     pub persist_pub: Option<PersistPubHandle>,
+    /// Funding view for /api/funding (S3.6): symbol → (next_settlement_ms,
+    /// last_rate_e9, running premium-TWAP estimate e9). Written by the
+    /// desk's funding task, read-only here.
+    pub funding_view: Arc<DashMap<String, (i64, i64, i64)>>,
     /// Per (user_id, base_asset) running VWAP of BUY fills. Updated by
     /// the spin thread on every BatchSettleTrade. Read by /api/positions.
     pub vwap_cache: VwapCache,
@@ -299,6 +303,7 @@ pub fn router(state: AppState) -> Router {
         // Trades, positions & tickers
         .route("/api/trades", get(handle_trades))
         .route("/api/positions", get(handle_positions))
+        .route("/api/funding", get(handle_funding))
         .route("/api/tickers", get(handle_tickers))
         // K-lines
         .route("/api/klines", get(handle_klines))
@@ -927,6 +932,30 @@ async fn handle_trades(
         )
             .into_response(),
     }
+}
+
+/// S3.6 — current funding state per symbol (public; no auth needed).
+/// `?symbol=BTC_USDT` filters; otherwise every tracked symbol.
+async fn handle_funding(
+    State(s): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let want = q.get("symbol");
+    let rows: Vec<Value> = s
+        .funding_view
+        .iter()
+        .filter(|e| want.is_none_or(|w| w == e.key()))
+        .map(|e| {
+            let (next_ms, last_rate_e9, premium_twap_e9) = *e.value();
+            json!({
+                "symbol": e.key(),
+                "next_settlement_at_ms": next_ms,
+                "last_rate_e9": last_rate_e9,
+                "premium_twap_e9": premium_twap_e9,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({ "funding": rows }))).into_response()
 }
 
 async fn handle_positions(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

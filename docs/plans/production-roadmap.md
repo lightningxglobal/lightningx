@@ -11,7 +11,7 @@
 
 | 阶段 | 进度 | 状态 |
 |------|------|------|
-| P1 资金定点化 | 🟢 ~98% | **legacy float8 账户列已物理下线**（迁移 018，预上线无兼容窗口）；over-fill 升硬约束。剩：orders/trades float8 随 P2 线格式升级退役 |
+| P1 资金定点化 | 🟢 100% | **关闭**：orders/trades float8 也已退役（迁移 021，GENERATED 列——读者零改动、写 float 列被 PG 物理拒绝）；freeze_price_atoms 补齐。Gate 1 完全达成：f64 仅存在于派生展示 |
 | P2 事件日志+序列号 | 🟢 100% | persist+引擎输入双 journal、exactly-once 位点、事件驱动 replay 完成检测、retention 清理（`5345f04`）。**关闭** |
 | P3 资金事务闭环 | 🟢 100% | settle+trade 单事务+全局唯一键、append-only fund_audit 全腿流水、journal-audit 三方对账工具（`87c1c55`）。**关闭** |
 | P4 风控补全 | 🟢 100% | 关闭（`3518336`） |
@@ -19,8 +19,8 @@
 | P6 安全加固 | 🟢 ~95% | /metrics(VictoriaMetrics)、JWT 吊销（O(1) 内存+Redis 30s 传播）、fuzz 实跑 683 万次零 crash（`9c12605`）。剩：第三方渗透测试（外部） |
 
 **代码侧工作面已基本清空。** 剩余四类：①混沌测试执行（Gate 2/4/5 的脚本化演练，
-基础设施已齐）；②多机部署件（PG 主从、双机 failover 演练）；③30 天观察类
-（orders/trades float8 退役随线格式升级）；④外部（渗透测试）。
+基础设施已齐）；②多机部署件（PG 主从、双机 failover 演练）；③外部（渗透测试）。
+P1-P4 全部关闭；P5 剩多机部署件；P6 剩渗透测试。
 
 ### 本轮设计决定（用户拍板，已存档）
 

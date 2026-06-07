@@ -44,6 +44,7 @@ pub fn margin_state_frames(
                 qty_lots: pos.qty_lots,
                 entry_price_ticks: pos.entry_price_ticks,
                 used_margin_atoms: pos.initial_margin,
+                cost_atoms: pos.cost_atoms,
             }));
         }
         None => {
@@ -164,7 +165,7 @@ pub async fn hydrate_from_pg(
     // ── Positions (+ the indexes on_fill normally maintains) ───────────
     let rows = sqlx::query(
         "SELECT user_id, symbol, side, qty_lots, entry_price_ticks, leverage,
-                used_margin_atoms
+                used_margin_atoms, cost_atoms
            FROM positions",
     )
     .fetch_all(pool)
@@ -189,6 +190,7 @@ pub async fn hydrate_from_pg(
         let entry: i64 = row.get("entry_price_ticks");
         let leverage: u8 = row.get::<i16, _>("leverage") as u8;
         let margin_atoms: i64 = row.get("used_margin_atoms");
+        let cost_atoms: i64 = row.get("cost_atoms");
 
         // Recompute derived prices with the SAME calc path as on_fill.
         let rules = crate::desk::symbol_rules::SymbolRules::for_symbol(&symbol_s);
@@ -205,6 +207,7 @@ pub async fn hydrate_from_pg(
                 symbol,
                 side,
                 qty_lots,
+                cost_atoms,
                 entry_price_ticks: entry,
                 mark_price_ticks: entry, // corrected by the first mark tick
                 unrealized_pnl: 0,

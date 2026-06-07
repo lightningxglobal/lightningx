@@ -161,6 +161,8 @@ pub struct PositionUpsertPayload {
     pub qty_lots: i64,
     pub entry_price_ticks: i64,
     pub used_margin_atoms: i64,
+    /// Cumulative open cost (atoms) — the PnL-bearing state (S2.4).
+    pub cost_atoms: i64,
 }
 
 /// Position fully closed → DELETE (user_id, symbol). 24 bytes.
@@ -501,6 +503,7 @@ mod tests {
             qty_lots: 1_000_000,
             entry_price_ticks: 5_000_000,
             used_margin_atoms: 25_000_000_000,
+            cost_atoms: 250_000_000_000,
         };
         let mut f = PersistFrame::position_upsert(pos);
         f.publisher_id = 7;

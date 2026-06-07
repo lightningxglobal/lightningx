@@ -279,13 +279,16 @@ impl RiskEngine {
                 // sell close (long liq): fill > liq → (fill - liq) * qty / scale > 0
                 // buy  close (short liq): liq > fill → (liq - fill) * qty / scale > 0
                 let sign: i64 = if order_side == 1 { 1 } else { -1 }; // sell=+1, buy=-1
-                // ×1e6: ticks×lots/scale yields cents; the engine books
-                // ATOMS (S2). Same convention as calc::calc_notional_atoms.
-                ((fill_price_ticks - liq_price_ticks) as i128
-                    * sign as i128
-                    * fill_qty_lots as i128
-                    * 1_000_000
-                    / notional_scale as i128) as i64
+                // Difference of two independently-computed fill VALUES —
+                // not a difference-of-ticks divided once. This makes the
+                // user's settlement leg + the fund's spread leg sum to
+                // exactly the counterparty's fill value for ANY
+                // notional_scale (zero-sum law, S2.4).
+                let fill_value =
+                    calc::calc_notional_atoms(fill_price_ticks, fill_qty_lots, notional_scale);
+                let settle_value =
+                    calc::calc_notional_atoms(liq_price_ticks, fill_qty_lots, notional_scale);
+                sign * (fill_value - settle_value)
             } else {
                 let is_liquidating = self
                     .accounts
@@ -573,6 +576,7 @@ fn compute_position_update(
                 symbol,
                 side: fill_side,
                 qty_lots: fill_qty_lots,
+                cost_atoms: notional, // open cost = fill value
                 entry_price_ticks: fill_price_ticks,
                 mark_price_ticks: fill_price_ticks,
                 unrealized_pnl: 0,
@@ -591,13 +595,16 @@ fn compute_position_update(
     updated.mark_price_ticks = fill_price_ticks;
 
     if pos.side == fill_side {
-        // Adding to same-side position — weighted-average entry price.
+        // Adding to same-side position — weighted-average entry price for
+        // display/liq reference; the PnL-bearing state is cost_atoms.
         let old_qty = pos.qty_lots;
         let new_qty = old_qty + fill_qty_lots;
         updated.entry_price_ticks = ((pos.entry_price_ticks as i128 * old_qty as i128
             + fill_price_ticks as i128 * fill_qty_lots as i128)
             / new_qty as i128) as i64;
         updated.qty_lots = new_qty;
+        updated.cost_atoms +=
+            calc::calc_notional_atoms(fill_price_ticks, fill_qty_lots, notional_scale);
         updated.initial_margin += fill_margin_atoms;
         refresh_risk_fields(&mut updated, notional_scale, maintenance_rate_bps);
         refresh_unrealized_pnl(&mut updated, notional_scale);
@@ -612,13 +619,16 @@ fn compute_position_update(
     };
 
     if fill_qty_lots >= pos.qty_lots {
-        // Close (and possibly flip).
+        // Close (and possibly flip). PnL against COST BASIS: the exit
+        // value and the recorded cost are both exact atoms, so the two
+        // sides of every trade book equal-and-opposite amounts and the
+        // venue-wide zero-sum law holds with no truncation residue
+        // (S2.4; VWAP-based PnL provably minted ~1e6 atoms per 300
+        // random trades).
         let close_qty = pos.qty_lots;
-        // ×1e6 → atoms (S2), matching calc::calc_unrealized_pnl_atoms.
-        let realized_pnl =
-            sign * (fill_price_ticks - pos.entry_price_ticks) as i128 * close_qty as i128
-                * 1_000_000
-                / notional_scale as i128;
+        let exit_value =
+            calc::calc_notional_atoms(fill_price_ticks, close_qty, notional_scale) as i128;
+        let realized_pnl = sign * (exit_value - pos.cost_atoms as i128);
         let released_margin = pos.initial_margin;
 
         let remaining_qty = fill_qty_lots - close_qty;
@@ -643,6 +653,7 @@ fn compute_position_update(
                 symbol,
                 side: fill_side,
                 qty_lots: remaining_qty,
+                cost_atoms: notional, // fresh side opens at the fill value
                 entry_price_ticks: fill_price_ticks,
                 mark_price_ticks: fill_price_ticks,
                 unrealized_pnl: 0,
@@ -656,16 +667,19 @@ fn compute_position_update(
             realized_pnl as i64,
         )
     } else {
-        // Partial close.
+        // Partial close: release a PRO-RATA share of the cost basis. The
+        // division truncates, but the残 remainder stays inside
+        // cost_atoms — redistribution within the user, never creation.
         let close_qty = fill_qty_lots;
-        // ×1e6 → atoms (S2), matching calc::calc_unrealized_pnl_atoms.
-        let realized_pnl =
-            sign * (fill_price_ticks - pos.entry_price_ticks) as i128 * close_qty as i128
-                * 1_000_000
-                / notional_scale as i128;
+        let released_cost =
+            (pos.cost_atoms as i128 * close_qty as i128 / pos.qty_lots as i128) as i64;
+        let exit_value =
+            calc::calc_notional_atoms(fill_price_ticks, close_qty, notional_scale) as i128;
+        let realized_pnl = sign * (exit_value - released_cost as i128);
         let released_margin = pos.initial_margin * close_qty / pos.qty_lots;
 
         updated.qty_lots = pos.qty_lots - close_qty;
+        updated.cost_atoms = pos.cost_atoms - released_cost;
         updated.initial_margin = pos.initial_margin - released_margin;
         refresh_risk_fields(&mut updated, notional_scale, maintenance_rate_bps);
         refresh_unrealized_pnl(&mut updated, notional_scale);

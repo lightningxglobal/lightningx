@@ -83,6 +83,7 @@ fn position_frame(seq: u64, user_id: i64) -> PersistFrame {
         qty_lots: seq as i64, // strictly increasing → last wins
         entry_price_ticks: 5_000_000,
         used_margin_atoms: seq as i64 * 100,
+        cost_atoms: seq as i64 * 1_000,
     });
     f.publisher_id = PUBLISHER_ID;
     f.seq = seq;

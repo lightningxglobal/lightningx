@@ -139,6 +139,12 @@ pub struct PositionRiskState {
     pub symbol: [u8; 16],
     pub side: PositionSide,
     pub qty_lots: i64,
+    /// Cumulative open cost in ATOMS (Σ fill values). PnL is computed
+    /// against this — NOT against entry_price_ticks — so the books stay
+    /// zero-sum to the atom: the VWAP entry truncates to whole ticks and
+    /// the S2.4 conservation test proved that truncation literally mints
+    /// money. entry_price_ticks remains the display/liq-price reference.
+    pub cost_atoms: i64,
     pub entry_price_ticks: i64,
     pub mark_price_ticks: i64,
     pub unrealized_pnl: i64,

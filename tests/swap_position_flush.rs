@@ -61,6 +61,7 @@ fn pos_frame(user: i64, qty: i64, entry: i64, margin_atoms: i64) -> PersistFrame
         qty_lots: qty,
         entry_price_ticks: entry,
         used_margin_atoms: margin_atoms,
+        cost_atoms: margin_atoms * 10, // 10x leverage notional
     })
 }
 

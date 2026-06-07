@@ -115,6 +115,7 @@ async fn crashed_engine_state_roundtrips_through_pg() {
         assert_eq!(pa.entry_price_ticks, pb.entry_price_ticks, "entry");
         assert_eq!(pa.leverage, pb.leverage, "leverage");
         assert_eq!(pa.initial_margin, pb.initial_margin, "margin");
+        assert_eq!(pa.cost_atoms, pb.cost_atoms, "cost basis (PnL-bearing, S2.4)");
         assert_eq!(pa.maintenance_margin, pb.maintenance_margin, "maint recomputed equal");
         assert_eq!(
             pa.liquidation_price_ticks, pb.liquidation_price_ticks,

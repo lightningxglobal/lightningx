@@ -166,6 +166,7 @@ enum PositionOp {
         entry_price_ticks: i64,
         leverage: i16,
         used_margin_atoms: i64,
+        cost_atoms: i64,
     },
     Delete {
         user_id: i64,
@@ -381,6 +382,7 @@ impl PgWriteBatch {
                         entry_price_ticks: p.entry_price_ticks,
                         leverage: p.leverage as i16,
                         used_margin_atoms: p.used_margin_atoms,
+                        cost_atoms: p.cost_atoms,
                     });
                     true
                 }
@@ -982,6 +984,7 @@ async fn flush_positions(conn: &mut PgConnection, ops: &[PositionOp]) -> anyhow:
     let mut up_entry = Vec::new();
     let mut up_lev: Vec<i16> = Vec::new();
     let mut up_margin = Vec::new();
+    let mut up_cost = Vec::new();
     let mut del_user = Vec::new();
     let mut del_symbol: Vec<String> = Vec::new();
     for i in keep_idx {
@@ -994,6 +997,7 @@ async fn flush_positions(conn: &mut PgConnection, ops: &[PositionOp]) -> anyhow:
                 entry_price_ticks,
                 leverage,
                 used_margin_atoms,
+                cost_atoms,
             } => {
                 up_user.push(*user_id);
                 up_symbol.push(symbol.clone());
@@ -1002,6 +1006,7 @@ async fn flush_positions(conn: &mut PgConnection, ops: &[PositionOp]) -> anyhow:
                 up_entry.push(*entry_price_ticks);
                 up_lev.push(*leverage);
                 up_margin.push(*used_margin_atoms);
+                up_cost.push(*cost_atoms);
             }
             PositionOp::Delete { user_id, symbol } => {
                 del_user.push(*user_id);
@@ -1016,18 +1021,19 @@ async fn flush_positions(conn: &mut PgConnection, ops: &[PositionOp]) -> anyhow:
             r#"
             INSERT INTO positions
                 (user_id, symbol, side, qty_lots, entry_price_ticks, leverage,
-                 used_margin_atoms, updated_at)
+                 used_margin_atoms, cost_atoms, updated_at)
             SELECT *, NOW() FROM UNNEST(
                 $1::bigint[], $2::text[], $3::text[], $4::bigint[],
-                $5::bigint[], $6::smallint[], $7::bigint[]
+                $5::bigint[], $6::smallint[], $7::bigint[], $8::bigint[]
             ) AS t(user_id, symbol, side, qty_lots, entry_price_ticks, leverage,
-                   used_margin_atoms)
+                   used_margin_atoms, cost_atoms)
             ON CONFLICT (user_id, symbol) DO UPDATE SET
                 side = EXCLUDED.side,
                 qty_lots = EXCLUDED.qty_lots,
                 entry_price_ticks = EXCLUDED.entry_price_ticks,
                 leverage = EXCLUDED.leverage,
                 used_margin_atoms = EXCLUDED.used_margin_atoms,
+                cost_atoms = EXCLUDED.cost_atoms,
                 updated_at = NOW()
             "#,
         )
@@ -1038,6 +1044,7 @@ async fn flush_positions(conn: &mut PgConnection, ops: &[PositionOp]) -> anyhow:
         .bind(&up_entry)
         .bind(&up_lev)
         .bind(&up_margin)
+        .bind(&up_cost)
         .execute(&mut *conn)
         .await?;
         total += res.rows_affected() as usize;

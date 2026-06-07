@@ -56,15 +56,13 @@ async fn make_user(pg: &PgPool) -> Option<i64> {
 
 async fn seed_account(pg: &PgPool, user_id: i64, asset: &str, balance_atoms: i64) {
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
-         VALUES ($1, $2, $3, 0, $4, 0)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+         VALUES ($1, $2, $3, 0)
          ON CONFLICT (user_id, asset) DO UPDATE SET
-            balance = EXCLUDED.balance, frozen = EXCLUDED.frozen,
             balance_atoms = EXCLUDED.balance_atoms, frozen_atoms = EXCLUDED.frozen_atoms",
     )
     .bind(user_id)
     .bind(asset)
-    .bind(AmountAtoms::from_atoms(balance_atoms).to_f64())
     .bind(balance_atoms)
     .execute(pg)
     .await

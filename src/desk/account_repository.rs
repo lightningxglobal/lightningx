@@ -4,8 +4,8 @@
 /// All monetary arithmetic happens in fixed-point atoms (i64, 1e-8). The
 /// `*_atoms` methods are the canonical API; the f64 variants are thin
 /// boundary wrappers kept for legacy callers and perform exactly one
-/// conversion at entry. Legacy float8 `balance`/`frozen` column writes are
-/// derived FROM the atom values so the two representations cannot diverge.
+/// conversion at entry. The float8 legacy columns were dropped pre-launch
+/// (migration 018): atoms are the only representation of money.
 use crate::desk::money::{AccountBalance, AmountAtoms};
 use crate::models::DbAccount;
 use anyhow::{Result, anyhow};
@@ -42,8 +42,8 @@ impl<'a> AccountRepository<'a> {
     /// Ensure an account row exists; creates it with zero balance if not.
     pub async fn ensure_account(&self, user_id: i64, asset: &str) -> Result<()> {
         sqlx::query(
-            "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
-             VALUES ($1, $2, 0, 0, 0, 0) ON CONFLICT DO NOTHING",
+            "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+             VALUES ($1, $2, 0, 0) ON CONFLICT DO NOTHING",
         )
         .bind(user_id)
         .bind(asset)
@@ -88,14 +88,12 @@ impl<'a> AccountRepository<'a> {
         }
         let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
-                frozen = frozen + $1,
-                frozen_atoms = frozen_atoms + $2,
+                frozen_atoms = frozen_atoms + $1,
                 updated_at = NOW()
-             WHERE user_id = $3 AND asset = $4
-               AND (balance_atoms - frozen_atoms) >= $2
+             WHERE user_id = $2 AND asset = $3
+               AND (balance_atoms - frozen_atoms) >= $1
              RETURNING balance_atoms, frozen_atoms",
         )
-        .bind(amount.to_f64())
         .bind(amount.atoms())
         .bind(user_id)
         .bind(asset)
@@ -138,13 +136,11 @@ impl<'a> AccountRepository<'a> {
         }
         let row: Option<(i64, i64)> = sqlx::query_as(
             "UPDATE accounts SET
-                frozen = GREATEST(frozen - $1, 0),
-                frozen_atoms = GREATEST(frozen_atoms - $2, 0),
+                frozen_atoms = GREATEST(frozen_atoms - $1, 0),
                 updated_at = NOW()
-             WHERE user_id = $3 AND asset = $4
+             WHERE user_id = $2 AND asset = $3
              RETURNING balance_atoms, frozen_atoms",
         )
-        .bind(amount.to_f64())
         .bind(amount.atoms())
         .bind(user_id)
         .bind(asset)
@@ -217,14 +213,11 @@ impl<'a> AccountRepository<'a> {
         // Buyer: deduct frozen quote (cost + fee), credit base
         sqlx::query(
             "UPDATE accounts SET
-                balance = balance - $1,
-                frozen = frozen - $1,
-                balance_atoms = balance_atoms - $2,
-                frozen_atoms = frozen_atoms - $2,
+                balance_atoms = balance_atoms - $1,
+                frozen_atoms = frozen_atoms - $1,
                 updated_at = NOW()
-             WHERE user_id = $3 AND asset = $4",
+             WHERE user_id = $2 AND asset = $3",
         )
-        .bind(buyer_debit.to_f64())
         .bind(buyer_debit.atoms())
         .bind(buyer_id)
         .bind(quote_asset)
@@ -233,16 +226,14 @@ impl<'a> AccountRepository<'a> {
         .map_err(|e| anyhow!("settle stmt-1: {e}"))?;
 
         sqlx::query(
-            "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
-             VALUES ($1, $2, $3, 0, $4, 0)
+            "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+             VALUES ($1, $2, $3, 0)
              ON CONFLICT (user_id, asset) DO UPDATE
-               SET balance = accounts.balance + $3,
-                   balance_atoms = accounts.balance_atoms + $4,
+               SET balance_atoms = accounts.balance_atoms + $3,
                    updated_at = NOW()",
         )
         .bind(buyer_id)
         .bind(base_asset)
-        .bind(quantity.to_f64())
         .bind(quantity.atoms())
         .execute(&mut *tx)
         .await
@@ -251,14 +242,11 @@ impl<'a> AccountRepository<'a> {
         // Seller: deduct frozen base, credit quote (proceeds - fee)
         sqlx::query(
             "UPDATE accounts SET
-                balance = balance - $1,
-                frozen = frozen - $1,
-                balance_atoms = balance_atoms - $2,
-                frozen_atoms = frozen_atoms - $2,
+                balance_atoms = balance_atoms - $1,
+                frozen_atoms = frozen_atoms - $1,
                 updated_at = NOW()
-             WHERE user_id = $3 AND asset = $4",
+             WHERE user_id = $2 AND asset = $3",
         )
-        .bind(quantity.to_f64())
         .bind(quantity.atoms())
         .bind(seller_id)
         .bind(base_asset)
@@ -267,16 +255,14 @@ impl<'a> AccountRepository<'a> {
         .map_err(|e| anyhow!("settle stmt-3: {e}"))?;
 
         sqlx::query(
-            "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
-             VALUES ($1, $2, $3, 0, $4, 0)
+            "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+             VALUES ($1, $2, $3, 0)
              ON CONFLICT (user_id, asset) DO UPDATE
-               SET balance = accounts.balance + $3,
-                   balance_atoms = accounts.balance_atoms + $4,
+               SET balance_atoms = accounts.balance_atoms + $3,
                    updated_at = NOW()",
         )
         .bind(seller_id)
         .bind(quote_asset)
-        .bind(seller_credit.to_f64())
         .bind(seller_credit.atoms())
         .execute(&mut *tx)
         .await

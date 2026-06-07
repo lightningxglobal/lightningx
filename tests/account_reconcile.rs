@@ -1,5 +1,6 @@
 //! Integration tests for desk::reconcile account invariant checks and the
-//! durability-enforcing pool. Requires a local PG (skips gracefully if
+//! durability-enforcing pool. (The legacy float/atoms drift check was
+//! removed together with the float8 account columns — migration 018.) Requires a local PG (skips gracefully if
 //! absent, same pattern as account_repository_atoms).
 
 use lightning_exchange::db;
@@ -37,22 +38,15 @@ async fn seed_account_atoms(
     balance_atoms: i64,
     frozen_atoms: i64,
 ) {
-    // Legacy float columns derived from atoms — consistent by construction.
-    let balance = AmountAtoms::from_atoms(balance_atoms).to_f64();
-    let frozen = AmountAtoms::from_atoms(frozen_atoms).to_f64();
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, asset) DO UPDATE SET
-            balance = EXCLUDED.balance,
-            frozen = EXCLUDED.frozen,
             balance_atoms = EXCLUDED.balance_atoms,
             frozen_atoms = EXCLUDED.frozen_atoms",
     )
     .bind(user_id)
     .bind(asset)
-    .bind(balance)
-    .bind(frozen)
     .bind(balance_atoms)
     .bind(frozen_atoms)
     .execute(pg)
@@ -143,47 +137,3 @@ async fn detects_hanging_frozen_funds() {
     cleanup(&pg, &[leaker, trader]).await;
 }
 
-#[tokio::test]
-async fn detects_legacy_atoms_drift() {
-    let Some(pg) = try_pg().await else {
-        eprintln!("skip: no PG");
-        return;
-    };
-    let Some(drifted) = make_user(&pg).await else {
-        eprintln!("skip: cannot make user");
-        return;
-    };
-    let Some(healthy) = make_user(&pg).await else {
-        eprintln!("skip: cannot make user");
-        cleanup(&pg, &[drifted]).await;
-        return;
-    };
-
-    // healthy: float and atoms agree.
-    seed_account_atoms(&pg, healthy, "USDT", 12_345_678_900, 0).await;
-    // drifted: a code path updated the float column but not the atoms one.
-    seed_account_atoms(&pg, drifted, "USDT", 10_000_000_000, 0).await;
-    sqlx::query("UPDATE accounts SET balance = 250.0 WHERE user_id = $1 AND asset = 'USDT'")
-        .bind(drifted)
-        .execute(&pg)
-        .await
-        .expect("inject drift");
-
-    let report = check_account_invariants(&pg)
-        .await
-        .expect("reconcile sweep");
-
-    assert!(
-        report
-            .atoms_drift
-            .iter()
-            .any(|r| r.user_id == drifted && r.asset == "USDT"),
-        "drifted account must be reported"
-    );
-    assert!(
-        !report.atoms_drift.iter().any(|r| r.user_id == healthy),
-        "consistent account must not be reported"
-    );
-
-    cleanup(&pg, &[drifted, healthy]).await;
-}

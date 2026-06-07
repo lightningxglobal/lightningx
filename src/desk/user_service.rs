@@ -117,10 +117,10 @@ pub async fn register(
 
     // Seed test funds: 10,000 USDT + 1 BTC for new users to trade immediately
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
          VALUES
-            ($1, 'USDT', 10000, 0, 1000000000000, 0),
-            ($1, 'BTC', 1, 0, 100000000, 0)
+            ($1, 'USDT', 1000000000000, 0),
+            ($1, 'BTC', 100000000, 0)
          ON CONFLICT DO NOTHING",
     )
     .bind(user.id)

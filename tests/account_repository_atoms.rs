@@ -41,21 +41,15 @@ async fn cleanup(pg: &PgPool, user_ids: &[i64]) {
 async fn seed_account(pg: &PgPool, user_id: i64, asset: &str, balance: &str, frozen: &str) {
     let balance_atoms = AmountAtoms::from_decimal_str(balance).unwrap().atoms();
     let frozen_atoms = AmountAtoms::from_decimal_str(frozen).unwrap().atoms();
-    let balance_f = balance.parse::<f64>().unwrap();
-    let frozen_f = frozen.parse::<f64>().unwrap();
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, asset) DO UPDATE SET
-            balance = EXCLUDED.balance,
-            frozen = EXCLUDED.frozen,
             balance_atoms = EXCLUDED.balance_atoms,
             frozen_atoms = EXCLUDED.frozen_atoms",
     )
     .bind(user_id)
     .bind(asset)
-    .bind(balance_f)
-    .bind(frozen_f)
     .bind(balance_atoms)
     .bind(frozen_atoms)
     .execute(pg)
@@ -63,9 +57,14 @@ async fn seed_account(pg: &PgPool, user_id: i64, asset: &str, balance: &str, fro
     .expect("seed account");
 }
 
+/// (balance_f64_projection, frozen_f64_projection, balance_atoms, frozen_atoms)
+/// — the float values are computed FROM atoms (the only stored truth).
 async fn account_amounts(pg: &PgPool, user_id: i64, asset: &str) -> (f64, f64, i64, i64) {
     sqlx::query_as(
-        "SELECT balance, frozen, balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset=$2",
+        "SELECT balance_atoms::float8 / 100000000.0,
+                frozen_atoms::float8 / 100000000.0,
+                balance_atoms, frozen_atoms
+           FROM accounts WHERE user_id=$1 AND asset=$2",
     )
     .bind(user_id)
     .bind(asset)

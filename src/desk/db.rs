@@ -151,6 +151,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         include_str!("../../migrations/017_audit_log.sql"),
     )
     .await?;
+    apply_migration(
+        pool,
+        "018_drop_legacy_float_accounts",
+        include_str!("../../migrations/018_drop_legacy_float_accounts.sql"),
+    )
+    .await?;
     Ok(())
 }
 

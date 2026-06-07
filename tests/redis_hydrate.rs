@@ -45,14 +45,12 @@ async fn ensure_test_user(pg: &sqlx::PgPool, email: &str) -> sqlx::Result<i64> {
     .fetch_one(pg)
     .await?;
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
          VALUES
-            ($1, 'USDT', 12345.6, 100, 1234560000000, 10000000000),
-            ($1, 'BTC', 7.5, 0.5, 750000000, 50000000)
+            ($1, 'USDT', 1234560000000, 10000000000),
+            ($1, 'BTC', 750000000, 50000000)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = EXCLUDED.balance,
-             frozen = EXCLUDED.frozen,
-             balance_atoms = EXCLUDED.balance_atoms,
+         SET balance_atoms = EXCLUDED.balance_atoms,
              frozen_atoms = EXCLUDED.frozen_atoms",
     )
     .bind(id)

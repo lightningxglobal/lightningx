@@ -329,6 +329,10 @@ async fn apply_account_set(
     if asset.is_empty() {
         return Ok(());
     }
+    // Display fields are projections of the atoms truth, never the other
+    // way around (the float payload fields are legacy wire baggage).
+    let balance = AmountAtoms::from_atoms(balance_atoms).to_f64();
+    let frozen = AmountAtoms::from_atoms(frozen_atoms).to_f64();
     redis::pipe()
         .hset_multiple(
             key_account(user_id, &asset),
@@ -461,8 +465,8 @@ pub async fn hydrate_from_pg(
 
     let t_pg_acct = std::time::Instant::now();
     // 2) Accounts.
-    let acct_rows: Vec<(i64, String, f64, f64, i64, i64)> =
-        sqlx::query_as("SELECT user_id, asset, balance, frozen, balance_atoms, frozen_atoms FROM accounts")
+    let acct_rows: Vec<(i64, String, i64, i64)> =
+        sqlx::query_as("SELECT user_id, asset, balance_atoms, frozen_atoms FROM accounts")
             .fetch_all(pg)
             .await?;
     let dt_pg_acct = t_pg_acct.elapsed();
@@ -470,7 +474,10 @@ pub async fn hydrate_from_pg(
     let t_redis_acct = std::time::Instant::now();
     if !acct_rows.is_empty() {
         let mut pipe = redis::pipe();
-        for (user_id, asset, balance, frozen, balance_atoms, frozen_atoms) in &acct_rows {
+        for (user_id, asset, balance_atoms, frozen_atoms) in &acct_rows {
+            // Display fields are projections of the atoms truth.
+            let balance = AmountAtoms::from_atoms(*balance_atoms).to_f64();
+            let frozen = AmountAtoms::from_atoms(*frozen_atoms).to_f64();
             pipe.hset_multiple(
                 key_account(*user_id, asset),
                 &[

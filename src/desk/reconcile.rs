@@ -11,10 +11,10 @@
 //!    crash between freeze and order INSERT). Conservative on purpose: a
 //!    user with ANY open order is skipped, so false positives are limited
 //!    to multi-asset edge cases rather than ordinary trading.
-//! 2. Legacy/atoms drift — during the float8 compatibility window both
-//!    column families are written together; `|balance×1e8 − balance_atoms|`
-//!    beyond a small tolerance means a code path updated one but not the
-//!    other and must be fixed before the legacy columns are dropped.
+//! 2. Orders/trades float/atoms drift — those tables still carry float8
+//!    originals next to the atoms twins until the order-path wire upgrade;
+//!    divergence means a code path updated one family but not the other.
+//!    (Accounts float8 columns were DROPPED pre-launch — migration 018.)
 
 use crate::desk::money::AMOUNT_SCALE;
 use anyhow::Result;
@@ -37,22 +37,10 @@ pub struct HangingFrozenRow {
     pub frozen_atoms: i64,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct AtomsDriftRow {
-    pub user_id: i64,
-    pub asset: String,
-    pub balance: f64,
-    pub balance_atoms: i64,
-    pub frozen: f64,
-    pub frozen_atoms: i64,
-}
-
 #[derive(Debug, Default)]
 pub struct ReconcileReport {
     pub hanging_frozen_total: i64,
     pub hanging_frozen: Vec<HangingFrozenRow>,
-    pub atoms_drift_total: i64,
-    pub atoms_drift: Vec<AtomsDriftRow>,
     /// orders rows whose float and atoms columns disagree (sample of ids).
     pub orders_drift_total: i64,
     pub orders_drift_ids: Vec<i64>,
@@ -69,7 +57,6 @@ pub struct ReconcileReport {
 impl ReconcileReport {
     pub fn is_clean(&self) -> bool {
         self.hanging_frozen_total == 0
-            && self.atoms_drift_total == 0
             && self.orders_drift_total == 0
             && self.trades_drift_total == 0
             && self.orders_overfill_total == 0
@@ -189,29 +176,6 @@ pub async fn check_account_invariants(pool: &PgPool) -> Result<ReconcileReport> 
             "SELECT user_id, asset, frozen_atoms FROM accounts
               WHERE {hanging_filter}
               ORDER BY frozen_atoms DESC LIMIT {REPORT_ROW_LIMIT}"
-        ))
-        .fetch_all(pool)
-        .await?;
-    }
-
-    // -- Check 2: legacy float vs atoms drift ------------------------------
-    let drift_filter = format!(
-        "ABS(ROUND(balance * {scale}) - balance_atoms) > {tol}
-          OR ABS(ROUND(frozen * {scale}) - frozen_atoms) > {tol}",
-        scale = AMOUNT_SCALE,
-        tol = DRIFT_TOLERANCE_ATOMS,
-    );
-    report.atoms_drift_total = sqlx::query_scalar::<_, i64>(&format!(
-        "SELECT COUNT(*) FROM accounts WHERE {drift_filter}"
-    ))
-    .fetch_one(pool)
-    .await?;
-    if report.atoms_drift_total > 0 {
-        report.atoms_drift = sqlx::query_as(&format!(
-            "SELECT user_id, asset, balance, balance_atoms, frozen, frozen_atoms
-               FROM accounts
-              WHERE {drift_filter}
-              ORDER BY user_id LIMIT {REPORT_ROW_LIMIT}"
         ))
         .fetch_all(pool)
         .await?;

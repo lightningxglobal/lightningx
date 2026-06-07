@@ -86,8 +86,6 @@ struct FillRow {
 struct AccountRow {
     user_id: i64,
     asset: String,
-    balance: f64,
-    frozen: f64,
     balance_atoms: i64,
     frozen_atoms: i64,
 }
@@ -459,8 +457,6 @@ impl PgWriteBatch {
         self.accounts.push(AccountRow {
             user_id,
             asset,
-            balance,
-            frozen,
             balance_atoms,
             frozen_atoms,
         });
@@ -842,34 +838,26 @@ async fn flush_accounts(conn: &mut PgConnection, rows: &[AccountRow]) -> anyhow:
     let keep_idx = dedup_account_indices_keep_last(rows);
     let mut user_ids = Vec::with_capacity(keep_idx.len());
     let mut assets = Vec::with_capacity(keep_idx.len());
-    let mut balances = Vec::with_capacity(keep_idx.len());
-    let mut frozens = Vec::with_capacity(keep_idx.len());
     let mut balance_atoms = Vec::with_capacity(keep_idx.len());
     let mut frozen_atoms = Vec::with_capacity(keep_idx.len());
     for i in keep_idx {
         let r = &rows[i];
         user_ids.push(r.user_id);
         assets.push(r.asset.clone());
-        balances.push(r.balance);
-        frozens.push(r.frozen);
         balance_atoms.push(r.balance_atoms);
         frozen_atoms.push(r.frozen_atoms);
     }
     let res = sqlx::query(
         r#"
-        INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms, updated_at)
+        INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms, updated_at)
         SELECT * FROM UNNEST(
             $1::bigint[],
             $2::varchar[],
-            $3::float8[],
-            $4::float8[],
-            $5::bigint[],
-            $6::bigint[]
-        ) AS t(user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+            $3::bigint[],
+            $4::bigint[]
+        ) AS t(user_id, asset, balance_atoms, frozen_atoms)
         CROSS JOIN LATERAL (SELECT NOW() AS updated_at) u
         ON CONFLICT (user_id, asset) DO UPDATE SET
-            balance     = EXCLUDED.balance,
-            frozen      = EXCLUDED.frozen,
             balance_atoms = EXCLUDED.balance_atoms,
             frozen_atoms  = EXCLUDED.frozen_atoms,
             updated_at  = NOW()
@@ -877,8 +865,6 @@ async fn flush_accounts(conn: &mut PgConnection, rows: &[AccountRow]) -> anyhow:
     )
     .bind(&user_ids)
     .bind(&assets)
-    .bind(&balances)
-    .bind(&frozens)
     .bind(&balance_atoms)
     .bind(&frozen_atoms)
     .execute(&mut *conn)
@@ -1327,8 +1313,6 @@ mod tests {
             AccountRow {
                 user_id,
                 asset: asset.into(),
-                balance,
-                frozen,
                 balance_atoms: AmountAtoms::from_f64_round(balance).unwrap().atoms(),
                 frozen_atoms: AmountAtoms::from_f64_round(frozen).unwrap().atoms(),
             }
@@ -1347,8 +1331,8 @@ mod tests {
             .iter()
             .find(|r| r.user_id == 1 && r.asset == "USDT")
             .expect("user=1 USDT present");
-        assert!((usdt_user1.balance - 150.0).abs() < 1e-9);
-        assert!((usdt_user1.frozen - 5.0).abs() < 1e-9);
+        assert_eq!(usdt_user1.balance_atoms, 15_000_000_000);
+        assert_eq!(usdt_user1.frozen_atoms, 500_000_000);
     }
 
     #[test]

@@ -174,17 +174,15 @@ async fn account_set_upserts() {
     assert!(batch.push(&f1));
     batch.flush(&pg).await.expect("flush insert");
 
-    let row: (f64, f64, i64, i64) = sqlx::query_as(
-        "SELECT balance, frozen, balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
     )
-            .bind(user_id)
-            .fetch_one(&pg)
-            .await
-            .expect("select after first upsert");
-    assert!((row.0 - 1000.0).abs() < 1e-9);
-    assert!((row.1 - 100.0).abs() < 1e-9);
-    assert_eq!(row.2, 100_000_000_000);
-    assert_eq!(row.3, 10_000_000_000);
+    .bind(user_id)
+    .fetch_one(&pg)
+    .await
+    .expect("select after first upsert");
+    assert_eq!(row.0, 100_000_000_000);
+    assert_eq!(row.1, 10_000_000_000);
 
     // Second set must overwrite.
     let f2 = PersistFrame::account_set(AccountSetPayload {
@@ -198,17 +196,15 @@ async fn account_set_upserts() {
     let mut batch = PgWriteBatch::new();
     assert!(batch.push(&f2));
     batch.flush(&pg).await.expect("flush update");
-    let row: (f64, f64, i64, i64) = sqlx::query_as(
-        "SELECT balance, frozen, balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
     )
-            .bind(user_id)
-            .fetch_one(&pg)
-            .await
-            .expect("select after second upsert");
-    assert!((row.0 - 900.0).abs() < 1e-9);
-    assert!((row.1 - 50.0).abs() < 1e-9);
-    assert_eq!(row.2, 90_000_000_000);
-    assert_eq!(row.3, 5_000_000_000);
+    .bind(user_id)
+    .fetch_one(&pg)
+    .await
+    .expect("select after second upsert");
+    assert_eq!(row.0, 90_000_000_000);
+    assert_eq!(row.1, 5_000_000_000);
 
     cleanup(&pg, user_id).await;
 }

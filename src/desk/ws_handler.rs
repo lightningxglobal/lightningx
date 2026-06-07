@@ -1364,9 +1364,9 @@ async fn handle_client_message(
                                         let _ = tx.try_send((
                                             ws_sbe::encode_balance_update(
                                                 asset,
-                                                acc.balance,
-                                                acc.balance - acc.frozen,
-                                                acc.frozen,
+                                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),
+                                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),
+                                                crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
                                             ),
                                             0,
                                         ));
@@ -1514,9 +1514,9 @@ async fn handle_client_message(
                             let _ = tx.try_send((
                                 ws_sbe::encode_balance_update(
                                     asset,
-                                    acc.balance,
-                                    acc.balance - acc.frozen,
-                                    acc.frozen,
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
                                 ),
                                 0,
                             ));
@@ -1598,9 +1598,9 @@ async fn handle_client_message(
                             let _ = tx.try_send((
                                 ws_sbe::encode_balance_update(
                                     rel_asset,
-                                    acc.balance,
-                                    acc.balance - acc.frozen,
-                                    acc.frozen,
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
                                 ),
                                 0,
                             ));
@@ -1811,9 +1811,7 @@ async fn handle_client_message(
                         let _ = tx.try_send((
                             ws_sbe::encode_balance_update(
                                 &acc.asset,
-                                acc.balance,
-                                acc.balance - acc.frozen,
-                                acc.frozen,
+                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),                                crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
                             ),
                             0,
                         ));

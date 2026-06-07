@@ -86,14 +86,18 @@ pub async fn position_for_user_asset(pool: &PgPool, user_id: i64, asset: &str) -
     }
     let symbol = format!("{}_USDT", asset);
 
-    let (balance, frozen): (f64, f64) =
-        sqlx::query_as("SELECT balance, frozen FROM accounts WHERE user_id=$1 AND asset=$2")
+    let (balance_atoms, frozen_atoms): (i64, i64) = sqlx::query_as(
+        "SELECT balance_atoms, frozen_atoms FROM accounts WHERE user_id=$1 AND asset=$2",
+    )
             .bind(user_id)
             .bind(asset)
             .fetch_optional(pool)
             .await
             .ok()
             .flatten()?;
+    // Display-layer projections of the atoms truth.
+    let balance = crate::desk::money::AmountAtoms::from_atoms(balance_atoms).to_f64();
+    let frozen = crate::desk::money::AmountAtoms::from_atoms(frozen_atoms).to_f64();
 
     let available = balance - frozen;
 

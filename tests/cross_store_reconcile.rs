@@ -41,17 +41,14 @@ async fn make_user(pg: &PgPool) -> Option<i64> {
 /// sweep is willing to compare it.
 async fn seed_pg_account(pg: &PgPool, user_id: i64, asset: &str, balance_atoms: i64, frozen_atoms: i64) {
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, NOW() - INTERVAL '60 seconds')
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms, updated_at)
+         VALUES ($1, $2, $3, $4, NOW() - INTERVAL '60 seconds')
          ON CONFLICT (user_id, asset) DO UPDATE SET
-            balance = EXCLUDED.balance, frozen = EXCLUDED.frozen,
             balance_atoms = EXCLUDED.balance_atoms, frozen_atoms = EXCLUDED.frozen_atoms,
             updated_at = NOW() - INTERVAL '60 seconds'",
     )
     .bind(user_id)
     .bind(asset)
-    .bind(balance_atoms as f64 / 1e8)
-    .bind(frozen_atoms as f64 / 1e8)
     .bind(balance_atoms)
     .bind(frozen_atoms)
     .execute(pg)
@@ -173,8 +170,8 @@ async fn grace_window_excludes_recent_writes() {
     // Freshly updated PG row (updated_at = NOW()) — inside the grace window,
     // diverged from Redis on purpose. The sweep must NOT flag it.
     sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
-         VALUES ($1, 'USDT', 10, 0, 1000000000, 0)",
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+         VALUES ($1, 'USDT', 1000000000, 0)",
     )
     .bind(user)
     .execute(&pg)

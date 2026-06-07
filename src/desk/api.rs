@@ -1302,9 +1302,10 @@ async fn handle_place_order(
                             .send((
                                 crate::ws_sbe::encode_balance_update(
                                     &acc.asset,
-                                    acc.balance,
-                                    acc.balance - acc.frozen,
-                                    acc.frozen,
+                                    AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),
+                                    AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms)
+                                        .to_f64(),
+                                    AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
                                 ),
                                 0,
                             ))
@@ -2161,15 +2162,14 @@ async fn handle_test_funds(State(s): State<AppState>, headers: HeaderMap) -> imp
 
     // Credit 10,000 USDT, 1 BTC, 10 ETH, 100 SOL
     let result = sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
          VALUES
-            ($1, 'USDT', 10000, 0, 1000000000000, 0),
-            ($1, 'BTC', 1, 0, 100000000, 0),
-            ($1, 'ETH', 10, 0, 1000000000, 0),
-            ($1, 'SOL', 100, 0, 10000000000, 0)
+            ($1, 'USDT', 1000000000000, 0),
+            ($1, 'BTC', 100000000, 0),
+            ($1, 'ETH', 1000000000, 0),
+            ($1, 'SOL', 10000000000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = accounts.balance + EXCLUDED.balance,
-             balance_atoms = accounts.balance_atoms + EXCLUDED.balance_atoms,
+         SET balance_atoms = accounts.balance_atoms + EXCLUDED.balance_atoms,
              updated_at = NOW()",
     )
     .bind(user_id)
@@ -2205,16 +2205,14 @@ async fn handle_robot_funds(State(s): State<AppState>, headers: HeaderMap) -> im
     }
 
     let result = sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
          VALUES
-            ($1, 'USDT', 10000000, 0, 1000000000000000, 0),
-            ($1, 'BTC', 10000, 0, 1000000000000, 0),
-            ($1, 'ETH', 1000000, 0, 100000000000000, 0),
-            ($1, 'SOL', 10000000, 0, 1000000000000000, 0)
+            ($1, 'USDT', 1000000000000000, 0),
+            ($1, 'BTC', 1000000000000, 0),
+            ($1, 'ETH', 100000000000000, 0),
+            ($1, 'SOL', 1000000000000000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = GREATEST(accounts.balance, EXCLUDED.balance),
-             frozen = 0,
-             balance_atoms = GREATEST(accounts.balance_atoms, EXCLUDED.balance_atoms),
+         SET balance_atoms = GREATEST(accounts.balance_atoms, EXCLUDED.balance_atoms),
              frozen_atoms = 0,
              updated_at = NOW()",
     )
@@ -2321,15 +2319,14 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
 
     // Upsert demo balances (including BTC).
     let _ = sqlx::query(
-        "INSERT INTO accounts (user_id, asset, balance, frozen, balance_atoms, frozen_atoms)
+        "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
          VALUES
-            ($1, 'USDT', 100000, 0, 10000000000000, 0),
-            ($1, 'BTC', 5, 0, 500000000, 0),
-            ($1, 'ETH', 50, 0, 5000000000, 0),
-            ($1, 'SOL', 1000, 0, 100000000000, 0)
+            ($1, 'USDT', 10000000000000, 0),
+            ($1, 'BTC', 500000000, 0),
+            ($1, 'ETH', 5000000000, 0),
+            ($1, 'SOL', 100000000000, 0)
          ON CONFLICT (user_id, asset) DO UPDATE
-         SET balance = GREATEST(accounts.balance, EXCLUDED.balance),
-             balance_atoms = GREATEST(accounts.balance_atoms, EXCLUDED.balance_atoms),
+         SET balance_atoms = GREATEST(accounts.balance_atoms, EXCLUDED.balance_atoms),
              updated_at = NOW()",
     )
     .bind(demo_user_id)

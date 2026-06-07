@@ -600,7 +600,6 @@ fn spawn_symbol_thread(
             let journal_replay_stream = orders_stream
                 + lightning_exchange::transport::journal::ORDERS_REPLAY_STREAM_OFFSET;
             let mut replay_sub: Option<AeronOrderSubscriber> = None;
-            let mut replay_last_frame = Instant::now();
 
             loop {
                 // Journal replay phase: start the next pending recording.
@@ -625,7 +624,6 @@ fn spawn_symbol_thread(
                                         panic!("[{symbol}] journal replay sub: {e}")
                                     }),
                                 );
-                                replay_last_frame = Instant::now();
                             }
                             Ok(None) => continue, // empty recording
                             Err(e) => panic!("[{symbol}] journal replay: {e}"),
@@ -1046,13 +1044,11 @@ fn spawn_symbol_thread(
                     }
                 }
 
-                // Journal replay end detection: a bounded replay dries up
-                // once the archive delivered everything; a 2s quiet period
-                // is the (conservative) end signal.
-                if replay_sub.is_some() {
-                    if batch_count > 0 {
-                        replay_last_frame = Instant::now();
-                    } else if replay_last_frame.elapsed() > Duration::from_secs(2) {
+                // Journal replay end detection: the bounded replay closes
+                // its image at the configured length — image-close plus a
+                // drained ring is the exact completion signal.
+                if let Some(rs) = &replay_sub {
+                    if batch_count == 0 && rs.replay_image_closed() {
                         replay_sub = None;
                         if journal_pending.is_empty() {
                             tracing::info!(

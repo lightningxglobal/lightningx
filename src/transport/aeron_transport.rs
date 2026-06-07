@@ -120,17 +120,21 @@ impl PollCallback for OrderInboundCallback {
 }
 
 pub struct AeronOrderSubscriber {
-    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback>>>>,
+    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<OrderInboundCallback, ImageTracker>>>>,
     rx: Consumer<InboundMsg>,
     dropped: Arc<AtomicU64>,
     last_reported_dropped: u64,
     client: Arc<AeronClient>,
+    image_live: Arc<std::sync::atomic::AtomicI64>,
+    image_ever: Arc<AtomicU64>,
 }
 
 impl AeronOrderSubscriber {
     pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
         let (tx, rx) = RingBuffer::<InboundMsg>::new(ORDER_INBOUND_RING);
         let dropped = Arc::new(AtomicU64::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let ever = Arc::new(AtomicU64::new(0));
 
         let subscriber = client
             .add_subscription(
@@ -141,7 +145,10 @@ impl AeronOrderSubscriber {
                     tx,
                     dropped: dropped.clone(),
                 },
-                NoopLifecycle,
+                ImageTracker {
+                    live: live.clone(),
+                    ever: ever.clone(),
+                },
             )
             .map_err(|e| format!("Failed to add subscription: {:?}", e))?;
 
@@ -159,7 +166,15 @@ impl AeronOrderSubscriber {
             dropped,
             last_reported_dropped: 0,
             client,
+            image_live: live,
+            image_ever: ever,
         })
+    }
+
+    /// Bounded-replay completion (see PersistSubscriber::replay_image_closed).
+    pub fn replay_image_closed(&self) -> bool {
+        self.image_ever.load(Ordering::Relaxed) > 0
+            && self.image_live.load(Ordering::Relaxed) <= 0
     }
 
     pub fn dropped_messages(&self) -> u64 {
@@ -966,17 +981,43 @@ impl PollCallback for PersistCallback {
 }
 
 pub struct PersistSubscriber {
-    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<PersistCallback>>>>,
+    subscriber: Arc<Mutex<Box<aeron_wrapper::Subscriber<PersistCallback, ImageTracker>>>>,
     rx: Consumer<PersistFrame>,
     dropped: Arc<AtomicU64>,
     last_reported_dropped: u64,
     client: Arc<AeronClient>,
+    image_live: Arc<std::sync::atomic::AtomicI64>,
+    image_ever: Arc<AtomicU64>,
+}
+
+/// Lifecycle hook counting live images. A bounded archive replay closes its
+/// image when the configured length has been delivered, so
+/// "saw an image, now zero live" == replay complete — event-driven, no
+/// quiet-period heuristic.
+pub struct ImageTracker {
+    live: Arc<std::sync::atomic::AtomicI64>,
+    ever: Arc<AtomicU64>,
+}
+
+impl aeron_wrapper::LifecycleCallbacks for ImageTracker {
+    fn on_image_available(&mut self, _image: *mut aeron_wrapper::bindings::aeron::aeron_image_t) {
+        self.live.fetch_add(1, Ordering::Relaxed);
+        self.ever.fetch_add(1, Ordering::Relaxed);
+    }
+    fn on_image_unavailable(
+        &mut self,
+        _image: *mut aeron_wrapper::bindings::aeron::aeron_image_t,
+    ) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PersistSubscriber {
     pub fn new(client: Arc<AeronClient>, channel: &str, stream_id: i32) -> Result<Self, String> {
         let (tx, rx) = RingBuffer::<PersistFrame>::new(PERSIST_RING);
         let dropped = Arc::new(AtomicU64::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let ever = Arc::new(AtomicU64::new(0));
         let subscriber = client
             .add_subscription(
                 channel,
@@ -986,7 +1027,10 @@ impl PersistSubscriber {
                     tx,
                     dropped: dropped.clone(),
                 },
-                NoopLifecycle,
+                ImageTracker {
+                    live: live.clone(),
+                    ever: ever.clone(),
+                },
             )
             .map_err(|e| format!("Failed to add persist subscription: {:?}", e))?;
         tracing::info!("✓ PersistSubscriber created on stream {}", stream_id);
@@ -996,7 +1040,17 @@ impl PersistSubscriber {
             dropped,
             last_reported_dropped: 0,
             client,
+            image_live: live,
+            image_ever: ever,
         })
+    }
+
+    /// Bounded-replay completion: an image appeared and every image is gone
+    /// again (a bounded archive replay closes its image at the configured
+    /// length). Event-driven — no quiet-period heuristic.
+    pub fn replay_image_closed(&self) -> bool {
+        self.image_ever.load(Ordering::Relaxed) > 0
+            && self.image_live.load(Ordering::Relaxed) <= 0
     }
 
     pub fn do_work(&self) {

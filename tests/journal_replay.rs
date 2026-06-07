@@ -231,6 +231,8 @@ async fn frames_lost_by_down_consumer_are_recovered_from_journal() {
     drop(batch); // writer "crashes"; frames 61..=100 were never delivered
 
     // ── Phase 3: restart with journal replay ────────────────────────────
+    let client_purge = client.clone();
+    let config_purge = config.clone();
     let replayed_frames = tokio::task::spawn_blocking(move || {
         let mut replayer =
             JournalReplayer::connect(&client, &config).expect("replayer connect");
@@ -253,7 +255,6 @@ async fn frames_lost_by_down_consumer_are_recovered_from_journal() {
             let mut sub =
                 PersistSubscriber::new(client.clone(), PERSIST_CHANNEL, PERSIST_REPLAY_STREAM)
                     .expect("replay subscriber");
-            let mut last = Instant::now();
             loop {
                 client.do_work();
                 sub.do_work();
@@ -262,11 +263,10 @@ async fn frames_lost_by_down_consumer_are_recovered_from_journal() {
                     got = true;
                     frames.push(f);
                 }
-                if got {
-                    last = Instant::now();
-                } else if last.elapsed() > Duration::from_secs(2) {
-                    break;
-                } else {
+                if !got {
+                    if sub.replay_image_closed() {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -309,6 +309,35 @@ async fn frames_lost_by_down_consumer_are_recovered_from_journal() {
     );
     let floors = load_checkpoints(&pg).await.expect("final floors");
     assert_eq!(floors.get(&PUBLISHER_ID), Some(&TOTAL));
+
+    // ── Retention: a fully-consumed STOPPED recording can be purged ─────
+    // (the recorder was dropped in phase 1; the recording auto-stops once
+    // its publication goes away). A future cutoff purges it; active
+    // recordings would be skipped by stopped_at_ms() == None.
+    let purge_stats = tokio::task::spawn_blocking(move || {
+        let mut recorder = lightning_exchange::transport::journal::JournalRecorder::start(
+            &client_purge,
+            &config_purge,
+            PERSIST_CHANNEL,
+            PERSIST_STREAM,
+        )
+        .expect("recorder for purge");
+        // wait for the old recording to be marked stopped
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (purged, segments) = recorder
+                .purge_stopped_before("ipc", PERSIST_STREAM, i64::MAX)
+                .expect("purge");
+            if purged > 0 {
+                return (purged, segments);
+            }
+            assert!(Instant::now() < deadline, "old recording never became purgeable");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    })
+    .await
+    .expect("purge phase");
+    assert!(purge_stats.0 >= 1, "stopped recording purged");
 
     cleanup(&pg).await;
 }

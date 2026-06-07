@@ -1486,7 +1486,7 @@ async fn async_main() -> anyhow::Result<()> {
                 // archive threading contract). Control traffic happens only
                 // here at startup; the recording itself is maintained by the
                 // archive driver. The handle must stay alive.
-                let _journal_recorder =
+                let mut _journal_recorder =
                     match lightning_exchange::transport::journal::archive_config_from_env() {
                         Some(cfg) => {
                             let journal_client = std::sync::Arc::new(
@@ -1512,6 +1512,9 @@ async fn async_main() -> anyhow::Result<()> {
                         None => None,
                     };
                 let mut idle_us: u64 = 10;
+                let journal_retention =
+                    lightning_exchange::transport::journal::retention_hours_from_env();
+                let mut last_journal_purge = std::time::Instant::now();
                 // Per-publisher monotonic sequence, assigned here — the single
                 // drain point — so consumers can checkpoint (publisher_id, seq)
                 // and dedup on replay/restart.
@@ -1535,6 +1538,27 @@ async fn async_main() -> anyhow::Result<()> {
                         sequenced.publisher_id = desk_id as u16;
                         sequenced.seq = persist_seq;
                         let _ = persist_publisher.publish(&sequenced);
+                    }
+                    // Journal retention: purge stopped recordings beyond the
+                    // horizon, hourly, on this (archive-owning) thread.
+                    if let (Some(hours), Some((recorder, _))) =
+                        (journal_retention, _journal_recorder.as_mut())
+                    {
+                        if last_journal_purge.elapsed().as_secs() >= 3600 {
+                            last_journal_purge = std::time::Instant::now();
+                            let cutoff = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0)
+                                - (hours as i64) * 3_600_000;
+                            match recorder.purge_stopped_before("ipc", PERSIST_STREAM, cutoff) {
+                                Ok((0, _)) => {}
+                                Ok((n, seg)) => tracing::info!(
+                                    "journal retention: purged {n} recording(s), {seg} segment(s)"
+                                ),
+                                Err(e) => tracing::warn!("journal retention failed: {e}"),
+                            }
+                        }
                     }
                     if !did_work {
                         if persist_spin {

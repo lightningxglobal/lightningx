@@ -167,12 +167,11 @@ async fn main() -> anyhow::Result<()> {
                         PersistSubscriber::new(aeron.clone(), PERSIST_CHANNEL, PERSIST_REPLAY_STREAM)
                             .map_err(|e| anyhow::anyhow!("{e}"))
                             .expect("create replay subscriber");
-                    // Bounded replay: poll until the stream dries up — the
-                    // archive closes the replay session at bounded_to. Use a
-                    // quiet-period heuristic (no frames for 2s after at
-                    // least one poll) as the end-of-replay signal.
+                    // Bounded replay: the archive closes the replay image at
+                    // bounded_to — image-close + drained ring is the exact,
+                    // event-driven completion signal (no quiet-period
+                    // heuristic).
                     let mut replayed: u64 = 0;
-                    let mut last_frame = Instant::now();
                     loop {
                         aeron.do_work();
                         replay_sub.do_work();
@@ -187,11 +186,10 @@ async fn main() -> anyhow::Result<()> {
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                         }
-                        if got {
-                            last_frame = Instant::now();
-                        } else if last_frame.elapsed() > Duration::from_secs(2) {
+                        if !got && replay_sub.replay_image_closed() {
                             break;
-                        } else {
+                        }
+                        if !got {
                             std::hint::spin_loop();
                         }
                     }

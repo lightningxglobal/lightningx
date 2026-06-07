@@ -18,8 +18,10 @@
 //!
 //! Durability note: "recorded" means fsynced only when the archive runs
 //! with `aeron.archive.file.sync.level >= 1`; set 2 for data+metadata.
-//! Recording growth is unbounded in this first cut — segment cleanup /
-//! truncate-below-floor is tracked in the roadmap.
+//! Retention: stopped recordings older than EXCHANGE_JOURNAL_RETENTION_HOURS
+//! are purged by the recording side (see JournalRecorder::purge_stopped_before).
+//! 0/unset keeps everything. NOTE: replay-based recovery reaches back only
+//! as far as retention — pair the horizon with your PG backup policy.
 
 use std::sync::Arc;
 
@@ -53,7 +55,6 @@ pub fn archive_config_from_env() -> Option<ArchiveConfig> {
 /// Records one channel/stream on the archive. Held by the publishing side
 /// (desk persist drain thread) for the lifetime of the process.
 pub struct JournalRecorder {
-    #[allow(dead_code)]
     archive: AeronArchive,
     subscription_id: i64,
 }
@@ -69,9 +70,26 @@ impl JournalRecorder {
     ) -> Result<Self, String> {
         let mut archive =
             AeronArchive::connect(client, config).map_err(|e| format!("archive connect: {e}"))?;
-        let subscription_id = archive
-            .start_recording(channel, stream_id, SourceLocation::Local, false)
-            .map_err(|e| format!("start_recording: {e}"))?;
+        // A recording subscription SURVIVES its client: after a process
+        // restart the archive still records this channel/stream (each new
+        // publication session becomes a new recording). "recording exists"
+        // therefore means the goal is already achieved — not an error.
+        let subscription_id = match archive.start_recording(
+            channel,
+            stream_id,
+            SourceLocation::Local,
+            false,
+        ) {
+            Ok(id) => id,
+            Err(e) if e.to_string().contains("recording exists") => {
+                tracing::info!(
+                    "journal: recording subscription for {channel} stream {stream_id} \
+                     already active (previous lifetime) — reusing"
+                );
+                -1
+            }
+            Err(e) => return Err(format!("start_recording: {e}")),
+        };
         tracing::info!(
             "journal: recording {channel} stream {stream_id} (subscription {subscription_id})"
         );
@@ -84,6 +102,59 @@ impl JournalRecorder {
     pub fn subscription_id(&self) -> i64 {
         self.subscription_id
     }
+
+    /// Purge STOPPED recordings of `channel_fragment`/`stream_id` whose stop
+    /// timestamp is older than `cutoff_epoch_ms`. Active recordings (this
+    /// lifetime's) are never touched. Returns (purged, segments_deleted).
+    /// Call from the recording thread on a slow cadence.
+    pub fn purge_stopped_before(
+        &mut self,
+        channel_fragment: &str,
+        stream_id: i32,
+        cutoff_epoch_ms: i64,
+    ) -> Result<(usize, i64), String> {
+        let recordings = self
+            .archive
+            .list_recordings_for_uri(channel_fragment, stream_id)
+            .map_err(|e| format!("list recordings: {e}"))?;
+        let mut purged = 0usize;
+        let mut segments = 0i64;
+        for rec in &recordings {
+            let Some(stopped_at) = rec.stopped_at_ms() else {
+                continue; // active
+            };
+            if stopped_at >= cutoff_epoch_ms {
+                continue;
+            }
+            match self.archive.purge_recording(rec.recording_id) {
+                Ok(n) => {
+                    purged += 1;
+                    segments += n;
+                    tracing::info!(
+                        "journal: purged recording {} ({} segment(s), stopped at {})",
+                        rec.recording_id, n, stopped_at
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "journal: purge of recording {} failed: {e}",
+                        rec.recording_id
+                    );
+                }
+            }
+        }
+        Ok((purged, segments))
+    }
+}
+
+/// Retention horizon from EXCHANGE_JOURNAL_RETENTION_HOURS (0/unset = keep
+/// everything).
+pub fn retention_hours_from_env() -> Option<u64> {
+    std::env::var("EXCHANGE_JOURNAL_RETENTION_HOURS")
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|&h| h > 0)
 }
 
 /// One bounded replay in flight.

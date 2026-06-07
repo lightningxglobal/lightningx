@@ -273,12 +273,23 @@ fn replayed_engine_rebuilds_identical_book() {
         };
         let mut replay_sub = AeronOrderSubscriber::new(client.clone(), "aeron:ipc", replay_stream)
             .expect("replay subscriber");
-        replay_applied += drain(
-            &client,
-            &mut replay_sub,
-            &mut engine_b,
-            Duration::from_secs(2),
-        );
+        // Bounded replay: image-close + drained ring = exact completion.
+        loop {
+            client.do_work();
+            replay_sub.do_work();
+            let mut got = false;
+            while let Some(msg) = replay_sub.poll() {
+                got = true;
+                replay_applied += 1;
+                apply(&mut engine_b, &msg);
+            }
+            if !got {
+                if replay_sub.replay_image_closed() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
     assert_eq!(replay_applied, OPS, "journal must re-deliver every input op");
 

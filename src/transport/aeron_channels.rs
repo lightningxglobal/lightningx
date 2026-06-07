@@ -43,9 +43,25 @@ fn engine_host() -> String {
 /// Build a channel URI for a given local port.
 /// ipc mode  → "aeron:ipc"  (ignores port, same channel for all)
 /// udp mode  → "aeron:udp?endpoint=<ENGINE_HOST>:<port>"
+/// udp mode extras for cross-machine deployment:
+///   ENGINE_HOST          unicast peer IP, or a multicast group (e.g.
+///                        224.10.9.8) so leader + standby + both archives
+///                        all receive the same stream;
+///   AERON_UDP_INTERFACE  local interface spec appended as `|interface=…`
+///                        — REQUIRED for multicast on multi-NIC hosts
+///                        (e.g. 10.0.0.5/24).
 fn channel(port: u16) -> String {
     match std::env::var("AERON_TRANSPORT").as_deref() {
-        Ok("udp") => format!("aeron:udp?endpoint={}:{}", engine_host(), port),
+        Ok("udp") => {
+            let mut c = format!("aeron:udp?endpoint={}:{}", engine_host(), port);
+            if let Ok(iface) = std::env::var("AERON_UDP_INTERFACE") {
+                if !iface.is_empty() {
+                    c.push_str("|interface=");
+                    c.push_str(&iface);
+                }
+            }
+            c
+        }
         _ => "aeron:ipc".to_string(), // default: IPC
     }
 }
@@ -156,4 +172,34 @@ pub fn counter_forward_cmd_stream_for_desk(desk_id: u16) -> i32 {
 #[inline]
 pub fn counter_forward_resp_stream_for_desk(desk_id: u16) -> i32 {
     COUNTER_FORWARD_RESP_STREAM_BASE + desk_id as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env-var driven: run serially within this test (no other test in the
+    /// workspace mutates AERON_TRANSPORT / AERON_UDP_INTERFACE).
+    #[test]
+    fn channel_udp_multicast_and_interface() {
+        unsafe {
+            std::env::set_var("AERON_TRANSPORT", "udp");
+            std::env::set_var("ENGINE_HOST", "224.10.9.8");
+            std::env::set_var("AERON_UDP_INTERFACE", "10.0.0.5/24");
+        }
+        assert_eq!(
+            orders_channel(),
+            "aeron:udp?endpoint=224.10.9.8:20121|interface=10.0.0.5/24"
+        );
+        unsafe {
+            std::env::set_var("AERON_UDP_INTERFACE", "");
+        }
+        assert_eq!(orders_channel(), "aeron:udp?endpoint=224.10.9.8:20121");
+        unsafe {
+            std::env::remove_var("AERON_TRANSPORT");
+            std::env::remove_var("ENGINE_HOST");
+            std::env::remove_var("AERON_UDP_INTERFACE");
+        }
+        assert_eq!(orders_channel(), "aeron:ipc");
+    }
 }

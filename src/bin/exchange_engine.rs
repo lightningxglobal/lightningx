@@ -216,7 +216,14 @@ fn publish_order_update(
     sequences: &mut [u64],
     stream_id: i32,
     msg: &OrderUpdateMsg,
+    live: bool,
 ) {
+    // Journal-replay mode: state is being rebuilt, nothing leaves the
+    // process — and the per-stream sequence must not advance for messages
+    // that were never sent.
+    if !live {
+        return;
+    }
     let idx = response_stream_index(stream_id, publishers.len());
     let mut sequenced = *msg;
     if let Some(seq) = sequences.get_mut(idx) {
@@ -547,14 +554,99 @@ fn spawn_symbol_thread(
             // Band fallback anchor when the book is empty/one-sided.
             let mut last_trade_ticks: i64 = 0;
 
+            // ── Input-stream journal (EXCHANGE_ARCHIVE_CONTROL) ──────────
+            // Order of operations matters:
+            //   1. live subscriber already exists (created above) — frames
+            //      arriving during replay wait in its image buffer;
+            //   2. list PRIOR recordings (this lifetime's recording does
+            //      not exist yet, so we never replay our own empty tail);
+            //   3. start recording this lifetime's input;
+            //   4. replay the prior recordings through the normal handler
+            //      with `live == false` (state rebuilt, nothing published,
+            //      response sequences untouched);
+            //   5. switch to the live subscriber.
+            // All archive control calls run on THIS thread, which drives
+            // this client's conductor — per the archive threading contract.
+            let journal_cfg =
+                lightning_exchange::transport::journal::archive_config_from_env();
+            let mut journal_replayer = None;
+            let mut journal_pending: std::collections::VecDeque<aeron_wrapper::RecordingSummary> =
+                Default::default();
+            let mut _journal_recorder = None;
+            if let Some(cfg) = &journal_cfg {
+                let mut replayer =
+                    lightning_exchange::transport::journal::JournalReplayer::connect(&client, cfg)
+                        .unwrap_or_else(|e| panic!("[{symbol}] journal connect: {e}"));
+                let recordings = replayer
+                    .recordings("aeron", orders_stream)
+                    .unwrap_or_else(|e| panic!("[{symbol}] journal list: {e}"));
+                tracing::info!(
+                    "[{}] journal: {} prior recording(s) to replay",
+                    symbol,
+                    recordings.len()
+                );
+                journal_pending.extend(recordings);
+                journal_replayer = Some(replayer);
+                _journal_recorder = Some(
+                    lightning_exchange::transport::journal::JournalRecorder::start(
+                        &client,
+                        cfg,
+                        &orders_channel(),
+                        orders_stream,
+                    )
+                    .unwrap_or_else(|e| panic!("[{symbol}] journal record: {e}")),
+                );
+            }
+            let journal_replay_stream = orders_stream
+                + lightning_exchange::transport::journal::ORDERS_REPLAY_STREAM_OFFSET;
+            let mut replay_sub: Option<AeronOrderSubscriber> = None;
+            let mut replay_last_frame = Instant::now();
+
             loop {
+                // Journal replay phase: start the next pending recording.
+                if replay_sub.is_none() {
+                    if let Some(rec) = journal_pending.pop_front() {
+                        let replayer = journal_replayer.as_mut().expect("replayer");
+                        match replayer
+                            .replay_bounded(&rec, &orders_channel(), journal_replay_stream)
+                        {
+                            Ok(Some(r)) => {
+                                tracing::info!(
+                                    "[{}] journal: replaying recording {} ({} bytes)",
+                                    symbol, r.recording_id, r.bounded_to
+                                );
+                                replay_sub = Some(
+                                    AeronOrderSubscriber::new(
+                                        client.clone(),
+                                        &orders_channel(),
+                                        journal_replay_stream,
+                                    )
+                                    .unwrap_or_else(|e| {
+                                        panic!("[{symbol}] journal replay sub: {e}")
+                                    }),
+                                );
+                                replay_last_frame = Instant::now();
+                            }
+                            Ok(None) => continue, // empty recording
+                            Err(e) => panic!("[{symbol}] journal replay: {e}"),
+                        }
+                    }
+                }
+                let live = replay_sub.is_none() && journal_pending.is_empty();
+
                 // Only the subscriber needs do_work() — it processes the incoming IPC ring.
                 // IPC publishers write directly to mapped memory; no do_work() needed.
-                subscriber.do_work();
+                match replay_sub.as_mut() {
+                    Some(rs) => rs.do_work(),
+                    None => subscriber.do_work(),
+                }
 
                 let batch_start = Instant::now();
                 let mut batch_count: u32 = 0;
-                while let Some(msg) = subscriber.poll() {
+                while let Some(msg) = match replay_sub.as_mut() {
+                    Some(rs) => rs.poll(),
+                    None => subscriber.poll(),
+                } {
                     batch_count += 1;
                     // Refresh Aeron client heartbeat every 256 msgs so a
                     // big burst (e.g. MM cancel-replace × 40 quotes × N
@@ -590,6 +682,7 @@ fn spawn_symbol_thread(
                                         4,
                                         now_ns(),
                                     ),
+                                    live,
                                 );
                                 continue;
                             }
@@ -617,6 +710,7 @@ fn spawn_symbol_thread(
                                         2,
                                         ts,
                                     ),
+                                    live,
                                 );
                                 continue;
                             }
@@ -633,6 +727,7 @@ fn spawn_symbol_thread(
                                         10,
                                         ts,
                                     ),
+                                    live,
                                 );
                                 continue;
                             }
@@ -653,6 +748,7 @@ fn spawn_symbol_thread(
                                         7,
                                         ts,
                                     ),
+                                    live,
                                 );
                                 continue;
                             }
@@ -675,6 +771,7 @@ fn spawn_symbol_thread(
                                         8,
                                         ts,
                                     ),
+                                    live,
                                 );
                                 continue;
                             }
@@ -695,6 +792,7 @@ fn spawn_symbol_thread(
                                         9,
                                         ts,
                                     ),
+                                    live,
                                 );
                                 continue;
                             }
@@ -731,7 +829,8 @@ fn spawn_symbol_thread(
                                             2,
                                             ts,
                                         ),
-                                    );
+                                    live,
+                                );
                                     // if let Some(ref t) = tracer {
                                     //     t.record_sym(
                                     //         MS_AERON_UPDATE_SEND,
@@ -862,7 +961,9 @@ fn spawn_symbol_thread(
                                             _pad: [0; 7],
                                             symbol: sym_bytes_fixed,
                                         };
-                                        let _ = trade_pub.publish(&trade);
+                                        if live {
+                                            let _ = trade_pub.publish(&trade);
+                                        }
                                         // GC routing metadata for makers this fill fully
                                         // consumed (the engine has already evicted them).
                                         // O(1) per fill; also fixes uid_map growing
@@ -878,7 +979,8 @@ fn spawn_symbol_thread(
                                         &mut ou_seqs,
                                         response_stream_id,
                                         &update,
-                                    );
+                                    live,
+                                );
                                     // if let Some(ref t) = tracer {
                                     //     t.record_sym(
                                     //         MS_AERON_UPDATE_SEND,
@@ -915,7 +1017,8 @@ fn spawn_symbol_thread(
                                             rules.lots_to_quantity(res.cancelled_quantity),
                                             ts,
                                         ),
-                                    );
+                                    live,
+                                );
                                 }
                                 Err(_) => {
                                     // Order not in this engine (wrong symbol or already gone).
@@ -934,11 +1037,30 @@ fn spawn_symbol_thread(
                                                 0.0,
                                                 ts,
                                             ),
-                                        );
+                                    live,
+                                );
                                     }
                                 }
                             }
                         }
+                    }
+                }
+
+                // Journal replay end detection: a bounded replay dries up
+                // once the archive delivered everything; a 2s quiet period
+                // is the (conservative) end signal.
+                if replay_sub.is_some() {
+                    if batch_count > 0 {
+                        replay_last_frame = Instant::now();
+                    } else if replay_last_frame.elapsed() > Duration::from_secs(2) {
+                        replay_sub = None;
+                        if journal_pending.is_empty() {
+                            tracing::info!(
+                                "[{}] journal: replay complete — switching to live input",
+                                symbol
+                            );
+                        }
+                        continue;
                     }
                 }
 
@@ -972,10 +1094,10 @@ fn spawn_symbol_thread(
                     stats_last = Instant::now();
                 }
 
-                // Depth snapshot every 10ms.
+                // Depth snapshot every 10ms (suppressed while replaying).
                 let now = Instant::now();
                 let mut did_work = batch_count > 0;
-                if now.duration_since(last_depth) >= depth_interval {
+                if live && now.duration_since(last_depth) >= depth_interval {
                     last_depth = now;
                     depth_seq += 1;
                     let mut snap = DepthSnapshotEvent::new(now_ns(), depth_seq);
@@ -1098,12 +1220,25 @@ async fn main() -> anyhow::Result<()> {
     // so that cancel events for restored orders carry the correct participant_id.
     let mut uid_maps: HashMap<String, HashMap<u64, (u64, i32)>> = HashMap::new();
 
-    let rows = sqlx::query_as::<_, DbOrder>(
-        "SELECT * FROM orders WHERE status IN ('PENDING', 'TRADING') ORDER BY id ASC",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+    // Journal mode rebuilds the book bit-exactly by replaying the recorded
+    // input stream inside each symbol thread — seeding from PG as well would
+    // double-insert every restored order. PG seed remains the fallback when
+    // journaling is disabled.
+    let journal_mode =
+        lightning_exchange::transport::journal::archive_config_from_env().is_some();
+    if journal_mode {
+        tracing::info!("journal mode: skipping PG order-book seed (replay rebuilds state)");
+    }
+    let rows = if journal_mode {
+        Vec::new()
+    } else {
+        sqlx::query_as::<_, DbOrder>(
+            "SELECT * FROM orders WHERE status IN ('PENDING', 'TRADING') ORDER BY id ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+    };
 
     let mut restored = 0usize;
     let mut skipped = 0usize;

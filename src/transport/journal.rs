@@ -31,6 +31,11 @@ use aeron_wrapper::{
 /// persist stream id.
 pub const PERSIST_REPLAY_STREAM: i32 = 31;
 
+/// Replayed engine-input (orders) traffic lands on
+/// `orders_stream + ORDERS_REPLAY_STREAM_OFFSET` — far above the live
+/// per-symbol order streams (base 10 + index) and the persist streams.
+pub const ORDERS_REPLAY_STREAM_OFFSET: i32 = 1000;
+
 /// Env var holding the archive control-request channel. Unset = disabled.
 pub const ARCHIVE_CONTROL_ENV: &str = "EXCHANGE_ARCHIVE_CONTROL";
 

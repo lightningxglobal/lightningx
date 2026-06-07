@@ -153,6 +153,44 @@ impl SkipCounts {
     }
 }
 
+/// One swap-position operation. Upsert and Delete share a queue so that
+/// "open then close within one batch" keeps its order after the
+/// keep-last-by-key dedup (the survivor IS the final state).
+#[derive(Clone, Debug)]
+enum PositionOp {
+    Upsert {
+        user_id: i64,
+        symbol: String,
+        side: &'static str,
+        qty_lots: i64,
+        entry_price_ticks: i64,
+        leverage: i16,
+        used_margin_atoms: i64,
+    },
+    Delete {
+        user_id: i64,
+        symbol: String,
+    },
+}
+
+impl PositionOp {
+    fn key(&self) -> (i64, &str) {
+        match self {
+            PositionOp::Upsert { user_id, symbol, .. }
+            | PositionOp::Delete { user_id, symbol } => (*user_id, symbol.as_str()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RiskAccountRow {
+    user_id: i64,
+    equity_atoms: i64,
+    used_margin_atoms: i64,
+    order_margin_atoms: i64,
+    status: &'static str,
+}
+
 #[derive(Default)]
 pub struct PgWriteBatch {
     upserts: Vec<UpsertRow>,
@@ -161,6 +199,10 @@ pub struct PgWriteBatch {
     accounts: Vec<AccountRow>,
     trades: Vec<TradeRow>,
     matching_events: Vec<MatchingEventRow>,
+    position_ops: Vec<PositionOp>,
+    risk_accounts: Vec<RiskAccountRow>,
+    /// Absolute fund balance — last one in the batch wins.
+    insurance_fund_atoms: Option<i64>,
     skipped: u64,
     skip_counts: SkipCounts,
     /// Checkpoint floor per publisher: frames with seq <= floor were
@@ -320,16 +362,86 @@ impl PgWriteBatch {
                     false
                 }
             },
-            // Swap margin frames: defined in S1.2, flushed to PG in S1.3.
-            // Until the flush lands they are counted as skipped so the
-            // metrics make the gap visible instead of silently dropping.
-            Some(PersistKind::PositionUpsert)
-            | Some(PersistKind::PositionDelete)
-            | Some(PersistKind::RiskAccountSet)
-            | Some(PersistKind::InsuranceFundSet) => {
-                self.skipped += 1;
-                false
-            }
+            Some(PersistKind::PositionUpsert) => match frame.as_position_upsert() {
+                Some(p) => {
+                    let side = match crate::desk::risk::PositionSide::from_u8(p.side) {
+                        Some(s) => s.as_db_str(),
+                        None => {
+                            self.skipped += 1;
+                            self.skip_counts.payload_decode_failed += 1;
+                            return false;
+                        }
+                    };
+                    self.position_ops.push(PositionOp::Upsert {
+                        user_id: p.user_id,
+                        symbol: crate::transport::persist_event::unpack_str(&p.symbol)
+                            .to_string(),
+                        side,
+                        qty_lots: p.qty_lots,
+                        entry_price_ticks: p.entry_price_ticks,
+                        leverage: p.leverage as i16,
+                        used_margin_atoms: p.used_margin_atoms,
+                    });
+                    true
+                }
+                None => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    false
+                }
+            },
+            Some(PersistKind::PositionDelete) => match frame.as_position_delete() {
+                Some(p) => {
+                    self.position_ops.push(PositionOp::Delete {
+                        user_id: p.user_id,
+                        symbol: crate::transport::persist_event::unpack_str(&p.symbol)
+                            .to_string(),
+                    });
+                    true
+                }
+                None => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    false
+                }
+            },
+            Some(PersistKind::RiskAccountSet) => match frame.as_risk_account_set() {
+                Some(p) => {
+                    let status = match crate::desk::risk::RiskStatus::from_u8(p.status) {
+                        Some(s) => s.as_db_str(),
+                        None => {
+                            self.skipped += 1;
+                            self.skip_counts.payload_decode_failed += 1;
+                            return false;
+                        }
+                    };
+                    self.risk_accounts.push(RiskAccountRow {
+                        user_id: p.user_id,
+                        equity_atoms: p.equity_atoms,
+                        used_margin_atoms: p.used_margin_atoms,
+                        order_margin_atoms: p.order_margin_atoms,
+                        status,
+                    });
+                    true
+                }
+                None => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    false
+                }
+            },
+            Some(PersistKind::InsuranceFundSet) => match frame.as_insurance_fund_set() {
+                Some(p) => {
+                    // Absolute value: the batch's last frame wins.
+                    self.insurance_fund_atoms = Some(p.balance_atoms);
+                    true
+                }
+                None => {
+                    self.skipped += 1;
+                    self.skip_counts.payload_decode_failed += 1;
+                    false
+                }
+            },
             None => {
                 self.skipped += 1;
                 self.skip_counts.unknown_kind += 1;
@@ -618,6 +730,21 @@ impl PgWriteBatch {
         if !self.matching_events.is_empty() {
             total += flush_matching_events(&mut *tx, &self.matching_events).await?;
         }
+        if !self.position_ops.is_empty() {
+            total += flush_positions(&mut *tx, &self.position_ops).await?;
+        }
+        if !self.risk_accounts.is_empty() {
+            total += flush_risk_accounts(&mut *tx, &self.risk_accounts).await?;
+        }
+        if let Some(balance) = self.insurance_fund_atoms {
+            sqlx::query(
+                "UPDATE insurance_fund SET balance_atoms = $1, updated_at = NOW() WHERE id = 1",
+            )
+            .bind(balance)
+            .execute(&mut *tx)
+            .await?;
+            total += 1;
+        }
         if !self.pending_max_seq.is_empty() {
             flush_checkpoints(&mut tx, &self.pending_max_seq).await?;
         }
@@ -637,6 +764,9 @@ impl PgWriteBatch {
         self.accounts.clear();
         self.trades.clear();
         self.matching_events.clear();
+        self.position_ops.clear();
+        self.risk_accounts.clear();
+        self.insurance_fund_atoms = None;
 
         Ok(total)
     }
@@ -827,6 +957,157 @@ async fn flush_fills(conn: &mut PgConnection, rows: &[FillRow]) -> anyhow::Resul
     .bind(&ids)
     .bind(&filled_atoms)
     .bind(&statuses)
+    .execute(&mut *conn)
+    .await?;
+    Ok(res.rows_affected() as usize)
+}
+
+/// Apply position ops in batch. Keep-last-by-(user,symbol) dedup first:
+/// PG's ON CONFLICT DO UPDATE refuses a batch touching the same row twice,
+/// and the last op IS the final state (absolute-state frames). Surviving
+/// upserts and deletes target disjoint keys by construction.
+async fn flush_positions(conn: &mut PgConnection, ops: &[PositionOp]) -> anyhow::Result<usize> {
+    use std::collections::HashMap;
+    let mut keep: HashMap<(i64, &str), usize> = HashMap::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        keep.insert(op.key(), i);
+    }
+    let mut keep_idx: Vec<usize> = keep.into_values().collect();
+    keep_idx.sort_unstable();
+
+    let mut up_user = Vec::new();
+    let mut up_symbol: Vec<String> = Vec::new();
+    let mut up_side: Vec<String> = Vec::new();
+    let mut up_qty = Vec::new();
+    let mut up_entry = Vec::new();
+    let mut up_lev: Vec<i16> = Vec::new();
+    let mut up_margin = Vec::new();
+    let mut del_user = Vec::new();
+    let mut del_symbol: Vec<String> = Vec::new();
+    for i in keep_idx {
+        match &ops[i] {
+            PositionOp::Upsert {
+                user_id,
+                symbol,
+                side,
+                qty_lots,
+                entry_price_ticks,
+                leverage,
+                used_margin_atoms,
+            } => {
+                up_user.push(*user_id);
+                up_symbol.push(symbol.clone());
+                up_side.push((*side).to_string());
+                up_qty.push(*qty_lots);
+                up_entry.push(*entry_price_ticks);
+                up_lev.push(*leverage);
+                up_margin.push(*used_margin_atoms);
+            }
+            PositionOp::Delete { user_id, symbol } => {
+                del_user.push(*user_id);
+                del_symbol.push(symbol.clone());
+            }
+        }
+    }
+
+    let mut total = 0usize;
+    if !up_user.is_empty() {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO positions
+                (user_id, symbol, side, qty_lots, entry_price_ticks, leverage,
+                 used_margin_atoms, updated_at)
+            SELECT *, NOW() FROM UNNEST(
+                $1::bigint[], $2::text[], $3::text[], $4::bigint[],
+                $5::bigint[], $6::smallint[], $7::bigint[]
+            ) AS t(user_id, symbol, side, qty_lots, entry_price_ticks, leverage,
+                   used_margin_atoms)
+            ON CONFLICT (user_id, symbol) DO UPDATE SET
+                side = EXCLUDED.side,
+                qty_lots = EXCLUDED.qty_lots,
+                entry_price_ticks = EXCLUDED.entry_price_ticks,
+                leverage = EXCLUDED.leverage,
+                used_margin_atoms = EXCLUDED.used_margin_atoms,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&up_user)
+        .bind(&up_symbol)
+        .bind(&up_side)
+        .bind(&up_qty)
+        .bind(&up_entry)
+        .bind(&up_lev)
+        .bind(&up_margin)
+        .execute(&mut *conn)
+        .await?;
+        total += res.rows_affected() as usize;
+    }
+    if !del_user.is_empty() {
+        // Deleting an absent row is a no-op by design: the close may
+        // replay after a restart that already applied it (idempotency).
+        let res = sqlx::query(
+            r#"
+            DELETE FROM positions p
+            USING UNNEST($1::bigint[], $2::text[]) AS d(user_id, symbol)
+            WHERE p.user_id = d.user_id AND p.symbol = d.symbol
+            "#,
+        )
+        .bind(&del_user)
+        .bind(&del_symbol)
+        .execute(&mut *conn)
+        .await?;
+        total += res.rows_affected() as usize;
+    }
+    Ok(total)
+}
+
+/// Absolute margin-account rows; keep-last-by-user dedup for the same
+/// ON CONFLICT reason as accounts/positions.
+async fn flush_risk_accounts(
+    conn: &mut PgConnection,
+    rows: &[RiskAccountRow],
+) -> anyhow::Result<usize> {
+    use std::collections::HashMap;
+    let mut keep: HashMap<i64, usize> = HashMap::with_capacity(rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        keep.insert(r.user_id, i);
+    }
+    let mut keep_idx: Vec<usize> = keep.into_values().collect();
+    keep_idx.sort_unstable();
+
+    let mut user = Vec::with_capacity(keep_idx.len());
+    let mut equity = Vec::with_capacity(keep_idx.len());
+    let mut used = Vec::with_capacity(keep_idx.len());
+    let mut order = Vec::with_capacity(keep_idx.len());
+    let mut status: Vec<String> = Vec::with_capacity(keep_idx.len());
+    for i in keep_idx {
+        let r = &rows[i];
+        user.push(r.user_id);
+        equity.push(r.equity_atoms);
+        used.push(r.used_margin_atoms);
+        order.push(r.order_margin_atoms);
+        status.push(r.status.to_string());
+    }
+    let res = sqlx::query(
+        r#"
+        INSERT INTO risk_accounts
+            (user_id, equity_atoms, used_margin_atoms, order_margin_atoms, status, updated_at)
+        SELECT *, NOW() FROM UNNEST(
+            $1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::text[]
+        ) AS t(user_id, equity_atoms, used_margin_atoms, order_margin_atoms, status)
+        ON CONFLICT (user_id) DO UPDATE SET
+            equity_atoms = EXCLUDED.equity_atoms,
+            used_margin_atoms = EXCLUDED.used_margin_atoms,
+            order_margin_atoms = EXCLUDED.order_margin_atoms,
+            status = EXCLUDED.status,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(&user)
+    .bind(&equity)
+    .bind(&used)
+    .bind(&order)
+    .bind(&status)
     .execute(&mut *conn)
     .await?;
     Ok(res.rows_affected() as usize)

@@ -3193,6 +3193,21 @@ async fn async_main() -> anyhow::Result<()> {
                                         rules.maintenance_rate_bps,
                                         meta.liq_price_ticks,
                                     );
+                                    // S1.3: persist the margin state this fill
+                                    // produced. Absolute-state frames (position
+                                    // row, account row, insurance fund) ride the
+                                    // same journaled persist stream as orders/
+                                    // trades — pg-writer applies them in the
+                                    // same exactly-once transaction.
+                                    for frame in
+                                        lightning_exchange::desk::risk_persist::margin_state_frames(
+                                            &risk_engine,
+                                            meta.user_id,
+                                            &meta.symbol,
+                                        )
+                                    {
+                                        publish_frame(&persist_pub, &frame);
+                                    }
                                 }
                             }
                         }

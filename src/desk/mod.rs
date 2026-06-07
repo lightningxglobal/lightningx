@@ -15,6 +15,7 @@ pub mod read_actor;
 pub mod reconcile;
 pub mod redis_store;
 pub mod risk;
+pub mod risk_persist;
 pub mod snowflake;
 pub mod symbol_rules;
 pub mod user_service;

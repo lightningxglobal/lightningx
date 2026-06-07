@@ -34,6 +34,71 @@ pub struct AccountRiskState {
     pub status: RiskStatus,
 }
 
+impl RiskStatus {
+    /// Stable wire/DB discriminant (PersistFrame RiskAccountSet.status and
+    /// the risk_accounts.status CHECK in migration 022 both key off this).
+    pub fn to_u8(self) -> u8 {
+        match self {
+            RiskStatus::Normal => 0,
+            RiskStatus::MarginCall => 1,
+            RiskStatus::LiquidationPending => 2,
+            RiskStatus::Liquidating => 3,
+            RiskStatus::Liquidated => 4,
+            RiskStatus::Bankruptcy => 5,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => RiskStatus::Normal,
+            1 => RiskStatus::MarginCall,
+            2 => RiskStatus::LiquidationPending,
+            3 => RiskStatus::Liquidating,
+            4 => RiskStatus::Liquidated,
+            5 => RiskStatus::Bankruptcy,
+            _ => return None,
+        })
+    }
+
+    /// The exact strings accepted by the risk_accounts.status CHECK.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            RiskStatus::Normal => "normal",
+            RiskStatus::MarginCall => "margin_call",
+            RiskStatus::LiquidationPending => "liquidation_pending",
+            RiskStatus::Liquidating => "liquidating",
+            RiskStatus::Liquidated => "liquidated",
+            RiskStatus::Bankruptcy => "bankruptcy",
+        }
+    }
+}
+
+impl PositionSide {
+    /// Wire/DB discriminant: 0 = long, 1 = short (PositionUpsert.side and
+    /// the positions.side CHECK).
+    pub fn to_u8(self) -> u8 {
+        match self {
+            PositionSide::Long => 0,
+            PositionSide::Short => 1,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => PositionSide::Long,
+            1 => PositionSide::Short,
+            _ => return None,
+        })
+    }
+
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            PositionSide::Long => "long",
+            PositionSide::Short => "short",
+        }
+    }
+}
+
 impl AccountRiskState {
     pub fn new(user_id: i64, usdt_balance_cents: i64) -> Self {
         Self {

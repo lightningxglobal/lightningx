@@ -195,6 +195,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         include_str!("../../migrations/022_swap_positions.sql"),
     )
     .await?;
+    apply_migration(
+        pool,
+        "023_insurance_fund_signed",
+        include_str!("../../migrations/023_insurance_fund_signed.sql"),
+    )
+    .await?;
     Ok(())
 }
 

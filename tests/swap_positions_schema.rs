@@ -139,14 +139,11 @@ async fn migration_is_idempotent_and_constraints_hold() {
     );
 
     // ── insurance_fund: exactly one row, pinned id, non-negative ───────
-    let (count, balance): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint, COALESCE(MIN(balance_atoms), -1)::bigint FROM insurance_fund",
-    )
-    .fetch_one(&pg)
-    .await
-    .expect("fund row");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM insurance_fund")
+        .fetch_one(&pg)
+        .await
+        .expect("fund row");
     assert_eq!(count, 1, "seed row must exist exactly once");
-    assert!(balance >= 0, "fund balance must be non-negative");
     assert!(
         sqlx::query("INSERT INTO insurance_fund (id, balance_atoms) VALUES (2, 0)")
             .execute(&pg)
@@ -154,13 +151,16 @@ async fn migration_is_idempotent_and_constraints_hold() {
             .is_err(),
         "a second fund row must be impossible (id pinned to 1)"
     );
-    assert!(
-        sqlx::query("UPDATE insurance_fund SET balance_atoms = -1 WHERE id = 1")
-            .execute(&pg)
-            .await
-            .is_err(),
-        "fund can never go negative"
-    );
+    // 023: the fund CAN go negative (socialised-loss debt) — and must be
+    // restorable. Round-trip a negative balance.
+    sqlx::query("UPDATE insurance_fund SET balance_atoms = -1 WHERE id = 1")
+        .execute(&pg)
+        .await
+        .expect("negative fund balance must be allowed (socialised losses)");
+    sqlx::query("UPDATE insurance_fund SET balance_atoms = 0 WHERE id = 1")
+        .execute(&pg)
+        .await
+        .expect("restore fund");
 
     cleanup(&pg, user).await;
 }

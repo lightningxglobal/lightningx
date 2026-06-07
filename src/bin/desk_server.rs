@@ -1316,8 +1316,8 @@ fn pin_current_thread_to_core(name: &str, label: &str) {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
+    let database_url = db::database_url_from_env()
+        .unwrap_or_else(|| "postgres://user:password@localhost:5432/mydb".to_string());
     let port = std::env::var("DESK_PORT").unwrap_or_else(|_| "4003".to_string());
     let public_market_data_enabled = std::env::var("DESK_PUBLIC_MARKET_DATA")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -2602,6 +2602,10 @@ async fn async_main() -> anyhow::Result<()> {
                 let full_channels = AtomicU64::new(0);
                 let mut last_order_update_epoch: u16 = 0;
                     let mut fenced_drop_count: u64 = 0;
+                    let m_fenced =
+                        lightning_exchange::metrics::counter("desk_fenced_drops_total");
+                    let m_gaps =
+                        lightning_exchange::metrics::counter("desk_order_update_gaps_total");
                     let mut last_order_update_seq: u64 = 0;
                 let mut order_update_gap_count: u64 = 0;
                 loop {
@@ -2645,6 +2649,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 lightning_exchange::leader::split_epoch(sequence);
                             if epoch < last_order_update_epoch {
                                 fenced_drop_count += 1;
+                                m_fenced.inc();
                                 if fenced_drop_count == 1 || fenced_drop_count % 1024 == 0 {
                                     tracing::warn!(
                                         "FENCED: dropped order_update from stale epoch {} (current {}), total {}",
@@ -2664,6 +2669,7 @@ async fn async_main() -> anyhow::Result<()> {
                             let expected = last_order_update_seq.saturating_add(1);
                             if seq != expected {
                                 order_update_gap_count += 1;
+                                m_gaps.inc();
                                 if order_update_gap_count == 1
                                     || order_update_gap_count % 1024 == 0
                                 {

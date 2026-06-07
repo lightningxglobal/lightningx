@@ -46,6 +46,21 @@ fn resolve_jwt_secret(
     }
 }
 
+/// Read a secret from `<VAR>_FILE` first (Docker/Kubernetes secrets mount
+/// the value as a file — the recommended pattern, since a file can't leak
+/// through `/proc/<pid>/environ` or a crash dump the way an env var can),
+/// falling back to `<VAR>` itself. The Vault-less production path: point
+/// the *_FILE var at a tmpfs-mounted secret. Trailing newline trimmed.
+fn secret_from_env_or_file(var: &str) -> Option<String> {
+    if let Ok(path) = std::env::var(format!("{var}_FILE")) {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => return Some(s.trim_end_matches(['\n', '\r']).to_string()),
+            Err(e) => panic!("{var}_FILE set to {path:?} but unreadable: {e}"),
+        }
+    }
+    std::env::var(var).ok()
+}
+
 /// Process-wide signing key. Resolved once on first use; a configuration
 /// error is fatal by design — serving auth with a broken key set-up must
 /// not silently degrade to the dev secret.
@@ -53,7 +68,7 @@ fn jwt_secret() -> &'static [u8] {
     static SECRET: OnceLock<Vec<u8>> = OnceLock::new();
     SECRET.get_or_init(|| {
         let secret = resolve_jwt_secret(
-            std::env::var("EXCHANGE_JWT_SECRET").ok(),
+            secret_from_env_or_file("EXCHANGE_JWT_SECRET"),
             std::env::var("EXCHANGE_ENV").ok(),
         )
         .unwrap_or_else(|e| panic!("JWT secret configuration error: {e}"));
@@ -489,6 +504,35 @@ mod tests {
         assert_eq!(claims2.sub, 42);
         assert_eq!(claims2.email, "user@example.com");
         assert!(claims2.exp >= claims.exp, "sliding expiry must not shrink");
+    }
+
+    #[test]
+    fn secret_file_takes_precedence_and_trims_newline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("jwt_secret_test_{}", std::process::id()));
+        std::fs::write(&path, "supersecretfromfile\n").unwrap();
+        // SAFETY: test-local env, unique var name.
+        unsafe {
+            std::env::set_var("P6TEST_SECRET_FILE", &path);
+            std::env::set_var("P6TEST_SECRET", "from-env-should-lose");
+        }
+        assert_eq!(
+            secret_from_env_or_file("P6TEST_SECRET").as_deref(),
+            Some("supersecretfromfile"),
+            "_FILE wins and newline is trimmed"
+        );
+        unsafe {
+            std::env::remove_var("P6TEST_SECRET_FILE");
+        }
+        assert_eq!(
+            secret_from_env_or_file("P6TEST_SECRET").as_deref(),
+            Some("from-env-should-lose"),
+            "falls back to the plain env var"
+        );
+        unsafe {
+            std::env::remove_var("P6TEST_SECRET");
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

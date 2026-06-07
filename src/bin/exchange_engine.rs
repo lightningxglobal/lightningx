@@ -489,6 +489,12 @@ fn spawn_symbol_thread(
 
             let mut engine = engine;
             let rules = SymbolRules::for_symbol(&symbol);
+            // Metrics counters resolved ONCE (registry lookup takes a lock);
+            // the hot path only calls .inc() (one relaxed atomic add).
+            let m_orders = lightning_exchange::metrics::counter("engine_orders_total");
+            let m_trades = lightning_exchange::metrics::counter("engine_trades_total");
+            let m_cb_trips =
+                lightning_exchange::metrics::counter("engine_circuit_breaker_trips_total");
             // order_id → participant_id: populated on ACCEPTED, used on CANCEL to route
             // the update back to the correct user even when cancel doesn't carry uid.
             let mut uid_map = uid_map;
@@ -688,6 +694,9 @@ fn spawn_symbol_thread(
                     }
                     match msg {
                         InboundMsg::NewOrder(req) => {
+                            if live {
+                                m_orders.inc();
+                            }
                             let req_symbol = symbol_from_bytes(&req.symbol);
                             let response_stream_id = req.response_stream_id;
                             if req_symbol != symbol {
@@ -976,8 +985,14 @@ fn spawn_symbol_thread(
                                         &result.fills
                                     {
                                         trade_seq += 1;
+                                        if live {
+                                            m_trades.inc();
+                                        }
                                         last_trade_ticks = fill_price_ticks;
                                         if breaker.on_trade(ts, fill_price_ticks) {
+                                            if live {
+                                                m_cb_trips.inc();
+                                            }
                                             tracing::warn!(
                                                 "[{}] CIRCUIT BREAKER tripped at {} ticks — cancel-only for {}ms",
                                                 symbol, fill_price_ticks, cb_cooldown_ms,
@@ -1184,8 +1199,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     lightning_exchange::util::install_panic_hook();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://user:password@localhost:5432/mydb".to_string());
+    let database_url = db::database_url_from_env()
+        .unwrap_or_else(|| "postgres://user:password@localhost:5432/mydb".to_string());
 
     let symbols: Vec<String> = std::env::var("SYMBOLS")
         .unwrap_or_else(|_| "ETH_USDT,BTC_USDT,SOL_USDT".to_string())
@@ -1578,6 +1593,11 @@ async fn main() -> anyhow::Result<()> {
             leadership.clone(),
         );
         handles.push(handle);
+    }
+
+    // Metrics endpoint (Prometheus text; scraped by VictoriaMetrics).
+    if let Ok(addr) = std::env::var("ENGINE_METRICS_ADDR") {
+        lightning_exchange::metrics::spawn_metrics_listener(addr);
     }
 
     tokio::signal::ctrl_c().await?;

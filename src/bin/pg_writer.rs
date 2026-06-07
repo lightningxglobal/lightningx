@@ -33,7 +33,7 @@ use tracing::{error, info, warn};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let pg_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+    let pg_url = db::database_url_from_env().context("DATABASE_URL must be set")?;
     let max_conns: u32 = parse_env_u32("PG_WRITER_MAX_CONNS", 16);
     // Bigger batches amortize the per-flush PG round-trip cost. UNNEST
     // INSERT scales linearly per row, so 5 000-row batches take ~100-200 ms

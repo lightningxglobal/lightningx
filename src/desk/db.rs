@@ -1,5 +1,19 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
+/// Resolve the database URL, preferring `DATABASE_URL_FILE` (Docker/K8s
+/// secret mount) over `DATABASE_URL`. Trailing newline trimmed. Panics if
+/// `_FILE` is set but unreadable — a misconfigured secret must fail loudly,
+/// never silently fall back to an env var an attacker might control.
+pub fn database_url_from_env() -> Option<String> {
+    if let Ok(path) = std::env::var("DATABASE_URL_FILE") {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => return Some(s.trim_end_matches(['\n', '\r']).to_string()),
+            Err(e) => panic!("DATABASE_URL_FILE set to {path:?} but unreadable: {e}"),
+        }
+    }
+    std::env::var("DATABASE_URL").ok()
+}
+
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     create_pool_sized(database_url, 20).await
 }

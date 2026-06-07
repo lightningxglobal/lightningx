@@ -20,6 +20,7 @@ pub mod risk;
 pub mod risk_persist;
 pub mod snowflake;
 pub mod symbol_rules;
+pub mod trigger;
 pub mod user_service;
 pub mod write_actor;
 pub mod ws_handler;

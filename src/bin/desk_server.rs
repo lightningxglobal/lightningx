@@ -2600,7 +2600,9 @@ async fn async_main() -> anyhow::Result<()> {
                 // of CPU per test inside the recv-spin critical section.
                 let lost_order_updates = AtomicU64::new(0);
                 let full_channels = AtomicU64::new(0);
-                let mut last_order_update_seq: u64 = 0;
+                let mut last_order_update_epoch: u16 = 0;
+                    let mut fenced_drop_count: u64 = 0;
+                    let mut last_order_update_seq: u64 = 0;
                 let mut order_update_gap_count: u64 = 0;
                 loop {
                     let mut did_work = false;
@@ -2636,8 +2638,31 @@ async fn async_main() -> anyhow::Result<()> {
                         // Copy packed struct fields to locals to avoid misaligned refs.
                         let sequence: u64 = msg.sequence;
                         if sequence != 0 {
+                            // Fencing: high 16 bits carry the leader epoch.
+                            // Output from an epoch BELOW the highest seen is
+                            // a zombie ex-leader — drop the message entirely.
+                            let (epoch, seq) =
+                                lightning_exchange::leader::split_epoch(sequence);
+                            if epoch < last_order_update_epoch {
+                                fenced_drop_count += 1;
+                                if fenced_drop_count == 1 || fenced_drop_count % 1024 == 0 {
+                                    tracing::warn!(
+                                        "FENCED: dropped order_update from stale epoch {} (current {}), total {}",
+                                        epoch, last_order_update_epoch, fenced_drop_count
+                                    );
+                                }
+                                continue;
+                            }
+                            if epoch > last_order_update_epoch {
+                                tracing::info!(
+                                    "leader epoch {} → {} (failover); sequence tracking reset",
+                                    last_order_update_epoch, epoch
+                                );
+                                last_order_update_epoch = epoch;
+                                last_order_update_seq = 0;
+                            }
                             let expected = last_order_update_seq.saturating_add(1);
-                            if sequence != expected {
+                            if seq != expected {
                                 order_update_gap_count += 1;
                                 if order_update_gap_count == 1
                                     || order_update_gap_count % 1024 == 0
@@ -2646,12 +2671,12 @@ async fn async_main() -> anyhow::Result<()> {
                                         "order_update sequence gap desk={} expected={} got={} gaps={}",
                                         desk_id,
                                         expected,
-                                        sequence,
+                                        seq,
                                         order_update_gap_count
                                     );
                                 }
                             }
-                            last_order_update_seq = sequence;
+                            last_order_update_seq = seq;
                         }
                         let order_id: u64 = msg.order_id;
                         let client_order_id: u64 = msg.client_order_id;

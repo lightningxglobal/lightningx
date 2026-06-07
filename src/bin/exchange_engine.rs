@@ -65,6 +65,22 @@ fn response_stream_index(stream_id: i32, publishers_len: usize) -> usize {
     0
 }
 
+/// Shared leadership state maintained by the lease task in main():
+/// `epoch` < 0 means "not leader". Engine threads read these atomics each
+/// loop — no IO on the matching path.
+#[derive(Clone)]
+struct LeadershipHandle {
+    epoch: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl LeadershipHandle {
+    #[inline]
+    fn current_epoch(&self) -> Option<i64> {
+        let e = self.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        (e >= 0).then_some(e)
+    }
+}
+
 // Self-trade prevention is intentionally NOT done in the matching hot path.
 // Compliance runs its own offline, non-realtime surveillance; the engine's
 // job is to attach sufficient metadata to every trade (both user ids are
@@ -217,10 +233,11 @@ fn publish_order_update(
     stream_id: i32,
     msg: &OrderUpdateMsg,
     live: bool,
+    epoch: i64,
 ) {
-    // Journal-replay mode: state is being rebuilt, nothing leaves the
-    // process — and the per-stream sequence must not advance for messages
-    // that were never sent.
+    // Journal-replay / standby mode: state is being rebuilt or shadowed,
+    // nothing leaves the process — and the per-stream sequence must not
+    // advance for messages that were never sent.
     if !live {
         return;
     }
@@ -228,7 +245,9 @@ fn publish_order_update(
     let mut sequenced = *msg;
     if let Some(seq) = sequences.get_mut(idx) {
         *seq += 1;
-        sequenced.sequence = *seq;
+        // Fencing: epoch in the high 16 bits — consumers drop output from
+        // any epoch lower than the highest they have seen (zombie leader).
+        sequenced.sequence = lightning_exchange::leader::stamp_epoch(epoch, *seq);
     }
     let _ = publishers[idx].publish(&sequenced);
 }
@@ -434,6 +453,7 @@ fn spawn_symbol_thread(
     engine: MatchingEngine,
     tracer: Option<lightning_exchange::tracer::ExchangeTracer>,
     uid_map: HashMap<u64, (u64, i32)>,
+    leadership: Option<LeadershipHandle>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("match-{}", symbol))
@@ -630,7 +650,16 @@ fn spawn_symbol_thread(
                         }
                     }
                 }
-                let live = replay_sub.is_none() && journal_pending.is_empty();
+                // Publishing requires: replay finished AND (no election
+                // configured OR we are the leader). A standby keeps
+                // applying input silently until it wins the lease.
+                let leader_epoch = match &leadership {
+                    None => Some(0),
+                    Some(h) => h.current_epoch(),
+                };
+                let live = replay_sub.is_none()
+                    && journal_pending.is_empty()
+                    && leader_epoch.is_some();
 
                 // Only the subscriber needs do_work() — it processes the incoming IPC ring.
                 // IPC publishers write directly to mapped memory; no do_work() needed.
@@ -681,6 +710,7 @@ fn spawn_symbol_thread(
                                         now_ns(),
                                     ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                 continue;
                             }
@@ -709,6 +739,7 @@ fn spawn_symbol_thread(
                                         ts,
                                     ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                 continue;
                             }
@@ -726,6 +757,7 @@ fn spawn_symbol_thread(
                                         ts,
                                     ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                 continue;
                             }
@@ -747,6 +779,7 @@ fn spawn_symbol_thread(
                                         ts,
                                     ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                 continue;
                             }
@@ -770,6 +803,7 @@ fn spawn_symbol_thread(
                                         ts,
                                     ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                 continue;
                             }
@@ -791,6 +825,7 @@ fn spawn_symbol_thread(
                                         ts,
                                     ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                 continue;
                             }
@@ -828,6 +863,7 @@ fn spawn_symbol_thread(
                                             ts,
                                         ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                     // if let Some(ref t) = tracer {
                                     //     t.record_sym(
@@ -978,6 +1014,7 @@ fn spawn_symbol_thread(
                                         response_stream_id,
                                         &update,
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                     // if let Some(ref t) = tracer {
                                     //     t.record_sym(
@@ -1016,6 +1053,7 @@ fn spawn_symbol_thread(
                                             ts,
                                         ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                 }
                                 Err(_) => {
@@ -1036,6 +1074,7 @@ fn spawn_symbol_thread(
                                                 ts,
                                             ),
                                     live,
+                                    leader_epoch.unwrap_or(0),
                                 );
                                     }
                                 }
@@ -1421,6 +1460,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Keep one handle for the leader-election lease task (below).
+    let lease_pool_keep = pool.clone();
     drop(pool);
 
     tracing::info!(
@@ -1454,13 +1495,88 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // ----- Leader election (EXCHANGE_LEADER_ELECT=1) --------------------------
+    // One lease per engine process (role "engine"). The lease task renews
+    // every ttl/3; symbol threads read the epoch atomic each loop. Losing a
+    // held lease is fatal by design: exit, restart as standby, catch up
+    // from the journal (which standby mode requires anyway).
+    let leadership: Option<LeadershipHandle> = if std::env::var("EXCHANGE_LEADER_ELECT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
+        let handle = LeadershipHandle {
+            epoch: epoch.clone(),
+        };
+        let holder = format!(
+            "engine-{}-{}",
+            std::process::id(),
+            std::env::var("HOSTNAME").unwrap_or_default()
+        );
+        let lease_pool = lease_pool_keep.clone();
+        let ttl: f64 = std::env::var("EXCHANGE_LEASE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6.0);
+        tokio::spawn(async move {
+            let mut was_leader = false;
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs_f64((ttl / 3.0).max(0.5)));
+            loop {
+                tick.tick().await;
+                match lightning_exchange::leader::try_acquire(
+                    &lease_pool,
+                    "engine",
+                    &holder,
+                    ttl,
+                )
+                .await
+                {
+                    Ok(Some(l)) => {
+                        if !was_leader {
+                            tracing::info!("LEADERSHIP ACQUIRED (epoch {})", l.epoch);
+                            was_leader = true;
+                        }
+                        epoch.store(l.epoch, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(None) => {
+                        if was_leader {
+                            // Lost a held lease: a new leader may already be
+                            // publishing under a higher epoch. Do not linger.
+                            tracing::error!("LEADERSHIP LOST — exiting for journal-based rejoin");
+                            std::process::exit(17);
+                        }
+                        epoch.store(-1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!("lease check failed: {e}");
+                        if was_leader {
+                            tracing::error!("cannot renew held lease — exiting");
+                            std::process::exit(17);
+                        }
+                    }
+                }
+            }
+        });
+        Some(handle)
+    } else {
+        None
+    };
+
     // ----- Spawn one independent matching thread per symbol ------------------
     // Each thread creates its own AeronClient so publications don't contend.
     let mut handles = Vec::new();
     for (idx, symbol) in symbols.iter().enumerate() {
         let engine = engines.remove(symbol).expect("engine missing");
         let uid_map = uid_maps.remove(symbol).unwrap_or_default();
-        let handle = spawn_symbol_thread(idx, symbol.clone(), engine, tracer.clone(), uid_map);
+        let handle = spawn_symbol_thread(
+            idx,
+            symbol.clone(),
+            engine,
+            tracer.clone(),
+            uid_map,
+            leadership.clone(),
+        );
         handles.push(handle);
     }
 

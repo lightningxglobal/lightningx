@@ -37,6 +37,7 @@ pub use desk::account_repository;
 pub use desk::api;
 pub use desk::counter_shard;
 pub use desk::db;
+pub use desk::metrics;
 pub use desk::models;
 pub use desk::money;
 pub use desk::order_state;

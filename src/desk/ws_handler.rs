@@ -618,6 +618,9 @@ async fn handle_client_message(
     match msg {
         ClientMsg::Auth { token } => match user_service::verify_token(&token) {
             Ok(claims) => {
+                if user_service::is_revoked(claims.sub) {
+                    return Some(ws_sbe::encode_auth_error("token revoked"));
+                }
                 session.user_id = Some(claims.sub);
                 state.user_tx.register(claims.sub, personal_tx.clone());
                 Some(ws_sbe::encode_auth_ok(claims.sub))

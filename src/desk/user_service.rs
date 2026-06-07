@@ -205,6 +205,64 @@ fn make_token(user_id: i64, email: &str) -> Result<String> {
     .map_err(|e| anyhow!("Token encode error: {}", e))
 }
 
+// ── Token revocation ──────────────────────────────────────────────────
+// Synchronous O(1) check against an in-memory set; persisted in a Redis
+// SET ("auth:revoked") and refreshed every 30s by the desk, so revocation
+// propagates across desks within seconds while the auth hot path never
+// does IO. Pair with a short EXCHANGE_JWT_ACCESS_TTL_SECS in production.
+
+fn revoked_set() -> &'static dashmap::DashSet<i64> {
+    static SET: OnceLock<dashmap::DashSet<i64>> = OnceLock::new();
+    SET.get_or_init(dashmap::DashSet::new)
+}
+
+/// Synchronous, IO-free revocation check used on every authenticated call.
+pub fn is_revoked(user_id: i64) -> bool {
+    revoked_set().contains(&user_id)
+}
+
+pub const REDIS_REVOKED_KEY: &str = "auth:revoked";
+
+/// Revoke every outstanding token of a user (memory + Redis).
+pub async fn revoke_user(
+    redis: Option<&mut redis::aio::MultiplexedConnection>,
+    user_id: i64,
+) -> Result<()> {
+    revoked_set().insert(user_id);
+    if let Some(conn) = redis {
+        use redis::AsyncCommands;
+        let _: () = conn.sadd(REDIS_REVOKED_KEY, user_id).await?;
+    }
+    Ok(())
+}
+
+/// Lift a revocation (memory + Redis).
+pub async fn unrevoke_user(
+    redis: Option<&mut redis::aio::MultiplexedConnection>,
+    user_id: i64,
+) -> Result<()> {
+    revoked_set().remove(&user_id);
+    if let Some(conn) = redis {
+        use redis::AsyncCommands;
+        let _: () = conn.srem(REDIS_REVOKED_KEY, user_id).await?;
+    }
+    Ok(())
+}
+
+/// Replace the in-memory set from Redis (startup + periodic refresh).
+pub async fn refresh_revocations(
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> Result<usize> {
+    use redis::AsyncCommands;
+    let ids: Vec<i64> = conn.smembers(REDIS_REVOKED_KEY).await?;
+    let set = revoked_set();
+    set.clear();
+    for id in &ids {
+        set.insert(*id);
+    }
+    Ok(ids.len())
+}
+
 /// Look up user_id by bare API key. Allowed ONLY for legacy keys without
 /// a signing secret; once a key has a secret, bare auth is rejected and
 /// the signed flow (verify_api_key_signed) is mandatory.
@@ -431,6 +489,16 @@ mod tests {
         assert_eq!(claims2.sub, 42);
         assert_eq!(claims2.email, "user@example.com");
         assert!(claims2.exp >= claims.exp, "sliding expiry must not shrink");
+    }
+
+    #[tokio::test]
+    async fn revocation_set_blocks_and_lifts() {
+        assert!(!is_revoked(990_001));
+        revoke_user(None, 990_001).await.unwrap();
+        assert!(is_revoked(990_001), "revoked user blocked");
+        assert!(!is_revoked(990_002), "others unaffected");
+        unrevoke_user(None, 990_001).await.unwrap();
+        assert!(!is_revoked(990_001), "revocation lifted");
     }
 
     #[test]

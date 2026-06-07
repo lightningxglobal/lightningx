@@ -148,3 +148,34 @@ async fn audit_log_is_append_only() {
         .await;
     assert!(del.is_err(), "DELETE must be blocked");
 }
+
+#[tokio::test]
+async fn revocation_persists_and_refreshes_via_redis() {
+    use lightning_exchange::user_service::{
+        is_revoked, refresh_revocations, revoke_user, unrevoke_user,
+    };
+    let url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+    let Ok(client) = redis::Client::open(url) else {
+        eprintln!("skip: no Redis");
+        return;
+    };
+    let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
+        eprintln!("skip: no Redis");
+        return;
+    };
+    let uid: i64 = 880_000_777;
+
+    revoke_user(Some(&mut conn), uid).await.expect("revoke");
+    assert!(is_revoked(uid));
+
+    // Simulate another desk: wipe local memory, refresh from Redis.
+    unrevoke_user(None, uid).await.expect("local clear only");
+    assert!(!is_revoked(uid), "local memory cleared");
+    refresh_revocations(&mut conn).await.expect("refresh");
+    assert!(is_revoked(uid), "revocation restored from Redis");
+
+    unrevoke_user(Some(&mut conn), uid).await.expect("lift");
+    refresh_revocations(&mut conn).await.expect("refresh 2");
+    assert!(!is_revoked(uid));
+}

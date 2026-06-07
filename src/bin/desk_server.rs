@@ -1809,6 +1809,23 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
+    // Revocation propagation: refresh the in-memory revoked set from Redis
+    // every 30s (auth checks stay synchronous and IO-free).
+    if let Some(conn) = redis_conn.clone() {
+        let mut conn = conn;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if let Err(e) =
+                    lightning_exchange::user_service::refresh_revocations(&mut conn).await
+                {
+                    tracing::warn!("revocation refresh failed: {e}");
+                }
+            }
+        });
+    }
+
     let state = AppState {
         db: Arc::new(pool),
         rate_limiter: rate_limiter.clone(),

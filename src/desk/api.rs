@@ -273,6 +273,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/register", post(handle_register))
         .route("/api/auth/login", post(handle_login))
         .route("/api/auth/refresh", post(handle_refresh))
+        .route("/metrics", get(handle_metrics))
+        .route("/api/admin/revoke", post(handle_admin_revoke))
+        .route("/api/admin/unrevoke", post(handle_admin_unrevoke))
         // User profile & KYC
         .route(
             "/api/user/profile",
@@ -398,6 +401,76 @@ async fn handle_login(
     }
 }
 
+fn admin_authorized(headers: &HeaderMap) -> bool {
+    let Ok(expected) = std::env::var("EXCHANGE_ADMIN_TOKEN") else {
+        return false; // no admin token configured → admin API disabled
+    };
+    if expected.len() < 32 {
+        return false;
+    }
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|t| t == expected)
+}
+
+#[derive(serde::Deserialize)]
+struct RevokeRequest {
+    user_id: i64,
+}
+
+/// Revoke every outstanding token of a user. Admin-only
+/// (EXCHANGE_ADMIN_TOKEN bearer; endpoint disabled when unset/short).
+async fn handle_admin_revoke(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeRequest>,
+) -> impl IntoResponse {
+    if !admin_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})));
+    }
+    let mut redis = s.redis.clone();
+    if let Err(e) = user_service::revoke_user(redis.as_mut(), req.user_id).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        );
+    }
+    user_service::audit(&s.db, None, "admin_revoke", None, json!({"user_id": req.user_id}))
+        .await;
+    (StatusCode::OK, Json(json!({"revoked": req.user_id})))
+}
+
+async fn handle_admin_unrevoke(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeRequest>,
+) -> impl IntoResponse {
+    if !admin_authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})));
+    }
+    let mut redis = s.redis.clone();
+    if let Err(e) = user_service::unrevoke_user(redis.as_mut(), req.user_id).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        );
+    }
+    user_service::audit(&s.db, None, "admin_unrevoke", None, json!({"user_id": req.user_id}))
+        .await;
+    (StatusCode::OK, Json(json!({"unrevoked": req.user_id})))
+}
+
+/// Prometheus exposition endpoint (scraped by VictoriaMetrics).
+async fn handle_metrics() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::desk::metrics::render(),
+    )
+}
+
 /// Re-issue an access token from a still-valid one (sliding expiry).
 /// Production pairs this with a short EXCHANGE_JWT_ACCESS_TTL_SECS.
 async fn handle_refresh(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -432,12 +505,20 @@ fn auth_claims(headers: &HeaderMap) -> Result<user_service::Claims, (StatusCode,
                 Json(json!({"error": "Missing token"})),
             )
         })?;
-    user_service::verify_token(token).map_err(|e| {
+    let claims = user_service::verify_token(token).map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": e.to_string()})),
         )
-    })
+    })?;
+    // Revocation: in-memory O(1), refreshed from Redis every 30s.
+    if user_service::is_revoked(claims.sub) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "token revoked"})),
+        ));
+    }
+    Ok(claims)
 }
 
 fn auth_user(headers: &HeaderMap) -> Result<i64, (StatusCode, Json<Value>)> {

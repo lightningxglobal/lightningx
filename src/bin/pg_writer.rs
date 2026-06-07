@@ -108,6 +108,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Metrics endpoint (Prometheus text; scraped by VictoriaMetrics).
+    if let Ok(addr) = std::env::var("PG_WRITER_METRICS_ADDR") {
+        lightning_exchange::metrics::spawn_metrics_listener(addr);
+    }
+
     let dir = aeron_dir();
     info!("connecting Aeron client (dir={})", dir);
 
@@ -119,6 +124,16 @@ async fn main() -> anyhow::Result<()> {
     // pg-writer dying with 47s service interval at 40K conn × 1 op/s.
     let queue: Arc<ArrayQueue<PersistFrame>> = Arc::new(ArrayQueue::new(queue_cap));
     let dropped_pushes = Arc::new(AtomicU64::new(0));
+    {
+        let q = queue.clone();
+        lightning_exchange::metrics::register_gauge("pgw_bridge_queue_depth", move || {
+            q.len() as f64
+        });
+        let d = dropped_pushes.clone();
+        lightning_exchange::metrics::register_gauge("pgw_bridge_dropped_total", move || {
+            d.load(Ordering::Relaxed) as f64
+        });
+    }
 
     let queue_tx = queue.clone();
     let dropped_tx = dropped_pushes.clone();
@@ -288,6 +303,19 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if last_log.elapsed() >= Duration::from_secs(30) {
+            // Export the cumulative counters VictoriaMetrics alerts on.
+            lightning_exchange::metrics::register_gauge("pgw_applied_total", {
+                let v = total_applied;
+                move || v as f64
+            });
+            lightning_exchange::metrics::register_gauge("pgw_checkpoint_dup_total", {
+                let v = batch.duplicate_seq_frames;
+                move || v as f64
+            });
+            lightning_exchange::metrics::register_gauge("pgw_seq_gap_total", {
+                let v = batch.seq_gap_frames;
+                move || v as f64
+            });
             let sc = batch.skip_counts();
             info!(
                 "pg-writer: applied={} flushes={} skipped={} bridge_dropped={} queue_depth={} \
@@ -354,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
                     info!("reconcile: account invariants clean");
                 }
                 Ok(report) => {
+                    lightning_exchange::metrics::counter("pgw_reconcile_violations_total").inc();
                     error!(
                         "reconcile: INVARIANT VIOLATIONS — hanging_frozen={} \
                          orders_drift={} trades_drift={} orders_overfill={}",

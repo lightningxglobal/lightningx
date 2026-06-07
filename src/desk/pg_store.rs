@@ -320,6 +320,16 @@ impl PgWriteBatch {
                     false
                 }
             },
+            // Swap margin frames: defined in S1.2, flushed to PG in S1.3.
+            // Until the flush lands they are counted as skipped so the
+            // metrics make the gap visible instead of silently dropping.
+            Some(PersistKind::PositionUpsert)
+            | Some(PersistKind::PositionDelete)
+            | Some(PersistKind::RiskAccountSet)
+            | Some(PersistKind::InsuranceFundSet) => {
+                self.skipped += 1;
+                false
+            }
             None => {
                 self.skipped += 1;
                 self.skip_counts.unknown_kind += 1;

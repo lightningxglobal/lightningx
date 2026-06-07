@@ -167,6 +167,14 @@ pub async fn apply_frame(
         Some(PersistKind::MatchingEvent) => {
             // Append-only audit/replay scaffold; pg-writer owns durable storage.
         }
+        Some(PersistKind::PositionUpsert)
+        | Some(PersistKind::PositionDelete)
+        | Some(PersistKind::RiskAccountSet)
+        | Some(PersistKind::InsuranceFundSet) => {
+            // Swap margin state lives in PG only (S1): the desk hydrates it
+            // straight from PG on startup, so an L1 copy would just be a
+            // second thing to reconcile. pg-writer owns these frames.
+        }
         None => {
             tracing::warn!("PersistFrame with unknown kind={}", frame.kind);
         }

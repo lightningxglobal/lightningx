@@ -34,6 +34,18 @@ pub enum PersistKind {
     OrderFillUpdate = 5,
     /// Append-only matching output event for audit/replay scaffolding.
     MatchingEvent = 6,
+    /// Swap position row absolute (user_id, symbol) — open / size change /
+    /// flip. Idempotent UPSERT semantics at the consumer (S1).
+    PositionUpsert = 7,
+    /// Swap position fully closed: DELETE the row. "No row" is the
+    /// canonical flat state (qty 0 rows are forbidden by schema 022).
+    PositionDelete = 8,
+    /// Margin-account state absolute (per user). Volatile derived values
+    /// (uPnL, maintenance margin) are intentionally NOT carried — they
+    /// are recomputed from the mark price after hydrate.
+    RiskAccountSet = 9,
+    /// Insurance-fund balance absolute (the single global row).
+    InsuranceFundSet = 10,
 }
 
 impl PersistKind {
@@ -45,6 +57,10 @@ impl PersistKind {
             4 => Some(Self::TradeInsert),
             5 => Some(Self::OrderFillUpdate),
             6 => Some(Self::MatchingEvent),
+            7 => Some(Self::PositionUpsert),
+            8 => Some(Self::PositionDelete),
+            9 => Some(Self::RiskAccountSet),
+            10 => Some(Self::InsuranceFundSet),
             _ => None,
         }
     }
@@ -132,6 +148,50 @@ pub struct MatchingEventPayload {
     pub ts_ns: u64,
 }
 
+/// Absolute swap-position state. Money in ATOMS (schema-022 convention),
+/// prices in ticks, quantities in lots. 56 bytes.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct PositionUpsertPayload {
+    pub user_id: i64,
+    pub symbol: [u8; 16], // null-padded
+    pub side: u8,         // 0 = long, 1 = short
+    pub leverage: u8,
+    pub _pad: [u8; 6],
+    pub qty_lots: i64,
+    pub entry_price_ticks: i64,
+    pub used_margin_atoms: i64,
+}
+
+/// Position fully closed → DELETE (user_id, symbol). 24 bytes.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct PositionDeletePayload {
+    pub user_id: i64,
+    pub symbol: [u8; 16], // null-padded
+}
+
+/// Absolute margin-account state. equity may be NEGATIVE (transient
+/// bankruptcy); reservations may not (schema CHECKs enforce it again at
+/// the PG boundary). 40 bytes.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct RiskAccountSetPayload {
+    pub user_id: i64,
+    pub equity_atoms: i64,
+    pub used_margin_atoms: i64,
+    pub order_margin_atoms: i64,
+    pub status: u8, // RiskStatus discriminant, see risk::types
+    pub _pad: [u8; 7],
+}
+
+/// Absolute insurance-fund balance (single global row, id pinned 1). 8 bytes.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct InsuranceFundSetPayload {
+    pub balance_atoms: i64,
+}
+
 /// Largest payload size. Anything new must fit here or the union grows.
 pub const MAX_PAYLOAD: usize = 136;
 
@@ -143,6 +203,10 @@ const _: () = {
     assert!(size_of::<TradeInsertPayload>() <= MAX_PAYLOAD);
     assert!(size_of::<OrderFillUpdatePayload>() <= MAX_PAYLOAD);
     assert!(size_of::<MatchingEventPayload>() <= MAX_PAYLOAD);
+    assert!(size_of::<PositionUpsertPayload>() <= MAX_PAYLOAD);
+    assert!(size_of::<PositionDeletePayload>() <= MAX_PAYLOAD);
+    assert!(size_of::<RiskAccountSetPayload>() <= MAX_PAYLOAD);
+    assert!(size_of::<InsuranceFundSetPayload>() <= MAX_PAYLOAD);
 };
 
 #[repr(C, packed)]
@@ -246,6 +310,58 @@ impl PersistFrame {
         f
     }
 
+    pub fn position_upsert(p: PositionUpsertPayload) -> Self {
+        let mut f = Self::zero();
+        f.kind = PersistKind::PositionUpsert as u8;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &p as *const _ as *const u8,
+                size_of::<PositionUpsertPayload>(),
+            )
+        };
+        f.payload[..bytes.len()].copy_from_slice(bytes);
+        f
+    }
+
+    pub fn position_delete(p: PositionDeletePayload) -> Self {
+        let mut f = Self::zero();
+        f.kind = PersistKind::PositionDelete as u8;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &p as *const _ as *const u8,
+                size_of::<PositionDeletePayload>(),
+            )
+        };
+        f.payload[..bytes.len()].copy_from_slice(bytes);
+        f
+    }
+
+    pub fn risk_account_set(p: RiskAccountSetPayload) -> Self {
+        let mut f = Self::zero();
+        f.kind = PersistKind::RiskAccountSet as u8;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &p as *const _ as *const u8,
+                size_of::<RiskAccountSetPayload>(),
+            )
+        };
+        f.payload[..bytes.len()].copy_from_slice(bytes);
+        f
+    }
+
+    pub fn insurance_fund_set(p: InsuranceFundSetPayload) -> Self {
+        let mut f = Self::zero();
+        f.kind = PersistKind::InsuranceFundSet as u8;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &p as *const _ as *const u8,
+                size_of::<InsuranceFundSetPayload>(),
+            )
+        };
+        f.payload[..bytes.len()].copy_from_slice(bytes);
+        f
+    }
+
     /// Cast the frame as a flat byte slice for an Aeron `publish`.
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, FRAME_SIZE) }
@@ -315,6 +431,42 @@ impl PersistFrame {
             std::ptr::read_unaligned(self.payload.as_ptr() as *const MatchingEventPayload)
         })
     }
+
+    pub fn as_position_upsert(&self) -> Option<PositionUpsertPayload> {
+        if self.kind() != Some(PersistKind::PositionUpsert) {
+            return None;
+        }
+        Some(unsafe {
+            std::ptr::read_unaligned(self.payload.as_ptr() as *const PositionUpsertPayload)
+        })
+    }
+
+    pub fn as_position_delete(&self) -> Option<PositionDeletePayload> {
+        if self.kind() != Some(PersistKind::PositionDelete) {
+            return None;
+        }
+        Some(unsafe {
+            std::ptr::read_unaligned(self.payload.as_ptr() as *const PositionDeletePayload)
+        })
+    }
+
+    pub fn as_risk_account_set(&self) -> Option<RiskAccountSetPayload> {
+        if self.kind() != Some(PersistKind::RiskAccountSet) {
+            return None;
+        }
+        Some(unsafe {
+            std::ptr::read_unaligned(self.payload.as_ptr() as *const RiskAccountSetPayload)
+        })
+    }
+
+    pub fn as_insurance_fund_set(&self) -> Option<InsuranceFundSetPayload> {
+        if self.kind() != Some(PersistKind::InsuranceFundSet) {
+            return None;
+        }
+        Some(unsafe {
+            std::ptr::read_unaligned(self.payload.as_ptr() as *const InsuranceFundSetPayload)
+        })
+    }
 }
 
 /// Pack a `&str` into a fixed-length null-padded byte array.
@@ -335,6 +487,80 @@ pub fn unpack_str(bytes: &[u8]) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S1.2: every swap-margin frame round-trips the wire byte-exactly,
+    /// the cast helpers enforce kind, and truncation never parses.
+    #[test]
+    fn swap_margin_frames_roundtrip() {
+        let pos = PositionUpsertPayload {
+            user_id: 42,
+            symbol: pack_str("BTC_USDT"),
+            side: 1, // short
+            leverage: 20,
+            _pad: [0; 6],
+            qty_lots: 1_000_000,
+            entry_price_ticks: 5_000_000,
+            used_margin_atoms: 25_000_000_000,
+        };
+        let mut f = PersistFrame::position_upsert(pos);
+        f.publisher_id = 7;
+        f.seq = 99;
+        let back = PersistFrame::from_bytes(f.as_bytes()).expect("frame parses");
+        assert_eq!(back.kind(), Some(PersistKind::PositionUpsert));
+        let p = back.as_position_upsert().expect("payload casts");
+        // packed struct: copy fields out before asserting (alignment).
+        let (uid, side, lev, qty, entry, margin) = (
+            p.user_id, p.side, p.leverage, p.qty_lots, p.entry_price_ticks, p.used_margin_atoms,
+        );
+        assert_eq!(
+            (uid, side, lev, qty, entry, margin),
+            (42, 1, 20, 1_000_000, 5_000_000, 25_000_000_000)
+        );
+        assert_eq!(unpack_str(&p.symbol), "BTC_USDT");
+        // kind enforcement: a position frame is NOT an account frame.
+        assert!(back.as_account_set().is_none());
+        assert!(back.as_position_delete().is_none());
+        // truncation must never parse.
+        let bytes = f.as_bytes();
+        assert!(PersistFrame::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+
+        let del = PositionDeletePayload {
+            user_id: 42,
+            symbol: pack_str("ETH_USDT"),
+        };
+        let f = PersistFrame::position_delete(del);
+        let p = PersistFrame::from_bytes(f.as_bytes())
+            .and_then(|b| b.as_position_delete())
+            .expect("delete roundtrip");
+        let uid = p.user_id;
+        assert_eq!(uid, 42);
+        assert_eq!(unpack_str(&p.symbol), "ETH_USDT");
+
+        let acct = RiskAccountSetPayload {
+            user_id: 9,
+            equity_atoms: -5_000, // negative equity is representable (bankruptcy)
+            used_margin_atoms: 0,
+            order_margin_atoms: 123,
+            status: 5, // bankruptcy discriminant
+            _pad: [0; 7],
+        };
+        let f = PersistFrame::risk_account_set(acct);
+        let p = PersistFrame::from_bytes(f.as_bytes())
+            .and_then(|b| b.as_risk_account_set())
+            .expect("risk account roundtrip");
+        let (uid, eq, om, st) = (p.user_id, p.equity_atoms, p.order_margin_atoms, p.status);
+        assert_eq!((uid, eq, om, st), (9, -5_000, 123, 5));
+
+        let fund = InsuranceFundSetPayload {
+            balance_atoms: 777_000_000,
+        };
+        let f = PersistFrame::insurance_fund_set(fund);
+        let p = PersistFrame::from_bytes(f.as_bytes())
+            .and_then(|b| b.as_insurance_fund_set())
+            .expect("fund roundtrip");
+        let bal = p.balance_atoms;
+        assert_eq!(bal, 777_000_000);
+    }
 
     #[test]
     fn frame_size_known() {

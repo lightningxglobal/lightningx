@@ -18,9 +18,11 @@
 | P5 高可用 | 🔴 ~10% | 重放确定性前置条件已满足（P2b）；剩 Archive + 选主 + 备机 |
 | P6 安全加固 | 🟢 ~75% | HMAC API key、JWT refresh、append-only 审计日志、fuzz 脚手架（`86e0563`）。剩：Prometheus、fuzz 长跑、JWT 吊销表、渗透测试 |
 
-**当前最关键缺口**：Aeron Archive journal（需 `aeron-wrapper` 扩展 Archive C 客户端，
-唯一剩余的"外部依赖"型工程）。消费位点、确定性重放、跨存储对账等所有可独立闭环的
-前置项已全部完成。
+**当前最关键缺口已解除**：`aeron-wrapper` 已支持 Archive 客户端
+（aeron-wrapper `aa9718b`：录制/重放/位置查询/截断，含真实 ArchivingMediaDriver
+端到端测试——录制 200 帧 → replay 逐字节有序比对 → truncate）。
+下一步是把它接入 exchange：录制 orders/persist 流 + 重启重放 + recording_position
+门控 ACK（P2 收尾）+ 备机 replay-merge（P5）。
 
 ### 本轮设计决定（用户拍板，已存档）
 
@@ -274,7 +276,10 @@
     ACK 等备机位点（窗口化摊薄 ~50–100µs 同机房 RTT）；Archive 降级为冷恢复/审计源。
   - 两级通用：fencing 用 epoch/term 嵌入输出序列号（备机接管 epoch+1，下游拒旧）；
     引擎重放快（百万级 ops/s），初期不做快照，全量重放当日 journal 即可。
-  - 主要工作量：`aeron-wrapper` 扩展 Archive C 客户端支持。
+  - ✅ `aeron-wrapper` Archive 客户端已完成（wrapper `aa9718b`，2026-06-07）：
+    connect/start_recording/stop/find/recording_position/start_replay/
+    truncate + `ReplayParams::follow_from`（备机追赶原语）；
+    真实 Java ArchivingMediaDriver 集成测试全绿。剩余 = exchange 侧接入。
 - ⬜ **撮合主备**：备机实时重放 journal，接管时从最后 seq 续跑；
   etcd/consul 选主与 fencing（防双主双发）。
 - ⬜ **gateway 无状态化**：desk-server 会话状态外置，前置 LB ×N 实例；

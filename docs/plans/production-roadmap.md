@@ -18,8 +18,12 @@
 | P5 高可用 | 🟢 ~90% | 选主+fencing+standby（`d8feae9`）+ **单机 failover 演练通过：RTO 实测 3.05s ≤ 要求 180s**（`c30fb25`）。剩：PG 主从/PITR 与跨机演练（部署工作） |
 | P6 安全加固 | 🟢 ~95% | 全套密钥/认证/审计/metrics/fuzz 完成（`9c12605`/`f0d7070`）；engine+desk 热路径埋点、文件 secret。剩仅 TODO 三项（双人复核/KYC/渗透测试，见 deferred-todos.md），均非代码 |
 
-**Gate 2/4/5 已实测通过**（`c30fb25`，真实进程 SIGKILL）：
-- Gate 2：100 次 kill -9 下 3000 帧零丢失零重复；
+**Gate 2/4/5 已实测通过**（`c30fb25` + `5817792`，真实进程 SIGKILL）：
+- Gate 2（全部三条款）：writer 侧 100 次 kill -9 下 3000 帧零丢失零重复；
+  **引擎侧** 5 杀 ×600 op 后簿与全知 reference 逐档一致（宕机期间的订单仅靠重放恢复）；
+  双 writer 轮换杀 8 次后 **PG=Redis=journal 三方对账 diff=0**（journal-audit exit 0）。
+  演练抓出并修复 2 个真实缺陷：redis-writer 此前无 journal 补缺路径；
+  引擎重放上界与 live image join 位置重叠会双重入簿（现以 join 位置为界）；
 - Gate 5：**failover RTO 实测 3.05s**（用户硬性要求 ≤180s，余量 59 倍），
   standby 静默、epoch fencing、接管后可撤 failover 前挂单（无缝）；
 - Gate 4：闪崩 -6% 触发熔断 → 仅撤单 → 冷却恢复，全链路过线。

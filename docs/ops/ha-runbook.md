@@ -388,6 +388,8 @@ sudo -u postgres pg_rewind --target-pgdata=/var/lib/postgresql/16/main \
 | **PGReplLag** | `pg_stat_replication.replay_lag` > 5s | 同步备库追不上:查备机 IO |
 | **ArchiveDisk** | /var/lib/exchange/archive 使用 > 70% | 扩容/检查 retention(§13) |
 | **ReconcileDrift** | pg-writer 对账日志出现 drift | P1 级:冻结出金,人工核账 |
+| **IndexFrozen** | `index_frozen_total` 增长 | 指数源低于法定数(<INDEX_MIN_SOURCES):标记价冻结、强平/funding 停摆。查各源连通性;长时间冻结=P1 |
+| **IndexOutliers** | `index_outliers_dropped_total` 持续增长 | 某外部源价格异常:检查该源,必要时从 INDEX_SOURCES 摘除 |
 
 ---
 
@@ -490,3 +492,24 @@ CHAOS_KILLS_ENGINE=10 cargo test --test chaos_gate2_engine -- --nocapture
 | 整机断电→恢复对账 | | diff=__ | =0 | □ |
 | journal-audit | | exit __ | 0 | □ |
 | 100 杀混沌 | | 丢__重__ | 0/0 | □ |
+
+## 附录 C:指数价格源配置(S4)
+
+```bash
+# /etc/exchange/desk.env 追加
+INDEX_SOURCES=binance,okx,coinbase     # ≥3 源,任一被攻陷不影响中位数
+INDEX_SOURCE_BINANCE_URL=https://api.binance.com/api/v3/ticker/price?symbol={BASEQUOTE}
+INDEX_SOURCE_BINANCE_PATH=/price
+INDEX_SOURCE_OKX_URL=https://www.okx.com/api/v5/market/ticker?instId={BASE-QUOTE}
+INDEX_SOURCE_OKX_PATH=/data/0/last
+INDEX_SOURCE_COINBASE_URL=https://api.coinbase.com/v2/prices/{BASE-QUOTE}/spot
+INDEX_SOURCE_COINBASE_PATH=/data/amount
+INDEX_POLL_SECS=5
+INDEX_STALENESS_MS=30000
+INDEX_OUTLIER_BPS=200       # 偏离中位数 >2% 的源被剔除
+INDEX_MIN_SOURCES=2         # 低于此数:标记价冻结(宁停勿错)
+MARK_CLAMP_BPS=50           # 标记价 = mid 钳制到指数 ±0.5%
+```
+
+规则:**不配置 INDEX_SOURCES 时标记价=裸盘口 mid(仅限开发环境)**;
+生产必须配置,否则等于把强平按钮交给任何能扫穿薄簿的人。

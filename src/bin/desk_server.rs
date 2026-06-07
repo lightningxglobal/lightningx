@@ -1910,6 +1910,57 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // ── S4: index aggregation (external sources → median, outlier-
+    //    rejected; below quorum → mark freezes). No INDEX_SOURCES env →
+    //    None → raw-mid marks (dev mode). ──────────────────────────────
+    let (index_agg, mark_frozen_count): (
+        Option<Arc<lightning_exchange::desk::index_price::IndexAggregator>>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) = {
+        let symbols: Vec<String> = std::env::var("SYMBOLS")
+            .unwrap_or_else(|_| "ETH_USDT,BTC_USDT,SOL_USDT".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let sources =
+            lightning_exchange::desk::index_price::spawn_http_pollers(symbols);
+        let agg = if sources.is_empty() {
+            tracing::warn!(
+                "S4: no INDEX_SOURCES configured — marks use the RAW book mid                  (manipulation-clamping disabled; fine for dev, not for production)"
+            );
+            None
+        } else {
+            tracing::info!("S4: index aggregation over {} source(s)", sources.len());
+            Some(Arc::new(
+                lightning_exchange::desk::index_price::IndexAggregator::new(sources),
+            ))
+        };
+        (agg, Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    };
+    // S4.5: index/mark health on /metrics — the runbook alarms on
+    // index_frozen_total and mark_update_frozen_total growth.
+    if let Some(agg) = &index_agg {
+        let a = agg.clone();
+        lightning_exchange::metrics::register_gauge("index_aggregations_ok_total", move || {
+            a.health.ok.load(std::sync::atomic::Ordering::Relaxed) as f64
+        });
+        let a = agg.clone();
+        lightning_exchange::metrics::register_gauge("index_frozen_total", move || {
+            a.health.frozen.load(std::sync::atomic::Ordering::Relaxed) as f64
+        });
+        let a = agg.clone();
+        lightning_exchange::metrics::register_gauge("index_outliers_dropped_total", move || {
+            a.health.outliers_dropped.load(std::sync::atomic::Ordering::Relaxed) as f64
+        });
+    }
+    {
+        let c = mark_frozen_count.clone();
+        lightning_exchange::metrics::register_gauge("mark_update_frozen_total", move || {
+            c.load(std::sync::atomic::Ordering::Relaxed) as f64
+        });
+    }
+
     // ── S3: funding scheduler/sampler task ────────────────────────────
     // Durable schedule anchor = funding_state (advanced by pg-writer in
     // the settlement transaction); the desk resumes from it on startup.
@@ -1951,6 +2002,7 @@ async fn async_main() -> anyhow::Result<()> {
             funding_view.insert(sym.clone(), (sched.next_settlement_at_ms, 0, 0));
         }
         let view = funding_view.clone();
+        let index_agg_f = index_agg.clone();
         let engine_f = risk_engine.clone();
         let persist_f = persist_pub.clone();
         tokio::spawn(async move {
@@ -1972,10 +2024,20 @@ async fn async_main() -> anyhow::Result<()> {
                         continue; // no market yet — nothing to sample/settle
                     };
                     if do_sample {
-                        // Index placeholder (S4 seam): the book's own mark
-                        // → premium 0, funding = interest term only. The
-                        // IndexPriceSource aggregation replaces this line.
-                        tracker.sample(mark, mark);
+                        // S4: real index when configured; without it the
+                        // mark doubles as index → premium 0, interest-only
+                        // funding (dev mode). Frozen index → skip sample.
+                        let index = match index_agg_f.as_ref() {
+                            Some(agg) => {
+                                use lightning_exchange::desk::funding::IndexPriceSource;
+                                match agg.index_price_ticks(sym16) {
+                                    Some(i) => i,
+                                    None => continue, // frozen — never guess
+                                }
+                            }
+                            None => mark,
+                        };
+                        tracker.sample(mark, index);
                         if let Some(mut v) = view.get_mut(sym) {
                             v.2 = tracker.twap_e9();
                         }
@@ -2554,6 +2616,12 @@ async fn async_main() -> anyhow::Result<()> {
         let rt_pub = tokio::runtime::Handle::current();
         let order_meta_cache_pub = open_order_meta.clone();
         let risk_engine_pub = state.risk_engine.clone();
+        let index_agg_pub = index_agg.clone();
+        let mark_frozen_pub = mark_frozen_count.clone();
+        let mark_clamp_bps: i64 = std::env::var("MARK_CLAMP_BPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
         let thread_name_recv_pub = format!("d{desk_id}-recv-pub");
         std::thread::Builder::new()
             .name(thread_name_recv_pub.clone())
@@ -2701,7 +2769,32 @@ async fn async_main() -> anyhow::Result<()> {
                                         let sym_str = std::str::from_utf8(&sym_key[..sym_str_end]).unwrap_or("");
                                         let rules = lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(sym_str);
                                         let mid_ticks = ((best_bid + best_ask) / 2.0 / rules.price_tick).round() as i64;
-                                        risk_engine_pub.update_mark_price(sym_key, mid_ticks, rules.notional_scale);
+                                        // S4.2: the mark is the mid CLAMPED into
+                                        // index × (1 ± MARK_CLAMP_BPS). With the
+                                        // index frozen (sources below quorum) the
+                                        // mark is NOT updated at all — the engine
+                                        // keeps its last value rather than trust
+                                        // a manipulable book (counted in metrics).
+                                        match index_agg_pub.as_ref().map(|a| {
+                                            use lightning_exchange::desk::funding::IndexPriceSource;
+                                            a.index_price_ticks(&sym_key)
+                                        }) {
+                                            Some(Some(index_ticks)) => {
+                                                let mark = lightning_exchange::desk::index_price::clamped_mark(
+                                                    mid_ticks, index_ticks, mark_clamp_bps,
+                                                );
+                                                risk_engine_pub.update_mark_price(sym_key, mark, rules.notional_scale);
+                                            }
+                                            Some(None) => {
+                                                mark_frozen_pub.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            }
+                                            // No aggregator configured (INDEX_SOURCES
+                                            // empty): raw mid, pre-S4 behavior — for
+                                            // dev/test setups without external feeds.
+                                            None => {
+                                                risk_engine_pub.update_mark_price(sym_key, mid_ticks, rules.notional_scale);
+                                            }
+                                        }
                                     }
                                 }
 

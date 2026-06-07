@@ -89,14 +89,19 @@
 
 ## S4. 指数价格与标记价格(P0,反操纵)
 
-- [ ] S4.1 指数服务接口:可插拔价格源 trait + 多源中位数聚合 +
-      异常源剔除(偏离>阈值)+ 源失效降级策略(源<2 时冻结标记价更新并告警)
-- [ ] S4.2 标记价格 = 指数价 + 基差的有界修正(clamp 到指数价 ±α%),
-      替换现在的"盘口中间价直接当标记价"
-- [ ] S4.3 强平/未实现 PnL/funding 全部切到标记价(审计所有 mark_price 调用点)
-- [ ] S4.4 测试:操纵场景仿真——本所盘口被打飞 ±20% 而指数价不动,
-      断言不触发强平(标记价被钳制)
-- [ ] S4.5 价格源运维:源配置 env 化、源健康 metrics、手册补一节
+- [x] S4.1 IndexAggregator:SharedSource(写入方任意:HTTP/测试/未来 WS)、
+      中位数+单轮异常剔除(单一被攻陷源无法移动指数)、staleness 淘汰、
+      低于法定数→None(冻结,宁停勿错);单测全覆盖
+- [x] S4.2 mark = clamp(mid, index×(1±MARK_CLAMP_BPS)),接在 desk 唯一
+      咽喉点;指数冻结时**不更新** mark(计数进 metrics);无 INDEX_SOURCES
+      = 裸 mid(开发模式,启动 WARN)
+- [x] S4.3 审计:uPnL/maintenance/强平触发/强平定价/funding premium 全部
+      经 update_mark_price 单点继承钳制;funding 占位 index 替换为真实聚合
+      (冻结时跳过采样,不猜价)
+- [x] S4.4 操纵仿真(`swap_mark_manipulation`):±20% 扫簿不触发强平;
+      对照组:真实指数崩盘正常强平、法定数丢失冻结保持旧值
+- [x] S4.5 HTTP 轮询源(URL 模板+JSON pointer,env 化)、健康 metrics
+      (ok/frozen/outliers + mark 冻结计数)、手册附录 C(三所示例配置+告警)
 
 ## S5. 触发单(止损/止盈)(P0,用户侧风控)
 
@@ -145,7 +150,7 @@
 | S1 持仓持久化 | ✅ 完成 | `decfbc6..fdb7556` |
 | S2 单位制统一 | ✅ 完成 | `b5e7162..` |
 | S3 funding | ✅ 完成 | `c549e8e..` |
-| S4 指数/标记价 | ⬜ 未开始 | |
+| S4 指数/标记价 | ✅ 完成 | 本提交 |
 | S5 触发单 | ⬜ 未开始 | |
 | S6 强平完善 | ⬜ 未开始 | |
 | S7 经济参数 | ⬜ 未开始 | |

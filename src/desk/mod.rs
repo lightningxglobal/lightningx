@@ -4,6 +4,7 @@ pub mod api;
 pub mod counter_shard;
 pub mod db;
 pub mod funding;
+pub mod index_price;
 pub mod leader;
 pub mod metrics;
 pub mod models;

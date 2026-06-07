@@ -60,6 +60,20 @@ impl RiskStatus {
         })
     }
 
+    /// Inverse of [`Self::as_db_str`]; `None` for unknown strings so the
+    /// hydrate path fails fast instead of guessing.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "normal" => RiskStatus::Normal,
+            "margin_call" => RiskStatus::MarginCall,
+            "liquidation_pending" => RiskStatus::LiquidationPending,
+            "liquidating" => RiskStatus::Liquidating,
+            "liquidated" => RiskStatus::Liquidated,
+            "bankruptcy" => RiskStatus::Bankruptcy,
+            _ => return None,
+        })
+    }
+
     /// The exact strings accepted by the risk_accounts.status CHECK.
     pub fn as_db_str(self) -> &'static str {
         match self {

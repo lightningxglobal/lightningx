@@ -18,6 +18,12 @@ use crate::transport::persist_event::{
 };
 use std::sync::atomic::Ordering;
 
+/// Exact atoms→cents for values we wrote ourselves (always *1e6 multiples);
+/// foreign/hand-edited rows truncate toward zero, which reconcile flags.
+fn atoms_to_cents(atoms: i64) -> i64 {
+    atoms / CENTS_TO_ATOMS
+}
+
 /// 1 cent = 0.01 USDT = 10^6 atoms (atoms are 1e-8 USDT).
 const CENTS_TO_ATOMS: i64 = 1_000_000;
 
@@ -85,6 +91,179 @@ pub fn margin_state_frames(
     }));
 
     frames
+}
+
+/// Wait until pg-writer's checkpoint floors stop advancing (two identical
+/// reads `interval` apart) before hydrating — S1.4 startup-race guard.
+///
+/// The scenario: desk dies, restarts quickly; pg-writer is still
+/// journal-replaying the dead desk's last frames, so risk_accounts/
+/// positions in PG lag the true pre-crash state by up to the replay tail.
+/// Hydrating mid-catch-up would resurrect a stale book of positions.
+/// "Floors quiet" is a heuristic, not a proof — but the tail is bounded
+/// (flush every ~20ms + replay at memory speed), so two quiet reads make
+/// staleness vanishingly unlikely; the reconcile sweep (S1.5) is the
+/// backstop that would flag a miss.
+pub async fn wait_for_writer_quiesce(
+    pool: &sqlx::PgPool,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut prev = crate::desk::pg_store::load_checkpoints(pool).await.ok();
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(interval).await;
+        let cur = crate::desk::pg_store::load_checkpoints(pool).await.ok();
+        if cur.is_some() && cur == prev {
+            return true;
+        }
+        prev = cur;
+    }
+    false
+}
+
+/// Counters returned by [`hydrate_from_pg`] for the startup log line.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct HydrateStats {
+    pub accounts: usize,
+    pub positions: usize,
+    pub insurance_fund_cents: i64,
+}
+
+/// Rebuild the margin engine's durable state from PG — S1.4, the inverse
+/// of the frame path. Call AFTER the naive balance seed: rows here are
+/// authoritative and overwrite it. Volatile values are RECOMPUTED, not
+/// loaded: mark price starts at entry (the first mark-price tick corrects
+/// it within ~10ms), uPnL starts 0, maintenance/liq/bankruptcy prices are
+/// derived from the persisted essentials via the same calc functions
+/// on_fill uses — so a hydrated engine is field-equivalent to one that
+/// never died, modulo the one mark-price tick.
+pub async fn hydrate_from_pg(
+    engine: &RiskEngine,
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<HydrateStats> {
+    use crate::desk::risk::calc;
+    use crate::desk::risk::{AccountRiskState, PositionRiskState, PositionSide, RiskStatus};
+    use sqlx::Row;
+    let mut stats = HydrateStats::default();
+
+    // ── Accounts ────────────────────────────────────────────────────────
+    let rows = sqlx::query(
+        "SELECT user_id, equity_atoms, used_margin_atoms, order_margin_atoms, status
+           FROM risk_accounts",
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let user_id: i64 = row.get("user_id");
+        let equity = atoms_to_cents(row.get::<i64, _>("equity_atoms"));
+        let used = atoms_to_cents(row.get::<i64, _>("used_margin_atoms"));
+        let order = atoms_to_cents(row.get::<i64, _>("order_margin_atoms"));
+        let status_s: String = row.get("status");
+        let Some(status) = RiskStatus::from_db_str(&status_s) else {
+            anyhow::bail!("risk_accounts user {user_id}: unknown status '{status_s}'");
+        };
+        // Persisted equity included uPnL at snapshot time; uPnL restarts
+        // at 0 here, so available absorbs the difference until the first
+        // mark-price update recomputes equity from live positions.
+        let acct = AccountRiskState {
+            user_id,
+            equity,
+            available_margin: std::sync::atomic::AtomicI64::new(equity - used - order),
+            order_margin: std::sync::atomic::AtomicI64::new(order),
+            used_margin: used,
+            maintenance_margin: 0, // recomputed by the next risk tick
+            unrealized_pnl: 0,
+            status,
+        };
+        engine.accounts.insert(user_id, acct);
+        stats.accounts += 1;
+    }
+
+    // ── Positions (+ the indexes on_fill normally maintains) ───────────
+    let rows = sqlx::query(
+        "SELECT user_id, symbol, side, qty_lots, entry_price_ticks, leverage,
+                used_margin_atoms
+           FROM positions",
+    )
+    .fetch_all(pool)
+    .await?;
+    // Account-level maintenance margin is the SUM over the user's
+    // positions. on_fill maintains it incrementally; hydrate must
+    // aggregate it here or the risk tick's "equity <= maintenance"
+    // branch can never fire after a restart (caught by the round-trip
+    // test: only the too-late Bankruptcy branch would remain).
+    let mut maint_by_user: std::collections::HashMap<i64, i64> = Default::default();
+    for row in rows {
+        let user_id: i64 = row.get("user_id");
+        let symbol_s: String = row.get("symbol");
+        let symbol = crate::transport::persist_event::pack_str(&symbol_s);
+        let side_s: String = row.get("side");
+        let side = match side_s.as_str() {
+            "long" => PositionSide::Long,
+            "short" => PositionSide::Short,
+            other => anyhow::bail!("positions user {user_id}: unknown side '{other}'"),
+        };
+        let qty_lots: i64 = row.get("qty_lots");
+        let entry: i64 = row.get("entry_price_ticks");
+        let leverage: u8 = row.get::<i16, _>("leverage") as u8;
+        let margin_cents = atoms_to_cents(row.get::<i64, _>("used_margin_atoms"));
+
+        // Recompute derived prices with the SAME calc path as on_fill.
+        let rules = crate::desk::symbol_rules::SymbolRules::for_symbol(&symbol_s);
+        let notional = calc::calc_notional_cents(entry, qty_lots, rules.notional_scale);
+        let maint = calc::calc_maintenance_margin_cents(notional, rules.maintenance_rate_bps);
+        let liq =
+            calc::calc_liquidation_price_ticks(entry, leverage, rules.maintenance_rate_bps, side);
+        let bkrpt = calc::calc_bankruptcy_price_ticks(entry, leverage, side);
+
+        engine.positions.insert(
+            (user_id, symbol),
+            PositionRiskState {
+                user_id,
+                symbol,
+                side,
+                qty_lots,
+                entry_price_ticks: entry,
+                mark_price_ticks: entry, // corrected by the first mark tick
+                unrealized_pnl: 0,
+                initial_margin: margin_cents,
+                maintenance_margin: maint,
+                liquidation_price_ticks: liq,
+                bankruptcy_price_ticks: bkrpt,
+                leverage,
+            },
+        );
+        engine
+            .symbol_position_index
+            .entry(symbol)
+            .or_default()
+            .insert(user_id);
+        engine
+            .symbol_oi_lots
+            .entry(symbol)
+            .or_insert_with(|| std::sync::atomic::AtomicI64::new(0))
+            .fetch_add(qty_lots, Ordering::Relaxed);
+        *maint_by_user.entry(user_id).or_insert(0) += maint;
+        stats.positions += 1;
+    }
+    for (user_id, maint) in maint_by_user {
+        if let Some(mut acct) = engine.accounts.get_mut(&user_id) {
+            acct.maintenance_margin = maint;
+        }
+    }
+
+    // ── Insurance fund ──────────────────────────────────────────────────
+    let fund_atoms: i64 =
+        sqlx::query_scalar("SELECT balance_atoms FROM insurance_fund WHERE id = 1")
+            .fetch_one(pool)
+            .await?;
+    stats.insurance_fund_cents = atoms_to_cents(fund_atoms);
+    engine
+        .insurance_fund_cents
+        .store(stats.insurance_fund_cents, Ordering::Relaxed);
+
+    Ok(stats)
 }
 
 #[cfg(test)]

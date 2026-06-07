@@ -1768,6 +1768,35 @@ async fn async_main() -> anyhow::Result<()> {
         "Risk engine initialized ({} accounts)",
         risk_engine.account_count()
     );
+    // S1.4: durable margin state overrides the naive balance seed. Rows in
+    // risk_accounts/positions are authoritative — a desk that died with
+    // open positions comes back field-equivalent (mark price re-converges
+    // within one tick). Refusing to start on hydrate failure is deliberate:
+    // trading against silently-forgotten positions is the one unrecoverable
+    // mistake here.
+    // Startup-race guard: let pg-writer finish catching up the journal
+    // tail before reading the margin tables (stale hydrate = trading
+    // against forgotten fills). Quiet floors twice in a row ≈ caught up.
+    if !lightning_exchange::desk::risk_persist::wait_for_writer_quiesce(
+        &pool,
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        tracing::warn!(
+            "pg-writer checkpoints still advancing after 10s — hydrating anyway              (reconcile will flag any staleness)"
+        );
+    }
+    match lightning_exchange::desk::risk_persist::hydrate_from_pg(&risk_engine, &pool).await {
+        Ok(stats) => tracing::info!(
+            "Risk engine hydrated: {} accounts, {} positions, insurance fund {} cents",
+            stats.accounts,
+            stats.positions,
+            stats.insurance_fund_cents
+        ),
+        Err(e) => panic!("risk hydrate failed — refusing to trade blind: {e}"),
+    }
 
     // Per-user order-entry rate limiter (WS_RL_* env; off by default).
     // Restore persisted buckets so a restart doesn't mint fresh budgets,

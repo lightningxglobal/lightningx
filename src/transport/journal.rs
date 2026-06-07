@@ -189,6 +189,12 @@ impl JournalReplayer {
         Ok(Self { archive })
     }
 
+    /// Direct access to the underlying archive client (replication,
+    /// position queries beyond the replay helpers).
+    pub fn archive_mut(&mut self) -> &mut AeronArchive {
+        &mut self.archive
+    }
+
     /// All recordings of `channel_fragment`/`stream_id`, oldest first.
     pub fn recordings(
         &mut self,

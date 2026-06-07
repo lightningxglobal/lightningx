@@ -113,5 +113,9 @@ name = "pressure-client"
 path = "src/bin/pressure_client.rs"
 
 [[bin]]
+name = "journal-replicate"
+path = "src/bin/journal_replicate.rs"
+
+[[bin]]
 name = "journal-audit"
 path = "src/bin/journal_audit.rs"

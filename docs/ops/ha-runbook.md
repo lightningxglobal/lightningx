@@ -402,7 +402,7 @@ sudo -u postgres pg_rewind --target-pgdata=/var/lib/postgresql/16/main \
 | 11.6 | **Redis 死** | 手动 §8 | FORCE_REHYDRATE 重灌 |
 | 11.7 | **media driver / Archive 死** | 部分 | driver 重启后:本机引擎/desk 的 Aeron 客户端会报错退出 → systemd 连环拉起,引擎以 standby 回归(本机录制有 driver 重启造成的缺口,但另一台机器的录制是完整的——此时**不要**让该机引擎做主,先走 §11.9 重建) |
 | 11.8 | **整机失联(M1 全挂)** | 引擎自动 | 引擎:M2 ~10s 接管 ✓。desk:VIP 漂到 M2 ✓。PG:若 M1 带着 PG 主一起挂 → §7.4 提升 M2。**损失界定**:M1 desk 已 ACK 但未入 PG 的 persist 尾帧(≤ 秒级窗口)随 M1 磁盘共存亡——M1 磁盘没坏就能在修复后补回;磁盘坏则丢失该窗口的衍生记录(资金主路径在 PG 同步复制内,不受影响) |
-| 11.9 | **备机 Archive 重建**(新机/磁盘更换/11.7 后) | 手动 | ① 新机 driver+Archive 启动并开始录制(从此刻起完整);② **维护窗口**(深夜):停主引擎写入(摘 desk 流量 30s)→ 等备机静默跟平 → 重启备引擎使其从"空簿+当前流"开始?**不行,簿不完整**。正确流程:停流量 → 让残存完整 Archive 的机器做主 → 新机引擎在 PG `orders` 表种子模式(临时不设 EXCHANGE_ARCHIVE_CONTROL,走 PG 近似 seed)拉起做 standby → 下一个维护窗口再切回 journal 模式。**这是当前架构最繁琐的流程,改进项见 §14** |
+| 11.9 | **备机 Archive 重建**(新机/磁盘更换/11.7 后) | 半自动 | ① 新机 driver+Archive 启动;② 跑引导工具(无需停流量,源录制活跃也可,e2e 实测):`AERON_DIR=/dev/shm/aeron EXCHANGE_ARCHIVE_CONTROL=<本机控制通道> SRC_ARCHIVE_CONTROL=<对端控制通道> SYMBOLS=<与引擎一致> journal-replicate`(exit 0 = 全部录制已拉齐,幂等可重跑);③ `systemctl start exchange-engine` —— 引擎从本机 Archive 重放重建簿,自动转 standby。常驻演练:`tests/chaos_standby_bootstrap.rs` |
 | 11.10 | **脑裂疑似**(两机都认为自己是主) | 理论不可能 | lease 是单行 PG 记录,epoch 单调;低 epoch 输出被 desk 全量丢弃(FencedDrops 可见)。若 FencedDrops 持续增长:`SELECT * FROM leader_lease` 看 holder/epoch,kill 低 epoch 进程 |
 
 ---
@@ -448,15 +448,18 @@ CHAOS_KILLS_ENGINE=10 cargo test --test chaos_gate2_engine -- --nocapture
 
 ## 14. 已知限制与改进路线(诚实清单)
 
-1. **备机 Archive 中途加入流程繁琐**(§11.9)——根治方案:aeron-wrapper 暴露
-   `AeronArchive::replicate()`(Archive 间复制,C API 已有),新备机直接从对端
-   Archive 拉历史。**建议作为双机上线前的最后一个代码项**(预估 1-2 天)。
+1. ~~备机 Archive 中途加入流程繁琐~~ **已解决**:`journal-replicate` 引导工具
+   (Archive 间有界复制,wrapper `5e18352` + matching 工具),§11.9 已更新为
+   一条命令;新机引导有 e2e 演练(`chaos_standby_bootstrap`)。
 2. **orders 流 journal 无限增长**——引擎重建需要从 genesis 重放。根治:定期
    引擎快照(序列化订单簿+uid_map 到 PG/文件)+ 截断快照点之前的录制。
    单 symbol 重放速度实测 ~10 万 op/s 量级,百万订单历史重放仅秒级,
    **量起来之前不急**;监控重启重放耗时,超过 60s 时排期快照功能。
 3. **desk 机器整机毁灭的 persist 尾窗**(§11.8)——已 ACK 未入 PG 的衍生记录
-   (秒级窗口)依赖该机磁盘。根治同样是 Archive replication。
+   (秒级窗口)依赖该机磁盘。缓解:可用 `journal-replicate` 周期性(如每分钟
+   cron)把 persist 流录制增量复制到对端 Archive,把尾窗从"磁盘寿命"缩到
+   "复制周期";完全消除需要持续复制(continuous replication,wrapper 已支持
+   `stop_position=None`,接线留待需要时)。
 4. **PG failover 是手动的**(5 分钟级,远低于资金路径的 RTO 要求,但需要值班)。
    若要全自动:上 Patroni + etcd,把本手册 §7 替换为 Patroni 管理,
    应用侧不变(仍走 VIP)。

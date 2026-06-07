@@ -16,7 +16,7 @@
 | P3 资金事务闭环 | 🟢 100% | settle+trade 单事务+全局唯一键、append-only fund_audit 全腿流水、journal-audit 三方对账工具（`87c1c55`）。**关闭** |
 | P4 风控补全 | 🟢 100% | 关闭（`3518336`） |
 | P5 高可用 | 🟢 ~80% | **PG 选主+epoch fencing+standby 引擎**（`d8feae9`）：备机=journal 重放+live 静默 apply，赢锁才发布，desk 拒旧 epoch（zombie 防护端到端）。剩：多机故障演练（RTO 实测）、PG 主从/PITR——部署工作非代码 |
-| P6 安全加固 | 🟢 ~95% | /metrics(VictoriaMetrics)、JWT 吊销（O(1) 内存+Redis 30s 传播）、fuzz 实跑 683 万次零 crash（`9c12605`）。剩：第三方渗透测试（外部） |
+| P6 安全加固 | 🟢 ~95% | 全套密钥/认证/审计/metrics/fuzz 完成（`9c12605`/`f0d7070`）；engine+desk 热路径埋点、文件 secret。剩仅 TODO 三项（双人复核/KYC/渗透测试，见 deferred-todos.md），均非代码 |
 
 **代码侧工作面已基本清空。** 剩余四类：①混沌测试执行（Gate 2/4/5 的脚本化演练，
 基础设施已齐）；②多机部署件（PG 主从、双机 failover 演练）；③外部（渗透测试）。
@@ -311,46 +311,34 @@ P1-P4 全部关闭；P5 剩多机部署件；P6 剩渗透测试。
 
 ---
 
-## Phase 6：安全与运维加固 — 🟡 ~25%
+## Phase 6：安全与运维加固 — 🟢 ~95%（内部项全部完成）
 
-- ✅ **JWT 密钥**（`8a0d6e7`）：`EXCHANGE_JWT_SECRET`（≥32 字节）环境变量化；
-  配置过短 = 硬错误；`EXCHANGE_ENV=production` 无密钥拒绝启动；dev/CI 回退
-  公开 dev 常量并 warn。解析规则为纯函数，密钥矩阵有单测。
-  - ⬜ 剩余：JWT 改短期 + refresh；API key 签名补 HMAC 时间戳防重放；Vault 集成。
-- ✅ **symbol 输入加固**（`8a0d6e7`）：`MAX_SYMBOL_LEN=16`（=线格式宽度）超长
-  **拒绝**而非 pack_str16 静默截断（截断曾使两个不同输入串别名同一线上 symbol /
-  风控 key）；字符集限 `[A-Z0-9_]`（无 NUL/小写别名/分隔符）。校验在 REST/WS
-  共用入口 `normalize_order_shape` 单点生效；边界 16/17 字节有单测。
-  - ⬜ 剩余：上限拓宽到 20（CompactString 内联）需联动全部 `[u8;16]` packed
-    struct 与 risk-engine DashMap key，独立 PR。
-- ✅ **解码健壮性（CI 层）**（`eba79b7`）：22 个解码入口 × 三类敌意语料
-  （随机垃圾 2000 例 / 全长度截断 / 全位翻转 + 非法 UTF-8），每次 cargo test
-  必跑，种子化可复现。
-  - ⬜ 剩余：cargo-fuzz 覆盖率导向长跑（nightly，复用同一入口清单，离线跑）。
-- ⬜ **可观测性**：各进程暴露 Prometheus 文本格式 `/metrics` 端点（撮合延迟分位数、
-  journal lag、消费位点滞后、对账 diff、ring 丢弃计数）；**抓取与存储用已部署的
-  VictoriaMetrics**（完全兼容 Prometheus 抓取协议与 PromQL，代码侧零差异）——
-  此项为纯内部工作（~3–4 天），不依赖外部。结构化日志、关键路径 trace
-  （现有 `tracer.rs` 可扩展）。
-- ⬜ **审计**：登录/提现/管理操作审计日志（append-only）；管理后台双人复核。
-- ⬜ **合规预留**：KYC 钩子、地址筛查接口、监管报送数据导出（按目标司法辖区裁剪）。
-- ⬜ 渗透测试 + 第三方安全审计（上线前硬性要求）。
+- ✅ **JWT 密钥**（`8a0d6e7`/`f0d7070`）：环境变量化、≥32 字节、生产无密钥拒启动；
+  **文件 secret**（`*_FILE`，Docker/K8s 挂载，不经环境变量）——Vault 的零依赖替代。
+- ✅ **JWT 短期 + refresh + 吊销**（`86e0563`/`9c12605`）：`access_ttl` 可配、
+  `/api/auth/refresh`；O(1) 内存吊销 + Redis 30s 跨 desk 传播 + admin 端点。
+- ✅ **HMAC API key 签名**（`86e0563`）：时间戳 ±30s 防重放、常数时间比较、legacy 弃用期。
+- ✅ **symbol 输入加固**（`8a0d6e7`）：超长/非法字符拒绝（消除截断别名）。
+- ✅ **解码健壮性**（`eba79b7`）：22 入口敌意输入 CI 测试 + cargo-fuzz 脚手架，
+  实跑 683 万次执行零 crash（`9c12605`）。
+- ✅ **可观测性**（`9c12605`/`f0d7070`）：Prometheus 文本 `/metrics`——desk(axum 路由)、
+  engine(`ENGINE_METRICS_ADDR`)、pg-writer(监听器)；计数器：撮合量/成交量/熔断、
+  fenced 丢弃、序列 gap、桥队列深度/丢弃、位点 dup/gap、**对账违规(应恒 0 的告警线)**。
+  VictoriaMetrics 直接抓取。
+- ✅ **审计**：append-only `audit_log`（登录/注册/token/admin）+ `fund_audit`
+  （freeze/release/结算四腿全流水），触发器禁改删。
+- ⬜ **双人复核（dual-control）**：TODO，**暂不做**——需策略输入（哪些操作、批准人模型）。
+  代码锚点在 `handle_admin_revoke`；底座 audit_log 已就绪。见 `deferred-todos.md §2`。
+- ⬜ **KYC/合规**：TODO，**当前不需要**——需供应商+司法辖区决策。占位端点已在。
+  见 `deferred-todos.md §1`。
+- ⬜ **第三方渗透测试/安全审计**：TODO，**外部机构工作**，上线前 Gate。
+  见 `deferred-todos.md §3`。
+- ⬜ symbol 16→20 拓宽（CompactString）：可选独立 PR，非安全关键。
 
-### P6 补齐排期（按依赖与收益排序，预估 2026-06-07 制定）
+**P6 内部可做项已全部完成。** 剩三项全部非代码：两项需业务决策（双人复核策略、
+KYC 供应商/辖区），一项纯外部（渗透测试）——均已在 `docs/plans/deferred-todos.md`
+明确标注 TODO 且当前不做。
 
-| # | 项 | 预估 | 要点 |
-|---|----|------|------|
-| 1 | API key HMAC 签名 | 2–3 天 | `api_keys` 表加 `secret` 列；请求带 `ts + HMAC-SHA256(secret, ts‖method‖path‖body)`；时戳偏差 >30s 拒绝（防重放）；与现有裸 api_key 并行一个弃用期 |
-| 2 | JWT 短期化 + refresh | 2 天 | access 15min + refresh 7d（旋转、可吊销，吊销表入 Redis）；WS 长连接在 token 过期时要求 re-auth 帧 |
-| 3 | Prometheus /metrics | 3–4 天 | `metrics` crate + exporter；每进程暴露：撮合 burst 分位数（已有统计直接导出）、ring 丢弃、persist 队列深度、flush 时延、reconcile violation 计数（应永远为 0 的告警指标）、WS 连接数 |
-| 4 | 审计日志 | 3 天 | append-only `audit_log` 表（actor/action/ip/detail/hash 链）+ 登录/注册/API key 操作埋点；提现埋点等钱包系统接入时加 |
-| 5 | cargo-fuzz 长跑 | 1 天搭 + 离线跑 | `fuzz/` crate，target 复用 `tests/sbe_robustness.rs` 的 `exercise_all_decoders`；nightly，CI 每夜 1h |
-| 6 | 限流桶 Redis 化（P4 尾巴） | 2 天 | 桶状态 `SETEX` 落 Redis（user 与 IP 双维度、下单/撤单分桶）；热路径仍内存判断，Redis 只做断连恢复源 |
-| 7 | 渗透测试 + 第三方审计 | 外部排期 | 上线 Gate，前置条件：1–4 完成 |
-
-合计内部工时约 2–2.5 周（1 人），可与 P2/P5 并行。
-
----
 
 ## 里程碑总览
 

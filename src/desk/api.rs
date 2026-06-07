@@ -427,6 +427,10 @@ async fn handle_admin_revoke(
     headers: HeaderMap,
     Json(req): Json<RevokeRequest>,
 ) -> impl IntoResponse {
+    // TODO(dual-control): sensitive admin ops should require two-person
+    // approval — single admin token for now. Policy + approver roles are
+    // a business decision; see docs/plans/deferred-todos.md §2. audit_log
+    // is already the append-only ledger such a flow would build on.
     if !admin_authorized(&headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})));
     }
@@ -2097,6 +2101,9 @@ struct KycRequest {
     full_name: String,
 }
 
+// TODO(compliance): real KYC/AML integration (vendor + jurisdiction +
+// address screening) is deferred — this endpoint only flags kyc_status.
+// See docs/plans/deferred-todos.md §1. Not needed at the current stage.
 async fn handle_submit_kyc(
     State(s): State<AppState>,
     headers: HeaderMap,

@@ -30,22 +30,19 @@
 > 现状:AccountRiskState/PositionRiskState/保险基金全在内存 DashMap,
 > desk 重启=持仓蒸发。复用 persist 流 + journal + 位点框架。
 
-- [ ] S1.1 PG schema:`positions` 表(user_id, symbol, side, qty_lots,
+- [x] S1.1 PG schema（`decfbc6` + 023 `ab8c085`）:`positions` 表(user_id, symbol, side, qty_lots,
       entry_ticks, leverage, used_margin, …)+ `risk_accounts` 表
       (equity, used/order/maintenance margin, status)+ `insurance_fund`
       单行表;非负/一致性 CHECK;迁移 022
-- [ ] S1.2 PersistFrame 新增 `PositionUpsert` / `RiskAccountSet` /
-      `InsuranceFundSet` 帧(152B 内布局,decoder 进 fuzz 列表)
-- [ ] S1.3 desk on_fill / 强平结算路径发布持仓帧(与现有 drain 线程
-      seq 体系共用);pg-writer 落库(同事务位点,exactly-once)
-- [ ] S1.4 desk 启动 hydrate:从 PG 重建 risk DashMap(含保险基金);
-      journal 补缺(复用 redis-writer 同款 replay 模式)
-- [ ] S1.5 reconcile 扩展:内存持仓 vs PG 持仓漂移检查;
-      Σ(持仓多空) 每 symbol 净额 = 0 不变量
-- [ ] S1.6 集成测试:开仓→kill -9 desk→重启→持仓/equity/保险基金
-      与 kill 前一致→可正常平仓(进 chaos 系列:`chaos_position_persist`)
-- [ ] S1.7 演练:持仓状态下跑 `chaos_gate2_writers` 模式的轮换杀,
-      三方对账含 positions 表
+- [x] S1.2 持仓帧 ×4(`1daaa49`,roundtrip+truncation+fuzz 路径)
+- [x] S1.3 desk 发布 + pg-writer 同事务落库(`ab8c085`;taker=spin 线程、
+      maker=trade-settle 路径的契约见 `fdb7556`)
+- [x] S1.4 hydrate + writer-quiesce 启动竞态防护(`2f84084`;
+      维持保证金按 user 重聚合——往返测试抓出的活性漏洞)
+- [x] S1.5 reconcile:每 symbol 净额=0 + 账户保证金自洽(`9c8c265`)
+- [x] S1.6 全拓扑混沌:HTTP 开仓→kill -9→hydrate 内存服务→平仓 flat
+      (`fdb7556`;抓出 2 个真缺陷:maker 持仓从未生效、test-funds 死列)
+- [x] S1.7 双 writer 轮换杀含持仓/风险帧,last-write-wins 精确收敛
 
 ## S2. 单位制统一(P0,趁状态模型在动手术时做)
 
@@ -125,7 +122,7 @@
 
 | 段 | 状态 | 完成 commit |
 |---|---|---|
-| S1 持仓持久化 | ⬜ 未开始 | |
+| S1 持仓持久化 | ✅ 完成 | `decfbc6..fdb7556` |
 | S2 单位制统一 | ⬜ 未开始 | |
 | S3 funding | ⬜ 未开始 | |
 | S4 指数/标记价 | ⬜ 未开始 | |

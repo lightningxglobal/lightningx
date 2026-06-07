@@ -10,6 +10,10 @@
 //! redis-writer recovery relies on its journal catch-up (added together
 //! with this drill — it previously had no replay path and lost frames
 //! missed while down).
+//!
+//! S1.7: the stream also carries swap-margin frames (PositionUpsert /
+//! RiskAccountSet) so the kill rotation proves the POSITION tables
+//! converge exactly like trades/accounts do.
 
 mod common;
 
@@ -26,7 +30,8 @@ use lightning_exchange::transport::aeron_channels::{PERSIST_CHANNEL, PERSIST_STR
 use lightning_exchange::transport::aeron_transport::PersistPublisher;
 use lightning_exchange::transport::journal::JournalRecorder;
 use lightning_exchange::transport::persist_event::{
-    AccountSetPayload, PersistFrame, TradeInsertPayload, pack_str,
+    AccountSetPayload, PersistFrame, PositionUpsertPayload, RiskAccountSetPayload,
+    TradeInsertPayload, pack_str,
 };
 
 const CONTROL_PORT: u16 = 18980;
@@ -34,7 +39,10 @@ const PUBLISHER_ID: u16 = 62_002;
 const ORDER_ID_BASE: i64 = 970_000_000;
 const TOTAL_FRAMES: u64 = 2_400;
 const ACCOUNT_EVERY: u64 = 40; // every 40th frame is an AccountSet
+const POSITION_EVERY: u64 = 60; // every 60th frame is a PositionUpsert
+const RISK_EVERY: u64 = 90; // every 90th frame is a RiskAccountSet
 const ASSET: &str = "USDT";
+const POS_SYMBOL: &str = "W3CHAOS"; // isolated from other suites
 
 fn trade_frame(seq: u64) -> PersistFrame {
     let mut f = PersistFrame::trade_insert(TradeInsertPayload {
@@ -59,6 +67,36 @@ fn account_frame(seq: u64, user_id: i64) -> PersistFrame {
         frozen: 0.0,
         balance_atoms: atoms,
         frozen_atoms: 0,
+    });
+    f.publisher_id = PUBLISHER_ID;
+    f.seq = seq;
+    f
+}
+
+fn position_frame(seq: u64, user_id: i64) -> PersistFrame {
+    let mut f = PersistFrame::position_upsert(PositionUpsertPayload {
+        user_id,
+        symbol: pack_str(POS_SYMBOL),
+        side: 0,
+        leverage: 10,
+        _pad: [0; 6],
+        qty_lots: seq as i64, // strictly increasing → last wins
+        entry_price_ticks: 5_000_000,
+        used_margin_atoms: seq as i64 * 100,
+    });
+    f.publisher_id = PUBLISHER_ID;
+    f.seq = seq;
+    f
+}
+
+fn risk_frame(seq: u64, user_id: i64) -> PersistFrame {
+    let mut f = PersistFrame::risk_account_set(RiskAccountSetPayload {
+        user_id,
+        equity_atoms: seq as i64 * 1_000,
+        used_margin_atoms: seq as i64 * 100,
+        order_margin_atoms: 0,
+        status: 0,
+        _pad: [0; 7],
     });
     f.publisher_id = PUBLISHER_ID;
     f.seq = seq;
@@ -120,7 +158,15 @@ async fn cleanup(pg: &sqlx::PgPool, users: &[i64]) {
         .bind(ORDER_ID_BASE + 20_000_000)
         .execute(pg)
         .await;
+    let _ = sqlx::query("DELETE FROM positions WHERE symbol = $1")
+        .bind(POS_SYMBOL)
+        .execute(pg)
+        .await;
     if !users.is_empty() {
+        let _ = sqlx::query("DELETE FROM risk_accounts WHERE user_id = ANY($1::bigint[])")
+            .bind(users)
+            .execute(pg)
+            .await;
         let _ = sqlx::query("DELETE FROM accounts WHERE user_id = ANY($1::bigint[])")
             .bind(users)
             .execute(pg)
@@ -179,15 +225,38 @@ async fn both_writers_killed_pg_redis_journal_agree() {
     let aeron_dir = driver.aeron_dir.clone();
     let control = driver.control_channel.clone();
 
-    // Expected final account value per user = its LAST AccountSet seq.
+    // Frame kind per seq (mutually exclusive priority: position > risk >
+    // account > trade) and expected last-write values per user.
+    let kind_of = |seq: u64| -> u8 {
+        if seq % POSITION_EVERY == 0 {
+            1 // position
+        } else if seq % RISK_EVERY == 0 {
+            2 // risk account
+        } else if seq % ACCOUNT_EVERY == 0 {
+            3 // account
+        } else {
+            0 // trade
+        }
+    };
     let mut last_set: std::collections::HashMap<i64, i64> = Default::default();
+    let mut last_pos: std::collections::HashMap<i64, i64> = Default::default();
+    let mut last_risk: std::collections::HashMap<i64, i64> = Default::default();
+    let mut trade_total = 0u64;
     for seq in 1..=TOTAL_FRAMES {
-        if seq % ACCOUNT_EVERY == 0 {
-            let user = users[(seq / ACCOUNT_EVERY) as usize % users.len()];
-            last_set.insert(user, seq as i64 * 1_000);
+        let user = users[(seq as usize) % users.len()];
+        match kind_of(seq) {
+            1 => {
+                last_pos.insert(user, seq as i64);
+            }
+            2 => {
+                last_risk.insert(user, seq as i64 * 1_000);
+            }
+            3 => {
+                last_set.insert(user, seq as i64 * 1_000);
+            }
+            _ => trade_total += 1,
         }
     }
-    let trade_total = TOTAL_FRAMES - TOTAL_FRAMES / ACCOUNT_EVERY;
 
     // ── Publisher thread ──────────────────────────────────────────────────
     let published = Arc::new(AtomicU64::new(0));
@@ -210,8 +279,12 @@ async fn both_writers_killed_pg_redis_journal_agree() {
             .expect("persist publisher");
         std::thread::sleep(Duration::from_millis(500));
         for seq in 1..=TOTAL_FRAMES {
-            let f = if seq % ACCOUNT_EVERY == 0 {
-                let user = users_t[(seq / ACCOUNT_EVERY) as usize % users_t.len()];
+            let user = users_t[(seq as usize) % users_t.len()];
+            let f = if seq % POSITION_EVERY == 0 {
+                position_frame(seq, user)
+            } else if seq % RISK_EVERY == 0 {
+                risk_frame(seq, user)
+            } else if seq % ACCOUNT_EVERY == 0 {
                 account_frame(seq, user)
             } else {
                 trade_frame(seq)
@@ -322,6 +395,29 @@ async fn both_writers_killed_pg_redis_journal_agree() {
         }
     }
     eprintln!("chaos3w: PG ↔ Redis account diff = 0 for all {} users", users.len());
+
+    // ── S1.7: swap-margin tables converged to the last-written values ───
+    for (&user, &expect_qty) in &last_pos {
+        let got: Option<i64> = sqlx::query_scalar(
+            "SELECT qty_lots FROM positions WHERE user_id = $1 AND symbol = $2",
+        )
+        .bind(user)
+        .bind(POS_SYMBOL)
+        .fetch_optional(&pg)
+        .await
+        .expect("pg position");
+        assert_eq!(got, Some(expect_qty), "position qty for user {user}");
+    }
+    for (&user, &expect_equity) in &last_risk {
+        let got: Option<i64> =
+            sqlx::query_scalar("SELECT equity_atoms FROM risk_accounts WHERE user_id = $1")
+                .bind(user)
+                .fetch_optional(&pg)
+                .await
+                .expect("pg risk account");
+        assert_eq!(got, Some(expect_equity), "equity for user {user}");
+    }
+    eprintln!("chaos3w: positions + risk accounts converged (last-write-wins exact)");
 
     // ── journal-audit: journal ↔ checkpoints ↔ PG, exit 0 ─────────────────
     drop(pgw);

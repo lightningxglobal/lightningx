@@ -221,6 +221,7 @@ DATABASE_URL_FILE=/opt/exchange/secrets/database_url
 REDIS_URL=redis://10.0.0.5:6379/0
 DESK_ID=0
 SYMBOLS=BTC_USDT,ETH_USDT,SOL_USDT
+DESK_PUBLIC_MARKET_DATA=1   # ⚠️ 非可选:trade 流消费线程承担成交结算 + MAKER 保证金更新
 # ── 安全(P6)─────────────────────────────────
 EXCHANGE_JWT_SECRET_FILE=/opt/exchange/secrets/jwt_secret   # ≥32 字节,两机同一份
 EXCHANGE_JWT_ACCESS_TTL_SECS=900

@@ -219,6 +219,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         include_str!("../../migrations/026_trigger_orders.sql"),
     )
     .await?;
+    apply_migration(
+        pool,
+        "027_order_type_width",
+        include_str!("../../migrations/027_order_type_width.sql"),
+    )
+    .await?;
     Ok(())
 }
 

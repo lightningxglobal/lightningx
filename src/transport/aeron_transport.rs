@@ -103,6 +103,17 @@ impl PollCallback for OrderInboundCallback {
                     {
                         self.dropped.fetch_add(1, Ordering::Relaxed);
                     }
+                } else {
+                    // A frame that claims template 1 but fails the audited
+                    // decode is either corruption or a producer bug — both
+                    // worth screaming about (S5 drill debugging found this
+                    // silent-drop hiding a real defect).
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        "NewOrder frame failed decode: len={} head={:02x?}",
+                        data.len(),
+                        &data[..data.len().min(24)]
+                    );
                 }
             }
             2 => {

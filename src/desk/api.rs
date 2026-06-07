@@ -250,6 +250,11 @@ pub struct AppState {
     /// last_rate_e9, running premium-TWAP estimate e9). Written by the
     /// desk's funding task, read-only here.
     pub funding_view: Arc<DashMap<String, (i64, i64, i64)>>,
+    /// Per-symbol trigger books (S5). REST inserts/cancels; the desk's
+    /// trigger task pops due entries on mark moves. parking_lot::Mutex —
+    /// held for O(log n) operations only.
+    pub trigger_books:
+        Arc<DashMap<String, parking_lot::Mutex<crate::desk::trigger::TriggerBook>>>,
     /// Per (user_id, base_asset) running VWAP of BUY fills. Updated by
     /// the spin thread on every BatchSettleTrade. Read by /api/positions.
     pub vwap_cache: VwapCache,
@@ -304,6 +309,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/trades", get(handle_trades))
         .route("/api/positions", get(handle_positions))
         .route("/api/funding", get(handle_funding))
+        .route(
+            "/api/trigger-orders",
+            get(handle_list_triggers).post(handle_place_trigger),
+        )
+        .route("/api/trigger-orders/:id", axum::routing::delete(handle_cancel_trigger))
         .route("/api/tickers", get(handle_tickers))
         // K-lines
         .route("/api/klines", get(handle_klines))
@@ -333,6 +343,19 @@ async fn warm_account_cache_for(s: &AppState, user_id: i64) {
             .unwrap_or_default();
     if rows.is_empty() {
         return;
+    }
+    // S5 fix: users who registered AFTER desk startup had no risk
+    // account (the seed loop runs once at boot), so every margin-gated
+    // path — trigger firing first among them — rejected with "Account
+    // not found". Initialize it here, where both register and login
+    // already warm the cache.
+    if !s.risk_engine.accounts.contains_key(&user_id) {
+        let usdt_atoms = rows
+            .iter()
+            .find(|(asset, _, _)| asset == "USDT")
+            .map(|(_, bal, _)| *bal)
+            .unwrap_or(0);
+        s.risk_engine.initialize_account(user_id, usdt_atoms);
     }
     let mut entry = s.account_cache.entry(user_id).or_insert_with(HashMap::new);
     for (asset, bal, frz) in rows {
@@ -932,6 +955,208 @@ async fn handle_trades(
         )
             .into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct PlaceTriggerRequest {
+    symbol: String,
+    side: String,       // "buy" | "sell"
+    order_type: String, // "limit" | "market"
+    trigger_price: f64,
+    price: Option<f64>, // required for limit
+    quantity: f64,
+    /// "rising" | "falling"; default = stop semantics for the side.
+    trigger_when: Option<String>,
+}
+
+/// S5 — park a stop/take-profit trigger. It lives at the DESK (not the
+/// engine book) until the manipulation-clamped mark crosses
+/// trigger_price, then converts into a regular order through the same
+/// margin checks as direct order entry.
+async fn handle_place_trigger(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PlaceTriggerRequest>,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
+    let side: u8 = match req.side.as_str() {
+        "buy" => 0,
+        "sell" => 1,
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "side must be buy|sell"})))
+                .into_response();
+        }
+    };
+    let is_market = match req.order_type.as_str() {
+        "market" => true,
+        "limit" => false,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "order_type must be limit|market"})),
+            )
+                .into_response();
+        }
+    };
+    let rules = crate::desk::symbol_rules::SymbolRules::for_symbol(&req.symbol);
+    let Ok(trigger_ticks) = rules.price_to_ticks(req.trigger_price) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "trigger_price off tick"})))
+            .into_response();
+    };
+    let price_ticks = match (is_market, req.price) {
+        (true, _) => None,
+        (false, Some(p)) => match rules.price_to_ticks(p) {
+            Ok(t) => Some(t),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": "price off tick"})))
+                    .into_response();
+            }
+        },
+        (false, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "limit trigger requires price"})),
+            )
+                .into_response();
+        }
+    };
+    let Ok(qty_lots) = rules.quantity_to_lots(req.quantity) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "quantity off step"})))
+            .into_response();
+    };
+    if qty_lots <= 0 || trigger_ticks <= 0 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "must be positive"})))
+            .into_response();
+    }
+    let when = match req.trigger_when.as_deref() {
+        None => crate::desk::trigger::TriggerWhen::default_for_side(side),
+        Some(w) => match crate::desk::trigger::TriggerWhen::from_db_str(w) {
+            Some(w) => w,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "trigger_when must be rising|falling"})),
+                )
+                    .into_response();
+            }
+        },
+    };
+
+    let id = s.next_order_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i64;
+    if let Err(e) = sqlx::query(
+        "INSERT INTO trigger_orders
+            (id, user_id, symbol, side, order_type, trigger_price_ticks, trigger_when,
+             price_ticks, qty_lots)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(&req.symbol)
+    .bind(if side == 0 { "buy" } else { "sell" })
+    .bind(&req.order_type)
+    .bind(trigger_ticks)
+    .bind(when.as_db_str())
+    .bind(price_ticks)
+    .bind(qty_lots)
+    .execute(s.db.as_ref())
+    .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            .into_response();
+    }
+    // Memory AFTER durable insert: a crash in between just re-hydrates it.
+    s.trigger_books
+        .entry(req.symbol.clone())
+        .or_default()
+        .lock()
+        .insert(
+            when,
+            crate::desk::trigger::PendingTrigger {
+                id,
+                user_id,
+                side,
+                is_market,
+                trigger_price_ticks: trigger_ticks,
+                price_ticks,
+                qty_lots,
+            },
+        );
+    (StatusCode::OK, Json(json!({"id": id, "status": "pending"}))).into_response()
+}
+
+async fn handle_cancel_trigger(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    // PG decides the race against firing: only a 'pending' row cancels.
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "UPDATE trigger_orders
+            SET status = 'cancelled', cancel_reason = 'user'
+          WHERE id = $1 AND user_id = $2 AND status = 'pending'
+          RETURNING symbol, trigger_when, trigger_price_ticks",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(s.db.as_ref())
+    .await
+    .unwrap_or(None);
+    let Some((symbol, when_s, trig)) = row else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not found, not yours, or already fired"})),
+        )
+            .into_response();
+    };
+    if let Some(book) = s.trigger_books.get(&symbol) {
+        if let Some(when) = crate::desk::trigger::TriggerWhen::from_db_str(&when_s) {
+            book.lock().remove(when, trig, id);
+        }
+    }
+    (StatusCode::OK, Json(json!({"id": id, "status": "cancelled"}))).into_response()
+}
+
+async fn handle_list_triggers(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let rows: Vec<(i64, String, String, String, i64, String, Option<i64>, i64, String)> =
+        sqlx::query_as(
+            "SELECT id, symbol, side, order_type, trigger_price_ticks, trigger_when,
+                    price_ticks, qty_lots, status
+               FROM trigger_orders
+              WHERE user_id = $1
+              ORDER BY created_at DESC LIMIT 200",
+        )
+        .bind(user_id)
+        .fetch_all(s.db.as_ref())
+        .await
+        .unwrap_or_default();
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, symbol, side, ot, trig, when, price, qty, status)| {
+            json!({
+                "id": id, "symbol": symbol, "side": side, "order_type": ot,
+                "trigger_price_ticks": trig, "trigger_when": when,
+                "price_ticks": price, "qty_lots": qty, "status": status,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({"triggers": out}))).into_response()
 }
 
 /// S3.6 — current funding state per symbol (public; no auth needed).

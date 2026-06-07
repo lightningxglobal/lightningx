@@ -736,6 +736,191 @@ fn account_set_payload(
 /// account_cache + vwap_cache, and user_tx.try_send. Callable directly
 /// from the recv-spin thread; no need for a separate db-worker thread
 /// or tokio::spawn wrapping. Saves one thread + one rtrb hop per command.
+/// S5.3/S5.4 — convert one fired (or recovery-orphaned) trigger into a
+/// real order. The PG status flip is the exactly-once anchor: only the
+/// rows_affected==1 winner proceeds. Margin is reserved BEFORE the flip;
+/// a reserve failure cancels the trigger with reason instead of
+/// injecting a doomed order (S5.4).
+#[allow(clippy::too_many_arguments)]
+async fn inject_trigger_order(
+    pool: &std::sync::Arc<sqlx::PgPool>,
+    engine: &std::sync::Arc<lightning_exchange::desk::risk::RiskEngine>,
+    cmd_tx: &Option<std::sync::Arc<crossbeam_queue::ArrayQueue<lightning_exchange::transport::AeronCmd>>>,
+    pending_meta: &std::sync::Arc<DashMap<u64, lightning_exchange::transport::OrderMeta>>,
+    runtime_meta_cache: &DashMap<u64, OrderRuntimeMeta>,
+    response_stream_id: i32,
+    trigger_id: i64,
+    order_id: i64,
+    user_id: i64,
+    symbol: &str,
+    side: u8,
+    is_market: bool,
+    price_ticks: Option<i64>,
+    qty_lots: i64,
+    already_marked: bool,
+) {
+    use lightning_exchange::sbe::NewOrderRequest as SbeNewOrder;
+    use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
+    let rules = lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(symbol);
+    let sym16 = lightning_exchange::transport::persist_event::pack_str(symbol);
+    let mark = engine.mark_price_ticks(&sym16).unwrap_or(0);
+    // Market triggers convert to an aggressive IOC limit 5% through the
+    // mark (same shape as liquidation orders — fills at market, the cap
+    // only guards against an empty far side).
+    let exec_ticks = match (is_market, price_ticks) {
+        (false, Some(p)) => p,
+        _ => {
+            if mark <= 0 {
+                tracing::warn!("trigger {trigger_id}: no mark for market conversion — cancelled");
+                let _ = sqlx::query(
+                    "UPDATE trigger_orders SET status='cancelled', cancel_reason='no mark'
+                      WHERE id=$1 AND status IN ('pending','triggered')",
+                )
+                .bind(trigger_id)
+                .execute(pool.as_ref())
+                .await;
+                return;
+            }
+            if side == 0 { mark + mark / 20 } else { mark - mark / 20 }
+        }
+    };
+    if exec_ticks <= 0 {
+        return;
+    }
+
+    // S5.4: same margin gate as direct order entry. Lazy-init the risk
+    // account from the ledger when this user has never been seen by the
+    // margin engine in this process lifetime (e.g. registered while a
+    // previous desk incarnation was running).
+    let margin =
+        lightning_exchange::desk::trigger::firing_margin_atoms(
+            exec_ticks, qty_lots, rules.notional_scale, rules.default_leverage,
+        );
+    if !engine.accounts.contains_key(&user_id) {
+        let usdt: Option<i64> = sqlx::query_scalar(
+            "SELECT balance_atoms FROM accounts WHERE user_id = $1 AND asset = 'USDT'",
+        )
+        .bind(user_id)
+        .fetch_optional(pool.as_ref())
+        .await
+        .unwrap_or(None);
+        engine.initialize_account(user_id, usdt.unwrap_or(0));
+    }
+    if engine.check_and_reserve_margin(user_id, margin).is_err() {
+        tracing::warn!(
+            "trigger {trigger_id}: margin reserve {margin} failed for user {user_id} — cancelled"
+        );
+        let _ = sqlx::query(
+            "UPDATE trigger_orders SET status='cancelled', cancel_reason='insufficient margin'
+              WHERE id=$1 AND status IN ('pending','triggered')",
+        )
+        .bind(trigger_id)
+        .execute(pool.as_ref())
+        .await;
+        return;
+    }
+
+    // Exactly-once anchor (skipped when recovery already holds the flip).
+    if !already_marked {
+        let flipped = sqlx::query(
+            "UPDATE trigger_orders
+                SET status='triggered', triggered_order_id=$2, triggered_at=NOW()
+              WHERE id=$1 AND status='pending'",
+        )
+        .bind(trigger_id)
+        .bind(order_id)
+        .execute(pool.as_ref())
+        .await
+        .map(|r| r.rows_affected() == 1)
+        .unwrap_or(false);
+        if !flipped {
+            // Lost the race to a user cancel — give the margin back.
+            engine.release_order_margin(user_id, margin);
+            return;
+        }
+    }
+
+    // Durable order row BEFORE the publish (the recovery footprint).
+    let price_f = exec_ticks as f64 * rules.price_tick;
+    let qty_f = rules.lots_to_quantity(qty_lots);
+    let ot = if is_market { "trigger-market" } else { "trigger-limit" };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO orders (id, user_id, symbol, side, order_type,
+                             price_atoms, quantity_atoms, filled_atoms, status, freeze_price_atoms)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'TRADING', 0)
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(order_id)
+    .bind(user_id)
+    .bind(symbol)
+    .bind(if side == 0 { "buy" } else { "sell" })
+    .bind(ot)
+    .bind(exec_ticks * rules.price_tick_atoms)
+    .bind(qty_lots * rules.quantity_step_atoms)
+    .execute(pool.as_ref())
+    .await
+    {
+        tracing::error!("trigger {trigger_id}: orders insert failed: {e}");
+        engine.release_order_margin(user_id, margin);
+        return;
+    }
+
+    pending_meta.insert(
+        order_id as u64,
+        OrderMeta {
+            user_id,
+            symbol: sym16,
+            side,
+            order_type: pack_str16(ot),
+            price: Some(price_f),
+            qty: qty_f,
+            client_order_id: format!("trig-{trigger_id}"),
+            freeze_price: 0.0,
+            initial_margin_atoms: margin,
+            liq_price_ticks: 0,
+        },
+    );
+    // Runtime meta BEFORE the publish: the engine emits the TRADE frame
+    // before the ACCEPTED update, so the trade consumer resolves
+    // taker_uid through this cache — without this entry an injected
+    // order's first fill settles with uid 0 and the trades row is
+    // silently dropped (caught live by the S5 drill).
+    remember_runtime_order(
+        runtime_meta_cache,
+        order_id as u64,
+        user_id,
+        0.0,
+        qty_f,
+        side,
+        sym16,
+        margin,
+    );
+    let req = SbeNewOrder {
+        client_order_id: order_id as u64,
+        participant_id: user_id as u64,
+        price_ticks: exec_ticks,
+        quantity_lots: qty_lots,
+        side,
+        time_in_force: if is_market { 1 } else { 0 }, // IOC for market
+        response_stream_id,
+        _pad: [0; 10],
+        symbol: sym16,
+    };
+    let Some(cmd_tx) = cmd_tx else {
+        tracing::error!("trigger {trigger_id}: no engine command queue — order stranded");
+        return;
+    };
+    if cmd_tx.push(AeronCmd::NewOrder(req)).is_err() {
+        tracing::error!("trigger {trigger_id}: engine queue full — recovery will re-inject");
+    } else {
+        tracing::info!(
+            "trigger {trigger_id} FIRED → order {order_id} ({symbol} {} {} @ {exec_ticks})",
+            if side == 0 { "buy" } else { "sell" },
+            qty_lots
+        );
+    }
+}
+
 fn process_db_cmd(
     cmd: DbCmd,
     account_cache: &lightning_exchange::api::AccountCache,
@@ -1961,6 +2146,12 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // ── S5: trigger-order books (hydrated + fired by the task below,
+    //    after AppState exists so it can reach the cmd queue) ───────────
+    let trigger_books: Arc<
+        DashMap<String, parking_lot::Mutex<lightning_exchange::desk::trigger::TriggerBook>>,
+    > = Arc::new(DashMap::new());
+
     // ── S3: funding scheduler/sampler task ────────────────────────────
     // Durable schedule anchor = funding_state (advanced by pg-writer in
     // the settlement transaction); the desk resumes from it on startup.
@@ -2116,6 +2307,7 @@ async fn async_main() -> anyhow::Result<()> {
         redis: redis_conn,
         persist_pub: Some(persist_pub.clone()),
         funding_view: funding_view.clone(),
+        trigger_books: trigger_books.clone(),
         vwap_cache: vwap_cache.clone(),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
         read_pool,
@@ -2247,8 +2439,17 @@ async fn async_main() -> anyhow::Result<()> {
                                         m.liq_price_ticks = liq_ticks;
                                     }
                                 }
-                                if let Some(pub_) = order_pubs.get_mut(sym) {
-                                    let _ = pub_.publish_new_order(&req);
+                                match order_pubs.get_mut(sym) {
+                                    Some(pub_) => {
+                                        if let Err(e) = pub_.publish_new_order(&req) {
+                                            tracing::error!(
+                                                "liq-ring publish failed for order {order_id} ({sym}): {e:?}"
+                                            );
+                                        }
+                                    }
+                                    None => tracing::error!(
+                                        "liq-ring: no order publisher for symbol '{sym}' (order {order_id})"
+                                    ),
                                 }
                             }
                             _ => {} // liquidation ring carries only NewOrder
@@ -2279,7 +2480,11 @@ async fn async_main() -> anyhow::Result<()> {
                                     .trim_end_matches('\0');
                                 let (_, quote_asset) = sym.split_once('_').unwrap_or(("BTC", "USDT"));
                                 let initial_margin_atoms = meta.initial_margin_atoms;
-                                let margin_usdt = initial_margin_atoms as f64 / 100.0;
+                                // atoms → USDT is 1e8 (S2); the old /100.0 was a
+                                // cents-era leftover that inflated the freeze by
+                                // 1e6× and silently rejected every cross-desk
+                                // order (found while wiring S5).
+                                let margin_usdt = initial_margin_atoms as f64 / 100_000_000.0;
                                 let mut reject = |reason: &str| {
                                     if let Some(frame) = CounterForwardWsFrame::new(
                                         user_id,
@@ -2847,7 +3052,7 @@ async fn async_main() -> anyhow::Result<()> {
         let vwap_cache = vwap_cache.clone();
         let rt = tokio::runtime::Handle::current();
         let spin_tracer = tracer.clone();
-        let order_meta_cache = open_order_meta;
+        let order_meta_cache = open_order_meta.clone();
         let forward_origin_recv = forwarded_order_origin.clone();
         let public_to_engine_recv = forwarded_public_to_engine.clone();
         let engine_to_public_recv = forwarded_engine_to_public.clone();
@@ -3713,6 +3918,113 @@ async fn async_main() -> anyhow::Result<()> {
     // ── Periodic depth broadcaster ───────────────────────────────────────────
     // Live ticker/kline/agg is generated from Aeron trade events. This
     // periodic task is off by default and only handles depth snapshots.
+    // ── S5: trigger hydrate + recovery + firing task ───────────────────
+    {
+        use lightning_exchange::desk::trigger::{
+            PendingTrigger, TriggerWhen, firing_margin_atoms, needs_reinjection,
+        };
+        use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
+        let pool_t = state.db.clone();
+        let runtime_meta_t = open_order_meta.clone();
+        let books = trigger_books.clone();
+        let engine_t = state.risk_engine.clone();
+        let cmd_tx_t = state.liq_cmd_tx.clone();
+        let next_id_t = state.next_order_id.clone();
+        let pending_meta_t = state.pending_meta.clone();
+        let resp_stream_t = state.response_stream_id;
+        tokio::spawn(async move {
+            // Hydrate pending triggers.
+            let rows: Vec<(i64, i64, String, String, String, i64, String, Option<i64>, i64)> =
+                sqlx::query_as(
+                    "SELECT id, user_id, symbol, side, order_type, trigger_price_ticks,
+                            trigger_when, price_ticks, qty_lots
+                       FROM trigger_orders WHERE status = 'pending'",
+                )
+                .fetch_all(pool_t.as_ref())
+                .await
+                .unwrap_or_default();
+            let hydrated = rows.len();
+            for (id, user_id, symbol, side_s, ot, trig, when_s, price, qty) in rows {
+                let Some(when) = TriggerWhen::from_db_str(&when_s) else { continue };
+                books.entry(symbol).or_default().lock().insert(
+                    when,
+                    PendingTrigger {
+                        id,
+                        user_id,
+                        side: if side_s == "buy" { 0 } else { 1 },
+                        is_market: ot == "market",
+                        trigger_price_ticks: trig,
+                        price_ticks: price,
+                        qty_lots: qty,
+                    },
+                );
+            }
+            // Recovery: 'triggered' rows whose injected order left NO
+            // footprint (desk died between the status flip and the
+            // publish) — re-inject with the SAME pre-allocated id.
+            let orphans: Vec<(i64, i64, i64, String, String, Option<i64>, i64, String)> =
+                sqlx::query_as(
+                    r#"SELECT t.id, t.triggered_order_id, t.user_id, t.symbol, t.side,
+                              t.price_ticks, t.qty_lots, t.order_type
+                         FROM trigger_orders t
+                        WHERE t.status = 'triggered'
+                          AND t.triggered_order_id IS NOT NULL
+                          AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = t.triggered_order_id)
+                          AND NOT EXISTS (SELECT 1 FROM matching_events m
+                                           WHERE m.order_id = t.triggered_order_id)"#,
+                )
+                .fetch_all(pool_t.as_ref())
+                .await
+                .unwrap_or_default();
+            tracing::info!(
+                "trigger hydrate: {} pending, {} interrupted firing(s) to recover",
+                hydrated,
+                orphans.len()
+            );
+            for (tid, oid, user_id, symbol, side_s, price, qty, ot) in orphans {
+                debug_assert!(needs_reinjection(false, false));
+                let side: u8 = if side_s == "buy" { 0 } else { 1 };
+                inject_trigger_order(
+                    &pool_t, &engine_t, &cmd_tx_t, &pending_meta_t, &runtime_meta_t,
+                    resp_stream_t, tid, oid, user_id, &symbol, side, ot == "market",
+                    price, qty, /*already_marked=*/ true,
+                )
+                .await;
+            }
+
+            // Firing loop: 50ms mark polling per symbol book.
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                for entry in books.iter() {
+                    let symbol = entry.key().clone();
+                    let sym16 = lightning_exchange::transport::persist_event::pack_str(&symbol);
+                    let Some(mark) = engine_t.mark_price_ticks(&sym16) else { continue };
+                    let fired = {
+                        let mut book = entry.value().lock();
+                        if book.is_empty() {
+                            continue;
+                        }
+                        book.due(mark)
+                    };
+                    for t in fired {
+                        let oid = next_id_t
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            as i64;
+                        inject_trigger_order(
+                            &pool_t, &engine_t, &cmd_tx_t, &pending_meta_t, &runtime_meta_t,
+                            resp_stream_t, t.id, oid, t.user_id, &symbol, t.side,
+                            t.is_market, t.price_ticks, t.qty_lots,
+                            /*already_marked=*/ false,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
     let market_broadcaster_enabled = std::env::var("MARKET_DATA_BROADCASTER")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);

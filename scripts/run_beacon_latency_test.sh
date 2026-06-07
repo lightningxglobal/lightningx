@@ -46,9 +46,20 @@ fi
 VM_ENDPOINT="${VM_ENDPOINT:-http://localhost:8428}"
 
 BEACON_BIN="${BEACON_BIN:-$BIN_DIR/beacon}"
+BEACON_SRC="${BEACON_SRC:-$HOME/work/rs/beacon}"
 BEACON_CONFIG="/tmp/beacon_latency.yaml"
 
-[[ -x "$BEACON_BIN" ]] || { echo "beacon binary not found: $BEACON_BIN" >&2; exit 2; }
+# Auto-build beacon from source if binary is missing.
+if [[ ! -x "$BEACON_BIN" ]]; then
+  if [[ -f "$BEACON_SRC/Cargo.toml" ]]; then
+    echo "beacon binary not found — building from $BEACON_SRC …"
+    cargo build --release --manifest-path "$BEACON_SRC/Cargo.toml" \
+      --target-dir "$(dirname "$BIN_DIR")" 2>&1 | tail -5
+    [[ -x "$BEACON_BIN" ]] || { echo "beacon build failed" >&2; exit 2; }
+  else
+    echo "beacon binary not found and source not at $BEACON_SRC" >&2; exit 2
+  fi
+fi
 
 # ── Write beacon config ───────────────────────────────────────────────────────
 cat > "$BEACON_CONFIG" <<EOF

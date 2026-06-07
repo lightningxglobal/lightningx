@@ -25,7 +25,7 @@ if $IS_LINUX; then
 else
   AERON_DIR="${AERON_DIR:-/tmp/aeron}"
 fi
-TOKENS_CSV="${TOKENS_CSV:-/tmp/pressure_users_40k.csv}"
+TOKENS_CSV="${TOKENS_CSV:-$HOME/work/pressure_tokens/pressure_users_40k.csv}"
 TOTAL_CONNS="${TOTAL_CONNS:-40000}"
 DESK_COUNT="${DESK_COUNT:-4}"
 TRACER_ENABLED="${TRACER_ENABLED:-0}"

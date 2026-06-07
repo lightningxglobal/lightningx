@@ -57,8 +57,8 @@ async fn seed_account_atoms(
 async fn seed_open_order(pg: &PgPool, user_id: i64) -> i64 {
     let id = (Uuid::new_v4().as_u128() % i64::MAX as u128) as i64;
     sqlx::query(
-        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, status)
-         VALUES ($1, $2, 'BTC_USDT', 'buy', 'limit', 100.0, 1.0, 'TRADING')",
+        "INSERT INTO orders (id, user_id, symbol, side, order_type, price_atoms, quantity_atoms, status)
+         VALUES ($1, $2, 'BTC_USDT', 'buy', 'limit', 10000000000, 100000000, 'TRADING')",
     )
     .bind(id)
     .bind(user_id)

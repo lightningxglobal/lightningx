@@ -313,16 +313,14 @@ impl<'a> AccountRepository<'a> {
         // Trade record commits atomically with the settlement legs.
         if let Some(t) = trade {
             sqlx::query(
-                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity,
+                "INSERT INTO trades (symbol, buy_order_id, sell_order_id,
                                      price_atoms, quantity_atoms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING",
             )
             .bind(&t.symbol)
             .bind(t.buy_order_id)
             .bind(t.sell_order_id)
-            .bind(price.to_f64())
-            .bind(quantity.to_f64())
             .bind(price.atoms())
             .bind(quantity.atoms())
             .execute(&mut *tx)

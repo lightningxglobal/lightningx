@@ -274,9 +274,9 @@ async fn settle_with_trade_record_is_atomic_and_idempotent() {
     // Idempotency: replaying the SAME trade pair is a no-op for the trades
     // table (unique pair), regardless of which path delivers it.
     let dup: i64 = sqlx::query_scalar(
-        "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity,
+        "INSERT INTO trades (symbol, buy_order_id, sell_order_id,
                              price_atoms, quantity_atoms)
-         VALUES ('BTC_USDT', $1, $2, 100.0, 0.5, $3, $4)
+         VALUES ('BTC_USDT', $1, $2, $3, $4)
          ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING
          RETURNING 1",
     )

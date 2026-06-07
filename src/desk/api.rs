@@ -1258,9 +1258,9 @@ async fn handle_place_order(
         let db_status = db_status_from_engine(result.status).as_str();
         let filled_qty = rules.lots_to_quantity(result.filled_lots);
 
-        let _ = sqlx::query("UPDATE orders SET status=$1, filled=$2, updated_at=NOW() WHERE id=$3")
+        let _ = sqlx::query("UPDATE orders SET status=$1, filled_atoms=$2, updated_at=NOW() WHERE id=$3")
             .bind(db_status)
-            .bind(filled_qty)
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(filled_qty).map(|a| a.atoms()).unwrap_or(0))
             .bind(db_order_id)
             .execute(s.db.as_ref())
             .await;
@@ -1342,11 +1342,11 @@ async fn handle_place_order(
             }
 
             let _ = sqlx::query(
-                "UPDATE orders SET filled = filled + $1,
-                 status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
+                "UPDATE orders SET filled_atoms = filled_atoms + $1,
+                 status = CASE WHEN filled_atoms + $1 >= quantity_atoms THEN 'COMPLETED' ELSE 'TRADING' END,
                  updated_at = NOW() WHERE id = $2",
             )
-            .bind(fq)
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(fq).map(|a| a.atoms()).unwrap_or(0))
             .bind(maker_order_id as i64)
             .execute(s.db.as_ref())
             .await;
@@ -1357,10 +1357,12 @@ async fn handle_place_order(
                 (Some(maker_order_id as i64), Some(db_order_id))
             };
             let _ = sqlx::query(
-                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+                "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price_atoms, quantity_atoms, created_at)
                  VALUES ($1, $2, $3, $4, $5, NOW())",
             )
-            .bind(&req.symbol).bind(buy_oid).bind(sell_oid).bind(fp).bind(fq)
+            .bind(&req.symbol).bind(buy_oid).bind(sell_oid)
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(fp).map(|a| a.atoms()).unwrap_or(0))
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(fq).map(|a| a.atoms()).unwrap_or(0))
             .execute(s.db.as_ref()).await;
 
             if let Some(uid) = maker_uid {
@@ -2524,15 +2526,15 @@ async fn handle_seed_demo(State(s): State<AppState>) -> impl IntoResponse {
             // sells persist 0 since freezing is by base-asset quantity.
             let seed_freeze_price = if side == "buy" { price } else { 0.0 };
             let inserted = sqlx::query_as::<_, DbOrder>(
-                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
+                "INSERT INTO orders (id, user_id, symbol, side, order_type, price_atoms, quantity_atoms, filled_atoms, status, freeze_price_atoms)
                  VALUES (nextval('orders_id_seq'), $1, $2, $3, 'limit', $4, $5, 0, 'PENDING', $6) RETURNING *",
             )
             .bind(demo_user_id)
             .bind(symbol)
             .bind(side)
-            .bind(price)
-            .bind(qty)
-            .bind(seed_freeze_price)
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(price).map(|a| a.atoms()).unwrap_or(0))
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(qty).map(|a| a.atoms()).unwrap_or(0))
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(seed_freeze_price).map(|a| a.atoms()).unwrap_or(0))
             .fetch_one(s.db.as_ref())
             .await;
 

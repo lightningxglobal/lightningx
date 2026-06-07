@@ -78,7 +78,7 @@ async fn seed_orders(
     let mut active_ids = Vec::with_capacity(n_active);
     let mut sql = String::from(
         "INSERT INTO orders (id, user_id, symbol, side, order_type,
-                             price, quantity, filled, status, freeze_price, client_order_id)
+                             price_atoms, quantity_atoms, filled_atoms, status, freeze_price_atoms, client_order_id)
          VALUES ",
     );
     let mut first = true;
@@ -86,20 +86,20 @@ async fn seed_orders(
         let id = start + i as i64;
         active_ids.push(id);
         let side = if i % 2 == 0 { "buy" } else { "sell" };
-        let price = 70000.0 + i as f64;
+        let price_atoms: i64 = (70000 + i as i64) * 100_000_000;
         let status = if i % 3 == 0 { "PENDING" } else { "TRADING" };
         if !first {
             sql.push(',');
         }
         first = false;
         sql.push_str(&format!(
-            "({id}, {user_id}, 'BTC_USDT', '{side}', 'limit', {price}, 0.01, 0, '{status}', {price}, 'rht-{id}')"
+            "({id}, {user_id}, 'BTC_USDT', '{side}', 'limit', {price_atoms}, 1000000, 0, '{status}', {price_atoms}, 'rht-{id}')"
         ));
     }
     for i in 0..n_terminal {
         let id = start + (n_active + i) as i64;
         let side = if i % 2 == 0 { "buy" } else { "sell" };
-        let price = 71000.0 + i as f64;
+        let price_atoms: i64 = (71000 + i as i64) * 100_000_000;
         // These statuses are NOT in ('PENDING','TRADING'), so hydrate must skip them.
         let status = ["COMPLETED", "CANCELED", "REJECTED"][i % 3];
         if !first {
@@ -107,7 +107,7 @@ async fn seed_orders(
         }
         first = false;
         sql.push_str(&format!(
-            "({id}, {user_id}, 'BTC_USDT', '{side}', 'market', {price}, 0.01, 0, '{status}', 0, 'rht-{id}')"
+            "({id}, {user_id}, 'BTC_USDT', '{side}', 'market', {price_atoms}, 1000000, 0, '{status}', 0, 'rht-{id}')"
         ));
     }
     sqlx::query(&sql).execute(pg).await?;

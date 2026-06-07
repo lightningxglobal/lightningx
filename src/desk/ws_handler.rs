@@ -1135,7 +1135,7 @@ async fn handle_client_message(
             // depending on a PostgreSQL sequence that doesn't exist for BIGINT PKs.
             let db_order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed) as i64;
             let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
-                "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
+                "INSERT INTO orders (id, user_id, symbol, side, order_type, price_atoms, quantity_atoms, filled_atoms, status, freeze_price_atoms)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8) RETURNING *",
             )
             .bind(db_order_id)
@@ -1143,9 +1143,9 @@ async fn handle_client_message(
             .bind(&symbol)
             .bind(&side)
             .bind(&order_type)
-            .bind(price)
-            .bind(qty)
-            .bind(freeze_price_val)
+            .bind(price.and_then(|x| crate::desk::money::AmountAtoms::from_f64_round(x).ok()).map(|a| a.atoms()))
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(qty).map(|a| a.atoms()).unwrap_or(0))
+            .bind(crate::desk::money::AmountAtoms::from_f64_round(freeze_price_val).map(|a| a.atoms()).unwrap_or(0))
             .fetch_one(state.db.as_ref())
             .await;
 
@@ -1270,7 +1270,7 @@ async fn handle_client_message(
 
             // Update DB with fill info.
             let _ = sqlx::query(
-                "UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3",
+                "UPDATE orders SET status = $1, filled_atoms = $2, updated_at = NOW() WHERE id = $3",
             )
             .bind(db_status)
             .bind(filled_qty)
@@ -1415,12 +1415,12 @@ async fn handle_client_message(
                     // RETURNING `filled` gives the post-update cumulative qty so the WS payload
                     // matches taker semantics — frontend treats `filled_qty` as cumulative.
                     let maker_row: Option<(String, f64)> = sqlx::query_as(
-                        "UPDATE orders SET filled = filled + $1,
-                         status = CASE WHEN filled + $1 >= quantity THEN 'COMPLETED' ELSE 'TRADING' END,
+                        "UPDATE orders SET filled_atoms = filled_atoms + $1,
+                         status = CASE WHEN filled_atoms + $1 >= quantity_atoms THEN 'COMPLETED' ELSE 'TRADING' END,
                          updated_at = NOW() WHERE id = $2
-                         RETURNING status, filled",
+                         RETURNING status, filled_atoms::float8 / 100000000.0",
                     )
-                    .bind(fq)
+                    .bind(crate::desk::money::AmountAtoms::from_f64_round(fq).map(|a| a.atoms()).unwrap_or(0))
                     .bind(maker_order_id as i64)
                     .fetch_optional(state.db.as_ref())
                     .await
@@ -1453,10 +1453,12 @@ async fn handle_client_message(
                         (Some(maker_order_id as i64), Some(db_order_id))
                     };
                     let _ = sqlx::query(
-                        "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price, quantity, created_at)
+                        "INSERT INTO trades (symbol, buy_order_id, sell_order_id, price_atoms, quantity_atoms, created_at)
                          VALUES ($1, $2, $3, $4, $5, NOW())",
                     )
-                    .bind(&symbol).bind(buy_oid).bind(sell_oid).bind(fp).bind(fq)
+                    .bind(&symbol).bind(buy_oid).bind(sell_oid)
+                    .bind(crate::desk::money::AmountAtoms::from_f64_round(fp).map(|a| a.atoms()).unwrap_or(0))
+                    .bind(crate::desk::money::AmountAtoms::from_f64_round(fq).map(|a| a.atoms()).unwrap_or(0))
                     .execute(state.db.as_ref())
                     .await;
                 }
@@ -2221,7 +2223,7 @@ async fn handle_client_message(
 
                 let db_order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed) as i64;
                 let db_result = sqlx::query_as::<_, crate::models::DbOrder>(
-                    "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, filled, status, freeze_price)
+                    "INSERT INTO orders (id, user_id, symbol, side, order_type, price_atoms, quantity_atoms, filled_atoms, status, freeze_price_atoms)
                      VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'PENDING', $8) RETURNING *",
                 )
                 .bind(db_order_id)
@@ -2229,9 +2231,9 @@ async fn handle_client_message(
                 .bind(&symbol)
                 .bind(&side)
                 .bind(&order_type)
-                .bind(price)
-                .bind(qty)
-                .bind(freeze_price_val)
+                .bind(price.and_then(|x| crate::desk::money::AmountAtoms::from_f64_round(x).ok()).map(|a| a.atoms()))
+                .bind(crate::desk::money::AmountAtoms::from_f64_round(qty).map(|a| a.atoms()).unwrap_or(0))
+                .bind(crate::desk::money::AmountAtoms::from_f64_round(freeze_price_val).map(|a| a.atoms()).unwrap_or(0))
                 .fetch_one(state.db.as_ref())
                 .await;
 
@@ -2352,7 +2354,7 @@ async fn handle_client_message(
                 let db_status = db_status_from_engine(result.status).as_str();
                 let filled_qty = rules.lots_to_quantity(result.filled_lots);
                 let _ = sqlx::query(
-                    "UPDATE orders SET status = $1, filled = $2, updated_at = NOW() WHERE id = $3",
+                    "UPDATE orders SET status = $1, filled_atoms = $2, updated_at = NOW() WHERE id = $3",
                 )
                 .bind(db_status)
                 .bind(filled_qty)

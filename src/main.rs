@@ -42,14 +42,16 @@ async fn seed_demo_if_empty(pool: &PgPool) {
     // show meaningful OHLCV variation across 1m / 5m / 15m / 1h intervals.
     if !eth_has_trades {
         let _ = sqlx::query(
-            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
+            "INSERT INTO trades (symbol, price_atoms, quantity_atoms, buy_fee_atoms, sell_fee_atoms, created_at)
              SELECT 'ETH_USDT',
+                    ROUND((
                     3000.0
                       + 80.0 * sin(extract(epoch from ts) / 1800.0)
                       + 15.0 * sin(extract(epoch from ts) /  300.0)
-                      +  4.0 * sin(extract(epoch from ts) /   60.0),
-                    0.05 + 0.08 * abs(sin(extract(epoch from ts) / 47.0)),
-                    0.0, 0.0,
+                      +  4.0 * sin(extract(epoch from ts) /   60.0)
+                    ) * 100000000)::BIGINT,
+                    ROUND((0.05 + 0.08 * abs(sin(extract(epoch from ts) / 47.0))) * 100000000)::BIGINT,
+                    0, 0,
                     ts + (((extract(epoch from ts)::bigint * 1337 + 271828) % 9999) * interval '1 microsecond')
              FROM generate_series(
                  NOW() - INTERVAL '3 hours',
@@ -61,14 +63,16 @@ async fn seed_demo_if_empty(pool: &PgPool) {
         .await;
 
         let _ = sqlx::query(
-            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
+            "INSERT INTO trades (symbol, price_atoms, quantity_atoms, buy_fee_atoms, sell_fee_atoms, created_at)
              SELECT 'SOL_USDT',
+                    ROUND((
                     150.0
                       + 6.0 * sin(extract(epoch from ts) / 1800.0)
                       + 1.5 * sin(extract(epoch from ts) /  300.0)
-                      + 0.4 * sin(extract(epoch from ts) /   60.0),
-                    0.5 + 0.8 * abs(sin(extract(epoch from ts) / 53.0)),
-                    0.0, 0.0,
+                      + 0.4 * sin(extract(epoch from ts) /   60.0)
+                    ) * 100000000)::BIGINT,
+                    ROUND((0.5 + 0.8 * abs(sin(extract(epoch from ts) / 53.0))) * 100000000)::BIGINT,
+                    0, 0,
                     ts + (((extract(epoch from ts)::bigint * 2311 + 161803) % 9999) * interval '1 microsecond')
              FROM generate_series(
                  NOW() - INTERVAL '3 hours',
@@ -83,14 +87,16 @@ async fn seed_demo_if_empty(pool: &PgPool) {
 
     if !btc_has_trades {
         let _ = sqlx::query(
-            "INSERT INTO trades (symbol, price, quantity, buy_fee, sell_fee, created_at)
+            "INSERT INTO trades (symbol, price_atoms, quantity_atoms, buy_fee_atoms, sell_fee_atoms, created_at)
              SELECT 'BTC_USDT',
+                    ROUND((
                     51000.0
                       + 400.0 * sin(extract(epoch from ts) / 1800.0)
                       +  80.0 * sin(extract(epoch from ts) /  300.0)
-                      +  20.0 * sin(extract(epoch from ts) /   60.0),
-                    0.002 + 0.004 * abs(sin(extract(epoch from ts) / 41.0)),
-                    0.0, 0.0,
+                      +  20.0 * sin(extract(epoch from ts) /   60.0)
+                    ) * 100000000)::BIGINT,
+                    ROUND((0.002 + 0.004 * abs(sin(extract(epoch from ts) / 41.0))) * 100000000)::BIGINT,
+                    0, 0,
                     ts + (((extract(epoch from ts)::bigint * 997 + 314159) % 9999) * interval '1 microsecond')
              FROM generate_series(
                  NOW() - INTERVAL '3 hours',

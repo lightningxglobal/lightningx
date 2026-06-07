@@ -101,8 +101,8 @@ async fn reconcile_drops_orphans_keeps_pg_backed_ids() {
         .unwrap();
     // Seed PG with only the survivor.
     sqlx::query(
-        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, status)
-         VALUES ($1, $2, 'BTC_USDT', 'buy', 'limit', 70000, 0.1, 'PENDING')",
+        "INSERT INTO orders (id, user_id, symbol, side, order_type, price_atoms, quantity_atoms, status)
+         VALUES ($1, $2, 'BTC_USDT', 'buy', 'limit', 7000000000000, 10000000, 'PENDING')",
     )
     .bind(survivor_id)
     .bind(user_id)

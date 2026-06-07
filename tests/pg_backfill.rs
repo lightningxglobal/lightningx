@@ -95,8 +95,8 @@ async fn backfill_inserts_missing_rows_from_redis() {
 
     // Only `id_present` exists in PG.
     sqlx::query(
-        "INSERT INTO orders (id, user_id, symbol, side, order_type, price, quantity, status)
-         VALUES ($1, $2, 'BTC_USDT', 'buy', 'limit', 71000, 0.05, 'PENDING')",
+        "INSERT INTO orders (id, user_id, symbol, side, order_type, price_atoms, quantity_atoms, status)
+         VALUES ($1, $2, 'BTC_USDT', 'buy', 'limit', 7100000000000, 5000000, 'PENDING')",
     )
     .bind(id_present)
     .bind(user_id)

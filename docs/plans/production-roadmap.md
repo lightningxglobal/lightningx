@@ -276,6 +276,12 @@
     ACK 等备机位点（窗口化摊薄 ~50–100µs 同机房 RTT）；Archive 降级为冷恢复/审计源。
   - 两级通用：fencing 用 epoch/term 嵌入输出序列号（备机接管 epoch+1，下游拒旧）；
     引擎重放快（百万级 ops/s），初期不做快照，全量重放当日 journal 即可。
+  - ✅ 源码级核查完成（wrapper `af8556c`）：①fsync 顺序验证——`file.sync.level≥1`
+    时 RecordingPos counter 在数据 fsync **之后**才推进，"counter ≥ 落盘位置"
+    恒成立 → 零 RPC 的 `RecordingPositionCounter`（counters 文件直读 + 槽位
+    复用防护）即为 ACK 门控正解；②conductor 线程契约——invoker 模式下 archive
+    控制调用自驱 conductor，必须与 `do_work` 同线程（已写入文档）；
+    ③context 所有权语义验证无泄漏。
   - ✅ `aeron-wrapper` Archive 客户端已完成（wrapper `aa9718b`，2026-06-07）：
     connect/start_recording/stop/find/recording_position/start_replay/
     truncate + `ReplayParams::follow_from`（备机追赶原语）；
@@ -310,8 +316,11 @@
   （随机垃圾 2000 例 / 全长度截断 / 全位翻转 + 非法 UTF-8），每次 cargo test
   必跑，种子化可复现。
   - ⬜ 剩余：cargo-fuzz 覆盖率导向长跑（nightly，复用同一入口清单，离线跑）。
-- ⬜ **可观测性**：Prometheus 指标（撮合延迟分位数、journal lag、消费位点滞后、
-  对账 diff、ring 丢弃计数）、结构化日志、关键路径 trace（现有 `tracer.rs` 可扩展）。
+- ⬜ **可观测性**：各进程暴露 Prometheus 文本格式 `/metrics` 端点（撮合延迟分位数、
+  journal lag、消费位点滞后、对账 diff、ring 丢弃计数）；**抓取与存储用已部署的
+  VictoriaMetrics**（完全兼容 Prometheus 抓取协议与 PromQL，代码侧零差异）——
+  此项为纯内部工作（~3–4 天），不依赖外部。结构化日志、关键路径 trace
+  （现有 `tracer.rs` 可扩展）。
 - ⬜ **审计**：登录/提现/管理操作审计日志（append-only）；管理后台双人复核。
 - ⬜ **合规预留**：KYC 钩子、地址筛查接口、监管报送数据导出（按目标司法辖区裁剪）。
 - ⬜ 渗透测试 + 第三方安全审计（上线前硬性要求）。

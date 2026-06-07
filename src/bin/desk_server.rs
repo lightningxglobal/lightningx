@@ -2386,6 +2386,11 @@ async fn async_main() -> anyhow::Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(256);
+        // S6.3: leverage tier table (RISK_TIERS env, e.g. "1000000:20,5000000:10,:5").
+        let risk_tiers_send =
+            lightning_exchange::desk::risk::calc::parse_risk_tiers(
+                &std::env::var("RISK_TIERS").unwrap_or_default(),
+            );
         let mut counter_forward_cmd_pubs = send_cf_cmd_pubs;
         let mut counter_forward_resp_pubs = send_cf_resp_pubs;
         let thread_name_send = format!("d{desk_id}-send");
@@ -2518,6 +2523,23 @@ async fn async_main() -> anyhow::Result<()> {
                                     &symbol,
                                     req.quantity_lots,
                                     fwd_rules.max_symbol_oi_lots,
+                                ) {
+                                    reject(reason);
+                                    continue;
+                                }
+                                let order_notional =
+                                    lightning_exchange::desk::risk::calc::calc_notional_atoms(
+                                        { let p: i64 = req.price_ticks; p },
+                                        req.quantity_lots,
+                                        fwd_rules.notional_scale,
+                                    );
+                                if let Err(reason) = risk_engine_send.check_leverage_tier(
+                                    user_id,
+                                    &symbol,
+                                    order_notional,
+                                    fwd_rules.notional_scale,
+                                    &risk_tiers_send,
+                                    fwd_rules.default_leverage,
                                 ) {
                                     reject(reason);
                                     continue;
@@ -3793,13 +3815,62 @@ async fn async_main() -> anyhow::Result<()> {
         let next_order_id_tick = state.next_order_id.clone();
         let pending_meta_tick = state.pending_meta.clone();
         let liq_cmd_tick = state.liq_cmd_tx.clone();
+        let persist_pub_tick = persist_pub.clone();
+        let symbols_tick: Vec<String> = std::env::var("SYMBOLS")
+            .unwrap_or_else(|_| "ETH_USDT,BTC_USDT,SOL_USDT".to_string())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         let tracer_liq = state.tracer.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                // S6.2 — ADL sweep: clear any bankrupt position whose
+                // liquidation IOC couldn't fill (rare; cold path).
+                for sym in symbols_tick.iter() {
+                    let sym16 = lightning_exchange::transport::persist_event::pack_str(sym);
+                    let rules =
+                        lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(sym);
+                    let adl = risk_engine_tick.run_adl(
+                        sym16,
+                        rules.notional_scale,
+                        rules.default_leverage,
+                        rules.maintenance_rate_bps,
+                    );
+                    for ev in adl {
+                        tracing::warn!(
+                            "ADL: bankrupt {} deleveraged against {} ({} lots @ {} ticks)",
+                            ev.bankrupt_user_id,
+                            ev.counterparty_user_id,
+                            ev.qty_lots,
+                            ev.price_ticks
+                        );
+                        for uid in [ev.bankrupt_user_id, ev.counterparty_user_id] {
+                            for frame in
+                                lightning_exchange::desk::risk_persist::margin_state_frames(
+                                    &risk_engine_tick,
+                                    uid,
+                                    &sym16,
+                                )
+                            {
+                                publish_frame(&persist_pub_tick, &frame);
+                            }
+                        }
+                    }
+                }
                 let to_liquidate = risk_engine_tick.run_risk_tick();
+                // S6.1 — tiered liquidation: close LIQ_TRANCHE_BPS of the
+                // position per round (default 10_000 = full, pre-S6
+                // behavior). The partial close resets the account to
+                // Normal; the next tick re-evaluates and emits the next
+                // tranche until the account is healthy or flat.
+                let tranche_bps: i64 = std::env::var("LIQ_TRANCHE_BPS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10_000);
                 for evt in &to_liquidate {
                     if let Some(ref t) = tracer_liq {
                         t.record_sym(MS_LIQ_TICK_EMIT, evt.user_id as u64, &evt.symbol);
@@ -3844,11 +3915,16 @@ async fn async_main() -> anyhow::Result<()> {
                     // Liquidation order is a limit IOC at the liquidation price.
                     // This is deliberately aggressive (well into the book), so it
                     // fills at market while the user is settled at liq_price_ticks.
+                    let tranche_lots =
+                        lightning_exchange::desk::risk::calc::liquidation_tranche_lots(
+                            evt.qty_lots,
+                            tranche_bps,
+                        );
                     let sbe_req = SbeNewOrder {
                         client_order_id: order_id,
                         participant_id: evt.user_id as u64,
                         price_ticks: evt.liq_price_ticks,
-                        quantity_lots: evt.qty_lots,
+                        quantity_lots: tranche_lots,
                         side: liq_side,
                         time_in_force: 1, // IOC
                         response_stream_id,
@@ -3861,7 +3937,7 @@ async fn async_main() -> anyhow::Result<()> {
                     let notional = if mark_ticks > 0 {
                         lightning_exchange::desk::risk::calc::calc_notional_atoms(
                             mark_ticks,
-                            evt.qty_lots,
+                            tranche_lots,
                             rules.notional_scale,
                         )
                     } else {
@@ -3884,7 +3960,7 @@ async fn async_main() -> anyhow::Result<()> {
                             side: liq_side,
                             order_type: pack_str16(order_type),
                             price: None,
-                            qty: rules.lots_to_quantity(evt.qty_lots),
+                            qty: rules.lots_to_quantity(tranche_lots),
                             client_order_id: format!("liq-{}", order_id),
                             freeze_price: 0.0,
                             initial_margin_atoms: margin_atoms,

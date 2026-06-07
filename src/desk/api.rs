@@ -2895,8 +2895,15 @@ async fn handle_debug_mark_price(
     let events = s.risk_engine.run_risk_tick();
     let liq_count = events.len();
 
-    // Dispatch liquidation events to the priority ring (same as the 10ms task).
-    for evt in events {
+    // Dispatch liquidation events to the priority ring (same as the 10ms
+    // task, including the S6.1 tranche).
+    let tranche_bps: i64 = std::env::var("LIQ_TRANCHE_BPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    for mut evt in events {
+        evt.qty_lots =
+            crate::desk::risk::calc::liquidation_tranche_lots(evt.qty_lots, tranche_bps);
         use crate::desk::risk::PositionSide;
         use crate::sbe::NewOrderRequest as SbeNewOrder;
         use crate::transport::{AeronCmd, OrderMeta, pack_str16};

@@ -155,6 +155,16 @@ pub struct PositionRiskState {
     pub leverage: u8,
 }
 
+/// One ADL pairing (S6.2): `counterparty` was force-closed against the
+/// bankrupt account at the bankruptcy price.
+#[derive(Debug, Clone)]
+pub struct AdlEvent {
+    pub bankrupt_user_id: i64,
+    pub counterparty_user_id: i64,
+    pub qty_lots: i64,
+    pub price_ticks: i64,
+}
+
 /// Emitted by run_risk_tick() when a position should be liquidated.
 #[derive(Debug, Clone)]
 pub struct LiquidationEvent {

@@ -72,6 +72,58 @@ pub fn calc_unrealized_pnl_atoms(
     ((diff as i128 * qty_lots as i128 * ATOMS_PER_CENT) / notional_scale as i128) as i64
 }
 
+/// S6.1 — tiered liquidation: liquidate `tranche_bps` of the position
+/// per round instead of the whole book at once; each partial close
+/// resets the account to Normal and the next risk tick re-evaluates, so
+/// rounds converge naturally. A残 tail smaller than 20% of the original
+/// is folded into the tranche (a dust position isn't worth a round).
+/// tranche_bps = 10_000 → full liquidation (the pre-S6 behavior).
+pub fn liquidation_tranche_lots(position_lots: i64, tranche_bps: i64) -> i64 {
+    if tranche_bps >= 10_000 || position_lots <= 0 {
+        return position_lots;
+    }
+    let tranche = ((position_lots as i128 * tranche_bps as i128) / 10_000) as i64;
+    let tranche = tranche.max(1);
+    let remainder = position_lots - tranche;
+    if remainder * 5 < position_lots {
+        position_lots // fold the dust tail into this round
+    } else {
+        tranche
+    }
+}
+
+/// S6.3 — leverage risk tiers: the bigger the position's notional, the
+/// less leverage it may use. Returns the max leverage permitted at
+/// `notional_atoms`. Tiers ascend; the first bound that fits wins.
+/// Format mirrors RISK_TIERS env: "bound_usdt:lev,bound:lev,:lev"
+/// (empty bound = catch-all).
+pub fn max_leverage_for_notional(notional_atoms: i64, tiers: &[(i64, u8)]) -> u8 {
+    for &(bound_atoms, lev) in tiers {
+        if bound_atoms == i64::MAX || notional_atoms <= bound_atoms {
+            return lev;
+        }
+    }
+    1 // empty/misconfigured table: most conservative
+}
+
+/// Parse "1000000:20,5000000:10,:5" (bounds in whole USDT) into atoms
+/// tiers. Unparseable entries are skipped; an empty result means "no
+/// tiering" and callers should treat it as disabled.
+pub fn parse_risk_tiers(spec: &str) -> Vec<(i64, u8)> {
+    spec.split(',')
+        .filter_map(|part| {
+            let (bound, lev) = part.split_once(':')?;
+            let lev: u8 = lev.trim().parse().ok()?;
+            let bound_atoms = if bound.trim().is_empty() {
+                i64::MAX
+            } else {
+                bound.trim().parse::<i64>().ok()?.checked_mul(100_000_000)?
+            };
+            Some((bound_atoms, lev))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::types::PositionSide;
@@ -189,6 +241,32 @@ mod tests {
         assert_eq!(notional, 5 * A);
         let margin = calc_initial_margin_atoms(notional, 10);
         assert_eq!(margin, 500_000);
+    }
+
+    #[test]
+    fn tranche_folds_dust_and_full_at_10000() {
+        // 50% of 100k = 50k; remainder 50k ≥ 20% → partial.
+        assert_eq!(liquidation_tranche_lots(100_000, 5_000), 50_000);
+        // 90% tranche leaves 10% < 20% → fold to full.
+        assert_eq!(liquidation_tranche_lots(100_000, 9_000), 100_000);
+        // Default/disabled = full.
+        assert_eq!(liquidation_tranche_lots(100_000, 10_000), 100_000);
+        // Tiny positions never produce a 0-lot order.
+        assert_eq!(liquidation_tranche_lots(1, 5_000), 1);
+    }
+
+    #[test]
+    fn risk_tiers_parse_and_select() {
+        let tiers = parse_risk_tiers("1000000:20,5000000:10,:5");
+        assert_eq!(tiers.len(), 3);
+        let a = 100_000_000i64; // atoms per USDT
+        assert_eq!(max_leverage_for_notional(500_000 * a, &tiers), 20);
+        assert_eq!(max_leverage_for_notional(1_000_000 * a, &tiers), 20, "boundary inclusive");
+        assert_eq!(max_leverage_for_notional(3_000_000 * a, &tiers), 10);
+        assert_eq!(max_leverage_for_notional(50_000_000 * a, &tiers), 5);
+        // Garbage entries skipped; empty disables (callers' contract).
+        assert!(parse_risk_tiers("nonsense").is_empty());
+        assert_eq!(max_leverage_for_notional(1, &[]), 1);
     }
 
     /// S2 boundary guard: a position big enough to overflow naive i64

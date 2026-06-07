@@ -136,6 +136,144 @@ impl RiskEngine {
         Ok(())
     }
 
+    /// S6.3 — leverage risk tiers: bigger total notional ⇒ less leverage
+    /// allowed. `add_notional_atoms` is the incoming order's notional;
+    /// the user's CURRENT position notional (at its mark) counts toward
+    /// the tier. O(1): one DashMap point read. Empty tiers = disabled.
+    /// S6.2 — auto-deleveraging. A Bankruptcy account that still holds a
+    /// position (its liquidation IOC could not fully fill — until now
+    /// such positions simply HUNG) is force-closed against the
+    /// highest-scoring opposite-side holders at the BANKRUPTCY price;
+    /// any negative equity left afterwards is socialized into the
+    /// insurance fund (which may go negative — that is its job).
+    ///
+    /// Cold path by construction (bankruptcies are rare): the sort is
+    /// O(n log n) over the symbol's opposite-side holders and runs only
+    /// when a bankrupt position exists. Conservation: every pair books
+    /// the SAME fill value on both legs, and the socialization step
+    /// moves the deficit fund-ward — Σequity + fund is unchanged.
+    pub fn run_adl(
+        &self,
+        symbol: [u8; 16],
+        notional_scale: i64,
+        leverage: u8,
+        maintenance_rate_bps: i64,
+    ) -> Vec<super::types::AdlEvent> {
+        use super::types::{AdlEvent, PositionSide};
+        let mut events = Vec::new();
+
+        // Bankrupt holders of this symbol (cheap scan of the symbol index).
+        let holders: Vec<i64> = self
+            .symbol_position_index
+            .get(&symbol)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let bankrupts: Vec<(i64, PositionSide, i64, i64)> = holders
+            .iter()
+            .filter(|uid| {
+                self.accounts
+                    .get(uid)
+                    .map(|a| a.status == RiskStatus::Bankruptcy)
+                    .unwrap_or(false)
+            })
+            .filter_map(|uid| {
+                let p = self.positions.get(&(*uid, symbol))?;
+                Some((*uid, p.side, p.qty_lots, p.bankruptcy_price_ticks))
+            })
+            .collect();
+        if bankrupts.is_empty() {
+            return events;
+        }
+
+        for (bankrupt_uid, b_side, mut qty_left, bkrpt_price) in bankrupts {
+            // Opposite-side candidates ranked by ADL score:
+            // profit share × leverage proxy (uPnL relative to margin).
+            let mut candidates: Vec<(i64, i64, i128)> = holders
+                .iter()
+                .filter(|uid| **uid != bankrupt_uid)
+                .filter_map(|uid| {
+                    let p = self.positions.get(&(*uid, symbol))?;
+                    if p.side == b_side {
+                        return None;
+                    }
+                    let score = (p.unrealized_pnl.max(0) as i128 * 10_000)
+                        / p.initial_margin.max(1) as i128;
+                    Some((*uid, p.qty_lots, score))
+                })
+                .collect();
+            candidates.sort_by_key(|&(_, _, score)| std::cmp::Reverse(score));
+
+            for (cand_uid, cand_qty, _) in candidates {
+                if qty_left <= 0 {
+                    break;
+                }
+                let take = qty_left.min(cand_qty);
+                // Counterparty: forced close at the bankruptcy price
+                // (normal PnL against their own cost basis).
+                let close_side_cand = if b_side == PositionSide::Long { 0 } else { 1 };
+                self.on_fill(
+                    cand_uid, symbol, close_side_cand, bkrpt_price, take, 0,
+                    notional_scale, leverage, maintenance_rate_bps, 0,
+                );
+                // Bankrupt: settled at the same price (liq path, zero
+                // spread → no fund movement on this leg).
+                let close_side_b = if b_side == PositionSide::Long { 1 } else { 0 };
+                self.on_fill(
+                    bankrupt_uid, symbol, close_side_b, bkrpt_price, take, 0,
+                    notional_scale, leverage, maintenance_rate_bps, bkrpt_price,
+                );
+                events.push(AdlEvent {
+                    bankrupt_user_id: bankrupt_uid,
+                    counterparty_user_id: cand_uid,
+                    qty_lots: take,
+                    price_ticks: bkrpt_price,
+                });
+                qty_left -= take;
+            }
+
+            // Socialize whatever deficit remains: the account is zeroed,
+            // the fund absorbs the loss (possibly going negative).
+            if let Some(mut acct) = self.accounts.get_mut(&bankrupt_uid) {
+                use std::sync::atomic::Ordering::Relaxed;
+                if acct.equity < 0 {
+                    self.insurance_fund_atoms.fetch_add(acct.equity, Relaxed);
+                    acct.equity = 0;
+                    acct.available_margin.store(0, Relaxed);
+                }
+                if acct.used_margin == 0 {
+                    acct.status = RiskStatus::Normal; // flat & settled
+                }
+            }
+        }
+        events
+    }
+
+    pub fn check_leverage_tier(
+        &self,
+        user_id: i64,
+        symbol: &[u8; 16],
+        add_notional_atoms: i64,
+        notional_scale: i64,
+        tiers: &[(i64, u8)],
+        used_leverage: u8,
+    ) -> Result<(), &'static str> {
+        if tiers.is_empty() {
+            return Ok(());
+        }
+        let current = self
+            .positions
+            .get(&(user_id, *symbol))
+            .map(|p| {
+                calc::calc_notional_atoms(p.mark_price_ticks, p.qty_lots, notional_scale)
+            })
+            .unwrap_or(0);
+        let total = current.saturating_add(add_notional_atoms.max(0));
+        if calc::max_leverage_for_notional(total, tiers) < used_leverage {
+            return Err("Leverage exceeds risk tier for position size");
+        }
+        Ok(())
+    }
+
     pub fn check_and_reserve_margin(
         &self,
         user_id: i64,
@@ -330,10 +468,14 @@ impl RiskEngine {
                 // For flip: flip_margin portion stays in used_margin, not available.
                 acct.used_margin += flip_margin;
                 let old_av = acct.available_margin.load(Relaxed);
+                // NO clamp to zero here: a close that leaves available
+                // negative is a real DEFICIT (bankruptcy beyond the
+                // margin). Clamping silently minted the difference —
+                // caught by the S6.2 ADL conservation test. The deficit
+                // flows to socialization (run_adl) → insurance fund.
                 acct.available_margin.store(
-                    (old_av + fill_margin_atoms + released_used_margin + realized_pnl_cents
-                        - flip_margin)
-                        .max(0),
+                    old_av + fill_margin_atoms + released_used_margin + realized_pnl_cents
+                        - flip_margin,
                     Relaxed,
                 );
                 // After forced liquidation close, let run_risk_tick re-evaluate status.
@@ -1271,6 +1413,121 @@ mod tests {
         assert!(events.is_empty());
         let acct = engine.accounts.get(&uid).unwrap();
         assert_eq!(acct.status, RiskStatus::Normal);
+    }
+
+    /// S6.2 — ADL pairs the bankrupt long against the best-scored short,
+    /// clears the hung position, socializes the deficit, and the books
+    /// stay exactly zero-sum.
+    #[test]
+    fn adl_clears_bankrupt_position_and_conserves() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let engine = RiskEngine::new();
+        // Bankrupt-to-be long, thin.
+        engine.initialize_account(1, 60_000 * A);
+        engine.check_and_reserve_margin(1, MARGIN_ATOMS).unwrap();
+        engine.on_fill(1, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        // Two shorts: A high-profit/high-score, B low.
+        for (uid, qty, margin) in [(2, 80_000, 40_000 * A), (3, 40_000, 200_000 * A)] {
+            engine.initialize_account(uid, 1_000_000 * A);
+            engine.check_and_reserve_margin(uid, margin).unwrap();
+            engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, qty, margin,
+                NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        }
+        // Inject an extra loss (think: funding payments) so settling at
+        // the bankruptcy price still leaves a deficit — bankruptcy-price
+        // settlement alone caps the loss at the margin, equity ≥ 0.
+        // Only `available` is touched; equity is recomputed from its
+        // components by the next mark update (the engine's own rule).
+        if let Some(acct) = engine.accounts.get(&1) {
+            use std::sync::atomic::Ordering::Relaxed;
+            acct.available_margin.fetch_sub(20_000 * A, Relaxed);
+        }
+        engine.update_mark_price(btc_sym(), PRICE_TICKS, NOTIONAL_SCALE); // recompute equity
+        let e0: i64 = engine
+            .accounts
+            .iter()
+            .map(|a| a.equity - a.unrealized_pnl)
+            .sum();
+
+        // Crash the mark far below bankruptcy: the long is insolvent.
+        for _ in 0..400 {
+            engine.update_mark_price(btc_sym(), 4_000_000, NOTIONAL_SCALE);
+        }
+        let _ = engine.run_risk_tick(); // flips the long to Bankruptcy
+        assert_eq!(
+            engine.accounts.get(&1).unwrap().status,
+            RiskStatus::Bankruptcy,
+            "deep insolvency goes straight to Bankruptcy (no liq event) — the hole ADL fills"
+        );
+        assert!(engine.positions.get(&(1, btc_sym())).is_some(), "position hangs pre-ADL");
+
+        let events = engine.run_adl(btc_sym(), NOTIONAL_SCALE, LEVERAGE, MAINT_BPS);
+        assert!(!events.is_empty(), "ADL must fire");
+        // Highest score (user 2: bigger uPnL per margin) deleverages first.
+        assert_eq!(events[0].counterparty_user_id, 2);
+        // Bankrupt position fully cleared, account settled to zero equity.
+        assert!(engine.positions.get(&(1, btc_sym())).is_none(), "hung position cleared");
+        let b = engine.accounts.get(&1).unwrap();
+        assert_eq!(b.equity, 0, "deficit socialized, account zeroed");
+        assert_eq!(b.status, RiskStatus::Normal, "flat & settled");
+        drop(b);
+        // Conservation in the REALIZED domain: the surviving shorts still
+        // carry unrealized PnL (marked far from entry), which nets to
+        // zero only когда everyone is flat — strip it before comparing.
+        let e1_realized: i64 = engine
+            .accounts
+            .iter()
+            .map(|a| a.equity - a.unrealized_pnl)
+            .sum();
+        if e1_realized + engine.insurance_fund_atoms.load(Relaxed) != e0 {
+            for a in engine.accounts.iter() {
+                eprintln!(
+                    "user {}: equity={} upnl={} avail={} order={} used={}",
+                    a.user_id,
+                    a.equity,
+                    a.unrealized_pnl,
+                    a.available_margin.load(Relaxed),
+                    a.order_margin.load(Relaxed),
+                    a.used_margin
+                );
+            }
+            eprintln!(
+                "fund={} e0={} e1_realized={}",
+                engine.insurance_fund_atoms.load(Relaxed),
+                e0,
+                e1_realized
+            );
+            panic!("realized conservation broken");
+        }
+        assert!(
+            engine.insurance_fund_atoms.load(Relaxed) < 0,
+            "the fund absorbed the deficit (its job)"
+        );
+    }
+
+    #[test]
+    fn leverage_tier_gate_counts_existing_exposure() {
+        let tiers = crate::desk::risk::calc::parse_risk_tiers("1000:20,5000:10,:5");
+        let (engine, uid) = setup_with_reserved(10_000_000 * A);
+        // No position yet: a small order at 10x passes.
+        let small = 500 * 100_000_000; // $500 notional
+        assert!(engine.check_leverage_tier(uid, &btc_sym(), small, NOTIONAL_SCALE, &tiers, 10).is_ok());
+        // A $6000 order at 10x exceeds the 5_000-USDT/10x tier → only 5x.
+        let big = 6_000 * 100_000_000;
+        assert!(engine.check_leverage_tier(uid, &btc_sym(), big, NOTIONAL_SCALE, &tiers, 10).is_err());
+        assert!(engine.check_leverage_tier(uid, &btc_sym(), big, NOTIONAL_SCALE, &tiers, 5).is_ok());
+        // Existing exposure counts: open $5,000, then even $1 more at 10x trips.
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        assert!(
+            engine
+                .check_leverage_tier(uid, &btc_sym(), 100_000_000, NOTIONAL_SCALE, &tiers, 10)
+                .is_err(),
+            "tier must include current position notional"
+        );
+        // Disabled tiers always pass.
+        assert!(engine.check_leverage_tier(uid, &btc_sym(), i64::MAX / 2, NOTIONAL_SCALE, &[], 125).is_ok());
     }
 
     #[test]

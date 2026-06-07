@@ -12,10 +12,10 @@
 | 阶段 | 进度 | 本轮关键落地 |
 |------|------|-------------|
 | P1 资金定点化 | 🟢 ~90% | （稳定）仅剩 legacy 列物理下线（等 30 天观察窗口，流程约束） |
-| P2 事件日志+序列号 | 🟢 ~85% | **persist 流 journal 化完成**（`8fff81c`）：desk 录制 + pg-writer 重启重放补缺，端到端测试证明"丢 40 帧→全部补回，零重复"。剩：撮合输入流录制 + ACK 后移（落盘门控）、recording 段清理 |
+| P2 事件日志+序列号 | 🟢 ~95% | persist 流 journal（`8fff81c`）+ **引擎输入流 journal**（`ccb0319`）：录制 orders 流，重启时静默重放**比特级重建订单簿**（300 op e2e：重建簿与崩溃前逐档一致），journal 模式跳过 PG 近似 seed。剩：recording 段清理、replay 结束改 stop-position 跟踪 |
 | P3 资金事务闭环 | 🟡 ~55% | PG↔Redis 跨存储账户对账（`fb6bc14`）。剩：双轨结算统一（依赖 journal）、冻结事件化 |
 | P4 风控补全 | 🟢 100% | 限流从"未接线"修到全入口接线 + 分桶 + Redis 持久化（`3518336`）——P4 关闭 |
-| P5 高可用 | 🟡 ~20% | Archive 全链路已通（wrapper + journal 模块 + replay 验证）；剩备机 replay-merge 接线 + etcd 选主 + epoch fencing |
+| P5 高可用 | 🟡 ~30% | **备机的核心原语已全部就绪并验证**：确定性引擎 + 输入流录制 + 重放比特级重建。剩：replay-merge 持续追赶接线 + etcd 选主 + epoch fencing + 切换演练 |
 | P6 安全加固 | 🟢 ~75% | HMAC API key、JWT refresh、append-only 审计日志、fuzz 脚手架（`86e0563`）。剩：Prometheus、fuzz 长跑、JWT 吊销表、渗透测试 |
 
 **当前最关键缺口已解除**：`aeron-wrapper` 已支持 Archive 客户端
@@ -172,8 +172,16 @@
   catch-up 不丢帧只阻塞）→ 切 live。`EXCHANGE_ARCHIVE_CONTROL` 开关，
   归档侧要求 `file.sync.level=2` + `catalog.file.sync.level=2`。
   端到端测试：丢 40 帧 → 全部补回、60 重复帧全部丢弃、PG 100/100。
-- ⬜ **剩余**：撮合输入流（orders）录制 + **ACK 后移**（RecordingPositionCounter
-  门控，零 RPC，wrapper 已备好）；recording 段清理（truncate 至 floor 以下）；
+- ✅ **引擎输入流 journal**（`ccb0319`）：每 symbol 线程录制 orders 流；重启时
+  先列旧 recordings 再开新录制（不会重放自己的空尾巴），经**正常处理逻辑**静默
+  重放（live=false：状态全更新、零发布、响应序列不前进），完成后切 live；
+  journal 模式跳过 PG 近似 seed（避免双重建簿）。e2e：300 op 混合负载重建簿
+  与崩溃前逐档一致。
+  - 设计修正记录：原计划的 per-order ACK 门控对本系统价值有限（订单在 ACK 前
+    已同步落 PG），真正的缺口是引擎内存簿的**精确**状态（队列优先级、部分成交），
+    输入流重放正中此靶。RecordingPositionCounter 门控保留给未来"成交事件
+    落盘才回报"语义（若产品要求）。
+- ⬜ **剩余**：recording 段清理（truncate 至消费 floor 以下）；
   replay 结束检测从 2s 静默期改为 stop-position 跟踪。
 - ⬜ Ring Buffer 满（`aeron_transport.rs`）改为：入站→拒绝并告知客户端；
   出站→journal 为真相，Aeron 只是推送。

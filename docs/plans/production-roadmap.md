@@ -15,12 +15,16 @@
 | P2 事件日志+序列号 | 🟢 100% | persist+引擎输入双 journal、exactly-once 位点、事件驱动 replay 完成检测、retention 清理（`5345f04`）。**关闭** |
 | P3 资金事务闭环 | 🟢 100% | settle+trade 单事务+全局唯一键、append-only fund_audit 全腿流水、journal-audit 三方对账工具（`87c1c55`）。**关闭** |
 | P4 风控补全 | 🟢 100% | 关闭（`3518336`） |
-| P5 高可用 | 🟢 ~80% | **PG 选主+epoch fencing+standby 引擎**（`d8feae9`）：备机=journal 重放+live 静默 apply，赢锁才发布，desk 拒旧 epoch（zombie 防护端到端）。剩：多机故障演练（RTO 实测）、PG 主从/PITR——部署工作非代码 |
+| P5 高可用 | 🟢 ~90% | 选主+fencing+standby（`d8feae9`）+ **单机 failover 演练通过：RTO 实测 3.05s ≤ 要求 180s**（`c30fb25`）。剩：PG 主从/PITR 与跨机演练（部署工作） |
 | P6 安全加固 | 🟢 ~95% | 全套密钥/认证/审计/metrics/fuzz 完成（`9c12605`/`f0d7070`）；engine+desk 热路径埋点、文件 secret。剩仅 TODO 三项（双人复核/KYC/渗透测试，见 deferred-todos.md），均非代码 |
 
-**代码侧工作面已基本清空。** 剩余四类：①混沌测试执行（Gate 2/4/5 的脚本化演练，
-基础设施已齐）；②多机部署件（PG 主从、双机 failover 演练）；③外部（渗透测试）。
-P1-P4 全部关闭；P5 剩多机部署件；P6 剩渗透测试。
+**Gate 2/4/5 已实测通过**（`c30fb25`，真实进程 SIGKILL）：
+- Gate 2：100 次 kill -9 下 3000 帧零丢失零重复；
+- Gate 5：**failover RTO 实测 3.05s**（用户硬性要求 ≤180s，余量 59 倍），
+  standby 静默、epoch fencing、接管后可撤 failover 前挂单（无缝）；
+- Gate 4：闪崩 -6% 触发熔断 → 仅撤单 → 冷却恢复，全链路过线。
+剩余：①多机部署件（PG 主从/PITR、跨机演练——部署工作）；②外部（渗透测试）；
+③已延后 TODO（双人复核/KYC，见 deferred-todos.md）。
 
 ### 本轮设计决定（用户拍板，已存档）
 

@@ -3,6 +3,7 @@ pub mod account_repository;
 pub mod api;
 pub mod counter_shard;
 pub mod db;
+pub mod funding;
 pub mod leader;
 pub mod metrics;
 pub mod models;

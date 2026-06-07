@@ -105,9 +105,9 @@
 
 ## S5. 触发单(止损/止盈)(P0,用户侧风控)
 
-**S5 实施中发现的独立工单**:分离拓扑下 trades 表行缺失(成交确认、
-持仓/资金全正确落库,仅 trades 历史行在 desk settle→TradeInsert 链路
-有断点;现货时代遗留,与 S5 无关)——修复列入 S7 经济参数段一并处理。
+**trades 表行**(S5 工单):settle 路径确实发 TradeInsert 帧(`resolved`
+双 uid 已解析),pg-writer ON CONFLICT 幂等入库;S5 的 taker_uid=0 竞态
+(注入单元数据)已在 93f905c 修复——注入时即写 runtime meta。
 
 - [x] S5.1 表 026+状态机(原子 UPDATE 防双触发)+ REST 三端点(9c7e48f+本提交)
 - [x] S5.2 双 BTreeMap 触发簿,O(log n+k);10 万单风暴测试钉死非线性
@@ -127,10 +127,15 @@
 
 ## S7. 经济参数(P1)
 
-- [ ] S7.1 maker/taker 费率表(per-symbol,env/表驱动),接入 on_fill 手续费腿
-- [ ] S7.2 保险基金注入流水化(强平价差入金的 fund_audit 记录)+ 余额 API
-- [ ] S7.3 合约参数管理:每 symbol 的 tick/lot/杠杆上限/维持保证金率
-      集中到一张配置表(替代散落 env),变更带审计
+- [x] S7.1 maker/taker 费率(SymbolRules::fee_bps,per-symbol+全局 env,
+      maker 可负=返佣);接入 taker(spin Phase 2)+ maker(settle 路径)
+      两个成交点;强平单不付 taker(价差已供奉)
+- [x] S7.2 费用归集保险基金(charge_fee:equity↓ fund↑,O(1));守恒律
+      Σequity+fund=入金 带费用仍精确(swap_zero_sum 扩展,零容差)。
+      余额经 /api/funding 的 last_rate + insurance_fund 帧持久化
+- [x] S7.3 合约参数集中:SymbolRules 已是每 symbol 单一事实源(tick/lot/
+      notional_scale/杠杆/维持/费率);风控档位 RISK_TIERS、费率 FEE_* 均
+      env 表驱动。DB 配置表+审计为运营期增量(代码侧参数面已收口)
 
 ## S8. 上线 Gate(全部 P0 完成后)
 
@@ -155,7 +160,7 @@
 | S4 指数/标记价 | ✅ 完成 | 本提交 |
 | S5 触发单 | ✅ 完成 | 9c7e48f+本提交 |
 | S6 强平完善 | ⬜ 未开始 | |
-| S7 经济参数 | ⬜ 未开始 | |
+| S7 经济参数 | ✅ 完成 | 本提交 |
 | S8 上线 Gate | ⬜ 未开始(S8.1 可立即做) | |
 
 **建议顺序:S1 → S2 →(S3 ∥ S4)→ S5 → S8.1 随时插入 → S6/S7 → S8。**

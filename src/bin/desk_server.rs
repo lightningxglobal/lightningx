@@ -1240,6 +1240,15 @@ fn process_db_cmd(
                     rules.maintenance_rate_bps,
                     0, // makers are never the liquidation order
                 );
+                // S7: maker fee on this fill's notional → insurance fund.
+                let (maker_bps, _) = lightning_exchange::desk::symbol_rules::SymbolRules::fee_bps(sym_str);
+                let fill_notional = lightning_exchange::desk::risk::calc::calc_notional_atoms(
+                    fp_ticks, fq_lots, rules.notional_scale,
+                );
+                risk_engine.charge_fee(
+                    e.maker_uid,
+                    lightning_exchange::desk::risk::calc::fee_atoms(fill_notional, maker_bps),
+                );
                 for frame in lightning_exchange::desk::risk_persist::margin_state_frames(
                     risk_engine,
                     e.maker_uid,
@@ -3723,6 +3732,23 @@ async fn async_main() -> anyhow::Result<()> {
                                         rules.maintenance_rate_bps,
                                         meta.liq_price_ticks,
                                     );
+                                    // S7: taker fee (liquidation orders pay
+                                    // none — their spread already funds the
+                                    // exchange).
+                                    if meta.liq_price_ticks == 0 {
+                                        let (_, taker_bps) =
+                                            lightning_exchange::desk::symbol_rules::SymbolRules::fee_bps(sym_str);
+                                        let fill_notional =
+                                            lightning_exchange::desk::risk::calc::calc_notional_atoms(
+                                                fp_ticks, fq_lots, rules.notional_scale,
+                                            );
+                                        risk_engine.charge_fee(
+                                            meta.user_id,
+                                            lightning_exchange::desk::risk::calc::fee_atoms(
+                                                fill_notional, taker_bps,
+                                            ),
+                                        );
+                                    }
                                     // S1.3: persist the margin state this fill
                                     // produced. Absolute-state frames (position
                                     // row, account row, insurance fund) ride the

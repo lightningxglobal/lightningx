@@ -248,6 +248,23 @@ impl RiskEngine {
         events
     }
 
+    /// S7.2 — charge `fee_atoms` to `user_id` (negative = rebate credit)
+    /// and credit it to the insurance fund. equity and available both
+    /// move by −fee (realized cash out). Conservation:
+    /// Σequity + fund is unchanged, so the venue-wide law extends to fees
+    /// with no new term. O(1).
+    pub fn charge_fee(&self, user_id: i64, fee_atoms: i64) {
+        if fee_atoms == 0 {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(mut acct) = self.accounts.get_mut(&user_id) {
+            acct.equity -= fee_atoms;
+            acct.available_margin.fetch_sub(fee_atoms, Relaxed);
+        }
+        self.insurance_fund_atoms.fetch_add(fee_atoms, Relaxed);
+    }
+
     pub fn check_leverage_tier(
         &self,
         user_id: i64,

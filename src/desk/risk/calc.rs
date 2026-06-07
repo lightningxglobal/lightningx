@@ -72,6 +72,12 @@ pub fn calc_unrealized_pnl_atoms(
     ((diff as i128 * qty_lots as i128 * ATOMS_PER_CENT) / notional_scale as i128) as i64
 }
 
+/// S7.1 — fee on a fill: notional × fee_bps / 10_000, atoms. Negative
+/// bps (maker rebate) yields a negative fee (a credit). i128 throughout.
+pub fn fee_atoms(notional_atoms: i64, fee_bps: i64) -> i64 {
+    ((notional_atoms as i128 * fee_bps as i128) / 10_000) as i64
+}
+
 /// S6.1 — tiered liquidation: liquidate `tranche_bps` of the position
 /// per round instead of the whole book at once; each partial close
 /// resets the account to Normal and the next risk tick re-evaluates, so
@@ -241,6 +247,15 @@ mod tests {
         assert_eq!(notional, 5 * A);
         let margin = calc_initial_margin_atoms(notional, 10);
         assert_eq!(margin, 500_000);
+    }
+
+    #[test]
+    fn fee_basic_and_rebate() {
+        // 5000 USDT notional = 5e11 atoms; 5 bps taker = 2.5 USDT = 2.5e8.
+        assert_eq!(fee_atoms(500_000_000_000, 5), 250_000_000);
+        // Maker rebate (-1 bp) is a credit (negative fee).
+        assert_eq!(fee_atoms(500_000_000_000, -1), -50_000_000);
+        assert_eq!(fee_atoms(500_000_000_000, 0), 0);
     }
 
     #[test]

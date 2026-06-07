@@ -13,8 +13,11 @@
 //! does for taker+maker), forces a liquidation mid-run, then closes
 //! everything and checks the books. Pure engine-level: no PG, fast.
 
+use lightning_exchange::desk::risk::calc::{calc_notional_atoms, fee_atoms};
 use lightning_exchange::desk::risk::{PositionSide, RiskEngine};
 use std::sync::atomic::Ordering;
+
+const TAKER_BPS: i64 = 5;
 
 const SYM: [u8; 16] = *b"ZSUM_TST\0\0\0\0\0\0\0\0";
 const SCALE: i64 = 1_000_000; // exactness depends on scale == ATOMS_PER_CENT
@@ -69,6 +72,13 @@ fn matched_trade(
                 .expect("reserve — accounts funded amply for the test");
         }
         engine.on_fill(user, SYM, side, price, qty, fill_margin, SCALE, LEV, MBPS, lp);
+        // S7: charge a taker fee on every non-liquidation fill (both
+        // sides), credited to the fund. The conservation law must still
+        // hold EXACTLY with fees folded into the fund term.
+        if lp == 0 {
+            let notional = calc_notional_atoms(price, qty, SCALE);
+            engine.charge_fee(user, fee_atoms(notional, TAKER_BPS));
+        }
     }
 }
 

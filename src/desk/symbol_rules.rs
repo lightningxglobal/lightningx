@@ -72,6 +72,29 @@ impl FixedOrderInput {
 }
 
 impl SymbolRules {
+    /// S7.1 — maker/taker fee in basis points. Per-symbol override
+    /// FEE_<SYMBOL>_MAKER_BPS / _TAKER_BPS, else global MAKER_FEE_BPS /
+    /// TAKER_FEE_BPS, else defaults (maker 1bp, taker 5bp). Negative
+    /// maker (rebate) is allowed. The fee is charged on fill NOTIONAL and
+    /// credited to the insurance fund (S7.2).
+    pub fn fee_bps(symbol: &str) -> (i64, i64) {
+        let get = |keys: &[String], d: i64| -> i64 {
+            keys.iter()
+                .find_map(|k| std::env::var(k).ok().and_then(|v| v.parse().ok()))
+                .unwrap_or(d)
+        };
+        let up = symbol.to_uppercase();
+        let maker = get(
+            &[format!("FEE_{up}_MAKER_BPS"), "MAKER_FEE_BPS".into()],
+            1,
+        );
+        let taker = get(
+            &[format!("FEE_{up}_TAKER_BPS"), "TAKER_FEE_BPS".into()],
+            5,
+        );
+        (maker, taker)
+    }
+
     pub fn for_symbol(symbol: &str) -> Self {
         match symbol {
             "BTC_USDT" => Self {

@@ -290,6 +290,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/unrevoke", post(handle_admin_unrevoke))
         .route("/api/admin/config", get(handle_admin_get_config).post(handle_admin_set_config))
         .route("/api/admin/force-close", post(handle_admin_force_close))
+        .route("/api/deposit/credit", post(handle_deposit_credit))
         // User profile & KYC
         .route(
             "/api/user/profile",
@@ -446,6 +447,135 @@ fn admin_authorized(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .is_some_and(|t| t == expected)
+}
+
+/// Service auth for the deposit watcher: EXCHANGE_DEPOSIT_TOKEN bearer
+/// (≥32 bytes). Separate from the human admin token so the on-chain
+/// service has its own least-privilege credential.
+fn deposit_service_authorized(headers: &HeaderMap) -> bool {
+    let Ok(expected) = std::env::var("EXCHANGE_DEPOSIT_TOKEN") else {
+        return false;
+    };
+    if expected.len() < 32 {
+        return false;
+    }
+    headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|t| t == expected)
+}
+
+#[derive(serde::Deserialize)]
+struct DepositCreditRequest {
+    chain: String,
+    tx_hash: String,
+    #[serde(default)]
+    log_index: i32,
+    user_id: i64,
+    asset: String,
+    /// Atoms (1e-8). The watcher converts the on-chain amount once.
+    amount_atoms: i64,
+    from_address: Option<String>,
+    to_address: Option<String>,
+}
+
+/// The narrow deposit interface (T-deposit): the off-chain watcher calls
+/// this ONCE per confirmed on-chain transfer. Idempotent by
+/// (chain, tx_hash, log_index); credits the user's virtual sub-account in
+/// one transaction (balance + fund_audit + deposit row) and publishes an
+/// AccountSet frame so Redis + every desk converge. The matching engine
+/// is never involved.
+async fn handle_deposit_credit(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DepositCreditRequest>,
+) -> impl IntoResponse {
+    if !deposit_service_authorized(&headers) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "deposit service token required"})))
+            .into_response();
+    }
+    if req.amount_atoms <= 0 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "amount must be positive"})))
+            .into_response();
+    }
+    // The crediting desk must own this user's shard (account state is
+    // sharded); the watcher should route to the owning desk, but reject
+    // cleanly if misrouted.
+    if let Err(e) = ensure_user_owned_by_this_desk(req.user_id, s.desk_id) {
+        return e.into_response();
+    }
+    let repo = crate::desk::account_repository::AccountRepository::new(s.db.as_ref());
+    let res = repo
+        .credit_chain_deposit(
+            &req.chain,
+            &req.tx_hash,
+            req.log_index,
+            req.user_id,
+            &req.asset,
+            req.amount_atoms,
+            req.from_address.as_deref(),
+            req.to_address.as_deref(),
+        )
+        .await;
+    let (credited, new_balance) = match res {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+                .into_response();
+        }
+    };
+
+    if credited {
+        // Refresh L1 (Redis hydrates account_cache lazily; invalidate so
+        // the next read reloads) and publish an AccountSet so other desks
+        // + Redis converge. frozen unchanged (a deposit is free balance).
+        s.account_cache.remove(&req.user_id);
+        if let Some(pp) = s.persist_pub.as_ref() {
+            let balance = new_balance as f64 / 100_000_000.0;
+            match account_set_payload(req.user_id, &req.asset, balance, 0.0) {
+                Ok(mut payload) => {
+                    payload.balance_atoms = new_balance;
+                    payload.frozen_atoms = 0; // overwritten below if frozen exists
+                    // Preserve any existing frozen by reading it.
+                    if let Ok(frz) = sqlx::query_scalar::<_, i64>(
+                        "SELECT frozen_atoms FROM accounts WHERE user_id = $1 AND asset = $2",
+                    )
+                    .bind(req.user_id)
+                    .bind(&req.asset)
+                    .fetch_one(s.db.as_ref())
+                    .await
+                    {
+                        payload.frozen_atoms = frz;
+                        payload.frozen = frz as f64 / 100_000_000.0;
+                    }
+                    let _ = pp.push(crate::transport::persist_event::PersistFrame::account_set(payload));
+                }
+                Err(e) => tracing::warn!("deposit: skip AccountSet frame: {e}"),
+            }
+        }
+        user_service::audit(
+            &s.db,
+            Some(req.user_id),
+            "deposit_credit",
+            None,
+            json!({
+                "chain": req.chain, "tx_hash": req.tx_hash, "log_index": req.log_index,
+                "asset": req.asset, "amount_atoms": req.amount_atoms,
+            }),
+        )
+        .await;
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "credited": credited,           // false = already applied (idempotent)
+            "new_balance_atoms": new_balance,
+            "tx_hash": req.tx_hash,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]

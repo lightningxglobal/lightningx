@@ -69,6 +69,21 @@ curl -s localhost:4003/api/admin/force-close -H "Authorization: Bearer $ADMIN" \
   -d '{"user_id":42,"symbol":"BTC_USDT"}'
 ```
 
+## 充值入账接口（链上服务调用，service token）
+链上充值监听器在确认 N 个区块后,对每笔到账**调用一次**(按
+`(chain, tx_hash, log_index)` 幂等,重放/重组重扫不会重复入账)。撮合
+引擎完全不参与——入账是账本上的一笔 AccountSet + fund_audit,单事务。
+```bash
+curl -s localhost:4003/api/deposit/credit   -H "Authorization: Bearer $EXCHANGE_DEPOSIT_TOKEN"   -d '{"chain":"TRON","tx_hash":"0xabc...","log_index":0,
+       "user_id":42,"asset":"USDT","amount_atoms":100000000000,
+       "from_address":"T...","to_address":"T..."}'
+# → {"credited":true,"new_balance_atoms":100000000000,"tx_hash":"0xabc..."}
+# 重放同一 tx → {"credited":false,...}（幂等,余额不变）
+```
+`amount_atoms` 是 1e-8 单位(链上服务换算一次)；入账后发 AccountSet 帧,
+Redis 与各 desk 自动收敛；走 fund_audit append-only 留痕。**与撮合解耦**,
+链上团队对接此一个窄接口即可。每日对账:Σ虚拟账户 USDT = 链上钱包总额。
+
 ## 沙箱
 testnet 本身即沙箱：资金来自注册种子 + `/api/test-funds` + admin 调账，
 无真实资金风险。

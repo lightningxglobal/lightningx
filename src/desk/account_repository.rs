@@ -51,6 +51,97 @@ impl<'a> AccountRepository<'a> {
         Self { pool }
     }
 
+    /// Credit a confirmed on-chain deposit to a user's virtual sub-account
+    /// — the narrow interface the deposit watcher calls after N
+    /// confirmations. EXACTLY ONCE per (chain, tx_hash, log_index): the
+    /// chain_deposits UNIQUE constraint + ON CONFLICT DO NOTHING makes a
+    /// replayed/duplicate delivery a harmless no-op. All in ONE
+    /// transaction: deposit row + balance credit + fund_audit, so a crash
+    /// can neither credit without recording nor record without crediting.
+    ///
+    /// Returns (credited, new_balance_atoms): credited=false means this
+    /// transfer was already applied (idempotent skip).
+    pub async fn credit_chain_deposit(
+        &self,
+        chain: &str,
+        tx_hash: &str,
+        log_index: i32,
+        user_id: i64,
+        asset: &str,
+        amount_atoms: i64,
+        from_address: Option<&str>,
+        to_address: Option<&str>,
+    ) -> Result<(bool, i64)> {
+        if amount_atoms <= 0 {
+            return Err(anyhow!("deposit amount must be positive"));
+        }
+        let mut tx = self.pool.begin().await?;
+
+        // Idempotency anchor: insert the deposit row. ON CONFLICT means
+        // this (chain, tx_hash, log_index) was already credited.
+        let inserted = sqlx::query(
+            "INSERT INTO chain_deposits
+                (chain, tx_hash, log_index, user_id, asset, amount_atoms,
+                 from_address, to_address)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (chain, tx_hash, log_index) DO NOTHING",
+        )
+        .bind(chain)
+        .bind(tx_hash)
+        .bind(log_index)
+        .bind(user_id)
+        .bind(asset)
+        .bind(amount_atoms)
+        .bind(from_address)
+        .bind(to_address)
+        .execute(&mut *tx)
+        .await?;
+
+        if inserted.rows_affected() == 0 {
+            // Already credited — return the current balance, no double credit.
+            tx.rollback().await?;
+            let bal: i64 = sqlx::query_scalar(
+                "SELECT balance_atoms FROM accounts WHERE user_id = $1 AND asset = $2",
+            )
+            .bind(user_id)
+            .bind(asset)
+            .fetch_optional(self.pool)
+            .await?
+            .unwrap_or(0);
+            return Ok((false, bal));
+        }
+
+        // Credit the balance (create the account row if first-ever).
+        let new_balance: i64 = sqlx::query_scalar(
+            "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+             VALUES ($1, $2, $3, 0)
+             ON CONFLICT (user_id, asset) DO UPDATE SET
+                balance_atoms = accounts.balance_atoms + EXCLUDED.balance_atoms,
+                updated_at = NOW()
+             RETURNING balance_atoms",
+        )
+        .bind(user_id)
+        .bind(asset)
+        .bind(amount_atoms)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Append-only audit row in the SAME transaction.
+        sqlx::query(
+            "INSERT INTO fund_audit (user_id, asset, kind, amount_atoms, ref_id)
+             VALUES ($1, $2, 'deposit', $3, $4)",
+        )
+        .bind(user_id)
+        .bind(asset)
+        .bind(amount_atoms)
+        .bind(0i64)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok((true, new_balance))
+    }
+
     pub async fn get_account(&self, user_id: i64, asset: &str) -> Result<DbAccount> {
         sqlx::query_as::<_, DbAccount>("SELECT * FROM accounts WHERE user_id = $1 AND asset = $2")
             .bind(user_id)

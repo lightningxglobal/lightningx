@@ -33,6 +33,10 @@ pub struct AccountRiskState {
     pub maintenance_margin: i64,
     pub unrealized_pnl: i64,
     pub status: RiskStatus,
+    /// B2: guard against stale-equity false liquidation after hydration.
+    /// Set to true by update_mark_price() the first time mark is updated for
+    /// any of this account's symbols. run_risk_tick() skips unhydrated accounts.
+    pub mark_price_ever_updated: bool,
 }
 
 impl RiskStatus {
@@ -125,6 +129,7 @@ impl AccountRiskState {
             maintenance_margin: 0,
             unrealized_pnl: 0,
             status: RiskStatus::Normal,
+            mark_price_ever_updated: false,
         }
     }
 

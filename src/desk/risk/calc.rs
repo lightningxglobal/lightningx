@@ -113,21 +113,45 @@ pub fn max_leverage_for_notional(notional_atoms: i64, tiers: &[(i64, u8)]) -> u8
 }
 
 /// Parse "1000000:20,5000000:10,:5" (bounds in whole USDT) into atoms
-/// tiers. Unparseable entries are skipped; an empty result means "no
-/// tiering" and callers should treat it as disabled.
+/// tiers. Unparseable entries are logged and skipped; an empty result means
+/// "no tiering" and callers should treat it as disabled.
 pub fn parse_risk_tiers(spec: &str) -> Vec<(i64, u8)> {
-    spec.split(',')
+    let tiers: Vec<(i64, u8)> = spec
+        .split(',')
         .filter_map(|part| {
-            let (bound, lev) = part.split_once(':')?;
-            let lev: u8 = lev.trim().parse().ok()?;
+            let Some((bound, lev)) = part.split_once(':') else {
+                // B6: log each malformed entry so operators notice misconfiguration.
+                tracing::error!("RISK_TIERS: invalid entry (missing ':'): {:?}", part);
+                return None;
+            };
+            let Ok(lev) = lev.trim().parse::<u8>() else {
+                tracing::error!("RISK_TIERS: invalid leverage in entry {:?}", part);
+                return None;
+            };
             let bound_atoms = if bound.trim().is_empty() {
                 i64::MAX
             } else {
-                bound.trim().parse::<i64>().ok()?.checked_mul(100_000_000)?
+                let Ok(usdt) = bound.trim().parse::<i64>() else {
+                    tracing::error!("RISK_TIERS: invalid bound in entry {:?}", part);
+                    return None;
+                };
+                let Some(atoms) = usdt.checked_mul(100_000_000) else {
+                    tracing::error!("RISK_TIERS: bound overflow in entry {:?}", part);
+                    return None;
+                };
+                atoms
             };
             Some((bound_atoms, lev))
         })
-        .collect()
+        .collect();
+    // B6: if every entry failed to parse, leverage limits are silently disabled.
+    if tiers.is_empty() && !spec.trim().is_empty() {
+        tracing::warn!(
+            "leverage limits disabled -- all RISK_TIERS entries failed to parse (spec={:?})",
+            spec
+        );
+    }
+    tiers
 }
 
 #[cfg(test)]
@@ -293,5 +317,17 @@ mod tests {
         // naive i64: ticks*lots*1e6 = 1e22 — would wrap. i128: exact.
         let notional = calc_notional_atoms(price_ticks, qty_lots, BTC_SCALE);
         assert_eq!(notional, 10_000_000_000_000_000); // 100M USDT in atoms
+    }
+
+    /// B6: a fully malformed RISK_TIERS string must produce an empty Vec
+    /// (no panic, no partially-valid state).
+    #[test]
+    fn parse_risk_tiers_malformed_returns_empty() {
+        let tiers = parse_risk_tiers("nonsense,alsobad,12345");
+        assert!(
+            tiers.is_empty(),
+            "B6: all malformed entries must yield an empty tier list, got: {:?}",
+            tiers
+        );
     }
 }

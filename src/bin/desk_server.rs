@@ -2195,7 +2195,7 @@ async fn async_main() -> anyhow::Result<()> {
             FundingConfig, FundingScheduler, PremiumTracker, apply_in_memory,
             compute_settlement, load_funding_schedule,
         };
-        let cfg = FundingConfig::from_env();
+        let cfg = FundingConfig::from_env().expect("invalid FUNDING_CLAMP_E9 or FUNDING_INTEREST_E9 env var");
         let persisted = load_funding_schedule(&pool).await.unwrap_or_default();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2268,7 +2268,10 @@ async fn async_main() -> anyhow::Result<()> {
                         }
                     }
                     while let Some(boundary_ms) = sched.due(now_ms) {
-                        let cfg = FundingConfig::from_env();
+                        let cfg = FundingConfig::from_env().unwrap_or_else(|e| {
+                            tracing::error!("FundingConfig::from_env failed: {e}; using defaults");
+                            FundingConfig { period_secs: 28_800, interest_e9: 100_000, clamp_e9: 7_500_000 }
+                        });
                         let rate_e9 = tracker.close_period(&cfg);
                         let rules =
                             lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(sym);

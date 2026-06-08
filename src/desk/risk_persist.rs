@@ -157,6 +157,10 @@ pub async fn hydrate_from_pg(
             maintenance_margin: 0, // recomputed by the next risk tick
             unrealized_pnl: 0,
             status,
+            // B2: mark_price_ever_updated starts false; run_risk_tick skips this
+            // account until update_mark_price() sets it true, preventing false
+            // liquidations from stale equity right after hydration.
+            mark_price_ever_updated: false,
         };
         engine.accounts.insert(user_id, acct);
         stats.accounts += 1;

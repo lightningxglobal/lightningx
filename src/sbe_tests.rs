@@ -225,7 +225,10 @@ mod sbe_encoding_tests {
             std::mem::offset_of!(NewOrderRequest, response_stream_id),
             34
         );
-        assert_eq!(std::mem::offset_of!(NewOrderRequest, _pad), 38);
+        // reduce_only takes offset 38 (the first old _pad byte); _pad
+        // shrank to [u8; 9] at 39; symbol stays at 48 (struct still 64B).
+        assert_eq!(std::mem::offset_of!(NewOrderRequest, reduce_only), 38);
+        assert_eq!(std::mem::offset_of!(NewOrderRequest, _pad), 39);
         assert_eq!(std::mem::offset_of!(NewOrderRequest, symbol), 48);
         assert_eq!(
             std::mem::offset_of!(CancelOrderRequest, response_stream_id),

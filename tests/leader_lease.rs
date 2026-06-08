@@ -25,20 +25,20 @@ async fn lease_mutual_exclusion_takeover_and_epochs() {
     let role = format!("test-engine-{}", Uuid::new_v4());
 
     // A acquires; epoch starts at 1.
-    let a = try_acquire(&pg, &role, "node-a", 1.0).await.expect("a1");
+    let a = try_acquire(&pg, &role, "node-a", 0.5).await.expect("a1");
     let epoch_a = a.expect("A must win a free lease").epoch;
     assert_eq!(epoch_a, 1);
 
     // B cannot acquire while A's lease is live.
-    let b = try_acquire(&pg, &role, "node-b", 1.0).await.expect("b1");
+    let b = try_acquire(&pg, &role, "node-b", 0.5).await.expect("b1");
     assert!(b.is_none(), "mutual exclusion while lease is live");
 
     // A renews: SAME epoch (renewal is not a change of ownership).
-    let a2 = try_acquire(&pg, &role, "node-a", 1.0).await.expect("a2");
+    let a2 = try_acquire(&pg, &role, "node-a", 0.5).await.expect("a2");
     assert_eq!(a2.expect("renewal").epoch, epoch_a);
 
     // A dies (no renewal); after expiry B takes over with epoch+1.
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     let b2 = try_acquire(&pg, &role, "node-b", 5.0).await.expect("b2");
     let epoch_b = b2.expect("takeover after expiry").epoch;
     assert_eq!(epoch_b, epoch_a + 1, "takeover bumps the fencing token");

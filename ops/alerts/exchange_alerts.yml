@@ -1,0 +1,90 @@
+# VictoriaMetrics / Prometheus alerting rules — testnet T5.
+# Load into vmalert: `vmalert -rule=ops/alerts/exchange_alerts.yml ...`
+# Mirrors the runbook §10 alarm table. Metric names are the exact
+# gauges/counters the desk + pg-writer expose on /metrics.
+groups:
+  - name: exchange-reliability
+    rules:
+      - alert: NoLeaderOrEngineStalled
+        # Orders accepted should keep climbing under live flow; flat for
+        # 2m during market hours means the engine isn't processing.
+        expr: increase(engine_orders_total[2m]) == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Engine processed no orders in 2m (no leader / stalled)"
+
+      - alert: PersistQueueBacklog
+        expr: persist_queue_depth > 50000
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "pg-writer bridge backlog {{ $value }} — falling behind"
+
+      - alert: PersistFramesDropped
+        expr: increase(pgw_bridge_dropped_total[5m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "pg-writer DROPPED frames — data-loss window, investigate now"
+
+      - alert: SeqGap
+        expr: increase(pgw_seq_gap_total[5m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "persist stream sequence GAP — run journal-audit"
+
+      - alert: ReconcileViolation
+        expr: increase(pgw_reconcile_violations_total[10m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "reconcile found a drift/violation — freeze withdrawals, investigate"
+
+      - alert: FencedDropsPersisting
+        # A brief burst right after failover is normal; sustained means a
+        # zombie old leader is still publishing.
+        expr: increase(desk_fenced_drops_total[5m]) > 0
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "desk still fencing old-epoch messages after 5m — zombie leader?"
+
+  - name: exchange-risk
+    rules:
+      - alert: IndexFrozen
+        # Below quorum → marks freeze → liquidations/funding stall.
+        expr: increase(index_frozen_total[5m]) > 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "index below source quorum — marks frozen, risk engine blind"
+
+      - alert: MarkUpdatesFrozen
+        expr: increase(mark_update_frozen_total[5m]) > 100
+        for: 1m
+        labels: { severity: warn }
+        annotations:
+          summary: "many mark updates skipped (frozen index) — check price feeds"
+
+      - alert: IndexOutliersSustained
+        expr: increase(index_outliers_dropped_total[10m]) > 50
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "a price source keeps deviating — inspect / drop it"
+
+      - alert: CircuitBreakerTrip
+        expr: increase(engine_circuit_breaker_trips_total[1m]) > 0
+        for: 0m
+        labels: { severity: warn }
+        annotations:
+          summary: "circuit breaker tripped — notify trading/risk desk"
+
+      - alert: OrderRejectSpike
+        expr: increase(orders_rejected_total[5m]) > 1000
+        for: 2m
+        labels: { severity: warn }
+        annotations:
+          summary: "order reject rate elevated — risk limits or a client bug"

@@ -1,0 +1,332 @@
+{
+  "title": "Lightning Exchange — Swap (testnet)",
+  "uid": "lightning-swap",
+  "schemaVersion": 39,
+  "version": 1,
+  "timezone": "",
+  "tags": [
+    "lightning",
+    "swap"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "撮合 / 吞吐 / 延迟",
+      "type": "row",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "title": "订单/成交速率 (per s)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(engine_orders_total[1m])",
+          "legendFormat": "orders/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(engine_trades_total[1m])",
+          "legendFormat": "trades/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "拒单速率",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(orders_rejected_total[1m])",
+          "legendFormat": "rejects/s",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "可靠性 / 持久化 / HA",
+      "type": "row",
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 5,
+      "title": "pg-writer 桥接队列深度",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "persist_queue_depth",
+          "legendFormat": "depth",
+          "refId": "A"
+        },
+        {
+          "expr": "pgw_bridge_queue_depth",
+          "legendFormat": "bridge",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "丢帧 / seq gap / 重复 (累计)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "pgw_bridge_dropped_total",
+          "legendFormat": "dropped",
+          "refId": "A"
+        },
+        {
+          "expr": "pgw_seq_gap_total",
+          "legendFormat": "seq_gap",
+          "refId": "B"
+        },
+        {
+          "expr": "pgw_checkpoint_dup_total",
+          "legendFormat": "dup",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "对账违规 / fencing / order-update gap (累计)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "pgw_reconcile_violations_total",
+          "legendFormat": "reconcile",
+          "refId": "A"
+        },
+        {
+          "expr": "desk_fenced_drops_total",
+          "legendFormat": "fenced",
+          "refId": "B"
+        },
+        {
+          "expr": "desk_order_update_gaps_total",
+          "legendFormat": "ou_gaps",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "pg-writer 已应用 (累计)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "pgw_applied_total",
+          "legendFormat": "applied",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "风控 / 指数 / 标记价",
+      "type": "row",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false
+    },
+    {
+      "id": 10,
+      "title": "指数聚合: ok / frozen / outliers (累计)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "index_aggregations_ok_total",
+          "legendFormat": "ok",
+          "refId": "A"
+        },
+        {
+          "expr": "index_frozen_total",
+          "legendFormat": "frozen",
+          "refId": "B"
+        },
+        {
+          "expr": "index_outliers_dropped_total",
+          "legendFormat": "outliers",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "标记价冻结跳过 + 熔断触发 (累计)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 27,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "mark_update_frozen_total",
+          "legendFormat": "mark_frozen",
+          "refId": "A"
+        },
+        {
+          "expr": "engine_circuit_breaker_trips_total",
+          "legendFormat": "cb_trips",
+          "refId": "B"
+        }
+      ]
+    }
+  ]
+}

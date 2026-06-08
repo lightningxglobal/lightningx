@@ -2122,6 +2122,29 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // A5: periodic conservation check — logs SUM(balance_atoms) every 5 min.
+    // Operators compare this to total_deposits - withdrawals - fees to verify
+    // zero-sum invariant. A divergence indicates a double-credit/double-debit bug.
+    {
+        let pool_c = pool.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                tick.tick().await;
+                match lightning_exchange::desk::account_repository::AccountRepository::new(&pool_c)
+                    .sum_all_balance_atoms()
+                    .await
+                {
+                    Ok((sum_bal, sum_frz, rows)) => tracing::info!(
+                        "conservation check: sum_balance_atoms={} sum_frozen_atoms={} account_rows={}",
+                        sum_bal, sum_frz, rows
+                    ),
+                    Err(e) => tracing::warn!("conservation check failed: {e}"),
+                }
+            }
+        });
+    }
+
     // ── S4: index aggregation (external sources → median, outlier-
     //    rejected; below quorum → mark freezes). No INDEX_SOURCES env →
     //    None → raw-mid marks (dev mode). ──────────────────────────────

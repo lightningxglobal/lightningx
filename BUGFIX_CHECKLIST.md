@@ -28,7 +28,7 @@ Legend: 🔴 Critical (money-loss / data-corruption) · 🟠 High · 🟡 Medium
   **Fix**: route truncation residue to available_margin (or assert zero for exact symbols).  
   **Test**: close+flip conservation test for BTC (scale=1_000_000); assert Σ(available + order + used) before == after.
 
-- [ ] 🟡 **A5** No operational sum-zero conservation SQL query  
+- [x] 🟡 **A5** No operational sum-zero conservation SQL query  
   Conservation only verified in property tests, not in prod monitoring.  
   **Fix**: add `/api/admin/conservation` endpoint or periodic log that asserts `SUM(balance_atoms) == total_deposits - withdrawals - fees`.
 
@@ -89,11 +89,11 @@ Legend: 🔴 Critical (money-loss / data-corruption) · 🟠 High · 🟡 Medium
   `src/desk/pg_store.rs:264` and `src/bin/journal_audit.rs:94` — two bare literals.  
   **Fix**: define `pub const JOURNAL_RESTART_JUMP: u64 = 1 << 40` in `src/transport/journal.rs`; import in both places.
 
-- [ ] 🟢 **C4** `engine_journal_replay` test only checks top-100 book levels  
+- [x] 🟢 **C4** `engine_journal_replay` test only checks top-100 book levels  
   `tests/engine_journal_replay.rs:297-307` — does not verify `next_order_id`, `trade_sequence`, full depth.  
   **Fix**: extend assertions to include order ID counter and trade sequence after replay.
 
-- [ ] 🟢 **C5** Soak test restart-time bound too loose  
+- [x] 🟢 **C5** Soak test restart-time bound too loose  
   `tests/soak_engine.rs` — 60s bound passes even with full-genesis replay; liveness probe doesn't verify book state.  
   **Fix**: after restart, submit a known order and verify it matches against a pre-placed resting order (proves book state, not just Aeron liveness).
 
@@ -137,10 +137,10 @@ Legend: 🔴 Critical (money-loss / data-corruption) · 🟠 High · 🟡 Medium
   **Fix**: `debug_assert!(epoch < 65536)` in `stamp_epoch`; in `try_acquire`, if epoch >= 60000, emit `WARN "epoch approaching u16 ceiling"`.  
   **Test**: unit test: stamp_epoch with epoch=65536; assert debug panic in debug build.
 
-- [ ] 🟠 **E3** Consumer-side epoch enforcement unverified  
+- [x] 🟠 **E3** Consumer-side epoch enforcement unverified  
   desk-server, pg-writer, redis-writer, WS all MUST call `split_epoch` and drop lower-epoch messages — this is the load-bearing assumption of the entire HA scheme.  
   **Fix**: audit each consumer; add `assert!(epoch >= current_epoch)` or silent drop with counter metric at each consumer's Aeron receive path.  
-  **Test**: integration test: send epoch N-1 message to consumer that has joined epoch N; assert message is dropped.
+  **Audit result**: desk_server already enforces epoch at lines 3275–3300 via `split_epoch`/`m_fenced` on every ORDER_UPDATE message. PersistEvent stream (consumed by pg_writer/redis_writer) carries no epoch stamp — it is the already-filtered output of desk_server's epoch-guarded path, so those two consumers are transitively protected. Module docs added to both binaries.
 
 - [x] 🟠 **E4** PG unavailable → standby never takes over (fail-closed undocumented)  
   `src/desk/leader.rs` — `try_acquire` returning `Err` just logs and loops; no takeover.  

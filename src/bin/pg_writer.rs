@@ -3,6 +3,14 @@
 //! Postgres. Pairs with `redis-writer` (which applies the same stream to
 //! Redis L1) so PG writes can be pulled out of the desk-server hot path.
 //!
+//! # Epoch / leader-fencing
+//! PersistEvent frames do NOT carry a leader epoch — they are the
+//! already-filtered output of desk_server's ORDER_UPDATE receive path,
+//! which enforces epoch fencing before emitting any PersistEvent (see
+//! desk_server.rs — `split_epoch` guard, `m_fenced` metric). A stale
+//! ex-leader never publishes PersistFrames for the new epoch, so epoch
+//! enforcement here is transitively provided by desk_server.
+//!
 //! Environment:
 //!   DATABASE_URL    postgres://user:password@127.0.0.1:5432/mydb
 //!   AERON_DIR       /tmp/aeron (macOS default) or /dev/shm/aeron (Linux)

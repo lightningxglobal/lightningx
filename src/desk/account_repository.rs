@@ -627,6 +627,25 @@ impl<'a> AccountRepository<'a> {
         tx.commit().await?;
         Ok(())
     }
+
+    /// A5: Returns (sum_balance_atoms, sum_frozen_atoms, row_count) across ALL
+    /// account rows. Callers compare sum_balance_atoms against
+    /// `total_deposits_atoms - total_withdrawn_atoms - total_fees_atoms`
+    /// to verify the zero-sum conservation invariant.
+    ///
+    /// Safe to call at any time; runs a single aggregate SELECT (no lock).
+    pub async fn sum_all_balance_atoms(&self) -> Result<(i64, i64, i64)> {
+        let row: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT SUM(balance_atoms), SUM(frozen_atoms), COUNT(*) FROM accounts",
+        )
+        .fetch_one(self.pool)
+        .await?;
+        Ok((
+            row.0.unwrap_or(0),
+            row.1.unwrap_or(0),
+            row.2.unwrap_or(0),
+        ))
+    }
 }
 
 #[cfg(test)]

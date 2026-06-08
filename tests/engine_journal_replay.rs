@@ -247,8 +247,10 @@ fn replayed_engine_rebuilds_identical_book() {
     let mut engine_a = MatchingEngine::new(PoolConfig::default()).unwrap();
     let live_applied = drain(&client, &mut live_sub, &mut engine_a, Duration::from_secs(2));
     assert_eq!(live_applied, OPS, "engine A must see the whole workload");
-    let bids_a = engine_a.get_top_levels(100, true);
-    let asks_a = engine_a.get_top_levels(100, false);
+    // C4: capture the FULL engine state (not just top-100 levels) before "crash".
+    let snap_a = engine_a.snapshot_resting();
+    let bids_a = engine_a.get_top_levels(usize::MAX, true);
+    let asks_a = engine_a.get_top_levels(usize::MAX, false);
     assert!(
         !bids_a.is_empty() || !asks_a.is_empty(),
         "workload must leave a non-trivial book"
@@ -295,14 +297,29 @@ fn replayed_engine_rebuilds_identical_book() {
     assert_eq!(replay_applied, OPS, "journal must re-deliver every input op");
 
     // ── the property: bit-identical book state ───────────────────────────
+    let snap_b = engine_b.snapshot_resting();
     assert_eq!(
-        engine_b.get_top_levels(100, true),
+        engine_b.get_top_levels(usize::MAX, true),
         bids_a,
         "replayed bid book must equal the live engine's"
     );
     assert_eq!(
-        engine_b.get_top_levels(100, false),
+        engine_b.get_top_levels(usize::MAX, false),
         asks_a,
         "replayed ask book must equal the live engine's"
+    );
+    // C4: verify full engine counters match, not just top-N book levels.
+    assert_eq!(
+        snap_b.next_order_id, snap_a.next_order_id,
+        "next_order_id must match after replay"
+    );
+    assert_eq!(
+        snap_b.trade_sequence, snap_a.trade_sequence,
+        "trade_sequence must match after replay"
+    );
+    assert_eq!(
+        snap_b.orders.len(),
+        snap_a.orders.len(),
+        "resting order count must match after replay"
     );
 }

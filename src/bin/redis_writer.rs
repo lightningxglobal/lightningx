@@ -4,6 +4,14 @@
 //!      to Redis. Runs indefinitely; restarts safely (Redis state is
 //!      durable enough that warm restart skips hydrate).
 //!
+//! # Epoch / leader-fencing
+//! PersistEvent frames do NOT carry a leader epoch. Epoch enforcement is
+//! transitively provided by desk_server's ORDER_UPDATE receive path, which
+//! calls `split_epoch` and increments `m_fenced` before publishing any
+//! PersistEvent (see desk_server.rs). A zombie ex-leader therefore never
+//! produces PersistFrames at a new epoch, so no additional epoch check is
+//! needed here.
+//!
 //! Environment:
 //!   DATABASE_URL    postgres://user:password@127.0.0.1:5432/mydb
 //!   REDIS_URL       redis://127.0.0.1:6379/0

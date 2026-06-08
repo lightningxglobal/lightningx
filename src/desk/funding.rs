@@ -409,9 +409,15 @@ mod tests {
     /// B7: negative clamp must return Err.
     #[test]
     fn negative_clamp_returns_err() {
-        std::env::set_var("FUNDING_CLAMP_E9", "-1");
+        // SAFETY: test-local env mutation; no parallel tests read this var.
+        unsafe {
+            std::env::set_var("FUNDING_CLAMP_E9", "-1");
+        }
         let result = FundingConfig::from_env();
-        std::env::remove_var("FUNDING_CLAMP_E9");
+        // SAFETY: paired with set_var above.
+        unsafe {
+            std::env::remove_var("FUNDING_CLAMP_E9");
+        }
         assert!(
             result.is_err(),
             "B7: negative FUNDING_CLAMP_E9 must return Err"

@@ -180,6 +180,28 @@ async fn engine_does_not_degrade_under_sustained_load() {
 
         // ── Post-soak restart replay time (must be snapshot-bounded) ────
         assert!(engine.is_running(), "engine died during the soak");
+
+        // C5: place a known resting buy at a price far from market so it
+        // survives the soak unchanged. After restart we cross it to prove
+        // the book state was correctly replayed (not just Aeron liveness).
+        let probe_id = next_id;
+        next_id += 1;
+        const PROBE_PRICE: i64 = 5; // deep below market, will never trade during soak
+        wait_for("probe bid placed", Duration::from_secs(5), || {
+            client.do_work();
+            order_pub
+                .publish_new_order(&order(probe_id, 0, PROBE_PRICE, 1, resp_stream, 0))
+                .ok()
+        });
+        // Drain any ack so the probe is committed before kill9.
+        let until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < until {
+            client.do_work();
+            updates.do_work();
+            while updates.poll().is_some() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
         eprintln!("soak: {placed} orders over {soak_secs}s — measuring restart replay…");
         engine.kill9();
         std::thread::sleep(Duration::from_millis(300));
@@ -210,6 +232,38 @@ async fn engine_does_not_degrade_under_sustained_load() {
             None
         });
         let replay_ms = restart.elapsed().as_millis();
+
+        // C5: cross the probe resting bid with an IOC sell at the same price.
+        // If the book was correctly replayed, the sell fills immediately.
+        let probe_sell_id = next_id;
+        next_id += 1;
+        let probe_filled = wait_for("probe bid still resting after restart", Duration::from_secs(10), || {
+            client.do_work();
+            let _ = order_pub.publish_new_order(&order(probe_sell_id, 1, PROBE_PRICE, 1, resp_stream, 1));
+            let until = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < until {
+                client.do_work();
+                updates.do_work();
+                while let Some(m) = updates.poll() {
+                    let kind: u8 = m.kind;
+                    let oid: u64 = m.order_id;
+                    if (kind == order_update_kind::FILLED || kind == order_update_kind::PARTIAL_FILL)
+                        && oid == probe_sell_id
+                    {
+                        return Some(true);
+                    }
+                    if kind == order_update_kind::CANCELLED && oid == probe_sell_id {
+                        return Some(false); // probe bid missing — book state wrong
+                    }
+                }
+            }
+            None
+        });
+        assert!(
+            probe_filled,
+            "probe resting bid (id={probe_id}) was not present after restart — book state not replayed correctly"
+        );
+
         drop(engine2_guard(&mut engine2));
 
         (placed, samples, replay_ms)

@@ -3070,8 +3070,13 @@ async fn handle_debug_mark_price(
     // unrealized PnL and equity are recomputed deterministically.
     s.risk_engine
         .force_mark_price_for_test(sym_bytes, price_ticks);
-    s.risk_engine
-        .update_mark_price(sym_bytes, price_ticks, rules.notional_scale);
+    // Converge the EWMA to the target in ONE call so tests are
+    // deterministic (otherwise each call moves the mark only ~10% toward
+    // the target and the test must spin, which flakes under load).
+    for _ in 0..40 {
+        s.risk_engine
+            .update_mark_price(sym_bytes, price_ticks, rules.notional_scale);
+    }
 
     let events = s.risk_engine.run_risk_tick();
     let liq_count = events.len();

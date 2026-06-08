@@ -140,18 +140,12 @@ async fn victim_qty(pg: &sqlx::PgPool, uid: i64) -> Option<i64> {
     .expect("qty")
 }
 
-// IGNORED (run with `--ignored`): this full-topology drill regressed at
-// the POSITION-BUILD stage during the testnet T1-T7 work — the
-// trigger-injected leveraged buy stops filling the resting asks in this
-// specific construction (trigger fires correctly per the engine log;
-// asks reach the engine; 0 trades result). The LIQUIDATION logic it
-// targets is independently covered: tiered-tranche and ADL+socialization
-// are unit-tested (desk::risk::engine::tests::adl_clears_…, the tranche
-// tests), trigger FIRING is proven by chaos_trigger_fire, and
-// position-across-kill-9 by chaos_position_persist. Left active-but-
-// ignored rather than deleted so the market-construction hardening (or
-// the real fill regression, if any) is visible and gets fixed.
-#[ignore = "regressed at position-build; liquidation logic is unit-tested — see note"]
+// NOTE: this full-topology drill is timing-sensitive — the mark EWMA
+// convergence + trigger fire + liquidation rounds all run on real
+// processes, and under heavy concurrent test load the desk's tokio tasks
+// get starved (it passes reliably solo; it flaked only inside the
+// full-parallel `cargo test`). Deadlines are generous to tolerate
+// contention; DrillGuard serializes it against the other heavy drills.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tiered_liquidation_survives_kill9_between_rounds() {
     let Some(jar) = jar_path() else {
@@ -234,7 +228,7 @@ async fn tiered_liquidation_survives_kill9_between_rounds() {
         .expect("victim trigger");
     assert!(r.status().is_success(), "victim trigger rejected");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let q = victim_qty(&pg, victim_uid).await;
         if q == Some(1_000_000) {
@@ -254,10 +248,13 @@ async fn tiered_liquidation_survives_kill9_between_rounds() {
     // 0.005·M → LiquidationPending window is M ∈ (40025, 40226]. Pick
     // $40,150 (equity ≈ $125 ≤ maintenance ≈ $201) — NOT Bankruptcy,
     // which would route to ADL instead of the tranche path under test.
+    // Generous budget: under saturated parallel `cargo test` the desk's
+    // 10ms liquidation tick is heavily starved, so allow ~60s for the
+    // first tranche rather than assuming prompt scheduling.
     let mut reduced = None;
-    for _ in 0..40 {
-        force_mark(&http, 40_150.0).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..200 {
+        force_mark(&http, 40_150.0).await; // converges the mark in one call
+        tokio::time::sleep(Duration::from_millis(300)).await;
         match victim_qty(&pg, victim_uid).await {
             Some(q) if q < 1_000_000 => {
                 reduced = Some(q);
@@ -292,7 +289,7 @@ async fn tiered_liquidation_survives_kill9_between_rounds() {
     // Each tranche RESCUES the account (that's the point of tiering), so
     // finishing the job requires progressively deeper marks — walk the
     // price down 7% per probe until flat.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     let mut last = after_r1;
     let mut px = 40_150.0_f64;
     loop {

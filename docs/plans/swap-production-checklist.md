@@ -140,8 +140,9 @@
 ## S8. 上线 Gate(全部 P0 完成后)
 
 - [x] S8.1 journal 压测(`load_journal_throughput`,fsync level 2 全开):
-      **debug 实测 132k orders/s,p99 4.1ms**;打印完整分布;LOAD_ORDERS 可调。
-      结论:此盘 fsync level 2 完全可行,无需降级。release 更高
+      **release 实测 220k orders/s,p50 584µs,p99 1.06ms,p99.9 4.3ms**
+      (10 万单;debug 为 132k/s)。结论:此盘 fsync level 2 完全可行,
+      无需降级。LOAD_ORDERS 可调
 - [x] S8.2 合约语义混沌:全拓扑 kill -9 演练覆盖持仓持久化
       (`chaos_position_persist`,含真实 funding 结算)、触发单跨重启
       (`chaos_trigger_fire`)、分档强平跨重启(`chaos_liquidation`)、

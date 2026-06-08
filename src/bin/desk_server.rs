@@ -929,6 +929,7 @@ fn process_db_cmd(
     persist_pub: &std::sync::Arc<crossbeam_queue::ArrayQueue<PersistFrame>>,
     vwap_cache: &lightning_exchange::api::VwapCache,
     risk_engine: &std::sync::Arc<lightning_exchange::desk::risk::RiskEngine>,
+    exchange_config_pdc: &std::sync::Arc<lightning_exchange::desk::exchange_config::ExchangeConfig>,
 ) {
     match cmd {
         DbCmd::UpsertOrder {
@@ -1242,7 +1243,7 @@ fn process_db_cmd(
                     0, // makers are never the liquidation order
                 );
                 // S7: maker fee on this fill's notional → insurance fund.
-                let (maker_bps, _) = lightning_exchange::desk::symbol_rules::SymbolRules::fee_bps(sym_str);
+                let (maker_bps, _) = exchange_config_pdc.fee_bps(sym_str);
                 let fill_notional = lightning_exchange::desk::risk::calc::calc_notional_atoms(
                     fp_ticks, fq_lots, rules.notional_scale,
                 );
@@ -2156,6 +2157,13 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // ── T2: runtime exchange controls (halt/fees), hydrated from PG ───
+    let exchange_config = lightning_exchange::desk::exchange_config::ExchangeConfig::new();
+    match exchange_config.hydrate(&pool).await {
+        Ok(n) => tracing::info!("exchange_config hydrated: {n} symbol control row(s)"),
+        Err(e) => tracing::warn!("exchange_config hydrate failed: {e}"),
+    }
+
     // ── S5: trigger-order books (hydrated + fired by the task below,
     //    after AppState exists so it can reach the cmd queue) ───────────
     let trigger_books: Arc<
@@ -2318,6 +2326,7 @@ async fn async_main() -> anyhow::Result<()> {
         persist_pub: Some(persist_pub.clone()),
         funding_view: funding_view.clone(),
         trigger_books: trigger_books.clone(),
+        exchange_config: exchange_config.clone(),
         vwap_cache: vwap_cache.clone(),
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
         read_pool,
@@ -2396,6 +2405,7 @@ async fn async_main() -> anyhow::Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(256);
+        let exchange_config_send = exchange_config.clone();
         // S6.3: leverage tier table (RISK_TIERS env, e.g. "1000000:20,5000000:10,:5").
         let risk_tiers_send =
             lightning_exchange::desk::risk::calc::parse_risk_tiers(
@@ -2535,6 +2545,14 @@ async fn async_main() -> anyhow::Result<()> {
                                     fwd_rules.max_symbol_oi_lots,
                                 ) {
                                     reject(reason);
+                                    continue;
+                                }
+                                // T2 halt gate: order ENTRY is blocked for a
+                                // halted symbol (cancels/liquidations still
+                                // flow). reduce_only orders are de-risking,
+                                // so they are allowed through a halt.
+                                if req.reduce_only == 0 && exchange_config_send.is_halted(sym) {
+                                    reject("trading halted for this symbol");
                                     continue;
                                 }
                                 // reduce-only gate (testnet): reject orders
@@ -2867,6 +2885,7 @@ async fn async_main() -> anyhow::Result<()> {
         let rt_pub = tokio::runtime::Handle::current();
         let order_meta_cache_pub = open_order_meta.clone();
         let risk_engine_pub = state.risk_engine.clone();
+        let exchange_config_pub = state.exchange_config.clone();
         let index_agg_pub = index_agg.clone();
         let mark_frozen_pub = mark_frozen_count.clone();
         let mark_clamp_bps: i64 = std::env::var("MARK_CLAMP_BPS")
@@ -2967,6 +2986,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 &persist_pub_pub,
                                 &vwap_cache_pub,
                                 &risk_engine_pub,
+                                &exchange_config_pub,
                             );
                             settle_count = 0;
                         }
@@ -2987,6 +3007,7 @@ async fn async_main() -> anyhow::Result<()> {
                             &persist_pub_pub,
                             &vwap_cache_pub,
                             &risk_engine_pub,
+                            &exchange_config_pub,
                         );
                         settle_count = 0;
                     }
@@ -3115,6 +3136,7 @@ async fn async_main() -> anyhow::Result<()> {
             })
             .collect();
         let risk_engine = state.risk_engine.clone();
+        let exchange_config_recv = state.exchange_config.clone();
 
         let thread_name_recv = format!("d{desk_id}-recv");
         std::thread::Builder::new()
@@ -3430,7 +3452,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchUpsertOrder {
                                             entries: accepted_batch,
                                             count: accepted_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                                     accepted_count = 0;
                                 }
                                 accepted_batch[accepted_count] = OrderInsertEntry {
@@ -3463,7 +3485,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       false,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.unwrap_or("")),
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                             }
                             // kind == FILLED here means "first event was a full fill"
                             // (market / IOC). Skip INSERT — the order is already terminal,
@@ -3522,7 +3544,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     side: meta.side,
                                     qty: meta.qty,
                                     freeze_price: meta.freeze_price,
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                             }
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).
@@ -3589,7 +3611,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchCancelConfirmed {
                                             entries: cancel_batch,
                                             count: cancel_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                                     cancel_count = 0;
                                 }
                                 cancel_batch[cancel_count] = entry;
@@ -3602,7 +3624,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchDeleteOrder {
                                             ids: delete_batch,
                                             count: delete_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                                     delete_count = 0;
                                 }
                                 delete_batch[delete_count] = order_id as i64;
@@ -3613,7 +3635,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     id:     order_id as i64,
                                     status,
                                     filled: fill_qty,
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                             }
                         }
 
@@ -3751,8 +3773,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     // none — their spread already funds the
                                     // exchange).
                                     if meta.liq_price_ticks == 0 {
-                                        let (_, taker_bps) =
-                                            lightning_exchange::desk::symbol_rules::SymbolRules::fee_bps(sym_str);
+                                        let (_, taker_bps) = exchange_config_recv.fee_bps(sym_str);
                                         let fill_notional =
                                             lightning_exchange::desk::risk::calc::calc_notional_atoms(
                                                 fp_ticks, fq_lots, rules.notional_scale,
@@ -3809,7 +3830,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchUpsertOrder {
                                 entries: accepted_batch,
                                 count: accepted_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                         accepted_count = 0;
                     }
 
@@ -3819,7 +3840,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchDeleteOrder {
                                 ids: delete_batch,
                                 count: delete_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                         delete_count = 0;
                     }
 
@@ -3830,7 +3851,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchCancelConfirmed {
                                 entries: cancel_batch,
                                 count: cancel_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
                         cancel_count = 0;
                     }
 

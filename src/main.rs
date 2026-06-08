@@ -356,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         funding_view: std::sync::Arc::new(dashmap::DashMap::new()),
         trigger_books: std::sync::Arc::new(dashmap::DashMap::new()),
+        exchange_config: lightning_exchange::desk::exchange_config::ExchangeConfig::new(),
         db: Arc::new(pool),
         rate_limiter: rate_limiter.clone(),
         engines: Some(Arc::new(engines)),

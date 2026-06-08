@@ -250,6 +250,9 @@ pub struct AppState {
     /// last_rate_e9, running premium-TWAP estimate e9). Written by the
     /// desk's funding task, read-only here.
     pub funding_view: Arc<DashMap<String, (i64, i64, i64)>>,
+    /// Runtime exchange controls (T2 ops console): halt/fees per symbol,
+    /// mutated by admin endpoints without a restart.
+    pub exchange_config: Arc<crate::desk::exchange_config::ExchangeConfig>,
     /// Per-symbol trigger books (S5). REST inserts/cancels; the desk's
     /// trigger task pops due entries on mark moves. parking_lot::Mutex —
     /// held for O(log n) operations only.
@@ -285,6 +288,8 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(handle_metrics))
         .route("/api/admin/revoke", post(handle_admin_revoke))
         .route("/api/admin/unrevoke", post(handle_admin_unrevoke))
+        .route("/api/admin/config", get(handle_admin_get_config).post(handle_admin_set_config))
+        .route("/api/admin/force-close", post(handle_admin_force_close))
         // User profile & KYC
         .route(
             "/api/user/profile",
@@ -441,6 +446,170 @@ fn admin_authorized(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .is_some_and(|t| t == expected)
+}
+
+#[derive(serde::Deserialize)]
+struct SetConfigRequest {
+    symbol: String,
+    /// Any omitted field is left unchanged.
+    trading_halted: Option<bool>,
+    maker_fee_bps: Option<i64>,
+    taker_fee_bps: Option<i64>,
+    /// Pass null explicitly to CLEAR a fee override back to the default.
+    #[serde(default)]
+    clear_maker_fee: bool,
+    #[serde(default)]
+    clear_taker_fee: bool,
+}
+
+/// T2 — set runtime controls for a symbol (halt/resume, fee override).
+/// Persists to exchange_config, refreshes the in-memory mirror, audits.
+async fn handle_admin_set_config(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetConfigRequest>,
+) -> impl IntoResponse {
+    if !admin_authorized(&headers) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin only"}))).into_response();
+    }
+    use crate::desk::exchange_config::SymbolControl;
+    let cur = s.exchange_config.get(&req.symbol);
+    let next = SymbolControl {
+        trading_halted: req.trading_halted.unwrap_or(cur.trading_halted),
+        maker_fee_bps: if req.clear_maker_fee {
+            None
+        } else {
+            req.maker_fee_bps.or(cur.maker_fee_bps)
+        },
+        taker_fee_bps: if req.clear_taker_fee {
+            None
+        } else {
+            req.taker_fee_bps.or(cur.taker_fee_bps)
+        },
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO exchange_config (symbol, trading_halted, maker_fee_bps, taker_fee_bps, updated_by)
+         VALUES ($1, $2, $3, $4, 'admin')
+         ON CONFLICT (symbol) DO UPDATE SET
+            trading_halted = EXCLUDED.trading_halted,
+            maker_fee_bps = EXCLUDED.maker_fee_bps,
+            taker_fee_bps = EXCLUDED.taker_fee_bps,
+            updated_at = NOW(), updated_by = 'admin'",
+    )
+    .bind(&req.symbol)
+    .bind(next.trading_halted)
+    .bind(next.maker_fee_bps)
+    .bind(next.taker_fee_bps)
+    .execute(s.db.as_ref())
+    .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+    }
+    s.exchange_config.set(&req.symbol, next);
+    user_service::audit(
+        &s.db,
+        None,
+        "admin_set_config",
+        None,
+        json!({
+            "symbol": req.symbol, "halted": next.trading_halted,
+            "maker_fee_bps": next.maker_fee_bps, "taker_fee_bps": next.taker_fee_bps,
+        }),
+    )
+    .await;
+    (StatusCode::OK, Json(json!({
+        "symbol": req.symbol,
+        "trading_halted": next.trading_halted,
+        "maker_fee_bps": next.maker_fee_bps,
+        "taker_fee_bps": next.taker_fee_bps,
+    }))).into_response()
+}
+
+async fn handle_admin_get_config(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !admin_authorized(&headers) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin only"}))).into_response();
+    }
+    let rows: Vec<Value> = s
+        .exchange_config
+        .all()
+        .into_iter()
+        .map(|(sym, c)| {
+            json!({
+                "symbol": sym, "trading_halted": c.trading_halted,
+                "maker_fee_bps": c.maker_fee_bps, "taker_fee_bps": c.taker_fee_bps,
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({"config": rows}))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ForceCloseRequest {
+    user_id: i64,
+    symbol: String,
+}
+
+/// T2 — admin force-close: inject a reduce-only market order that flattens
+/// the user's position (manual intervention). Reuses the normal fill
+/// pipeline; the position must exist and be owned by this desk's shard.
+async fn handle_admin_force_close(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ForceCloseRequest>,
+) -> impl IntoResponse {
+    if !admin_authorized(&headers) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "admin only"}))).into_response();
+    }
+    let sym16 = crate::transport::persist_event::pack_str(&req.symbol);
+    let Some(pos) = s.risk_engine.positions.get(&(req.user_id, sym16)) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "no open position"}))).into_response();
+    };
+    // Closing side: opposite the position.
+    let close_side: u8 = match pos.side {
+        crate::desk::risk::PositionSide::Long => 1,
+        crate::desk::risk::PositionSide::Short => 0,
+    };
+    let qty = pos.qty_lots;
+    drop(pos);
+    let Some(cmd_tx) = s.liq_cmd_tx.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "no command queue"}))).into_response();
+    };
+    let rules = crate::symbol_rules::SymbolRules::for_symbol(&req.symbol);
+    let mark = s.risk_engine.mark_price_ticks(&sym16).unwrap_or(0);
+    if mark <= 0 {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "no mark price"}))).into_response();
+    }
+    // Aggressive IOC 5% through the mark so it fills.
+    let exec = if close_side == 0 { mark + mark / 20 } else { mark - mark / 20 };
+    let order_id = s.next_order_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let req_sbe = crate::sbe::NewOrderRequest {
+        client_order_id: order_id,
+        participant_id: req.user_id as u64,
+        price_ticks: exec,
+        quantity_lots: qty,
+        side: close_side,
+        time_in_force: 1, // IOC
+        response_stream_id: s.response_stream_id,
+        reduce_only: 1,
+        _pad: [0; 9],
+        symbol: sym16,
+    };
+    let _ = rules;
+    if cmd_tx.push(crate::transport::AeronCmd::NewOrder(req_sbe)).is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "command queue full"}))).into_response();
+    }
+    user_service::audit(
+        &s.db,
+        Some(req.user_id),
+        "admin_force_close",
+        None,
+        json!({"symbol": req.symbol, "qty_lots": qty, "order_id": order_id}),
+    )
+    .await;
+    (StatusCode::OK, Json(json!({"order_id": order_id, "qty_lots": qty}))).into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -1241,6 +1410,15 @@ async fn handle_place_order(
     }
     if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
         return e.into_response();
+    }
+    // T2 halt gate: a halted symbol rejects order ENTRY at the REST edge
+    // (cancels still work; reduce-only de-risking is allowed through).
+    if !req.reduce_only && s.exchange_config.is_halted(&req.symbol) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "trading halted for this symbol"})),
+        )
+            .into_response();
     }
     let fixed_shape = match crate::symbol_rules::normalize_order_shape(
         &req.symbol,

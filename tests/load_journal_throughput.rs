@@ -49,7 +49,8 @@ fn order(id: u64, side: u8, price_ticks: i64, stream: i32) -> NewOrderRequest {
         side,
         time_in_force: 0,
         response_stream_id: stream,
-        _pad: [0; 10],
+        reduce_only: 0,
+        _pad: [0; 9],
         symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
     }
 }

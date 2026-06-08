@@ -241,7 +241,8 @@ mod sbe_encoding_tests {
             side: 0,
             time_in_force: 1,
             response_stream_id: 203,
-            _pad: [0; 10],
+            reduce_only: 0,
+            _pad: [0; 9],
             symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
         };
         let new_bytes = unsafe {

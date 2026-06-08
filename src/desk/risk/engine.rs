@@ -265,6 +265,34 @@ impl RiskEngine {
         self.insurance_fund_atoms.fetch_add(fee_atoms, Relaxed);
     }
 
+    /// reduce-only gate (testnet): the order must REDUCE an existing
+    /// opposite-side position and not exceed it. Returns Ok with the
+    /// (possibly capped) quantity that is allowed to execute, or Err if
+    /// it would open/increase/flip. O(1): one position point read.
+    ///   * no position, or same side as the order's resulting exposure →
+    ///     reject (a buy reduces a SHORT; a sell reduces a LONG);
+    ///   * qty > position size → cap to the position size.
+    pub fn check_reduce_only(
+        &self,
+        user_id: i64,
+        symbol: &[u8; 16],
+        order_side: u8, // 0 = buy, 1 = sell
+        qty_lots: i64,
+    ) -> Result<i64, &'static str> {
+        let pos = self
+            .positions
+            .get(&(user_id, *symbol))
+            .ok_or("reduce-only: no open position to reduce")?;
+        let reduces = match pos.side {
+            PositionSide::Long => order_side == 1,  // sell reduces a long
+            PositionSide::Short => order_side == 0, // buy reduces a short
+        };
+        if !reduces {
+            return Err("reduce-only: order would increase the position");
+        }
+        Ok(qty_lots.min(pos.qty_lots))
+    }
+
     pub fn check_leverage_tier(
         &self,
         user_id: i64,
@@ -1521,6 +1549,25 @@ mod tests {
             engine.insurance_fund_atoms.load(Relaxed) < 0,
             "the fund absorbed the deficit (its job)"
         );
+    }
+
+    #[test]
+    fn reduce_only_gate() {
+        let (engine, uid) = setup_with_reserved(10_000_000 * A);
+        // No position: reduce-only is rejected.
+        assert!(engine.check_reduce_only(uid, &btc_sym(), 1, 10).is_err());
+        // Open a LONG 100k.
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+        // A SELL reduces the long → allowed, capped to position size.
+        assert_eq!(engine.check_reduce_only(uid, &btc_sym(), 1, 30_000), Ok(30_000));
+        assert_eq!(
+            engine.check_reduce_only(uid, &btc_sym(), 1, 999_999),
+            Ok(QTY_LOTS),
+            "over-size reduce-only caps to the position"
+        );
+        // A BUY would INCREASE the long → rejected.
+        assert!(engine.check_reduce_only(uid, &btc_sym(), 0, 10).is_err());
     }
 
     #[test]

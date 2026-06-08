@@ -53,7 +53,11 @@ pub struct NewOrderRequest {
     pub side: u8,         // 0=Buy, 1=Sell
     pub time_in_force: u8, // 0=GTC, 1=IOC, 2=FOK, 3=PostOnly
     pub response_stream_id: i32,
-    pub _pad: [u8; 10],
+    /// reduce-only flag (S-testnet): 1 = the order may only REDUCE an
+    /// existing opposite-side position, never open/increase/flip. The
+    /// desk gate rejects it at entry if it would increase exposure.
+    pub reduce_only: u8,
+    pub _pad: [u8; 9],
     pub symbol: [u8; 16],
 }
 
@@ -359,7 +363,8 @@ mod tests {
             side: 0,          // Buy
             time_in_force: 0, // GTC
             response_stream_id: 200,
-            _pad: [0; 10],
+            reduce_only: 0,
+            _pad: [0; 9],
             symbol: [0; 16],
         };
 
@@ -425,7 +430,8 @@ mod tests {
             side: 0,
             time_in_force: 0,
             response_stream_id: 200,
-            _pad: [0; 10],
+            reduce_only: 0,
+            _pad: [0; 9],
             symbol: [0; 16],
         };
 

@@ -231,7 +231,8 @@ fn replayed_engine_rebuilds_identical_book() {
                 side: (rng.next() % 2) as u8,
                 time_in_force: (rng.next() % 4) as u8,
                 response_stream_id: 200,
-                _pad: [0; 10],
+                reduce_only: 0,
+                _pad: [0; 9],
                 symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
             };
             placed.push(i);

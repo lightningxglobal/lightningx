@@ -903,7 +903,8 @@ async fn inject_trigger_order(
         side,
         time_in_force: if is_market { 1 } else { 0 }, // IOC for market
         response_stream_id,
-        _pad: [0; 10],
+        reduce_only: 0,
+        _pad: [0; 9],
         symbol: sym16,
     };
     let Some(cmd_tx) = cmd_tx else {
@@ -2536,6 +2537,20 @@ async fn async_main() -> anyhow::Result<()> {
                                     reject(reason);
                                     continue;
                                 }
+                                // reduce-only gate (testnet): reject orders
+                                // that would increase exposure; cap to the
+                                // position size otherwise.
+                                if req.reduce_only != 0 {
+                                    match risk_engine_send.check_reduce_only(
+                                        user_id, &symbol, req.side, req.quantity_lots,
+                                    ) {
+                                        Ok(_capped) => {}
+                                        Err(reason) => {
+                                            reject(reason);
+                                            continue;
+                                        }
+                                    }
+                                }
                                 let order_notional =
                                     lightning_exchange::desk::risk::calc::calc_notional_atoms(
                                         { let p: i64 = req.price_ticks; p },
@@ -3954,7 +3969,8 @@ async fn async_main() -> anyhow::Result<()> {
                         side: liq_side,
                         time_in_force: 1, // IOC
                         response_stream_id,
-                        _pad: [0; 10],
+                        reduce_only: 0,
+                        _pad: [0; 9],
                         symbol: evt.symbol,
                     };
 

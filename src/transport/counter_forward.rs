@@ -222,7 +222,8 @@ mod tests {
             side: 0,
             time_in_force: 0,
             response_stream_id: crate::aeron_channels::order_update_stream_for_desk(owner_desk),
-            _pad: [0; 10],
+            reduce_only: 0,
+            _pad: [0; 9],
             symbol: sym16("SOL_USDT"),
         };
         let meta = CounterForwardOrderMeta::new(

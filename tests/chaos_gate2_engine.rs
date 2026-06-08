@@ -59,7 +59,8 @@ fn req_tif(id: u64, side: u8, price_ticks: i64, qty: i64, stream: i32, tif: u8) 
         side,
         time_in_force: tif,
         response_stream_id: stream,
-        _pad: [0; 10],
+        reduce_only: 0,
+        _pad: [0; 9],
         symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
     }
 }

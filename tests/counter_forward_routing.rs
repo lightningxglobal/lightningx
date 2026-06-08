@@ -49,7 +49,8 @@ fn forwarded_order_targets_owner_private_update_stream() {
         side: 0,
         time_in_force: 0,
         response_stream_id: order_update_stream_for_desk(owner),
-        _pad: [0; 10],
+        reduce_only: 0,
+        _pad: [0; 9],
         symbol: sym16("BTC_USDT"),
     };
     let meta = CounterForwardOrderMeta::new(
@@ -88,7 +89,8 @@ fn wrong_owner_order_uses_owner_cmd_stream_and_ingress_resp_stream() {
         side: 0,
         time_in_force: 0,
         response_stream_id: order_update_stream_for_desk(owner),
-        _pad: [0; 10],
+        reduce_only: 0,
+        _pad: [0; 9],
         symbol: sym16("BTC_USDT"),
     };
     let meta = CounterForwardOrderMeta::new(

@@ -906,7 +906,8 @@ async fn handle_client_message(
                         response_stream_id: crate::aeron_channels::order_update_stream_for_desk(
                             owner_desk_id,
                         ),
-                        _pad: [0; 10],
+                        reduce_only: 0,
+                        _pad: [0; 9],
                         symbol: sym_bytes,
                     };
                     let meta = CounterForwardOrderMeta::new(
@@ -1031,7 +1032,8 @@ async fn handle_client_message(
                     side: side_byte,
                     time_in_force: tif_byte,
                     response_stream_id: state.response_stream_id,
-                    _pad: [0; 10],
+                    reduce_only: 0,
+                    _pad: [0; 9],
                     symbol: sym_bytes,
                 };
 
@@ -2044,7 +2046,8 @@ async fn handle_client_message(
                         side: side_byte,
                         time_in_force: tif_byte,
                         response_stream_id: state.response_stream_id,
-                        _pad: [0; 10],
+                        reduce_only: 0,
+                        _pad: [0; 9],
                         symbol: sym_bytes,
                     };
                     validated.push(V {

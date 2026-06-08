@@ -1147,7 +1147,8 @@ mod tests {
             side: 0,
             time_in_force: 0,
             response_stream_id: 200,
-            _pad: [0; 10],
+            reduce_only: 0,
+            _pad: [0; 9],
             symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
         };
         let mut data = [0u8; 72];

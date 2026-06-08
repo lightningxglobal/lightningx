@@ -58,7 +58,8 @@ fn decoders_survive_every_truncation_of_valid_frames() {
         side: 0,
         time_in_force: 0,
         response_stream_id: 200,
-        _pad: [0; 10],
+        reduce_only: 0,
+        _pad: [0; 9],
         symbol: *b"BTC_USDT\0\0\0\0\0\0\0\0",
     };
     let mut frame = [0u8; 128];
@@ -101,7 +102,8 @@ fn decoders_survive_bitflips_of_valid_frames() {
         side: 1,
         time_in_force: 2,
         response_stream_id: 201,
-        _pad: [0; 10],
+        reduce_only: 0,
+        _pad: [0; 9],
         symbol: *b"ETH_USDT\0\0\0\0\0\0\0\0",
     };
     let mut frame = [0u8; 128];

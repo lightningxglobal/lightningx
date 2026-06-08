@@ -1216,6 +1216,8 @@ struct PlaceOrderRequest {
     price: Option<f64>,
     quantity: f64,
     client_order_id: Option<String>,
+    #[serde(default)]
+    reduce_only: bool,
 }
 
 async fn handle_place_order(
@@ -1767,7 +1769,8 @@ async fn handle_place_order(
             side: side_byte,
             time_in_force: tif_byte,
             response_stream_id: s.response_stream_id,
-            _pad: [0; 10],
+            reduce_only: u8::from(req.reduce_only),
+            _pad: [0; 9],
             symbol: sym_bytes,
         };
 
@@ -2934,7 +2937,8 @@ async fn handle_debug_mark_price(
             side: liq_side,
             time_in_force: 1,
             response_stream_id: s.response_stream_id,
-            _pad: [0; 10],
+            reduce_only: 0,
+            _pad: [0; 9],
             symbol: evt.symbol,
         };
         let mark_ticks = s.risk_engine.mark_price_ticks(&evt.symbol).unwrap_or(0);

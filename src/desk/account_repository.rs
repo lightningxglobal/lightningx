@@ -142,6 +142,183 @@ impl<'a> AccountRepository<'a> {
         Ok((true, new_balance))
     }
 
+    /// Phase 1 — request a withdrawal: freeze (amount + fee) and insert a
+    /// 'pending' row, in ONE transaction. Returns the withdrawal id and
+    /// the post-freeze balance. Fails (no row, no freeze) on insufficient
+    /// spendable balance. ref_id of the audit row is the withdrawal id.
+    pub async fn request_withdrawal(
+        &self,
+        user_id: i64,
+        asset: &str,
+        chain: &str,
+        to_address: &str,
+        amount_atoms: i64,
+        fee_atoms: i64,
+    ) -> Result<(i64, AccountBalance)> {
+        if amount_atoms <= 0 || fee_atoms < 0 {
+            return Err(anyhow!("withdrawal amount must be positive, fee non-negative"));
+        }
+        let total = amount_atoms
+            .checked_add(fee_atoms)
+            .ok_or_else(|| anyhow!("amount + fee overflow"))?;
+        let mut tx = self.pool.begin().await?;
+        // Freeze the total (amount + fee) atomically — only succeeds if
+        // spendable (balance - frozen) covers it.
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "UPDATE accounts SET frozen_atoms = frozen_atoms + $1, updated_at = NOW()
+              WHERE user_id = $2 AND asset = $3 AND (balance_atoms - frozen_atoms) >= $1
+              RETURNING balance_atoms, frozen_atoms",
+        )
+        .bind(total)
+        .bind(user_id)
+        .bind(asset)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((balance_atoms, frozen_atoms)) = row else {
+            tx.rollback().await.ok();
+            return Err(anyhow!("insufficient {asset} balance to withdraw"));
+        };
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO withdrawals
+                (user_id, asset, chain, to_address, amount_atoms, fee_atoms, status)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id",
+        )
+        .bind(user_id)
+        .bind(asset)
+        .bind(chain)
+        .bind(to_address)
+        .bind(amount_atoms)
+        .bind(fee_atoms)
+        .fetch_one(&mut *tx)
+        .await?;
+        fund_audit(&mut tx, user_id, asset, "wd_freeze", total, id).await?;
+        tx.commit().await?;
+        Ok((id, AccountBalance::from_atoms(balance_atoms, frozen_atoms)))
+    }
+
+    /// Move a withdrawal between non-terminal statuses (approve/broadcast)
+    /// WITHOUT touching the balance. Idempotent on `from`: only a row in
+    /// `from` transitions, so a re-delivery is a no-op (returns false).
+    pub async fn set_withdrawal_status(
+        &self,
+        id: i64,
+        from: &str,
+        to: &str,
+        tx_hash: Option<&str>,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE withdrawals
+                SET status = $3, tx_hash = COALESCE($4, tx_hash), updated_at = NOW()
+              WHERE id = $1 AND status = $2",
+        )
+        .bind(id)
+        .bind(from)
+        .bind(to)
+        .bind(tx_hash)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Phase 2a — confirm: the chain settled the send, so DEBIT the frozen
+    /// amount + fee (balance -= total, frozen -= total) and mark
+    /// 'confirmed'. Idempotent: only a non-terminal ('approved' or
+    /// 'broadcast') row debits, so a re-delivery cannot double-debit.
+    /// Returns true if this call performed the debit.
+    pub async fn confirm_withdrawal(&self, id: i64, tx_hash: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        // Lock the row and read its terminal-ness + amounts.
+        let row: Option<(i64, String, i64, i64, String)> = sqlx::query_as(
+            "SELECT user_id, asset, amount_atoms, fee_atoms, status
+               FROM withdrawals WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((user_id, asset, amount, fee, status)) = row else {
+            tx.rollback().await.ok();
+            return Err(anyhow!("withdrawal {id} not found"));
+        };
+        if status == "confirmed" {
+            tx.rollback().await.ok();
+            return Ok(false); // already confirmed — idempotent no-op
+        }
+        if status != "approved" && status != "broadcast" {
+            tx.rollback().await.ok();
+            return Err(anyhow!("withdrawal {id} not in a confirmable state ({status})"));
+        }
+        let total = amount + fee;
+        // Debit: the frozen funds actually leave the exchange.
+        sqlx::query(
+            "UPDATE accounts SET
+                balance_atoms = balance_atoms - $1,
+                frozen_atoms  = frozen_atoms - $1,
+                updated_at = NOW()
+              WHERE user_id = $2 AND asset = $3",
+        )
+        .bind(total)
+        .bind(user_id)
+        .bind(&asset)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE withdrawals SET status='confirmed', tx_hash=$2, updated_at=NOW() WHERE id=$1",
+        )
+        .bind(id)
+        .bind(tx_hash)
+        .execute(&mut *tx)
+        .await?;
+        fund_audit(&mut tx, user_id, &asset, "wd_debit", total, id).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Phase 2b — fail: the send did not happen, so RELEASE the freeze
+    /// (frozen -= total, funds spendable again) and mark 'failed'.
+    /// Idempotent: only a non-terminal row releases.
+    pub async fn fail_withdrawal(&self, id: i64, reason: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(i64, String, i64, i64, String)> = sqlx::query_as(
+            "SELECT user_id, asset, amount_atoms, fee_atoms, status
+               FROM withdrawals WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((user_id, asset, amount, fee, status)) = row else {
+            tx.rollback().await.ok();
+            return Err(anyhow!("withdrawal {id} not found"));
+        };
+        if status == "failed" || status == "cancelled" {
+            tx.rollback().await.ok();
+            return Ok(false); // already released — idempotent
+        }
+        if status == "confirmed" {
+            tx.rollback().await.ok();
+            return Err(anyhow!("withdrawal {id} already confirmed — cannot fail"));
+        }
+        let total = amount + fee;
+        sqlx::query(
+            "UPDATE accounts SET frozen_atoms = frozen_atoms - $1, updated_at = NOW()
+              WHERE user_id = $2 AND asset = $3",
+        )
+        .bind(total)
+        .bind(user_id)
+        .bind(&asset)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE withdrawals SET status='failed', fail_reason=$2, updated_at=NOW() WHERE id=$1",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+        fund_audit(&mut tx, user_id, &asset, "wd_release", total, id).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn get_account(&self, user_id: i64, asset: &str) -> Result<DbAccount> {
         sqlx::query_as::<_, DbAccount>("SELECT * FROM accounts WHERE user_id = $1 AND asset = $2")
             .bind(user_id)

@@ -291,6 +291,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/config", get(handle_admin_get_config).post(handle_admin_set_config))
         .route("/api/admin/force-close", post(handle_admin_force_close))
         .route("/api/deposit/credit", post(handle_deposit_credit))
+        .route("/api/withdrawals", get(handle_list_withdrawals).post(handle_request_withdrawal))
+        .route("/api/withdrawals/:id/status", post(handle_withdrawal_status))
         // User profile & KYC
         .route(
             "/api/user/profile",
@@ -576,6 +578,190 @@ async fn handle_deposit_credit(
         })),
     )
         .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct WithdrawalRequest {
+    asset: String,
+    chain: String,
+    to_address: String,
+    /// Atoms (1e-8). The exchange's fee is added on top and frozen too.
+    amount_atoms: i64,
+}
+
+/// Phase 1 — a USER requests a withdrawal: freezes amount + fee and
+/// records a 'pending' row. The chain service later approves/broadcasts/
+/// confirms. Fee from exchange_config-driven default (flat for now).
+async fn handle_request_withdrawal(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<WithdrawalRequest>,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = ensure_user_owned_by_this_desk(user_id, s.desk_id) {
+        return e.into_response();
+    }
+    if req.amount_atoms <= 0 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "amount must be positive"})))
+            .into_response();
+    }
+    // Flat withdrawal fee (atoms), env-tunable; the chain service's gas
+    // is covered by this. WITHDRAW_FEE_ATOMS default 1 USDT.
+    let fee_atoms: i64 = std::env::var("WITHDRAW_FEE_ATOMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000_000);
+    let repo = crate::desk::account_repository::AccountRepository::new(s.db.as_ref());
+    match repo
+        .request_withdrawal(
+            user_id, &req.asset, &req.chain, &req.to_address, req.amount_atoms, fee_atoms,
+        )
+        .await
+    {
+        Ok((id, bal)) => {
+            // The freeze changed `frozen` — converge L1 + other desks.
+            s.account_cache.remove(&user_id);
+            if let Some(pp) = s.persist_pub.as_ref() {
+                if let Ok(mut p) =
+                    account_set_payload(user_id, &req.asset, bal.balance(), bal.frozen())
+                {
+                    p.balance_atoms = bal.balance_atoms;
+                    p.frozen_atoms = bal.frozen_atoms;
+                    let _ = pp.push(crate::transport::persist_event::PersistFrame::account_set(p));
+                }
+            }
+            user_service::audit(
+                &s.db,
+                Some(user_id),
+                "withdrawal_request",
+                None,
+                json!({"id": id, "asset": req.asset, "chain": req.chain,
+                       "amount_atoms": req.amount_atoms, "fee_atoms": fee_atoms,
+                       "to": req.to_address}),
+            )
+            .await;
+            (StatusCode::OK, Json(json!({"id": id, "status": "pending",
+                "fee_atoms": fee_atoms}))).into_response()
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WithdrawalStatusRequest {
+    /// "approved" | "broadcast" | "confirmed" | "failed"
+    status: String,
+    tx_hash: Option<String>,
+    reason: Option<String>,
+}
+
+/// Phase 2 — the chain SERVICE advances a withdrawal's state
+/// (EXCHANGE_DEPOSIT_TOKEN — same least-privilege service credential).
+/// confirmed → debit frozen; failed → release frozen; both idempotent.
+async fn handle_withdrawal_status(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(req): Json<WithdrawalStatusRequest>,
+) -> impl IntoResponse {
+    if !deposit_service_authorized(&headers) {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "service token required"})))
+            .into_response();
+    }
+    let repo = crate::desk::account_repository::AccountRepository::new(s.db.as_ref());
+    // Find the owning user for cache/frame convergence on terminal moves.
+    let owner: Option<(i64, String)> = sqlx::query_as(
+        "SELECT user_id, asset FROM withdrawals WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(s.db.as_ref())
+    .await
+    .unwrap_or(None);
+
+    let result = match req.status.as_str() {
+        "approved" => repo.set_withdrawal_status(id, "pending", "approved", None).await,
+        "broadcast" => {
+            repo.set_withdrawal_status(id, "approved", "broadcast", req.tx_hash.as_deref()).await
+        }
+        "confirmed" => {
+            let tx = req.tx_hash.as_deref().unwrap_or("");
+            repo.confirm_withdrawal(id, tx).await
+        }
+        "failed" => {
+            let reason = req.reason.as_deref().unwrap_or("chain send failed");
+            repo.fail_withdrawal(id, reason).await
+        }
+        other => {
+            return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown status '{other}'")}))).into_response();
+        }
+    };
+    match result {
+        Ok(changed) => {
+            // On confirm/fail the balance/frozen moved — converge L1 +
+            // publish AccountSet for the owner.
+            if changed && (req.status == "confirmed" || req.status == "failed") {
+                if let Some((user_id, asset)) = owner {
+                    s.account_cache.remove(&user_id);
+                    if let (Some(pp), Ok((bal, frz))) = (
+                        s.persist_pub.as_ref(),
+                        sqlx::query_as::<_, (i64, i64)>(
+                            "SELECT balance_atoms, frozen_atoms FROM accounts
+                              WHERE user_id = $1 AND asset = $2",
+                        )
+                        .bind(user_id)
+                        .bind(&asset)
+                        .fetch_one(s.db.as_ref())
+                        .await,
+                    ) {
+                        if let Ok(mut p) = account_set_payload(
+                            user_id, &asset, bal as f64 / 1e8, frz as f64 / 1e8,
+                        ) {
+                            p.balance_atoms = bal;
+                            p.frozen_atoms = frz;
+                            let _ = pp
+                                .push(crate::transport::persist_event::PersistFrame::account_set(p));
+                        }
+                    }
+                }
+            }
+            (StatusCode::OK, Json(json!({"id": id, "status": req.status, "changed": changed})))
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn handle_list_withdrawals(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user_id = match auth_user(&headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let rows: Vec<(i64, String, String, String, i64, i64, String, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, asset, chain, to_address, amount_atoms, fee_atoms, status, tx_hash
+               FROM withdrawals WHERE user_id = $1 ORDER BY requested_at DESC LIMIT 200",
+        )
+        .bind(user_id)
+        .fetch_all(s.db.as_ref())
+        .await
+        .unwrap_or_default();
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|(id, asset, chain, to, amt, fee, st, tx)| {
+            json!({"id": id, "asset": asset, "chain": chain, "to_address": to,
+                   "amount_atoms": amt, "fee_atoms": fee, "status": st, "tx_hash": tx})
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({"withdrawals": out}))).into_response()
 }
 
 #[derive(serde::Deserialize)]

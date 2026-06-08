@@ -84,6 +84,26 @@ curl -s localhost:4003/api/deposit/credit   -H "Authorization: Bearer $EXCHANGE_
 Redis 与各 desk 自动收敛；走 fund_audit append-only 留痕。**与撮合解耦**,
 链上团队对接此一个窄接口即可。每日对账:Σ虚拟账户 USDT = 链上钱包总额。
 
+## 提现接口（两段式：用户申请 + 链上服务确认）
+**Phase 1 — 用户申请**(JWT):冻结 amount + fee,记 `pending` 行,**不扣余额**。
+```bash
+curl -s localhost:4003/api/withdrawals -H "Authorization: Bearer $TOKEN"   -d '{"asset":"USDT","chain":"TRON","to_address":"T...","amount_atoms":500000000000}'
+# → {"id":123,"status":"pending","fee_atoms":100000000}
+```
+**Phase 2 — 链上服务推进**(service token):风控/签名出账后调用。
+```bash
+# 审核通过 → 广播 → 确认(链上成交,扣减冻结)
+curl /api/withdrawals/123/status -H "Authorization: Bearer $DEPOSIT_TOKEN" -d '{"status":"approved"}'
+curl /api/withdrawals/123/status -H "Authorization: Bearer $DEPOSIT_TOKEN" -d '{"status":"broadcast","tx_hash":"0x..."}'
+curl /api/withdrawals/123/status -H "Authorization: Bearer $DEPOSIT_TOKEN" -d '{"status":"confirmed","tx_hash":"0x..."}'
+# 或失败 → 释放冻结
+curl /api/withdrawals/123/status -H "Authorization: Bearer $DEPOSIT_TOKEN" -d '{"status":"failed","reason":"..."}'
+```
+**幂等**:`confirmed` 重放不二次扣减,`failed` 重放不二次释放,confirm/fail 互斥(状态机)。
+**守恒**:每笔 `wd_freeze` 必有等额 `wd_release` 或 `wd_debit`。冻结在申请时锁定,
+确认才真正离开交易所。`WITHDRAW_FEE_ATOMS` 配手续费(默认 1 USDT)。
+查询:`GET /api/withdrawals`。
+
 ## 沙箱
 testnet 本身即沙箱：资金来自注册种子 + `/api/test-funds` + admin 调账，
 无真实资金风险。

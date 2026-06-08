@@ -2139,7 +2139,7 @@ async fn async_main() -> anyhow::Result<()> {
             lightning_exchange::desk::index_price::spawn_http_pollers(symbols);
         let agg = if sources.is_empty() {
             tracing::warn!(
-                "S4: no INDEX_SOURCES configured — marks use the RAW book mid                  (manipulation-clamping disabled; fine for dev, not for production)"
+                "INDEX_SOURCES is empty -- using raw book mid; liquidations disabled until real mark arrives"
             );
             None
         } else {
@@ -2150,6 +2150,15 @@ async fn async_main() -> anyhow::Result<()> {
         };
         (agg, Arc::new(std::sync::atomic::AtomicU64::new(0)))
     };
+    // B4: flag shared with the risk-tick task; true when INDEX_SOURCES is empty.
+    let index_sources_empty = index_agg.is_none();
+    // B5: track last mark update time per symbol (spin thread writes, risk tick reads).
+    let last_mark_update: Arc<DashMap<[u8; 16], std::time::Instant>> =
+        Arc::new(DashMap::new());
+    let mark_freeze_threshold_secs: u64 = std::env::var("MARK_FREEZE_THRESHOLD_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
     // S4.5: index/mark health on /metrics — the runbook alarms on
     // index_frozen_total and mark_update_frozen_total growth.
     if let Some(agg) = &index_agg {
@@ -2904,6 +2913,7 @@ async fn async_main() -> anyhow::Result<()> {
         let exchange_config_pub = state.exchange_config.clone();
         let index_agg_pub = index_agg.clone();
         let mark_frozen_pub = mark_frozen_count.clone();
+        let last_mark_update_pub = last_mark_update.clone();
         let mark_clamp_bps: i64 = std::env::var("MARK_CLAMP_BPS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -3072,6 +3082,8 @@ async fn async_main() -> anyhow::Result<()> {
                                                     mid_ticks, index_ticks, mark_clamp_bps,
                                                 );
                                                 risk_engine_pub.update_mark_price(sym_key, mark, rules.notional_scale);
+                                                // B5: record that the mark was updated now.
+                                                last_mark_update_pub.insert(sym_key, std::time::Instant::now());
                                             }
                                             Some(None) => {
                                                 mark_frozen_pub.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3081,6 +3093,8 @@ async fn async_main() -> anyhow::Result<()> {
                                             // dev/test setups without external feeds.
                                             None => {
                                                 risk_engine_pub.update_mark_price(sym_key, mid_ticks, rules.notional_scale);
+                                                // B5: record that the mark was updated now.
+                                                last_mark_update_pub.insert(sym_key, std::time::Instant::now());
                                             }
                                         }
                                     }
@@ -3554,6 +3568,16 @@ async fn async_main() -> anyhow::Result<()> {
                                 if meta.initial_margin_atoms > 0 {
                                     risk_engine.release_order_margin(meta.user_id, meta.initial_margin_atoms);
                                 }
+                                // B1: if a liquidation IOC was CANCELLED (e.g. no
+                                // liquidity), re-arm the account to LiquidationPending
+                                // so run_risk_tick retries on the next tick.
+                                if meta.liq_price_ticks != 0 {
+                                    risk_engine.set_account_status_if(
+                                        meta.user_id,
+                                        lightning_exchange::desk::risk::RiskStatus::Liquidating,
+                                        lightning_exchange::desk::risk::RiskStatus::LiquidationPending,
+                                    );
+                                }
                                 process_db_cmd(DbCmd::ReleaseReservation {
                                     user_id: meta.user_id,
                                     symbol: meta.symbol,
@@ -3901,6 +3925,11 @@ async fn async_main() -> anyhow::Result<()> {
             .filter(|s| !s.is_empty())
             .collect();
         let tracer_liq = state.tracer.clone();
+        // B4: skip liquidation when no real index price source is configured.
+        let index_sources_empty_tick = index_sources_empty;
+        // B5: last mark timestamp per symbol (written by the public spin thread).
+        let last_mark_update_tick = last_mark_update.clone();
+        let mark_freeze_threshold_tick = std::time::Duration::from_secs(mark_freeze_threshold_secs);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3969,6 +3998,36 @@ async fn async_main() -> anyhow::Result<()> {
                             "liquidation skipped: zero liq_price_ticks"
                         );
                         continue;
+                    }
+
+                    // B4: no real index price source — raw mid is untrustworthy for
+                    // liquidation decisions; skip until INDEX_SOURCES is configured.
+                    if index_sources_empty_tick {
+                        tracing::warn!(
+                            user_id = evt.user_id,
+                            "liquidation skipped: INDEX_SOURCES is empty, mark price unreliable"
+                        );
+                        continue;
+                    }
+
+                    // B5: stale mark price — skip liquidation for this symbol to avoid
+                    // triggering at an outdated price.
+                    {
+                        let sym_str_end = evt.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                        let sym_str_b5 =
+                            std::str::from_utf8(&evt.symbol[..sym_str_end]).unwrap_or("?");
+                        let is_stale = match last_mark_update_tick.get(&evt.symbol) {
+                            Some(last) => last.elapsed() > mark_freeze_threshold_tick,
+                            None => true,
+                        };
+                        if is_stale {
+                            tracing::warn!(
+                                user_id = evt.user_id,
+                                symbol = sym_str_b5,
+                                "mark price frozen for symbol -- skipping liquidation check"
+                            );
+                            continue;
+                        }
                     }
 
                     // Mark account as Liquidating immediately so no new orders can be placed.

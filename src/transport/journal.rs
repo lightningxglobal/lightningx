@@ -217,6 +217,55 @@ impl JournalReplayer {
         self.replay_bounded_to(recording, None, replay_channel, replay_stream_id)
     }
 
+    /// Replay a recording starting at `from_position` (clamped to the
+    /// recording's [start, max] range) up to its max recorded position.
+    /// Used by snapshot-bounded recovery (T4): the engine restored its
+    /// book from a snapshot taken at journal position `from_position`, so
+    /// only frames AFTER it must be replayed. Returns None if nothing
+    /// remains beyond `from_position`.
+    pub fn replay_from(
+        &mut self,
+        recording: &RecordingSummary,
+        from_position: i64,
+        replay_channel: &str,
+        replay_stream_id: i32,
+    ) -> Result<Option<JournalReplay>, String> {
+        let max = self
+            .archive
+            .max_recorded_position(recording.recording_id)
+            .map_err(|e| format!("max recorded position: {e}"))?;
+        let start = from_position.max(recording.start_position);
+        if max <= start {
+            return Ok(None);
+        }
+        let replay_session_id = self
+            .archive
+            .start_replay(
+                recording.recording_id,
+                replay_channel,
+                replay_stream_id,
+                ReplayParams {
+                    position: Some(start),
+                    length: Some(max - start),
+                },
+            )
+            .map_err(|e| format!("start_replay: {e}"))?;
+        Ok(Some(JournalReplay {
+            recording_id: recording.recording_id,
+            replay_session_id,
+            bounded_to: max,
+        }))
+    }
+
+    /// Current max recorded position of `recording_id` (T4: read in
+    /// lockstep with the engine's single-threaded consumption at snapshot
+    /// time, so it exactly tags the frames consumed).
+    pub fn recorded_position(&mut self, recording_id: i64) -> Result<i64, String> {
+        self.archive
+            .max_recorded_position(recording_id)
+            .map_err(|e| format!("max recorded position: {e}"))
+    }
+
     /// Like [`Self::replay_bounded`], but with an explicit upper bound.
     ///
     /// `upper` is the live-image JOIN POSITION of the same session: frames

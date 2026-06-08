@@ -105,9 +105,12 @@
 
 ## S5. 触发单(止损/止盈)(P0,用户侧风控)
 
-**trades 表行**(S5 工单):settle 路径确实发 TradeInsert 帧(`resolved`
-双 uid 已解析),pg-writer ON CONFLICT 幂等入库;S5 的 taker_uid=0 竞态
-(注入单元数据)已在 93f905c 修复——注入时即写 runtime meta。
+**testnet 上线补全(T1-T7,均单机/纯代码)** — 见 testnet-first-scope:
+- T1 reduce-only(`a3ce9af`)；T2 运营后台:停牌/费率/强平免重启
+  (`eecff6f`)；T3 trades 表行修复(`331671b`,根因:emit 在 resolved
+  早返回之后)；T4 引擎快照免 genesis 重放(本提交)；
+  T5 Grafana+告警(`96347ae`)；T6 API 文档/OpenAPI/SDK(`a753465`)；
+  T7 release 压测 220k/s p99 1.06ms(`d315dbf`)。
 
 - [x] S5.1 表 026+状态机(原子 UPDATE 防双触发)+ REST 三端点(9c7e48f+本提交)
 - [x] S5.2 双 BTreeMap 触发簿,O(log n+k);10 万单风暴测试钉死非线性

@@ -14,6 +14,17 @@ use rtrb::Producer;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
+/// A logical snapshot of the matching engine's resting state (T4) — the
+/// set of resting orders plus the sequence counters. Serialized to PG so
+/// a restart restores from here instead of replaying the journal from
+/// genesis. Order book structure is rebuilt from the orders, not stored.
+#[derive(Debug, Clone, Default)]
+pub struct EngineSnapshot {
+    pub orders: Vec<Order>,
+    pub next_order_id: u64,
+    pub trade_sequence: u64,
+}
+
 pub struct MatchingEngine {
     buy_book: OrderBookWrapper,
     sell_book: OrderBookWrapper,
@@ -140,6 +151,56 @@ impl MatchingEngine {
     #[inline]
     pub fn contains_order(&self, order_id: u64) -> bool {
         self.orders.contains_key(&order_id)
+    }
+
+    /// T4 snapshot: every RESTING order with its remaining quantity,
+    /// plus the sequence counters needed to resume identically. A resting
+    /// book never holds crossing orders, so restoring them (in
+    /// price-time order) into a fresh engine reproduces the book without
+    /// any matching. The returned orders carry their original id and
+    /// timestamp so price-time priority is preserved on restore.
+    pub fn snapshot_resting(&self) -> EngineSnapshot {
+        let mut orders: Vec<Order> = self
+            .orders
+            .values()
+            .filter_map(|&idx| self.pools.orders.get(idx).copied())
+            .map(|mut o| {
+                // Persist the LIVE remaining as the quantity; filled is
+                // folded in so a restored order is a fresh resting order
+                // of size = remaining.
+                let remaining = o.remaining_lots();
+                o.quantity_lots = remaining;
+                o.filled_lots = 0;
+                o
+            })
+            .filter(|o| o.quantity_lots > 0)
+            .collect();
+        // Canonical order: timestamp then id — FIFO within a price level
+        // is reproduced when these are re-inserted in this order.
+        orders.sort_unstable_by_key(|o| (o.timestamp, o.id));
+        EngineSnapshot {
+            orders,
+            next_order_id: self.next_order_id,
+            trade_sequence: self.trade_sequence,
+        }
+    }
+
+    /// Rebuild a fresh engine from a snapshot. Orders are inserted in the
+    /// snapshot's canonical (timestamp, id) order via the normal resting
+    /// path; because the set is non-crossing by construction, no trades
+    /// occur. Returns the count restored.
+    pub fn restore_resting(&mut self, snap: &EngineSnapshot) -> usize {
+        let mut n = 0;
+        for o in &snap.orders {
+            let mut order = *o;
+            order.is_market = false; // resting orders are limits
+            if self.place_order(order).is_ok() {
+                n += 1;
+            }
+        }
+        self.next_order_id = snap.next_order_id;
+        self.trade_sequence = snap.trade_sequence;
+        n
     }
 
     /// 验证订单有效性
@@ -1503,6 +1564,67 @@ pub struct CancelOrderResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t4_snapshot_restore_reproduces_book() {
+        // Build a non-trivial resting book: several price levels per side,
+        // multiple orders per level (FIFO), one partially filled.
+        let mut a = MatchingEngine::new(PoolConfig::default()).unwrap();
+        let mut id = 1u64;
+        let mut place = |e: &mut MatchingEngine, side, price, qty, ts| {
+            let o = Order::new(id, side, price, qty, TimeInForce::GTC, ts);
+            e.place_order(o).unwrap();
+            let this = id;
+            id += 1;
+            this
+        };
+        // Bids below asks (non-crossing).
+        place(&mut a, Side::Buy, 49_000, 10, 1);
+        place(&mut a, Side::Buy, 49_000, 5, 2); // same level, later → behind
+        place(&mut a, Side::Buy, 48_500, 7, 3);
+        place(&mut a, Side::Sell, 50_000, 8, 4);
+        place(&mut a, Side::Sell, 50_000, 3, 5);
+        place(&mut a, Side::Sell, 50_500, 12, 6);
+        // Partially fill the front ask with a crossing IOC buy of 2 lots.
+        let ioc = Order::new(id, Side::Buy, 50_000, 2, TimeInForce::IOC, 7);
+        id += 1;
+        a.place_order(ioc).unwrap();
+
+        let before_bids = a.get_top_levels(10, true);
+        let before_asks = a.get_top_levels(10, false);
+
+        // Snapshot → restore into a fresh engine.
+        let snap = a.snapshot_resting();
+        let mut b = MatchingEngine::new(PoolConfig::default()).unwrap();
+        let restored = b.restore_resting(&snap);
+
+        // Same aggregate book shape (price → qty per level, both sides).
+        assert_eq!(b.get_top_levels(10, true), before_bids, "bid levels identical");
+        assert_eq!(b.get_top_levels(10, false), before_asks, "ask levels identical");
+        // Every resting order id is present in the restored engine.
+        for o in &snap.orders {
+            assert!(b.contains_order(o.id), "order {} restored", o.id);
+        }
+        assert_eq!(restored, snap.orders.len(), "all snapshot orders restored");
+        // Counters carried over.
+        assert_eq!(b.next_order_id, snap.next_order_id);
+        assert_eq!(b.trade_sequence, snap.trade_sequence);
+
+        // The restored book MATCHES like the original: a crossing buy of 9
+        // lots at 50_000 fills the remaining front ask (6) + next (3).
+        let cross = Order::new(9999, Side::Buy, 50_000, 9, TimeInForce::IOC, 100);
+        let res = b.place_order(cross).unwrap();
+        assert_eq!(res.filled_lots, 9, "restored book matches with correct priority");
+    }
+
+    #[test]
+    fn t4_snapshot_empty_book() {
+        let a = MatchingEngine::new(PoolConfig::default()).unwrap();
+        let snap = a.snapshot_resting();
+        assert!(snap.orders.is_empty());
+        let mut b = MatchingEngine::new(PoolConfig::default()).unwrap();
+        assert_eq!(b.restore_resting(&snap), 0);
+    }
 
     #[test]
     fn test_market_buy_vs_limit_sell() {

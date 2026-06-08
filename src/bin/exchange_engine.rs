@@ -447,6 +447,7 @@ mod tests {
 ///
 /// Each thread creates its own AeronClient connection — this avoids the 3rd
 /// publication registration hanging when all symbols share one client.
+#[allow(clippy::too_many_arguments)]
 fn spawn_symbol_thread(
     core_index: usize,
     symbol: String,
@@ -454,11 +455,16 @@ fn spawn_symbol_thread(
     tracer: Option<lightning_exchange::tracer::ExchangeTracer>,
     uid_map: HashMap<u64, (u64, i32)>,
     leadership: Option<LeadershipHandle>,
+    pool: sqlx::PgPool,
+    // (recording_id, position) the restored snapshot was taken at; the
+    // replay skips everything up to here (T4).
+    snap_bound: Option<(i64, i64)>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("match-{}", symbol))
         .spawn(move || {
             pin_current_thread_to_core("ENGINE_MATCH_CORES", core_index, "matching");
+            let snapshot_pool_thread = pool; // T4: PG handle for periodic save
             let client = Arc::new(AeronClient::new(&aeron_dir()).expect("AeronClient"));
             let orders_stream = orders_stream_for_symbol(&symbol);
             let mut subscriber =
@@ -502,6 +508,29 @@ fn spawn_symbol_thread(
             let mut depth_seq: u64 = 0;
             let depth_interval = Duration::from_millis(10);
             let mut last_depth = Instant::now();
+            // T4: periodic engine snapshot. SNAPSHOT_INTERVAL_SECS=0 (or no
+            // journal) disables it. Uses a current-thread runtime to run
+            // the async PG save from this sync engine thread; called at
+            // most once per interval so the cost is negligible.
+            let snapshot_interval_secs: u64 = std::env::var("SNAPSHOT_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| {
+                    if lightning_exchange::transport::journal::archive_config_from_env().is_some() {
+                        60
+                    } else {
+                        0
+                    }
+                });
+            let snapshot_rt = if snapshot_interval_secs > 0 {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()
+            } else {
+                None
+            };
+            let mut last_snapshot = Instant::now();
             let sym_bytes_fixed = symbol_bytes(&symbol);
 
             tracing::info!("[{}] matching thread started", symbol);
@@ -632,6 +661,41 @@ fn spawn_symbol_thread(
                 if replay_sub.is_none() {
                     if let Some(rec) = journal_pending.pop_front() {
                         let replayer = journal_replayer.as_mut().expect("replayer");
+                        // T4 snapshot bound: the restored book already
+                        // reflects everything up to (snap_rec, snap_pos).
+                        // Skip recordings older than the snapshot's; for
+                        // the snapshot's own recording, replay only the
+                        // tail from snap_pos (replay_from); newer
+                        // recordings replay in full (below).
+                        if let Some((snap_rec, snap_pos)) = snap_bound {
+                            if rec.recording_id < snap_rec {
+                                continue; // fully reflected in the snapshot
+                            }
+                            if rec.recording_id == snap_rec {
+                                match replayer.replay_from(
+                                    &rec, snap_pos, &orders_channel(), journal_replay_stream,
+                                ) {
+                                    Ok(Some(r)) => {
+                                        tracing::info!(
+                                            "[{}] journal: snapshot-bounded replay of recording {} from pos {}",
+                                            symbol, r.recording_id, snap_pos
+                                        );
+                                        replay_sub = Some(
+                                            AeronOrderSubscriber::new(
+                                                client.clone(),
+                                                &orders_channel(),
+                                                journal_replay_stream,
+                                            )
+                                            .unwrap_or_else(|e| panic!("[{symbol}] replay sub: {e}")),
+                                        );
+                                    }
+                                    Ok(None) => continue, // nothing past the snapshot
+                                    Err(e) => panic!("[{symbol}] snapshot-bounded replay: {e}"),
+                                }
+                                continue;
+                            }
+                            // rec.recording_id > snap_rec → full replay below.
+                        }
                         // Hand-off boundary: if this recording's session is
                         // STILL ACTIVE, the live subscription also receives
                         // its frames from the image's join position onward.
@@ -1182,6 +1246,42 @@ fn spawn_symbol_thread(
                     stats_last = Instant::now();
                 }
 
+                // T4: periodic snapshot (live only). Read the current
+                // recording's exact position IN this single-threaded loop
+                // so it tags precisely the frames consumed, then persist
+                // the resting book. On restart the replay resumes here.
+                if live
+                    && snapshot_interval_secs > 0
+                    && Instant::now().duration_since(last_snapshot).as_secs() >= snapshot_interval_secs
+                {
+                    last_snapshot = Instant::now();
+                    if let (Some(rt), Some(replayer)) =
+                        (snapshot_rt.as_ref(), journal_replayer.as_mut())
+                    {
+                        if let Ok(recs) = replayer.recordings("aeron", orders_stream) {
+                            if let Some(rec) = recs.last() {
+                                let rec_id = rec.recording_id;
+                                if let Ok(pos) = replayer.recorded_position(rec_id) {
+                                    let snap = engine.snapshot_resting();
+                                    let n = snap.orders.len();
+                                    if let Err(e) = rt.block_on(
+                                        lightning_exchange::matching::engine_snapshot::save(
+                                            &snapshot_pool_thread, &symbol, &snap, rec_id, pos,
+                                        ),
+                                    ) {
+                                        tracing::warn!("[{}] snapshot save failed: {e}", symbol);
+                                    } else {
+                                        tracing::info!(
+                                            "[{}] snapshot saved: {} orders @ recording {} pos {}",
+                                            symbol, n, rec_id, pos
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Depth snapshot every 10ms (suppressed while replaying).
                 let now = Instant::now();
                 let mut did_work = batch_count > 0;
@@ -1515,6 +1615,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Keep one handle for the leader-election lease task (below).
     let lease_pool_keep = pool.clone();
+    let snapshot_pool = pool.clone(); // T4: passed to symbol threads
     drop(pool);
 
     tracing::info!(
@@ -1620,8 +1721,31 @@ async fn main() -> anyhow::Result<()> {
     // Each thread creates its own AeronClient so publications don't contend.
     let mut handles = Vec::new();
     for (idx, symbol) in symbols.iter().enumerate() {
-        let engine = engines.remove(symbol).expect("engine missing");
+        let mut engine = engines.remove(symbol).expect("engine missing");
         let uid_map = uid_maps.remove(symbol).unwrap_or_default();
+        // T4: restore the latest snapshot BEFORE the thread starts; the
+        // replay then resumes from the snapshot's journal position rather
+        // than genesis. Only in journal mode (a snapshot without bounded
+        // replay would be re-applied from genesis and double-count).
+        let snap_bound = if journal_mode {
+            match lightning_exchange::matching::engine_snapshot::load_latest(&snapshot_pool, symbol).await {
+                Ok(Some((snap, rec_id, pos))) => {
+                    let n = engine.restore_resting(&snap);
+                    tracing::info!(
+                        "[{}] snapshot restored: {} resting orders, journal recording {} pos {}",
+                        symbol, n, rec_id, pos
+                    );
+                    Some((rec_id, pos))
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("[{}] snapshot load failed: {e} — full replay", symbol);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let handle = spawn_symbol_thread(
             idx,
             symbol.clone(),
@@ -1629,6 +1753,8 @@ async fn main() -> anyhow::Result<()> {
             tracer.clone(),
             uid_map,
             leadership.clone(),
+            snapshot_pool.clone(),
+            snap_bound,
         );
         handles.push(handle);
     }

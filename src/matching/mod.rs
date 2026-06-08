@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod engine_snapshot;
 pub mod error;
 pub mod event;
 pub mod list_pool;

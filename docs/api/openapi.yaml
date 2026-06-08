@@ -1,0 +1,150 @@
+openapi: 3.0.3
+info:
+  title: Lightning Exchange — Swap (perpetual) API
+  version: "testnet-1"
+  description: |
+    REST + WebSocket API for the perpetual-swap venue. Testnet: accounts
+    are funded by registration (10,000 USDT seed) and admin adjustment;
+    there is no deposit/withdrawal yet. All prices are decimal strings or
+    numbers in quote (USDT); quantities in base (e.g. BTC). Auth is a
+    JWT bearer obtained from /api/auth/login.
+servers:
+  - url: http://localhost:4003
+    description: local / testnet desk
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+    adminToken: { type: http, scheme: bearer, description: EXCHANGE_ADMIN_TOKEN }
+  schemas:
+    PlaceOrder:
+      type: object
+      required: [symbol, side, order_type, quantity]
+      properties:
+        symbol: { type: string, example: BTC_USDT }
+        side: { type: string, enum: [buy, sell] }
+        order_type: { type: string, enum: [limit, market] }
+        price: { type: number, description: required for limit }
+        quantity: { type: number }
+        client_order_id: { type: string, nullable: true }
+        reduce_only:
+          type: boolean
+          default: false
+          description: only reduce an existing opposite-side position
+    TriggerOrder:
+      type: object
+      required: [symbol, side, order_type, trigger_price, quantity]
+      properties:
+        symbol: { type: string }
+        side: { type: string, enum: [buy, sell] }
+        order_type: { type: string, enum: [limit, market] }
+        trigger_price: { type: number }
+        price: { type: number, description: required for limit }
+        quantity: { type: number }
+        trigger_when:
+          type: string
+          enum: [rising, falling]
+          description: default = stop semantics for the side
+paths:
+  /api/auth/register:
+    post:
+      summary: Register (seeds 10,000 USDT on testnet)
+      requestBody: { required: true, content: { application/json: { schema:
+        { type: object, properties: { email: {type: string}, password: {type: string} } } } } }
+      responses: { "200": { description: registered + token } }
+  /api/auth/login:
+    post:
+      summary: Login → JWT
+      requestBody: { required: true, content: { application/json: { schema:
+        { type: object, properties: { email: {type: string}, password: {type: string} } } } } }
+      responses: { "200": { description: "{ token }" } }
+  /api/auth/refresh:
+    post: { summary: Refresh access token, security: [{ bearerAuth: [] }],
+      responses: { "200": { description: new token } } }
+  /api/user/password:
+    patch: { summary: Change password, security: [{ bearerAuth: [] }],
+      responses: { "200": { description: ok } } }
+  /api/orders:
+    get:
+      summary: Open orders
+      security: [{ bearerAuth: [] }]
+      responses: { "200": { description: list } }
+    post:
+      summary: Place an order
+      security: [{ bearerAuth: [] }]
+      requestBody: { required: true, content: { application/json: { schema:
+        { $ref: "#/components/schemas/PlaceOrder" } } } }
+      responses: { "200": { description: accepted }, "503": { description: trading halted } }
+    delete:
+      summary: Cancel all open orders
+      security: [{ bearerAuth: [] }]
+      responses: { "200": { description: cancelled } }
+  /api/orders/{order_id}:
+    get: { summary: One order, security: [{ bearerAuth: [] }],
+      parameters: [{ name: order_id, in: path, required: true, schema: {type: integer} }],
+      responses: { "200": { description: order } } }
+    delete: { summary: Cancel one order, security: [{ bearerAuth: [] }],
+      parameters: [{ name: order_id, in: path, required: true, schema: {type: integer} }],
+      responses: { "200": { description: cancelled } } }
+  /api/trigger-orders:
+    get: { summary: List trigger orders, security: [{ bearerAuth: [] }],
+      responses: { "200": { description: list } } }
+    post:
+      summary: Place a stop / take-profit trigger
+      security: [{ bearerAuth: [] }]
+      requestBody: { required: true, content: { application/json: { schema:
+        { $ref: "#/components/schemas/TriggerOrder" } } } }
+      responses: { "200": { description: "{ id, status: pending }" } }
+  /api/trigger-orders/{id}:
+    delete: { summary: Cancel a pending trigger, security: [{ bearerAuth: [] }],
+      parameters: [{ name: id, in: path, required: true, schema: {type: integer} }],
+      responses: { "200": { description: cancelled }, "404": { description: gone/fired } } }
+  /api/positions:
+    get: { summary: Open positions (live, from memory), security: [{ bearerAuth: [] }],
+      responses: { "200": { description: positions } } }
+  /api/accounts:
+    get: { summary: Balances (exact decimal strings), security: [{ bearerAuth: [] }],
+      responses: { "200": { description: balances } } }
+  /api/balances:
+    get: { summary: Alias of /api/accounts, security: [{ bearerAuth: [] }],
+      responses: { "200": { description: balances } } }
+  /api/trades:
+    get: { summary: Recent trades, security: [{ bearerAuth: [] }],
+      responses: { "200": { description: trades } } }
+  /api/tickers:
+    get: { summary: Tickers (public), responses: { "200": { description: tickers } } }
+  /api/klines:
+    get: { summary: Candlesticks (public), responses: { "200": { description: klines } } }
+  /api/funding:
+    get:
+      summary: Funding state per symbol (public)
+      parameters: [{ name: symbol, in: query, required: false, schema: {type: string} }]
+      responses: { "200": { description: "next_settlement_at_ms, last_rate_e9, premium_twap_e9" } }
+  /api/test-funds:
+    post: { summary: "Claim test funds (testnet, when balance < 100)", security: [{ bearerAuth: [] }],
+      responses: { "200": { description: granted } } }
+  /api/admin/config:
+    get: { summary: Runtime controls, security: [{ adminToken: [] }],
+      responses: { "200": { description: per-symbol halt/fees } } }
+    post:
+      summary: Halt/resume + fee override (no restart)
+      security: [{ adminToken: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object,
+        properties: { symbol: {type: string}, trading_halted: {type: boolean},
+          maker_fee_bps: {type: integer}, taker_fee_bps: {type: integer},
+          clear_maker_fee: {type: boolean}, clear_taker_fee: {type: boolean} } } } } }
+      responses: { "200": { description: applied } }
+  /api/admin/force-close:
+    post:
+      summary: Force-flatten a user's position (manual intervention)
+      security: [{ adminToken: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object,
+        properties: { user_id: {type: integer}, symbol: {type: string} } } } } }
+      responses: { "200": { description: "{ order_id, qty_lots }" } }
+  /api/admin/revoke:
+    post: { summary: Revoke a user's sessions, security: [{ adminToken: [] }],
+      responses: { "200": { description: revoked } } }
+  /api/admin/unrevoke:
+    post: { summary: Un-revoke, security: [{ adminToken: [] }],
+      responses: { "200": { description: ok } } }
+  /metrics:
+    get: { summary: Prometheus metrics (text), responses: { "200": { description: metrics } } }

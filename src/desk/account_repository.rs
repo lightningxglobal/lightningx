@@ -247,7 +247,7 @@ impl<'a> AccountRepository<'a> {
             tx.rollback().await.ok();
             return Err(anyhow!("withdrawal {id} not in a confirmable state ({status})"));
         }
-        let total = amount + fee;
+        let total = amount.checked_add(fee).ok_or_else(|| anyhow::anyhow!("withdrawal total overflow: amount={} fee={}", amount, fee))?;
         // Debit: the frozen funds actually leave the exchange.
         sqlx::query(
             "UPDATE accounts SET
@@ -297,7 +297,7 @@ impl<'a> AccountRepository<'a> {
             tx.rollback().await.ok();
             return Err(anyhow!("withdrawal {id} already confirmed — cannot fail"));
         }
-        let total = amount + fee;
+        let total = amount.checked_add(fee).ok_or_else(|| anyhow::anyhow!("withdrawal total overflow: amount={} fee={}", amount, fee))?;
         sqlx::query(
             "UPDATE accounts SET frozen_atoms = frozen_atoms - $1, updated_at = NOW()
               WHERE user_id = $2 AND asset = $3",
@@ -520,6 +520,34 @@ impl<'a> AccountRepository<'a> {
         }
         let mut tx = self.pool.begin().await?;
 
+        // Idempotency anchor: insert the trade row FIRST.
+        // ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING means a
+        // replayed call skips the INSERT (rows_affected == 0) and we
+        // return early — the 4 account UPDATEs below are NOT re-executed,
+        // so there is no double-debit/double-credit on replay.
+        if let Some(t) = trade {
+            let inserted = sqlx::query(
+                "INSERT INTO trades (symbol, buy_order_id, sell_order_id,
+                                     price_atoms, quantity_atoms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING",
+            )
+            .bind(&t.symbol)
+            .bind(t.buy_order_id)
+            .bind(t.sell_order_id)
+            .bind(price.atoms())
+            .bind(quantity.atoms())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| anyhow!("settle trade insert: {e}"))?;
+
+            if inserted.rows_affected() == 0 {
+                // Duplicate — already settled. Skip all account updates.
+                tx.rollback().await.ok();
+                return Ok(());
+            }
+        }
+
         // Buyer: deduct frozen quote (cost + fee), credit base
         sqlx::query(
             "UPDATE accounts SET
@@ -578,24 +606,6 @@ impl<'a> AccountRepository<'a> {
         .await
         .map_err(|e| anyhow!("settle stmt-4: {e}"))?;
 
-        // Trade record commits atomically with the settlement legs.
-        if let Some(t) = trade {
-            sqlx::query(
-                "INSERT INTO trades (symbol, buy_order_id, sell_order_id,
-                                     price_atoms, quantity_atoms)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (buy_order_id, sell_order_id) DO NOTHING",
-            )
-            .bind(&t.symbol)
-            .bind(t.buy_order_id)
-            .bind(t.sell_order_id)
-            .bind(price.atoms())
-            .bind(quantity.atoms())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| anyhow!("settle trade insert: {e}"))?;
-        }
-
         // Fund audit: all four legs, same transaction.
         let trade_ref = trade.map(|t| t.buy_order_id).unwrap_or(0);
         fund_audit(&mut tx, buyer_id, quote_asset, "settle_debit", buyer_debit.atoms(), trade_ref)
@@ -616,5 +626,112 @@ impl<'a> AccountRepository<'a> {
 
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Documents the overflow case for withdrawal total arithmetic (A2).
+    /// i64::MAX + 1 must be None, not a silent wrap-around.
+    #[test]
+    fn test_checked_add_overflow() {
+        assert!(i64::MAX.checked_add(1).is_none());
+        assert!(i64::MAX.checked_add(0).is_some());
+        assert_eq!(i64::MAX.checked_add(0).unwrap(), i64::MAX);
+    }
+
+    /// Idempotent settle_trade_atoms (A1): calling with the same
+    /// (buy_order_id, sell_order_id) a second time must be a no-op.
+    /// Requires a live PostgreSQL database — skipped in unit-test runs.
+    #[sqlx::test]
+    #[ignore]
+    async fn test_settle_trade_atoms_idempotent(pool: sqlx::PgPool) {
+        use super::{AccountRepository, SettleTradeRecord};
+        use crate::desk::money::AmountAtoms;
+
+        let repo = AccountRepository::new(&pool);
+
+        let buyer_id = 1i64;
+        let seller_id = 2i64;
+
+        // Seed accounts with enough balance/frozen.
+        sqlx::query(
+            "INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms)
+             VALUES ($1, 'USDT', 1000000, 1000000),
+                    ($2, 'BTC',  1000000, 1000000)
+             ON CONFLICT (user_id, asset) DO UPDATE
+               SET balance_atoms = EXCLUDED.balance_atoms,
+                   frozen_atoms  = EXCLUDED.frozen_atoms",
+        )
+        .bind(buyer_id)
+        .bind(seller_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let trade = SettleTradeRecord {
+            symbol: "BTC_USDT".to_string(),
+            buy_order_id: 9001,
+            sell_order_id: 9002,
+        };
+        let price = AmountAtoms::from_atoms(100_0000_0000i64); // 100 USDT
+        let qty = AmountAtoms::from_atoms(1_0000_0000i64); // 1 BTC
+        let fee = AmountAtoms::from_atoms(0);
+
+        // First call — should settle.
+        repo.settle_trade_atoms(
+            buyer_id, seller_id, "BTC", "USDT", price, qty, fee, fee, Some(&trade),
+        )
+        .await
+        .unwrap();
+
+        // Snapshot balances after first call.
+        let buyer_usdt: i64 = sqlx::query_scalar(
+            "SELECT balance_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
+        )
+        .bind(buyer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let seller_btc: i64 = sqlx::query_scalar(
+            "SELECT balance_atoms FROM accounts WHERE user_id=$1 AND asset='BTC'",
+        )
+        .bind(seller_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Second call — duplicate trade, must be a no-op.
+        repo.settle_trade_atoms(
+            buyer_id, seller_id, "BTC", "USDT", price, qty, fee, fee, Some(&trade),
+        )
+        .await
+        .unwrap();
+
+        let buyer_usdt_after: i64 = sqlx::query_scalar(
+            "SELECT balance_atoms FROM accounts WHERE user_id=$1 AND asset='USDT'",
+        )
+        .bind(buyer_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let seller_btc_after: i64 = sqlx::query_scalar(
+            "SELECT balance_atoms FROM accounts WHERE user_id=$1 AND asset='BTC'",
+        )
+        .bind(seller_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            buyer_usdt, buyer_usdt_after,
+            "buyer USDT balance must not change on replay"
+        );
+        assert_eq!(
+            seller_btc, seller_btc_after,
+            "seller BTC balance must not change on replay"
+        );
     }
 }

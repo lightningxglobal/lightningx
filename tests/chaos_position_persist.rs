@@ -195,6 +195,7 @@ async fn positions_survive_desk_kill9_and_remain_closable() {
         "DELETE FROM positions WHERE symbol = $1",
         "DELETE FROM funding_history WHERE symbol = $1",
         "DELETE FROM funding_state WHERE symbol = $1",
+        "DELETE FROM trades WHERE symbol = $1",
     ] {
         let _ = sqlx::query(sql).bind(SYMBOL).execute(&pg).await;
     }
@@ -254,6 +255,18 @@ async fn positions_survive_desk_kill9_and_remain_closable() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     eprintln!("chaos-pos: positions durable in PG");
+
+    // T3: the fill that opened these positions must also leave a trades
+    // history row (the split-topology gap — trades were silently dropped
+    // when the recv-public consumer couldn't resolve the taker uid).
+    let trade_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE symbol = $1")
+            .bind(SYMBOL)
+            .fetch_one(&pg)
+            .await
+            .expect("trades count");
+    assert!(trade_rows >= 1, "the opening fill must produce a trades row (T3)");
+    eprintln!("chaos-pos: trades history row present ({trade_rows})");
 
     // ── S3 end-to-end: a real funding settlement lands through the
     //    desk task → frame → pg-writer single-tx path. With premium 0

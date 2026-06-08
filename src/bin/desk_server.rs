@@ -1277,6 +1277,38 @@ fn process_db_cmd(
                 .iter()
                 .filter(|e| e.taker_uid != 0 && e.maker_uid != 0)
                 .collect();
+            // T3 — TradeInsert per fill BEFORE the uid-resolution gate: a
+            // trade history row needs only the two ORDER ids (always
+            // present), not the participant uids. The recv-public trade
+            // consumer often can't resolve uids (the taker's runtime meta
+            // lives in the recv-PRIVATE thread's cache), which left
+            // `resolved` empty and returned here — silently dropping every
+            // trade row while positions still landed via the maker loop
+            // above. Emit here, unconditionally on order ids.
+            {
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                for e in entries.iter() {
+                    if e.taker_id == 0 || e.maker_id == 0 {
+                        continue;
+                    }
+                    let sym_end = e.symbol.iter().position(|&b| b == 0).unwrap_or(16);
+                    let symbol = std::str::from_utf8(&e.symbol[..sym_end]).unwrap_or("BTC_USDT");
+                    publish_frame(
+                        &persist_pub,
+                        &PersistFrame::trade_insert(TradeInsertPayload {
+                            buy_order_id: if e.side == 0 { e.taker_id } else { e.maker_id },
+                            sell_order_id: if e.side == 0 { e.maker_id } else { e.taker_id },
+                            symbol: pack_str(symbol),
+                            price: e.price,
+                            qty: e.qty,
+                            ts_ms,
+                        }),
+                    );
+                }
+            }
             if resolved.is_empty() {
                 return;
             }
@@ -1424,22 +1456,6 @@ fn process_db_cmd(
                 }
             }
 
-            // Emit TradeInsert per fill — pg-writer applies these to trades table.
-            for r in &resolved {
-                let sym_end = r.symbol.iter().position(|&b| b == 0).unwrap_or(16);
-                let symbol = std::str::from_utf8(&r.symbol[..sym_end]).unwrap_or("BTC_USDT");
-                publish_frame(
-                    &persist_pub,
-                    &PersistFrame::trade_insert(TradeInsertPayload {
-                        buy_order_id: if r.side == 0 { r.taker_id } else { r.maker_id },
-                        sell_order_id: if r.side == 0 { r.maker_id } else { r.taker_id },
-                        symbol: pack_str(symbol),
-                        price: r.price,
-                        qty: r.qty,
-                        ts_ms: (ts / 1000) as i64,
-                    }),
-                );
-            }
         }
     }
 }

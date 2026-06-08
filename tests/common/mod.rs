@@ -104,6 +104,11 @@ impl ProcGuard {
         self.child = None;
     }
 
+    /// OS pid of the running child (for /proc sampling), if alive.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     pub fn is_running(&mut self) -> bool {
         match &mut self.child {
             Some(c) => matches!(c.try_wait(), Ok(None)),
@@ -194,4 +199,16 @@ impl Drop for DrillGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Resident set size (KiB) of a process from /proc/<pid>/status, or None
+/// if it can't be read (process gone / not Linux).
+pub fn rss_kib(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.trim().trim_end_matches(" kB").trim().parse().ok();
+        }
+    }
+    None
 }

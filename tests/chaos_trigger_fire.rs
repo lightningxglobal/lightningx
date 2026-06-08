@@ -387,5 +387,14 @@ async fn triggers_fire_on_mark_cross_and_survive_kill9() {
     .bind(format!("chaos_trig_{run}_%"))
     .execute(&pg)
     .await;
+    // D4: also clean up trigger_orders rows created by this drill run so that
+    // account_reconcile and recovery-reinjection scans are not crowded out by
+    // drill residue across runs.
+    let _ = sqlx::query(
+        "DELETE FROM trigger_orders WHERE user_id IN (SELECT id FROM users WHERE email LIKE $1)",
+    )
+    .bind(format!("chaos_trig_{run}_%"))
+    .execute(&pg)
+    .await;
     drop(desk);
 }

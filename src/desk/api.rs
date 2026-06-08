@@ -1520,7 +1520,7 @@ async fn handle_place_trigger(
             .into_response();
     }
     let when = match req.trigger_when.as_deref() {
-        None => crate::desk::trigger::TriggerWhen::default_for_side(side),
+        None => crate::desk::trigger::TriggerWhen::default_stop_loss_direction(side),
         Some(w) => match crate::desk::trigger::TriggerWhen::from_db_str(w) {
             Some(w) => w,
             None => {

@@ -48,6 +48,18 @@ impl ExchangeConfig {
         }
     }
 
+    /// Update the in-memory control for `symbol`. The caller is responsible for
+    /// persisting the new state to PG so that a desk restart restores it via
+    /// `hydrate`.
+    ///
+    /// D3-TODO: persist halt state to PG table exchange_config (key TEXT PK, value TEXT).
+    // DDL: CREATE TABLE IF NOT EXISTS exchange_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    // On halt: INSERT INTO exchange_config (key,value)
+    //          VALUES (format!("market_halt:{symbol}"), "true")
+    //          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+    // On resume: same upsert with value = "false".
+    // On startup: query exchange_config WHERE key LIKE 'market_halt:%' and restore
+    //             trading_halted for each symbol before accepting orders.
     pub fn set(&self, symbol: &str, control: SymbolControl) {
         self.by_symbol.insert(symbol.to_string(), control);
     }

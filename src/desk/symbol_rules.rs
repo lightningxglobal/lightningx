@@ -72,6 +72,26 @@ impl FixedOrderInput {
 }
 
 impl SymbolRules {
+    /// BTC_USDT defaults — used as a safe fallback in test builds only.
+    /// Never call this in production code; use `for_symbol` instead.
+    #[cfg(test)]
+    fn btc_defaults() -> Self {
+        Self {
+            price_tick: 0.01,
+            quantity_step: 0.000001,
+            price_tick_atoms: 1_000_000,
+            quantity_step_atoms: 100,
+            min_notional: 5.0,
+            notional_scale: 1_000_000,
+            default_leverage: 10,
+            maintenance_rate_bps: 50,
+            margin_call_rate_bps: 75,
+            price_band_bps: 10_000,
+            max_position_lots: 0,
+            max_symbol_oi_lots: 0,
+        }
+    }
+
     /// S7.1 — maker/taker fee in basis points. Per-symbol override
     /// FEE_<SYMBOL>_MAKER_BPS / _TAKER_BPS, else global MAKER_FEE_BPS /
     /// TAKER_FEE_BPS, else defaults (maker 1bp, taker 5bp). Negative
@@ -139,20 +159,14 @@ impl SymbolRules {
                 max_position_lots: 0,
                 max_symbol_oi_lots: 0,
             },
-            _ => Self {
-                price_tick: 0.01,
-                quantity_step: 0.000001,
-                price_tick_atoms: 1_000_000,
-                quantity_step_atoms: 100,
-                min_notional: 1.0,
-                notional_scale: 1_000_000,
-                default_leverage: 10,
-                maintenance_rate_bps: 50,
-                margin_call_rate_bps: 75,
-                price_band_bps: 10_000,
-                max_position_lots: 0,
-                max_symbol_oi_lots: 0,
-            },
+            _ => {
+                // F1: unknown symbols must never silently return BTC params in production.
+                // In test builds, return BTC defaults for convenience (tests use synthetic symbols).
+                #[cfg(not(test))]
+                panic!("SymbolRules::for_symbol: unknown symbol {:?} -- add it to the match", symbol);
+                #[cfg(test)]
+                Self::btc_defaults()
+            }
         }
     }
 
@@ -308,6 +322,22 @@ pub fn validate_order_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_for_symbol_known_symbols_ok() {
+        // F1: known symbols must return their correct params without panic.
+        let btc = SymbolRules::for_symbol("BTC_USDT");
+        assert_eq!(btc.price_tick_atoms, 1_000_000);
+        assert_eq!(btc.notional_scale, 1_000_000);
+
+        let eth = SymbolRules::for_symbol("ETH_USDT");
+        assert_eq!(eth.price_tick_atoms, 1_000_000);
+        assert_eq!(eth.notional_scale, 10_000);
+
+        let sol = SymbolRules::for_symbol("SOL_USDT");
+        assert_eq!(sol.price_tick_atoms, 100_000);
+        assert_eq!(sol.notional_scale, 10_000);
+    }
 
     #[test]
     fn atoms_twins_match_float_rules_for_all_symbols() {

@@ -19,6 +19,7 @@
 //! - `status` byte → `'PENDING' | 'TRADING' | 'COMPLETED' | 'CANCELED' | 'REJECTED'`.
 
 use crate::desk::money::AmountAtoms;
+use crate::transport::journal::JOURNAL_RESTART_JUMP;
 use crate::transport::persist_event::{
     AccountSetPayload, MatchingEventPayload, OrderDeletePayload, OrderFillUpdatePayload,
     OrderUpsertPayload, PersistFrame, PersistKind, TradeInsertPayload, unpack_str,
@@ -245,6 +246,10 @@ impl PgWriteBatch {
     /// Unsequenced frames (seq == 0) always pass.
     fn admit_seq(&mut self, publisher_id: u16, seq: u64) -> bool {
         if seq == 0 {
+            tracing::warn!(
+                "seq=0 frame from publisher {} -- applying without dedup",
+                publisher_id
+            );
             return true;
         }
         let floor = self.applied_seq.get(&publisher_id).copied().unwrap_or(0);
@@ -261,8 +266,7 @@ impl PgWriteBatch {
         if pending > 0 && jump > 1 {
             // Clock-seeded restart sequences jump by ~nanoseconds-of-downtime;
             // anything that large is a restart, not frame loss.
-            const RESTART_JUMP: u64 = 1 << 40;
-            if jump > RESTART_JUMP {
+            if jump > JOURNAL_RESTART_JUMP {
                 self.publisher_restarts += 1;
             } else {
                 self.seq_gap_frames += jump - 1;
@@ -708,7 +712,28 @@ impl PgWriteBatch {
         freeze_price: f64,
         client_order_id: Option<String>,
         created_at: DateTime<Utc>,
-    ) {
+    ) -> bool {
+        let quantity_atoms = match to_atoms(quantity) {
+            Some(v) => v,
+            None => {
+                tracing::warn!("push_upsert_row: to_atoms failed for quantity, skipping");
+                return false;
+            }
+        };
+        let filled_atoms = match to_atoms(filled) {
+            Some(v) => v,
+            None => {
+                tracing::warn!("push_upsert_row: to_atoms failed for filled, skipping");
+                return false;
+            }
+        };
+        let freeze_price_atoms = match to_atoms(freeze_price) {
+            Some(v) => v,
+            None => {
+                tracing::warn!("push_upsert_row: to_atoms failed for freeze_price, skipping");
+                return false;
+            }
+        };
         let price_atoms = price.and_then(to_atoms);
         self.upserts.push(UpsertRow {
             id,
@@ -720,13 +745,14 @@ impl PgWriteBatch {
             quantity,
             filled,
             price_atoms,
-            quantity_atoms: to_atoms(quantity).unwrap_or(0),
-            filled_atoms: to_atoms(filled).unwrap_or(0),
+            quantity_atoms,
+            filled_atoms,
             status,
-            freeze_price_atoms: to_atoms(freeze_price).unwrap_or(0),
+            freeze_price_atoms,
             client_order_id,
             created_at,
         });
+        true
     }
 
     /// Apply everything to PG inside one transaction. Returns total rows
@@ -1303,6 +1329,17 @@ async fn flush_accounts(conn: &mut PgConnection, rows: &[AccountRow]) -> anyhow:
         balance_atoms.push(r.balance_atoms);
         frozen_atoms.push(r.frozen_atoms);
     }
+    // TODO(F2): add frame_seq guard to prevent stale replayed frames from
+    // overwriting newer account state. Migration required first:
+    //   ALTER TABLE accounts ADD COLUMN IF NOT EXISTS frame_seq BIGINT NOT NULL DEFAULT 0;
+    // Then change the ON CONFLICT clause to:
+    //   ON CONFLICT (user_id, asset) DO UPDATE SET
+    //       balance_atoms = EXCLUDED.balance_atoms,
+    //       frozen_atoms  = EXCLUDED.frozen_atoms,
+    //       frame_seq     = EXCLUDED.frame_seq,
+    //       updated_at    = NOW()
+    //   WHERE EXCLUDED.frame_seq > accounts.frame_seq
+    // And bind the Aeron frame sequence as an additional parameter.
     let res = sqlx::query(
         r#"
         INSERT INTO accounts (user_id, asset, balance_atoms, frozen_atoms, updated_at)
@@ -1631,7 +1668,7 @@ pub async fn backfill_from_redis(
             continue;
         };
 
-        batch.push_upsert_row(
+        if !batch.push_upsert_row(
             *id,
             user_id,
             symbol,
@@ -1644,7 +1681,9 @@ pub async fn backfill_from_redis(
             freeze_price,
             client_order_id,
             created_at,
-        );
+        ) {
+            stats.skipped_decode += 1;
+        }
     }
 
     let written = batch.flush(pg).await?;
@@ -1796,5 +1835,29 @@ mod tests {
         let mut b = PgWriteBatch::new();
         assert!(!b.push(&f));
         assert_eq!(b.skipped(), 1);
+    }
+
+    /// A3: push_upsert_row must return false (not silently store 0 atoms)
+    /// when the quantity is non-finite (NaN / infinity).
+    #[test]
+    fn push_upsert_row_skips_nonfinite() {
+        use chrono::Utc;
+        let mut b = PgWriteBatch::new();
+        let ok = b.push_upsert_row(
+            1,
+            7,
+            "BTC_USDT".to_string(),
+            "buy",
+            "limit".to_string(),
+            Some(70000.0),
+            f64::NAN, // non-finite quantity
+            0.0,
+            "PENDING",
+            70000.0,
+            None,
+            Utc::now(),
+        );
+        assert!(!ok, "push_upsert_row should return false for NaN quantity");
+        assert!(b.upserts.is_empty(), "no row must be staged when quantity is NaN");
     }
 }

@@ -498,15 +498,31 @@ impl RiskEngine {
         // Flip case: closed old position AND opened a new one on the opposite side.
         // The flip's new_pos.side == fill_side (e.g. closed long via sell → new Short pos).
         // For a simple partial close, new_pos.side is still the old side → flip_margin = 0.
-        let flip_margin = match &new_pos {
-            Some(p) if p.side == fill_side => p.initial_margin,
-            _ => 0,
+        let (flip_margin, flip_dust) = match &new_pos {
+            Some(p) if p.side == fill_side => {
+                let fm = p.initial_margin;
+                // A4: integer division truncates; the remainder (dust) would be silently
+                // lost. Credit it back to available_margin so the venue-wide sum is exact.
+                let dust = if fill_qty_lots > 0 {
+                    fill_margin_atoms * p.qty_lots % fill_qty_lots
+                } else {
+                    0
+                };
+                (fm, dust)
+            }
+            _ => (0, 0),
         };
         if let Some(mut acct) = self.accounts.get_mut(&user_id) {
             use std::sync::atomic::Ordering::Relaxed;
-            let old_om = acct.order_margin.load(Relaxed);
-            acct.order_margin
-                .store((old_om - fill_margin_atoms).max(0), Relaxed);
+            // B3: liquidation IOC orders never go through check_and_reserve_margin,
+            // so order_margin was never incremented for them. Decrementing it with
+            // .max(0) would silently lose value. Skip the order_margin adjustment
+            // entirely for liquidation fills (liq_price_ticks != 0).
+            if liq_price_ticks == 0 {
+                let old_om = acct.order_margin.load(Relaxed);
+                acct.order_margin
+                    .store((old_om - fill_margin_atoms).max(0), Relaxed);
+            }
             if released_used_margin > 0 {
                 // Closing (or closing+flipping): release old position's used_margin and credit pnl.
                 acct.used_margin = (acct.used_margin - released_used_margin).max(0);
@@ -520,7 +536,7 @@ impl RiskEngine {
                 // flows to socialization (run_adl) → insurance fund.
                 acct.available_margin.store(
                     old_av + fill_margin_atoms + released_used_margin + realized_pnl_cents
-                        - flip_margin,
+                        - flip_margin + flip_dust,
                     Relaxed,
                 );
                 // After forced liquidation close, let run_risk_tick re-evaluate status.
@@ -617,6 +633,8 @@ impl RiskEngine {
                     + acct.order_margin.load(Relaxed)
                     + acct.used_margin
                     + acct.unrealized_pnl;
+                // B2: mark that this account has seen at least one real mark-price update.
+                acct.mark_price_ever_updated = true;
             }
         }
     }
@@ -659,6 +677,12 @@ impl RiskEngine {
             .filter_map(|user_id| self.accounts.get(user_id))
             .filter_map(|entry| {
                 let acct = entry.value();
+                // B2: skip accounts whose mark price has never been updated — their
+                // equity is stale (mark == entry_price, unrealized_pnl == 0) and
+                // checking them would produce false liquidations.
+                if !acct.mark_price_ever_updated {
+                    return None;
+                }
                 if matches!(
                     acct.status,
                     RiskStatus::Liquidating | RiskStatus::Liquidated | RiskStatus::Bankruptcy
@@ -2271,5 +2295,136 @@ mod tests {
                 liq_price_ticks
             );
         }
+    }
+
+    // ── B2: stale-equity guard ────────────────────────────────────────────────
+
+    /// B2 fix: run_risk_tick skips accounts whose mark_price_ever_updated is false.
+    /// Without the fix, a freshly hydrated account with a large unrealized loss
+    /// (stale equity) would be immediately liquidated before the mark price arrives.
+    #[test]
+    fn hydrate_guard_prevents_false_liquidation() {
+        let engine = RiskEngine::new();
+        let uid = 77i64;
+        // Fund tightly so the account WOULD trigger liquidation if checked at stale equity.
+        engine.initialize_account(uid, 52_600 * A);
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
+        // Open a short position (entry == mark → unrealized_pnl == 0 at open).
+        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        // Manually corrupt equity to simulate a stale (negative) value as would
+        // happen right after hydration from a DB snapshot, before update_mark_price.
+        if let Some(mut acct) = engine.accounts.get_mut(&uid) {
+            acct.unrealized_pnl = -500_000 * A; // huge loss on paper
+            use std::sync::atomic::Ordering::Relaxed;
+            acct.equity = acct.available_margin.load(Relaxed)
+                + acct.order_margin.load(Relaxed)
+                + acct.used_margin
+                + acct.unrealized_pnl;
+        }
+        // mark_price_ever_updated is still false (no update_mark_price called).
+
+        // run_risk_tick MUST return empty — the guard protects unhydrated accounts.
+        let events = engine.run_risk_tick();
+        assert!(
+            events.is_empty(),
+            "B2: stale account must not trigger liquidation before first mark update"
+        );
+    }
+
+    // ── B3: liq fill order_margin conservation ───────────────────────────────
+
+    /// B3 fix: equity (available + order_margin + used + unrealized) is unchanged
+    /// across a liquidation fill that carries liq_price_ticks != 0.
+    #[test]
+    fn test_liq_fill_conservation() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (engine, uid) = setup_with_reserved(500_000 * A);
+        // Open long at $50,000.
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        if let Some(mut acct) = engine.accounts.get_mut(&uid) {
+            acct.status = RiskStatus::Liquidating;
+        }
+
+        // Capture equity before liq fill.
+        let eq_before = {
+            let acct = engine.accounts.get(&uid).unwrap();
+            acct.available_margin.load(Relaxed)
+                + acct.order_margin.load(Relaxed)
+                + acct.used_margin
+                + acct.unrealized_pnl
+        };
+
+        // Liquidation fill: fill_margin_atoms = 0 (no reservation), liq_price_ticks set.
+        let liq_ticks = 4_900_000i64;
+        let fill_ticks = 4_980_000i64;
+        engine.on_fill(uid, btc_sym(), 1, fill_ticks, QTY_LOTS, 0,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, liq_ticks);
+
+        // Equity after must equal equity before (conservation law).
+        let acct = engine.accounts.get(&uid).unwrap();
+        let eq_after = acct.available_margin.load(Relaxed)
+            + acct.order_margin.load(Relaxed)
+            + acct.used_margin
+            + acct.unrealized_pnl;
+
+        // The settlement is at liq_price (not fill_price), so realized_pnl
+        // is computed at liq_price. The difference (spread) goes to the fund.
+        // Equity before + realized_pnl_at_liq == equity after + spread_to_fund.
+        // Simplified: eq_before == eq_after + insurance_fund_delta
+        //   (where insurance_fund_delta = spread credited above).
+        let fund = engine.insurance_fund();
+        assert_eq!(
+            eq_before,
+            eq_after + fund,
+            "B3: equity + fund must be conserved across a liq fill (before={} after={} fund={})",
+            eq_before, eq_after, fund
+        );
+    }
+
+    // ── A4: close+flip margin conservation ───────────────────────────────────
+
+    /// A4 fix: available + order_margin + used_margin is unchanged across a
+    /// close+flip fill (the dust from integer division must not be lost).
+    #[test]
+    fn flip_margin_conservation() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (engine, uid) = make_engine_with_account(10_000_000 * A);
+
+        // Reserve and open a long 100k lots at $50,000.
+        engine.check_and_reserve_margin(uid, MARGIN_ATOMS).unwrap();
+        engine.on_fill(uid, btc_sym(), 0, PRICE_TICKS, QTY_LOTS, MARGIN_ATOMS,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        // Reserve margin for a sell 150k lots (closes 100k long and opens 50k short).
+        // Use an odd qty (150_001) to provoke integer dust in flip_margin computation.
+        let flip_qty = 150_001i64;
+        let flip_margin = MARGIN_ATOMS * flip_qty / QTY_LOTS;
+        engine.check_and_reserve_margin(uid, flip_margin).unwrap();
+
+        let acct_before = engine.accounts.get(&uid).unwrap();
+        let eq_before = acct_before.available_margin.load(Relaxed)
+            + acct_before.order_margin.load(Relaxed)
+            + acct_before.used_margin;
+        drop(acct_before);
+
+        // Flip: sell 150_001 lots → close 100k long, open 50_001 short.
+        engine.on_fill(uid, btc_sym(), 1, PRICE_TICKS, flip_qty, flip_margin,
+            NOTIONAL_SCALE, LEVERAGE, MAINT_BPS, 0);
+
+        let acct_after = engine.accounts.get(&uid).unwrap();
+        let eq_after = acct_after.available_margin.load(Relaxed)
+            + acct_after.order_margin.load(Relaxed)
+            + acct_after.used_margin;
+        drop(acct_after);
+
+        assert_eq!(
+            eq_before, eq_after,
+            "A4: available+order+used must be unchanged across a flip (before={} after={})",
+            eq_before, eq_after
+        );
     }
 }

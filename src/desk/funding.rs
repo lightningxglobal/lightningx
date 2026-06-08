@@ -47,15 +47,30 @@ pub struct FundingConfig {
 }
 
 impl FundingConfig {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> anyhow::Result<Self> {
         let get = |k: &str, d: i64| -> i64 {
             std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
         };
-        Self {
-            period_secs: get("FUNDING_PERIOD_SECS", 28_800) as u64,
-            interest_e9: get("FUNDING_INTEREST_E9", 100_000),
-            clamp_e9: get("FUNDING_CLAMP_E9", 7_500_000),
+        let clamp_e9 = get("FUNDING_CLAMP_E9", 7_500_000);
+        let interest_e9 = get("FUNDING_INTEREST_E9", 100_000);
+        // B7: reject nonsensical values that would silently disable or corrupt funding math.
+        if clamp_e9 < 0 {
+            return Err(anyhow::anyhow!(
+                "FUNDING_CLAMP_E9 must be >= 0, got {}",
+                clamp_e9
+            ));
         }
+        if interest_e9.abs() > 1_000_000 {
+            return Err(anyhow::anyhow!(
+                "FUNDING_INTEREST_E9 out of range (|{}| > 1_000_000)",
+                interest_e9
+            ));
+        }
+        Ok(Self {
+            period_secs: get("FUNDING_PERIOD_SECS", 28_800) as u64,
+            interest_e9,
+            clamp_e9,
+        })
     }
 }
 
@@ -389,5 +404,17 @@ mod tests {
         );
         assert!(s.deltas.is_empty());
         assert_eq!(s.residue_atoms, 0);
+    }
+
+    /// B7: negative clamp must return Err.
+    #[test]
+    fn negative_clamp_returns_err() {
+        std::env::set_var("FUNDING_CLAMP_E9", "-1");
+        let result = FundingConfig::from_env();
+        std::env::remove_var("FUNDING_CLAMP_E9");
+        assert!(
+            result.is_err(),
+            "B7: negative FUNDING_CLAMP_E9 must return Err"
+        );
     }
 }

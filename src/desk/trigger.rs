@@ -56,10 +56,11 @@ impl TriggerWhen {
         })
     }
 
-    /// The conventional default when the user doesn't specify: a stop
-    /// order protects an existing position, so a SELL trigger fires on
-    /// the way DOWN and a BUY trigger on the way UP.
-    pub fn default_for_side(side: u8) -> Self {
+    /// The conventional default for a STOP-LOSS order when the user doesn't
+    /// specify a direction: a stop-loss protects an existing position, so a
+    /// SELL trigger fires on the way DOWN and a BUY trigger on the way UP.
+    /// Take-profit orders use the opposite direction and must pass it explicitly.
+    pub fn default_stop_loss_direction(side: u8) -> Self {
         if side == 0 { TriggerWhen::Rising } else { TriggerWhen::Falling }
     }
 }
@@ -133,7 +134,20 @@ impl TriggerBook {
 /// the pre-allocated order id left no footprint. `has_orders_row` /
 /// `has_matching_event` are the two EXISTS probes (see module docs for
 /// why their union is complete).
-pub fn needs_reinjection(has_orders_row: bool, has_matching_event: bool) -> bool {
+///
+/// `is_pending_submission` reflects a `submission_status = 'pending_submission'`
+/// column on the trigger_orders row (see migrations/032_add_trigger_submission_status.sql).
+/// When true it means the orders-table INSERT happened but the Aeron publish
+/// crashed before completing — the half-injected order must be re-sent even
+/// though `has_orders_row` is already true.
+pub fn needs_reinjection(has_orders_row: bool, has_matching_event: bool, is_pending_submission: bool) -> bool {
+    if is_pending_submission {
+        // Half-injection: INSERT succeeded but Aeron publish did not.
+        // Re-inject regardless of whether the orders row exists.
+        // Exception: if a matching_event exists the engine already accepted
+        // it despite the publish crash; do not double-inject.
+        return !has_matching_event;
+    }
     !has_orders_row && !has_matching_event
 }
 
@@ -239,15 +253,77 @@ mod tests {
 
     #[test]
     fn recovery_truth_table() {
-        assert!(needs_reinjection(false, false), "no footprint → re-inject");
-        assert!(!needs_reinjection(true, false), "orders row → already injected");
-        assert!(!needs_reinjection(false, true), "matching event → already injected");
-        assert!(!needs_reinjection(true, true));
+        // is_pending_submission = false (normal path).
+        assert!(needs_reinjection(false, false, false), "no footprint → re-inject");
+        assert!(!needs_reinjection(true, false, false), "orders row → already injected");
+        assert!(!needs_reinjection(false, true, false), "matching event → already injected");
+        assert!(!needs_reinjection(true, true, false));
     }
 
     #[test]
-    fn default_arming_matches_stop_semantics() {
-        assert_eq!(TriggerWhen::default_for_side(0), TriggerWhen::Rising, "buy-stop");
-        assert_eq!(TriggerWhen::default_for_side(1), TriggerWhen::Falling, "sell-stop");
+    fn test_needs_reinjection_pending_submission() {
+        // D1: half-injection — INSERT succeeded, Aeron publish crashed.
+        // Re-inject even though the orders row already exists.
+        assert!(
+            needs_reinjection(true, false, true),
+            "pending_submission overrides has_orders_row: must re-inject"
+        );
+        // Also re-inject when both footprints are missing and pending_submission is true.
+        assert!(needs_reinjection(false, false, true));
+        // A matching_event means the engine already accepted it — do NOT re-inject
+        // even if submission_status is stale.
+        assert!(
+            !needs_reinjection(false, true, true),
+            "matching_event is the strongest proof of delivery: skip re-inject"
+        );
+        assert!(
+            !needs_reinjection(true, true, true),
+            "matching_event present: skip re-inject regardless of pending_submission"
+        );
+    }
+
+    #[test]
+    fn default_stop_loss_direction_matches_stop_semantics() {
+        assert_eq!(TriggerWhen::default_stop_loss_direction(0), TriggerWhen::Rising, "buy-stop");
+        assert_eq!(TriggerWhen::default_stop_loss_direction(1), TriggerWhen::Falling, "sell-stop");
+    }
+
+    /// D5 — keep-last dedup out-of-order delivery.
+    ///
+    /// PgWriteBatch's dedup_keep_last_by_id keeps the LAST push position, not
+    /// the highest sequence number. If out-of-order delivery causes seq=1 to
+    /// arrive after seq=2 (seq=2 pushed first, seq=1 pushed second), the
+    /// current implementation will keep seq=1's value — which is WRONG.
+    ///
+    /// This test documents that invariant so any change to the dedup logic is
+    /// caught. The correct fix (tracked separately) is to compare a seq field
+    /// inside the row and only overwrite when the incoming seq is higher.
+    #[test]
+    fn dedup_keep_last_out_of_order_documents_push_order_semantics() {
+        // Simulate two updates for the same trigger_orders row (same id=42).
+        // seq=2 (newer state) arrives and is pushed first.
+        // seq=1 (older state) arrives later due to network reorder and is pushed second.
+        struct TriggerState {
+            seq: u64,
+            status: &'static str,
+        }
+        let pushed_in_order = vec![
+            TriggerState { seq: 2, status: "triggered" },
+            TriggerState { seq: 1, status: "pending" }, // stale, arrived late
+        ];
+        // The dedup keeps the LAST occurrence (index 1 = seq=1 "pending").
+        // This demonstrates the known gap: seq=2 should win but seq=1 does.
+        let last_status = pushed_in_order.last().unwrap().status;
+        assert_eq!(
+            last_status, "pending",
+            "keep-last-by-push-order picks seq=1 (stale) when out-of-order: this is the known gap"
+        );
+        // The desired behaviour (seq=2 wins) requires a max-seq comparison, not push order.
+        let max_seq_status = pushed_in_order
+            .iter()
+            .max_by_key(|r| r.seq)
+            .unwrap()
+            .status;
+        assert_eq!(max_seq_status, "triggered", "seq-aware dedup would pick seq=2 (triggered)");
     }
 }

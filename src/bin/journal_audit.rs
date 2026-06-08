@@ -20,7 +20,9 @@ use lightning_exchange::db;
 use lightning_exchange::desk::pg_store::load_checkpoints;
 use lightning_exchange::transport::aeron_channels::{PERSIST_CHANNEL, PERSIST_STREAM, aeron_dir};
 use lightning_exchange::transport::aeron_transport::PersistSubscriber;
-use lightning_exchange::transport::journal::{JournalReplayer, archive_config_from_env};
+use lightning_exchange::transport::journal::{
+    JournalReplayer, JOURNAL_RESTART_JUMP, archive_config_from_env,
+};
 use lightning_exchange::transport::persist_event::PersistKind;
 
 /// Private replay stream for audits — never collides with live (31) or
@@ -91,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
                             // clock-seeded restarts produce huge jumps; only
                             // count plausible in-recording holes.
                             let jump = seq - e.last_seq;
-                            if jump < 1 << 40 {
+                            if jump < JOURNAL_RESTART_JUMP {
                                 e.gaps += jump - 1;
                             }
                         }

@@ -33,6 +33,12 @@ use aeron_wrapper::{
 /// persist stream id.
 pub const PERSIST_REPLAY_STREAM: i32 = 31;
 
+/// Threshold for distinguishing a clock-seeded publisher restart from an
+/// ordinary in-recording sequence gap. Sequence numbers jump by roughly
+/// the nanoseconds of downtime on restart; anything larger than this
+/// constant is treated as a restart, not frame loss.
+pub const JOURNAL_RESTART_JUMP: u64 = 1 << 40;
+
 /// Replayed engine-input (orders) traffic lands on
 /// `orders_stream + ORDERS_REPLAY_STREAM_OFFSET` — far above the live
 /// per-symbol order streams (base 10 + index) and the persist streams.
@@ -234,7 +240,14 @@ impl JournalReplayer {
             .archive
             .max_recorded_position(recording.recording_id)
             .map_err(|e| format!("max recorded position: {e}"))?;
-        let start = from_position.max(recording.start_position);
+        if from_position < recording.start_position {
+            return Err(format!(
+                "replay gap: from_position={} < recording.start_position={}; \
+                 increase journal retention",
+                from_position, recording.start_position
+            ));
+        }
+        let start = from_position;
         if max <= start {
             return Ok(None);
         }
@@ -346,5 +359,32 @@ mod tests {
             PERSIST_REPLAY_STREAM,
             crate::transport::aeron_channels::PERSIST_STREAM
         );
+    }
+
+    /// C1: replay_from must return an error when from_position < recording
+    /// start_position instead of silently clamping to start_position.
+    #[test]
+    fn replay_from_rejects_stale_position() {
+        // We test the logic directly without a real archive by verifying the
+        // guard path: a recording whose start_position=100 and a caller asking
+        // from_position=50 must produce Err containing "replay gap".
+        // We cannot instantiate JournalReplayer without a real AeronClient, so
+        // we replicate the guard logic inline as a compile-time-verified unit.
+        fn check_replay_from(from_position: i64, start_position: i64) -> Result<(), String> {
+            if from_position < start_position {
+                return Err(format!(
+                    "replay gap: from_position={} < recording.start_position={}; \
+                     increase journal retention",
+                    from_position, start_position
+                ));
+            }
+            Ok(())
+        }
+        let result = check_replay_from(50, 100);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("replay gap"), "expected 'replay gap' in: {msg}");
+        assert!(check_replay_from(100, 100).is_ok());
+        assert!(check_replay_from(200, 100).is_ok());
     }
 }

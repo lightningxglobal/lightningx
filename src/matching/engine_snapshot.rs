@@ -92,25 +92,23 @@ pub async fn save(
     journal_position: i64,
 ) -> anyhow::Result<i64> {
     let payload = serialize(snap);
+    // Atomic: compute next seq AND insert in one statement to avoid a
+    // race where two concurrent saves both SELECT the same MAX and then
+    // both try to INSERT the same snapshot_seq.
     let seq: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(snapshot_seq), 0) + 1 FROM engine_snapshots WHERE symbol = $1",
-    )
-    .bind(symbol)
-    .fetch_one(pool)
-    .await?;
-    sqlx::query(
         "INSERT INTO engine_snapshots
             (symbol, snapshot_seq, journal_recording_id, journal_position,
              order_count, payload)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         SELECT $1, COALESCE(MAX(snapshot_seq), 0) + 1, $2, $3, $4, $5
+           FROM engine_snapshots WHERE symbol = $1
+         RETURNING snapshot_seq",
     )
     .bind(symbol)
-    .bind(seq)
     .bind(journal_recording_id)
     .bind(journal_position)
     .bind(snap.orders.len() as i32)
     .bind(&payload)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
     sqlx::query(
         "DELETE FROM engine_snapshots WHERE symbol = $1 AND snapshot_seq <= $2 - 3",

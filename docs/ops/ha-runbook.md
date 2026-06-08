@@ -441,7 +441,7 @@ CHAOS_KILLS_ENGINE=10 cargo test --test chaos_gate2_engine -- --nocapture
 
 | 周期 | 动作 |
 |---|---|
-| 每日(cron) | `journal-audit` 跑一次,exit≠0 即告警;检查 PG 复制 lag、Archive 磁盘 |
+| 每日(cron) | `journal-audit` 跑一次,exit≠0 即告警;检查 PG 复制 lag、Archive 磁盘;**充提对账**(见 §15):Σ虚拟账户余额(每资产)== 链上钱包总额 + 在途归集,diff≠0 即 P1 冻结出金 |
 | 每周 | `pg_basebackup` 全量;WAL 归档外移确认 |
 | 每月 | 演练 Redis 重灌(§8)计时;审查 audit_log 异常 |
 | 每季 | §12 第 4-7 项重演;PITR 真实恢复演练 |
@@ -469,6 +469,71 @@ CHAOS_KILLS_ENGINE=10 cargo test --test chaos_gate2_engine -- --nocapture
 5. 多播不可用的网络(部分云环境):改用 Aeron MDC(multi-destination-cast),
    desk 的 orders publication 改 control 模式频道字符串——需要一个小的
    channel 配置扩展,届时排期。
+
+---
+
+## 15. 充提(链上托管)接入与对账
+
+撮合系统**不碰链**。链上是独立服务,通过两个窄账本接口对接(代码侧已落地,
+均单事务+幂等+守恒):充值入账 `POST /api/deposit/credit`、提现状态推进
+`POST /api/withdrawals/:id/status`。下面是运维侧。
+
+### 15.1 凭证与配置(desk-server env)
+
+```bash
+# 链上服务的 service token(≥32 字节,独立于人工 admin token,最小权限)
+EXCHANGE_DEPOSIT_TOKEN_FILE=/opt/exchange/secrets/deposit_token
+WITHDRAW_FEE_ATOMS=100000000        # 提现手续费,1 USDT = 1e8 atoms
+```
+```bash
+install -m 0400 -o root -g exchange /dev/stdin /opt/exchange/secrets/deposit_token <<<"$(openssl rand -hex 32)"
+```
+> ⚠️ deposit token 给**链上服务**用(充值入账 + 提现状态推进),与 desk
+> 的 `EXCHANGE_ADMIN_TOKEN`(人工运营)分开。链上服务只持有这一个,拿不到
+> 人工后台权限。
+
+### 15.2 充值流(链上服务侧)
+
+1. HD 钱包派生每用户充值地址(主私钥**冷存**),或共享地址 + memo。
+2. 监听器扫块,识别到账地址 → 等 N 个确认(Tron ~20、ETH ~12-30,防重组)。
+3. 确认后**对每笔到账调一次** `POST /api/deposit/credit`,body 带
+   `(chain, tx_hash, log_index, user_id, asset, amount_atoms)`。
+   **幂等键 = (chain, tx_hash, log_index)**:重启/重组重扫重复调用 = no-op
+   (`{"credited":false}`),绝不二次入账。
+4. 入账 = 账本一笔 AccountSet + fund_audit(单事务),Redis/各 desk 自动收敛。
+
+路由:必须调**该用户 shard 归属的 desk**(账户状态按 shard 分);误路由返回
+421,链上服务按 `user_id % 4` 重路由(见 §1 desk 分片)。
+
+### 15.3 提现流(两段式)
+
+- **用户申请**(JWT)→ `POST /api/withdrawals` → 冻结 amount+fee,记 `pending`。
+- **链上服务**(deposit token)→ `POST /api/withdrawals/:id/status`:
+  `approved`(风控/人工放行)→ `broadcast`(已签名出账,带 tx_hash)→
+  `confirmed`(链上成交,**扣减冻结**)。失败任一步 → `failed`(**释放冻结**)。
+- 幂等:`confirmed`/`failed` 重放不二次扣减/释放;confirm 与 fail 互斥。
+- **热钱包只放运营流动性**(如总量 5%)供提现;其余冷钱包多签离线。
+  风控闸门(建议链上服务侧):日/单笔限额、新地址 24h 冷却、大额人工复核
+  (接 deferred-todos 的双人复核)。
+
+### 15.4 每日对账(死于账对不上,与撮合同级别)
+
+**不变量**:对每个资产,`Σ(accounts.balance_atoms) == 链上钱包总额 + 在途归集`。
+```sql
+-- 账本侧总额(每资产)
+SELECT asset, SUM(balance_atoms) FROM accounts GROUP BY asset;
+-- 在途:已申请未终态的提现冻结 + 已确认未上链广播的差额由链上服务核
+SELECT asset, SUM(amount_atoms + fee_atoms) FROM withdrawals
+ WHERE status IN ('pending','approved','broadcast') GROUP BY asset;
+-- fund_audit 自洽:每笔 wd_freeze 必有等额 wd_release 或 wd_debit
+SELECT
+  COALESCE(SUM(amount_atoms) FILTER (WHERE kind='wd_freeze'),0)
+  - COALESCE(SUM(amount_atoms) FILTER (WHERE kind IN ('wd_release','wd_debit')),0) AS net
+FROM fund_audit;  -- 必须为 0
+```
+链上服务每日把链余额喂进对账脚本,与账本总额比对;**diff≠0 → P1:立即冻结
+出金(`/api/admin/config` 或停 deposit-token 服务)+ 人工核账**。这条进
+§13 每日 cron 与 §10 告警(`ReconcileDrift` 同级)。
 
 ---
 

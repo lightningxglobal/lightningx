@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     // dropping. Sustained PG-can't-keep-up scenarios still drop, but the
     // Aeron client never times out because the polling thread doesn't
     // share its loop with PG `.await`.
-    let queue_cap: usize = parse_env_u32("PG_WRITER_QUEUE", 5_000_000) as usize;
+    let queue_cap: usize = parse_env_u32("PG_WRITER_QUEUE", 1 << 22) as usize; // 4_194_304
     // Account invariant sweep interval (hanging freezes, legacy/atoms
     // drift). Read-only SQL, runs in this writer process — never on the
     // order hot path. 0 disables.

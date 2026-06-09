@@ -1728,7 +1728,7 @@ async fn async_main() -> anyhow::Result<()> {
     let persist_queue_cap: usize = std::env::var("PERSIST_QUEUE_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1_000_000);
+        .unwrap_or(1 << 20); // 1_048_576
     let persist_pub: Arc<crossbeam_queue::ArrayQueue<PersistFrame>> =
         Arc::new(crossbeam_queue::ArrayQueue::new(persist_queue_cap));
     {

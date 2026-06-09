@@ -32,9 +32,9 @@ const MAX_BACKPRESSURE_SPINS: u32 = 100_000;
 // total — fine on a modern host, prevents the silent-drop failure mode
 // where the engine inbound ring full triggers a recv-spin stall → engine
 // ou_pub spin → conductor timeout → entire Aeron client death.
-const ORDER_INBOUND_RING: usize = 5_000_000;
-const ORDER_UPDATE_RING: usize = 5_000_000;
-const TRADE_RING: usize = 5_000_000;
+const ORDER_INBOUND_RING: usize = 1 << 22; // 4_194_304
+const ORDER_UPDATE_RING: usize = 1 << 22; // 4_194_304
+const TRADE_RING: usize = 1 << 22; // 4_194_304
 // Depth events are periodic (every 10-50 ms from the engine), not burst-driven.
 // DeskDepthMsg enum is ~12.9 KB (dominated by Level2SnapshotEvent with 400 levels).
 // 5M entries × 12.9 KB × 3 rings ≈ 193 GB — was causing 10 GB RSS.

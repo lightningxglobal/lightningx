@@ -12,6 +12,29 @@ LightningX is an experimental low-latency trading infrastructure, where I explor
 
 ---
 
+## System Capabilities
+
+LightningX is more than a matching-engine benchmark. The repository contains a working testnet-style exchange stack with the following subsystems:
+
+| Area | Capability |
+|---|---|
+| Trading | Limit, market, IOC, FOK, post-only, reduce-only, batch place, cancel, batch cancel |
+| Matching | Per-symbol single-threaded matching engines, deterministic symbol routing, restored resting orders |
+| Private gateway | JWT auth, owner-sharded users, private order/account/position WebSocket pushes |
+| Market data | Public trades, depth, ticker, kline, aggregate trades, Binance depth mirror market maker |
+| Risk | Margin reservation, leverage rules, position limits, mark-price driven liquidation checks |
+| Perpetual swaps | Positions, funding schedule/view, funding settlement persistence, trigger orders |
+| Funds | Test funds, account balances, deposit credit API, two-phase withdrawal state machine |
+| Operations | Admin trading halt/config, admin force-close, user token revoke/unrevoke, metrics endpoint |
+| Persistence | PostgreSQL migrations, async pg-writer, Redis hot cache, append-style fund audit records |
+| Recovery/HA experiments | Input/output journal helpers, journal replay/audit tools, engine snapshots |
+| Observability | Beacon latency tracing, HDR histograms, VictoriaMetrics/Grafana integration notes |
+| Load testing | Pressure client, Aeron demo scripts, 40K/100K/200K WebSocket connection test paths |
+
+The current implementation is still a demo/testnet system. It is useful for studying low-latency exchange design and operational tradeoffs, not for custody or real-money trading.
+
+---
+
 ## Latency
 
 ![LightningX end-to-end latency on M4 Mac](lightningx-latency-m4.jpg)
@@ -23,25 +46,50 @@ LightningX is an experimental low-latency trading infrastructure, where I explor
 ## Architecture
 
 ```
-Browser / API client
-    │  HTTPS / WSS
-    ▼
-nginx  (TLS termination, reverse proxy)
-    │
-    ├─ private /api + /ws  ──►  desk-server  (counter/private gateway)
-    ├─ public  /ws         ──►  market-data-gateway
-    └─ slow REST /api      ──►  lightning-data
-                            │
-                            │  Aeron IPC (lock-free ring buffer)
-                            ▼
-                   exchange-engine  (matching engine, one thread per symbol)
-                      SkipList order book · SBE binary messages
-                            │
-                            ├─ order_update  ──►  desk-server  ──►  private WS push
-                            ├─ depth / trades ──►  market-data-gateway  ──►  public WS broadcast
-                            └─ metrics  ──►  beacon  ──►  VictoriaMetrics
-                                                                         │
-                            PostgreSQL  ◄──  writers / lightning-data  Grafana
+External clients
+  +-- Browser / API client
+  +-- market-maker / trade-bot / pressure-client
+  +-- chain watcher or admin tooling
+        |
+        | HTTPS / WSS
+        v
+nginx / load balancer
+        |
+        +-- private /api + /ws
+        |      v
+        |   desk-server
+        |      +-- auth, owner-sharded user sessions, private WS pushes
+        |      +-- risk engine: margin, positions, liquidations, funding view
+        |      +-- trigger orders, admin controls, deposit/withdraw APIs
+        |      +-- Redis hot cache writer/reader path
+        |      +-- Aeron command publish
+        |             |
+        |             v
+        |   exchange-engine
+        |      +-- one spin-loop matching thread per symbol
+        |      +-- SkipList order book, fixed-point ticks/lots
+        |      +-- SBE command/update frames
+        |      +-- depth/trade/order-update/event streams
+        |             |
+        |             +-- order_update -------> desk-server -------> private WS
+        |             +-- depth / trades -----> market-data-gateway -> public WS
+        |             +-- persist events -----> pg-writer / redis-writer
+        |             +-- journal / snapshots -> replay and audit tools
+        |             +-- latency beacons ----> beacon -> VictoriaMetrics -> Grafana
+        |
+        +-- public /ws
+        |      v
+        |   market-data-gateway
+        |      +-- trades, depth, ticker, kline, aggregate trade fanout
+        |
+        +-- slow REST /api
+               v
+            lightning-data
+               +-- historical tickers, klines, trades, orders, accounts, positions
+
+PostgreSQL is the durable store for users, orders, balances, positions, trades,
+funding, withdrawals, audits, and snapshots. Redis is the low-latency cache for
+hot account/order reads and downstream convergence.
 ```
 
 `desk-server` is intentionally private-only by default. Set `DESK_PUBLIC_MARKET_DATA=1`
@@ -88,6 +136,11 @@ exchange-engine
 | `kline-service` | Aggregates trades from Aeron into OHLCV candles and persists to PostgreSQL |
 | `trade-bot` | Demo user that places random orders to keep the book active |
 | `beacon` | Reads HDR histogram latency traces from the engine, pushes `latency_us` metrics to VictoriaMetrics |
+| `pg-writer` | Consumes compact persistence frames and writes orders, trades, balances, positions, funding, and risk state to PostgreSQL |
+| `redis-writer` | Mirrors hot state into Redis for low-latency reads and recovery convergence |
+| `pressure-client` | WebSocket load generator used for connection-count and order-ack latency tests |
+| `journal-replicate` | Replicates journal streams for HA/replay experiments |
+| `journal-audit` | Audits journal output for sequence and replay consistency checks |
 
 ---
 
@@ -194,12 +247,39 @@ All frames: `[msg_type: u8][payload...]`. See `src/transport/ws_sbe.rs` for exac
 |---|---|---|---|
 | POST | `/api/auth/register` | — | Create account |
 | POST | `/api/auth/login` | — | Login, returns JWT |
+| POST | `/api/auth/refresh` | JWT | Refresh auth token |
+| GET/PATCH | `/api/user/profile` | JWT | Read or update user profile |
+| PATCH | `/api/user/password` | JWT | Change password |
+| POST | `/api/kyc` | JWT | Submit KYC-style profile data for the demo system |
 | GET | `/api/accounts` | JWT | Asset balances |
+| GET | `/api/balances` | JWT | Alias for account balances |
 | GET | `/api/orders` | JWT | Open and past orders |
 | POST | `/api/orders` | JWT | Place order |
-| DELETE | `/api/orders/:id` | JWT | Cancel order |
+| DELETE | `/api/orders` | JWT | Cancel all open orders for the authenticated user |
+| GET | `/api/orders/:order_id` | JWT | Get one order |
+| DELETE | `/api/orders/:order_id` | JWT | Cancel one order |
 | GET | `/api/trades` | JWT | User trades |
+| GET | `/api/positions` | JWT | Current perpetual-swap positions |
+| GET | `/api/funding` | — | Funding state for a symbol |
+| GET/POST | `/api/trigger-orders` | JWT | List or create trigger orders |
+| DELETE | `/api/trigger-orders/:id` | JWT | Cancel trigger order |
+| GET/POST | `/api/withdrawals` | JWT | List or request withdrawals |
+| POST | `/api/deposit/credit` | Service token | Idempotent deposit credit from a chain watcher |
+| POST | `/api/withdrawals/:id/status` | Service token | Advance withdrawal status after chain-service actions |
+| POST | `/api/admin/config` | Admin token | Halt/resume trading and update symbol config |
+| GET | `/api/admin/config` | Admin token | Read symbol config |
+| POST | `/api/admin/force-close` | Admin token | Force-close a user position |
+| POST | `/api/admin/revoke` | Admin token | Revoke a user's outstanding tokens |
+| POST | `/api/admin/unrevoke` | Admin token | Restore a user's login ability |
 | GET | `/api/tickers` | — | 24h ticker stats |
+| GET | `/api/klines` | — | Historical OHLCV candles |
+| POST | `/api/test-funds` | JWT | Add sandbox funds to the authenticated user |
+| POST | `/api/robot-funds` | Robot JWT | Fund the market-maker service account |
+| POST | `/api/seed-demo` | — | Seed demo data for local/testnet runs |
+| POST | `/api/debug/mark-price` | Test-only | Force mark price when `TEST_ENDPOINTS=1` |
+| GET | `/metrics` | — | Process metrics |
+
+See [`docs/api/README.md`](docs/api/README.md) and [`docs/api/openapi.yaml`](docs/api/openapi.yaml) for the testnet-oriented API guide and machine-readable schema.
 
 ---
 

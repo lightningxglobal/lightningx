@@ -8,6 +8,8 @@ A high-performance crypto exchange built in Rust. The matching engine sustains *
 
 Live demo with very limited resources and a very very simple market making bot: **https://www.lightningx.global**
 
+LightningX is an experimental low-latency trading infrastructure, where I explore exchange architecture, execution engines, market data distribution, risk systems, replication, persistence, and latency optimization. It is not intended to be a production exchange, but a collection of production-inspired components and design experiments.
+
 ---
 
 ## Latency

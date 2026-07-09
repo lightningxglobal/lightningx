@@ -1,0 +1,267 @@
+<title>撮合引擎故障恢复时序</title>
+<style>
+  :root{
+    --ground:#0d1320; --panel:#141d2d; --panel2:#1a2336; --line:#28344c;
+    --ink:#dce4f1; --muted:#7c8aa2; --faint:#586479;
+    --epoch:#e8a13a; --live:#48bd8c; --dead:#e5566b; --standby:#8493d4; --journal:#52a8cb;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+    line-height:1.65;font-size:15px;
+    background-image:radial-gradient(1200px 600px at 80% -10%,rgba(82,168,203,.06),transparent 60%),
+      radial-gradient(900px 500px at 0% 5%,rgba(232,161,58,.05),transparent 55%);}
+  .wrap{max-width:1000px;margin:0 auto;padding:clamp(28px,5vw,72px) clamp(18px,4vw,40px) 88px}
+
+  /* ---- header ---- */
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--journal);display:flex;align-items:center;gap:10px;margin:0 0 18px}
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--journal);opacity:.7}
+  h1{font-family:var(--sans);font-weight:650;font-size:clamp(26px,4.4vw,42px);line-height:1.12;
+    letter-spacing:-.01em;margin:0 0 16px;text-wrap:balance}
+  .thesis{font-size:clamp(15px,2vw,17px);color:var(--muted);max-width:64ch;margin:0}
+  .thesis b{color:var(--epoch);font-weight:600}
+
+  /* ---- legend ---- */
+  .legend{display:flex;flex-wrap:wrap;gap:8px 20px;margin:30px 0 6px;
+    padding:16px 18px;border:1px solid var(--line);border-radius:12px;background:rgba(20,29,45,.55)}
+  .actor{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12.5px}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none;box-shadow:0 0 10px currentColor}
+  .a-lead{color:var(--live)} .a-pg{color:var(--epoch)} .a-jrn{color:var(--journal)}
+  .a-stby{color:var(--standby)} .a-desk{color:var(--ink)} .a-zomb{color:var(--dead)}
+  .actor .dot{background:currentColor}
+  .actor span{color:var(--muted)}
+
+  /* ---- phase band ---- */
+  .phase{display:grid;grid-template-columns:210px 1fr;gap:clamp(16px,3vw,34px);
+    padding:34px 0;border-top:1px solid var(--line);position:relative}
+  .phase:first-of-type{border-top:none}
+  .rail{position:relative}
+  .pnum{font-family:var(--mono);font-size:12px;letter-spacing:.18em;color:var(--faint)}
+  .ptime{font-family:var(--mono);font-size:12.5px;color:var(--journal);margin:2px 0 12px;
+    display:flex;align-items:center;gap:8px}
+  .ptime .tk{width:6px;height:6px;border-radius:50%;background:var(--journal)}
+  .ptitle{font-size:20px;font-weight:640;line-height:1.2;letter-spacing:-.01em;margin:0 0 14px}
+  .epochchip{display:inline-flex;align-items:baseline;gap:8px;font-family:var(--mono);
+    font-size:12px;padding:7px 12px;border-radius:999px;border:1px solid rgba(232,161,58,.35);
+    background:rgba(232,161,58,.08);color:var(--epoch);white-space:nowrap}
+  .epochchip .lbl{color:var(--faint);letter-spacing:.12em;font-size:10.5px;text-transform:uppercase}
+  .epochchip.dead{border-color:rgba(229,86,107,.35);background:rgba(229,86,107,.08);color:var(--dead)}
+  .epochchip b{font-size:14px;font-variant-numeric:tabular-nums}
+
+  /* ---- steps ---- */
+  .steps{display:flex;flex-direction:column;gap:2px}
+  .step{display:grid;grid-template-columns:132px 1fr;gap:16px;padding:11px 0;
+    border-bottom:1px dashed rgba(40,52,76,.6)}
+  .step:last-child{border-bottom:none}
+  .who{font-family:var(--mono);font-size:12px;display:flex;align-items:center;gap:8px;
+    padding-top:2px;color:var(--muted)}
+  .who .dot{width:8px;height:8px}
+  .act{font-size:14.2px;color:var(--ink)}
+  .act .m{font-family:var(--mono);font-size:12.5px;background:rgba(255,255,255,.045);
+    border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:#c3d2ea;white-space:nowrap}
+  .act .k{color:var(--epoch);font-family:var(--mono);font-size:12.5px}
+  .act .g{color:var(--live)} .act .r{color:var(--dead)}
+  .note{color:var(--muted);font-size:13px;margin-top:3px}
+
+  /* ---- fencing math callout ---- */
+  .math{margin:38px 0 4px;border:1px solid var(--line);border-radius:14px;overflow:hidden;
+    background:linear-gradient(180deg,rgba(26,35,54,.7),rgba(20,29,45,.7))}
+  .math-h{padding:16px 22px;border-bottom:1px solid var(--line);display:flex;
+    align-items:center;gap:12px;flex-wrap:wrap}
+  .math-h .tag{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--epoch);padding:4px 9px;border:1px solid rgba(232,161,58,.35);border-radius:6px}
+  .math-h h3{margin:0;font-size:16px;font-weight:620}
+  .math-body{padding:22px;display:grid;gap:14px;overflow-x:auto}
+  .bits{font-family:var(--mono);font-size:13px;display:grid;gap:9px;min-width:min-content}
+  .bitrow{display:grid;grid-template-columns:150px auto 1fr;gap:14px;align-items:center;white-space:nowrap}
+  .bitrow .lab{color:var(--muted);font-size:12px}
+  .seg{display:inline-flex;border-radius:6px;overflow:hidden;border:1px solid var(--line)}
+  .seg b{padding:5px 12px;font-variant-numeric:tabular-nums}
+  .seg .e{background:rgba(232,161,58,.16);color:var(--epoch)}
+  .seg .s{background:rgba(82,168,203,.13);color:var(--journal)}
+  .verdict{font-family:var(--mono);font-size:12.5px;color:var(--faint)}
+  .verdict b{color:var(--live)}
+  .cmp{font-family:var(--mono);font-size:14px;color:var(--ink);padding-top:6px;
+    border-top:1px dashed var(--line);margin-top:2px}
+  .cmp .k{color:var(--epoch)} .cmp .g{color:var(--live);font-weight:600}
+
+  /* ---- footer note ---- */
+  .foot{margin-top:40px;padding:20px 22px;border:1px solid var(--line);border-radius:12px;
+    background:rgba(20,29,45,.5);color:var(--muted);font-size:13.5px}
+  .foot b{color:var(--ink);font-weight:600}
+  .foot .m{font-family:var(--mono);font-size:12px;color:#c3d2ea}
+
+  @media(max-width:680px){
+    .phase{grid-template-columns:1fr;gap:16px}
+    .step{grid-template-columns:1fr;gap:4px}
+    .who{padding-top:0}
+    .bitrow{grid-template-columns:1fr;gap:6px;white-space:normal}
+  }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Aeron · PostgreSQL fencing · deterministic replay</p>
+  <h1>撮合引擎故障恢复：leader 猝死到僵尸被 fence 的全时序</h1>
+  <p class="thesis">一句话贯穿：<b>epoch（栅栏令牌）</b>是唯一的安全边界——不是锁。leader 每次更替 epoch +1，并盖进输出流的高 16 位；任何来自更低 epoch 的消息都被消费端当作僵尸整条丢弃。锁只管"谁来发"，epoch 管"谁的话算数"。</p>
+
+  <div class="legend" aria-label="参与组件">
+    <div class="actor a-lead"><span class="dot"></span>Leader&nbsp;Engine <span>撮合主</span></div>
+    <div class="actor a-stby"><span class="dot"></span>Standby&nbsp;Engine <span>热备</span></div>
+    <div class="actor a-pg"><span class="dot"></span>PG&nbsp;leader_lease <span>租约表</span></div>
+    <div class="actor a-jrn"><span class="dot"></span>Aeron&nbsp;Journal <span>Archive 录制</span></div>
+    <div class="actor a-desk"><span class="dot"></span>desk-server <span>消费/fence</span></div>
+  </div>
+
+  <!-- PHASE 0 -->
+  <section class="phase">
+    <div class="rail">
+      <div class="pnum">PHASE 00</div>
+      <div class="ptime"><span class="tk"></span>稳态 · steady state</div>
+      <h2 class="ptitle">主备并行，只有一个在发声</h2>
+      <div class="epochchip"><span class="lbl">epoch</span><b>N</b> · leader-A</div>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="who a-lead"><span class="dot"></span>Leader-A</div>
+        <div class="act">消费 orders 流撮合，<span class="m">publish_order_update</span> 每条盖 <span class="k">epoch=N</span>、<span class="m">seq++</span>；<span class="m">live=true</span>。</div>
+      </div>
+      <div class="step">
+        <div class="who a-pg"><span class="dot"></span>leader_lease</div>
+        <div class="act">holder=A、epoch=N；每 TTL 续租走 <span class="m">holder=EXCLUDED.holder</span> 分支——<b>续租保持 epoch 不变</b>。</div>
+      </div>
+      <div class="step">
+        <div class="who a-jrn"><span class="dot"></span>Journal</div>
+        <div class="act">ArchivingMediaDriver 录制 orders + persist 两条流；引擎每 <span class="m">SNAPSHOT_INTERVAL_SECS</span> 存一次 <span class="m">(rec_id, pos)</span> 快照。</div>
+      </div>
+      <div class="step">
+        <div class="who a-stby"><span class="dot"></span>Standby-B</div>
+        <div class="act">静默 replay 同一条输入流，订单簿与 A <b>逐位一致</b>；<span class="m">live=false</span> → <span class="r">不发布、seq 不推进</span>。</div>
+      </div>
+      <div class="step">
+        <div class="who a-desk"><span class="dot"></span>desk-server</div>
+        <div class="act">last_epoch=N，接受 epoch≥N；断号检测 <span class="m">seq == last+1</span>，否则计 <span class="m">m_gaps</span>。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PHASE 1 -->
+  <section class="phase">
+    <div class="rail">
+      <div class="pnum">PHASE 01</div>
+      <div class="ptime"><span class="tk"></span>T+0 · leader 失联</div>
+      <h2 class="ptitle">fail-closed：先闭嘴，再退出</h2>
+      <div class="epochchip dead"><span class="lbl">leader</span><b>—</b> · 无人续租</div>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="who a-lead"><span class="dot"></span>Leader-A</div>
+        <div class="act">崩溃或 PG 不可达。<span class="m">LeaseGuard</span> 本地 <span class="m">Instant</span> TTL 到期 → <span class="m">is_lease_valid()=false</span>，<span class="r">立即停止发布</span>，不等 sqlx 超时。</div>
+        <div class="note">失去 leadership 被引擎视为 fatal → 进程退出；重启后以 standby 身份从 journal 追赶。</div>
+      </div>
+      <div class="step">
+        <div class="who a-pg"><span class="dot"></span>leader_lease</div>
+        <div class="act">A 停止续租，<span class="m">expires_at &lt; NOW()</span> 逐渐成立，租约进入"可被抢占"状态。</div>
+      </div>
+      <div class="step">
+        <div class="who a-desk"><span class="dot"></span>desk-server</div>
+        <div class="act">order_update 断流；pending 的 REST/WS 请求开始等待。此刻 last_epoch 仍 = N。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PHASE 2 -->
+  <section class="phase">
+    <div class="rail">
+      <div class="pnum">PHASE 02</div>
+      <div class="ptime"><span class="tk"></span>抢占 · one atomic UPSERT</div>
+      <h2 class="ptitle">谁先抢到租约，谁把 epoch +1</h2>
+      <div class="epochchip"><span class="lbl">epoch</span><b>N&nbsp;→&nbsp;N+1</b> · leader-B</div>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="who a-stby"><span class="dot"></span>Standby-B</div>
+        <div class="act"><span class="m">try_acquire</span> 命中 <span class="m">WHERE expires_at &lt; NOW()</span> 的接管分支：<span class="k">epoch = leader_lease.epoch + 1 = N+1</span>。</div>
+      </div>
+      <div class="step">
+        <div class="who a-pg"><span class="dot"></span>leader_lease</div>
+        <div class="act">一条 <span class="m">INSERT … ON CONFLICT DO UPDATE</span> 原子完成 holder=B、epoch=N+1。<b>接管才 bump，续租不 bump</b>。</div>
+        <div class="note">用 PG 一行 UPSERT 而非 etcd/quorum：安全靠 epoch 令牌，不靠锁本身，且复用已托管资金的同一套基础设施。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PHASE 3 -->
+  <section class="phase">
+    <div class="rail">
+      <div class="pnum">PHASE 03</div>
+      <div class="ptime"><span class="tk"></span>接管 · catch-up &amp; publish</div>
+      <h2 class="ptitle">快照抬起点，确定性保证一致</h2>
+      <div class="epochchip"><span class="lbl">epoch</span><b>N+1</b> · seq 从 1</div>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="who a-stby"><span class="dot"></span>B (now leader)</div>
+        <div class="act">冷启动则 <span class="m">load_latest</span> 恢复订单簿到 <span class="m">(snap_rec, snap_pos)</span> → <span class="m">replay_from(snap_pos)</span> 只补尾 → 切 live 输入。</div>
+        <div class="note">因输入流确定性，B 重建的簿与死掉的 A 逐位相同——不是"接近"，是 bit-identical。</div>
+      </div>
+      <div class="step">
+        <div class="who a-lead"><span class="dot"></span>publish</div>
+        <div class="act">开始 <span class="m">publish_order_update</span>，盖 <span class="k">epoch=N+1</span>，<span class="m">seq</span> 从 1 起（新 epoch 段独立计数）。</div>
+      </div>
+      <div class="step">
+        <div class="who a-desk"><span class="dot"></span>desk-server</div>
+        <div class="act">收到 epoch=N+1 &gt; last_epoch=N → 记 failover 日志，<span class="m">last_epoch=N+1</span>、<span class="g">seq 跟踪 reset=0</span>，恢复正常消费。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PHASE 4 -->
+  <section class="phase">
+    <div class="rail">
+      <div class="pnum">PHASE 04</div>
+      <div class="ptime"><span class="tk"></span>僵尸复活 · zombie fence</div>
+      <h2 class="ptitle">旧 leader 假死复活，说的话不算数</h2>
+      <div class="epochchip dead"><span class="lbl">zombie</span><b>epoch N</b> · dropped</div>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <div class="who a-zomb"><span class="dot"></span>Leader-A′</div>
+        <div class="act">GC 长停顿后"诈尸"，尚不知已被接管，仍以 <span class="r">epoch=N</span> 继续 publish 旧输出。</div>
+      </div>
+      <div class="step">
+        <div class="who a-desk"><span class="dot"></span>desk-server</div>
+        <div class="act"><span class="m">split_epoch</span> 取高 16 位 = N &lt; last_epoch=N+1 → <span class="r">整条丢弃</span>，<span class="m">fenced_drop_count++</span>、<span class="m">m_fenced.inc()</span>。</div>
+        <div class="note">pg-writer / redis-writer 侧同样先 split_epoch 再 m_fenced，绝不落库僵尸帧。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FENCING MATH -->
+  <div class="math">
+    <div class="math-h">
+      <span class="tag">the property it all rests on</span>
+      <h3>为什么"高 epoch 永远压过低 epoch"是数学保证的</h3>
+    </div>
+    <div class="math-body">
+      <div class="bits">
+        <div class="bitrow">
+          <span class="lab">僵尸最大序号</span>
+          <span class="seg"><b class="e">epoch = N</b><b class="s">seq = 2⁴⁸−1</b></span>
+          <span class="verdict"><span class="m" style="background:none;border:none;padding:0;color:#7c8aa2">stamp_epoch(N, SEQ_MASK)</span></span>
+        </div>
+        <div class="bitrow">
+          <span class="lab">新 leader 首帧</span>
+          <span class="seg"><b class="e">epoch = N+1</b><b class="s">seq = 0</b></span>
+          <span class="verdict"><span class="m" style="background:none;border:none;padding:0;color:#7c8aa2">stamp_epoch(N+1, 0)</span></span>
+        </div>
+      </div>
+      <div class="cmp">因为 <span class="k">EPOCH_SHIFT = 48</span>：<span class="k">(N+1)&lt;&lt;48 | 0</span> &nbsp;<span class="g">&gt;</span>&nbsp; <span class="k">N&lt;&lt;48 | (2⁴⁸−1)</span> —— 高位 epoch 一进位，就跨过整段低位 seq 空间。48 位 ≈ 每 epoch 281×10¹² 条消息，几十年用不完；epoch 到 65535 才回绕。</div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>两条序列号别混淆。</b>本图讲的是 <span class="m">OrderUpdate.sequence</span>（epoch+seq，做客户端排序 + 防僵尸）。另一条 <span class="m">PersistFrame (publisher_id, seq)</span> 是持久化去重用的，时钟播种、单调递增，由 pg/redis-writer 靠 checkpoint floor 做精确一次 / 至少一次——它与 epoch fence <b>正交</b>：writer 重启靠 journal replay + floor 补齐，engine 重启靠 snapshot + replay_from 补齐。
+  </div>
+</div>

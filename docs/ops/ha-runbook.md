@@ -8,6 +8,9 @@
 > 选主+epoch fencing(`chaos_gate5_failover`,RTO 3.05s)、
 > 引擎 journal 重建(`chaos_gate2_engine`)、writer 断点续传与三方对账
 > (`chaos_gate2`/`chaos_gate2_writers`)、熔断(`chaos_gate4_flashcrash`)。
+>
+> 📊 **故障恢复全时序图**(leader 猝死 → standby 抢占 epoch+1 → 快照追赶 →
+> 僵尸被 fence):浏览器打开 [`failover-timeline.html`](./failover-timeline.html)。
 
 ---
 

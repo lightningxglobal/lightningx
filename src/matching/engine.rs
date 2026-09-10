@@ -28,7 +28,7 @@ pub struct EngineSnapshot {
 pub struct MatchingEngine {
     buy_book: OrderBookWrapper,
     sell_book: OrderBookWrapper,
-    orders: HashMap<u64, usize>, // order_id -> pool index
+    orders: HashMap<u64, OrderLocation>,
     pools: Pools,
     next_order_id: u64,
     snapshot_sequence: u64,
@@ -52,6 +52,12 @@ pub struct MatchingEngine {
     affected_makers_buf: SmallVec<[u64; 64]>,
     // 每次撮合产生的逐笔成交记录 (maker_order_id, price, qty)，供调用方做结算
     fills_buf: SmallVec<[(u64, PriceTicks, QuantityLots); 16]>,
+}
+
+#[derive(Clone, Copy)]
+struct OrderLocation {
+    order_pool_idx: usize,
+    list_node_idx: usize,
 }
 
 // Safety: MatchingEngine is accessed only through Mutex<MatchingEngine>; the raw
@@ -163,7 +169,7 @@ impl MatchingEngine {
         let mut orders: Vec<Order> = self
             .orders
             .values()
-            .filter_map(|&idx| self.pools.orders.get(idx).copied())
+            .filter_map(|location| self.pools.orders.get(location.order_pool_idx).copied())
             .map(|mut o| {
                 // Persist the LIVE remaining as the quantity; filled is
                 // folded in so a restored order is a fresh resting order
@@ -223,7 +229,7 @@ impl MatchingEngine {
     pub fn get_order(&self, order_id: u64) -> Option<Order> {
         self.orders
             .get(&order_id)
-            .and_then(|&pool_idx| self.pools.orders.get(pool_idx))
+            .and_then(|location| self.pools.orders.get(location.order_pool_idx))
             .copied()
     }
 
@@ -232,7 +238,7 @@ impl MatchingEngine {
     pub fn get_order_fill_status(&self, order_id: u64) -> Option<(QuantityLots, QuantityLots)> {
         self.orders
             .get(&order_id)
-            .and_then(|&pool_idx| self.pools.orders.get(pool_idx))
+            .and_then(|location| self.pools.orders.get(location.order_pool_idx))
             .map(|order| (order.filled_lots, order.remaining_lots()))
     }
 
@@ -642,34 +648,29 @@ impl MatchingEngine {
             *pooled_order = order;
         }
 
-        // 插入价格档位（如果不存在）
         let book = match order.side {
             Side::Buy => &mut self.buy_book,
             Side::Sell => &mut self.sell_book,
         };
 
-        // 尝试插入新价格级别，如果已存在则忽略错误
-        let _ = book.insert_level(order.price_ticks);
-
-        // 添加订单到价格档位队列（使用 remaining_lots，而非 quantity_lots，
-        // 因为 GTC 部分成交后剩余量才是实际进入订单簿的量）
-        if book
-            .add_order_at_level(order.price_ticks, order.id, order.remaining_lots())
-            .is_err()
-        {
-            self.pools.orders.release(pool_idx);
-            let level_empty = book
-                .get_node_at_price(order.price_ticks)
-                .map(|n| n.orders.is_empty())
-                .unwrap_or(false);
-            if level_empty {
-                let _ = book.remove_level(order.price_ticks);
-            }
-            return Err(MatchingEngineError::NodePoolExhausted);
-        }
+        // 一次价格查找完成档位创建和 FIFO 入队。
+        let list_node_idx =
+            match book.add_order_at_level(order.price_ticks, order.id, order.remaining_lots()) {
+                Ok(idx) => idx,
+                Err(_) => {
+                    self.pools.orders.release(pool_idx);
+                    return Err(MatchingEngineError::NodePoolExhausted);
+                }
+            };
 
         // 储存池索引
-        self.orders.insert(order.id, pool_idx);
+        self.orders.insert(
+            order.id,
+            OrderLocation {
+                order_pool_idx: pool_idx,
+                list_node_idx,
+            },
+        );
 
         // Invalidate the best-price cache for this book side.  Without this,
         // a new order at a BETTER price (lower ask / higher bid) than the
@@ -757,7 +758,7 @@ impl MatchingEngine {
                 }
 
                 // 从对手订单簿获取最优价格级别的第一个订单ID
-                let counter_order_id = {
+                let (counter_list_node_idx, counter_order_id) = {
                     let opposite_book = match order.side {
                         Side::Buy => &mut self.sell_book,
                         Side::Sell => &mut self.buy_book,
@@ -768,7 +769,7 @@ impl MatchingEngine {
                             if let Some(node_idx) = node.orders.front() {
                                 let list_pool = opposite_book.get_list_pool();
                                 if let Some(list_node) = list_pool.get(node_idx) {
-                                    list_node.order_id
+                                    (node_idx, list_node.order_id)
                                 } else {
                                     break;
                                 }
@@ -781,8 +782,8 @@ impl MatchingEngine {
                 };
 
                 let counter_order = match self.orders.get(&counter_order_id) {
-                    Some(&pool_idx) => {
-                        match self.pools.orders.get(pool_idx) {
+                    Some(&location) => {
+                        match self.pools.orders.get(location.order_pool_idx) {
                             Some(o) => *o,
                             None => {
                                 // Pool slot invalid: stale entry. Clean up and try next.
@@ -790,7 +791,11 @@ impl MatchingEngine {
                                     Side::Buy => &mut self.sell_book,
                                     Side::Sell => &mut self.buy_book,
                                 };
-                                let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                                let _ = opp.remove_order_at_level(
+                                    best_price,
+                                    counter_order_id,
+                                    counter_list_node_idx,
+                                );
                                 self.orders.remove(&counter_order_id);
                                 if opp
                                     .get_node_at_price(best_price)
@@ -810,7 +815,11 @@ impl MatchingEngine {
                             Side::Buy => &mut self.sell_book,
                             Side::Sell => &mut self.buy_book,
                         };
-                        let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                        let _ = opp.remove_order_at_level(
+                            best_price,
+                            counter_order_id,
+                            counter_list_node_idx,
+                        );
                         if opp
                             .get_node_at_price(best_price)
                             .map(|n| n.orders.is_empty())
@@ -836,9 +845,13 @@ impl MatchingEngine {
                         Side::Buy => &mut self.sell_book,
                         Side::Sell => &mut self.buy_book,
                     };
-                    let _ = opp.remove_order_at_level(best_price, counter_order_id);
-                    if let Some(idx) = self.orders.remove(&counter_order_id) {
-                        self.pools.orders.release(idx);
+                    let _ = opp.remove_order_at_level(
+                        best_price,
+                        counter_order_id,
+                        counter_list_node_idx,
+                    );
+                    if let Some(location) = self.orders.remove(&counter_order_id) {
+                        self.pools.orders.release(location.order_pool_idx);
                     }
                     if opp
                         .get_node_at_price(best_price)
@@ -859,13 +872,13 @@ impl MatchingEngine {
 
                 // 更新订单状态
                 {
-                    if let Some(&pool_idx) = self.orders.get(&order.id) {
-                        if let Some(o) = self.pools.orders.get_mut(pool_idx) {
+                    if let Some(location) = self.orders.get(&order.id) {
+                        if let Some(o) = self.pools.orders.get_mut(location.order_pool_idx) {
                             o.filled_lots += trade_lots;
                         }
                     }
-                    if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
-                        if let Some(o) = self.pools.orders.get_mut(counter_pool_idx) {
+                    if let Some(location) = self.orders.get(&counter_order_id) {
+                        if let Some(o) = self.pools.orders.get_mut(location.order_pool_idx) {
                             o.filled_lots += trade_lots;
                         }
                     }
@@ -878,6 +891,7 @@ impl MatchingEngine {
                     let _ = opposite_book.reduce_order_quantity_at_level(
                         best_price,
                         counter_order_id,
+                        counter_list_node_idx,
                         trade_lots,
                     );
                 }
@@ -928,18 +942,21 @@ impl MatchingEngine {
                 }
 
                 // 检查对手订单是否完全成交
-                if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
-                    if let Some(counter) = self.pools.orders.get(counter_pool_idx) {
+                if let Some(&location) = self.orders.get(&counter_order_id) {
+                    if let Some(counter) = self.pools.orders.get(location.order_pool_idx) {
                         if counter.is_filled() {
                             let opposite_book = match order.side {
                                 Side::Buy => &mut self.sell_book,
                                 Side::Sell => &mut self.buy_book,
                             };
-                            let _ =
-                                opposite_book.remove_order_at_level(best_price, counter_order_id);
+                            let _ = opposite_book.remove_order_at_level(
+                                best_price,
+                                counter_order_id,
+                                location.list_node_idx,
+                            );
                             // 从orders HashMap中移除并释放池索引
-                            if let Some(idx) = self.orders.remove(&counter_order_id) {
-                                self.pools.orders.release(idx);
+                            if let Some(location) = self.orders.remove(&counter_order_id) {
+                                self.pools.orders.release(location.order_pool_idx);
                             }
                             // Drop the level when its last order has gone.
                             // Use orders.is_empty() instead of total_quantity_lots <= 0
@@ -1034,7 +1051,7 @@ impl MatchingEngine {
                         break;
                     }
 
-                    let counter_order_id = {
+                    let (counter_list_node_idx, counter_order_id) = {
                         let opposite_book = match order.side {
                             Side::Buy => &mut self.sell_book,
                             Side::Sell => &mut self.buy_book,
@@ -1045,7 +1062,7 @@ impl MatchingEngine {
                                 if let Some(node_idx) = node.orders.front() {
                                     let list_pool = opposite_book.get_list_pool();
                                     if let Some(list_node) = list_pool.get(node_idx) {
-                                        list_node.order_id
+                                        (node_idx, list_node.order_id)
                                     } else {
                                         break;
                                     }
@@ -1058,14 +1075,18 @@ impl MatchingEngine {
                     };
 
                     let counter_order = match self.orders.get(&counter_order_id) {
-                        Some(&pool_idx) => match self.pools.orders.get(pool_idx) {
+                        Some(&location) => match self.pools.orders.get(location.order_pool_idx) {
                             Some(o) => *o,
                             None => {
                                 let opp = match order.side {
                                     Side::Buy => &mut self.sell_book,
                                     Side::Sell => &mut self.buy_book,
                                 };
-                                let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                                let _ = opp.remove_order_at_level(
+                                    best_price,
+                                    counter_order_id,
+                                    counter_list_node_idx,
+                                );
                                 self.orders.remove(&counter_order_id);
                                 if opp
                                     .get_node_at_price(best_price)
@@ -1082,7 +1103,11 @@ impl MatchingEngine {
                                 Side::Buy => &mut self.sell_book,
                                 Side::Sell => &mut self.buy_book,
                             };
-                            let _ = opp.remove_order_at_level(best_price, counter_order_id);
+                            let _ = opp.remove_order_at_level(
+                                best_price,
+                                counter_order_id,
+                                counter_list_node_idx,
+                            );
                             if opp
                                 .get_node_at_price(best_price)
                                 .map(|n| n.orders.is_empty())
@@ -1102,9 +1127,13 @@ impl MatchingEngine {
                             Side::Buy => &mut self.sell_book,
                             Side::Sell => &mut self.buy_book,
                         };
-                        let _ = opp.remove_order_at_level(best_price, counter_order_id);
-                        if let Some(idx) = self.orders.remove(&counter_order_id) {
-                            self.pools.orders.release(idx);
+                        let _ = opp.remove_order_at_level(
+                            best_price,
+                            counter_order_id,
+                            counter_list_node_idx,
+                        );
+                        if let Some(location) = self.orders.remove(&counter_order_id) {
+                            self.pools.orders.release(location.order_pool_idx);
                         }
                         if opp
                             .get_node_at_price(best_price)
@@ -1120,13 +1149,13 @@ impl MatchingEngine {
 
                     // 更新订单状态
                     {
-                        if let Some(&pool_idx) = self.orders.get(&order.id) {
-                            if let Some(o) = self.pools.orders.get_mut(pool_idx) {
+                        if let Some(location) = self.orders.get(&order.id) {
+                            if let Some(o) = self.pools.orders.get_mut(location.order_pool_idx) {
                                 o.filled_lots += trade_lots;
                             }
                         }
-                        if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
-                            if let Some(o) = self.pools.orders.get_mut(counter_pool_idx) {
+                        if let Some(location) = self.orders.get(&counter_order_id) {
+                            if let Some(o) = self.pools.orders.get_mut(location.order_pool_idx) {
                                 o.filled_lots += trade_lots;
                             }
                         }
@@ -1139,6 +1168,7 @@ impl MatchingEngine {
                         let _ = opposite_book.reduce_order_quantity_at_level(
                             best_price,
                             counter_order_id,
+                            counter_list_node_idx,
                             trade_lots,
                         );
                     }
@@ -1177,18 +1207,21 @@ impl MatchingEngine {
                         ));
                     }
 
-                    if let Some(&counter_pool_idx) = self.orders.get(&counter_order_id) {
-                        if let Some(counter) = self.pools.orders.get(counter_pool_idx) {
+                    if let Some(&location) = self.orders.get(&counter_order_id) {
+                        if let Some(counter) = self.pools.orders.get(location.order_pool_idx) {
                             if counter.is_filled() {
                                 let opposite_book = match order.side {
                                     Side::Buy => &mut self.sell_book,
                                     Side::Sell => &mut self.buy_book,
                                 };
-                                let _ = opposite_book
-                                    .remove_order_at_level(best_price, counter_order_id);
+                                let _ = opposite_book.remove_order_at_level(
+                                    best_price,
+                                    counter_order_id,
+                                    location.list_node_idx,
+                                );
                                 // 从orders HashMap中移除并释放池索引
-                                if let Some(idx) = self.orders.remove(&counter_order_id) {
-                                    self.pools.orders.release(idx);
+                                if let Some(location) = self.orders.remove(&counter_order_id) {
+                                    self.pools.orders.release(location.order_pool_idx);
                                 }
                                 let level_empty = opposite_book
                                     .get_node_at_price(best_price)
@@ -1234,26 +1267,25 @@ impl MatchingEngine {
                     Side::Sell => &mut self.sell_book,
                 };
 
-                if book
-                    .get_node_at_price(remaining_order.price_ticks)
-                    .is_none()
-                {
-                    let _ = book.insert_level(remaining_order.price_ticks);
-                }
+                let list_node_idx = match book.add_order_at_level(
+                    remaining_order.price_ticks,
+                    remaining_order.id,
+                    remaining_order.quantity_lots - remaining_order.filled_lots,
+                ) {
+                    Ok(idx) => idx,
+                    Err(_) => {
+                        self.pools.orders.release(pool_idx);
+                        return Err(MatchingEngineError::NodePoolExhausted);
+                    }
+                };
 
-                if book
-                    .add_order_at_level(
-                        remaining_order.price_ticks,
-                        remaining_order.id,
-                        remaining_order.quantity_lots - remaining_order.filled_lots,
-                    )
-                    .is_err()
-                {
-                    self.pools.orders.release(pool_idx);
-                    return Err(MatchingEngineError::NodePoolExhausted);
-                }
-
-                self.orders.insert(remaining_order.id, pool_idx);
+                self.orders.insert(
+                    remaining_order.id,
+                    OrderLocation {
+                        order_pool_idx: pool_idx,
+                        list_node_idx,
+                    },
+                );
             }
 
             results.push((filled, result_trades));
@@ -1317,7 +1349,7 @@ impl MatchingEngine {
         sample_depth: bool,
     ) -> OrderResult<CancelOrderResult> {
         // 查询订单池索引
-        let pool_idx = self
+        let location = self
             .orders
             .get(&order_id)
             .copied()
@@ -1327,7 +1359,7 @@ impl MatchingEngine {
         let order = self
             .pools
             .orders
-            .get(pool_idx)
+            .get(location.order_pool_idx)
             .copied()
             .ok_or(MatchingEngineError::OrderNotFound)?;
 
@@ -1344,8 +1376,8 @@ impl MatchingEngine {
         self.remove_from_book(order_id)?;
 
         // 从orders HashMap中移除并release到池
-        if let Some(idx) = self.orders.remove(&order_id) {
-            self.pools.orders.release(idx);
+        if let Some(location) = self.orders.remove(&order_id) {
+            self.pools.orders.release(location.order_pool_idx);
         }
 
         // 发布撤单事件
@@ -1383,7 +1415,7 @@ impl MatchingEngine {
 
     /// 从订单簿移除未成交订单（取消订单时调用）
     fn remove_from_book(&mut self, order_id: u64) -> OrderResult<()> {
-        let pool_idx = self
+        let location = self
             .orders
             .get(&order_id)
             .copied()
@@ -1392,7 +1424,7 @@ impl MatchingEngine {
         let order = self
             .pools
             .orders
-            .get(pool_idx)
+            .get(location.order_pool_idx)
             .copied()
             .ok_or(MatchingEngineError::OrderNotFound)?;
 
@@ -1401,7 +1433,7 @@ impl MatchingEngine {
             Side::Sell => &mut self.sell_book,
         };
 
-        book.remove_order_at_level(order.price_ticks, order_id)
+        book.remove_order_at_level(order.price_ticks, order_id, location.list_node_idx)
             .map_err(|_| MatchingEngineError::OrderNotFound)?;
 
         // Remove the price level entirely if no orders remain, to avoid ghost
@@ -1434,8 +1466,8 @@ impl MatchingEngine {
                 let list_pool = &self.buy_book.list_pool;
                 while let Some(node_idx) = node_idx_opt {
                     if let Some(list_node) = list_pool.get(node_idx) {
-                        if let Some(&pool_idx) = self.orders.get(&list_node.order_id) {
-                            if let Some(order) = self.pools.orders.get(pool_idx) {
+                        if let Some(location) = self.orders.get(&list_node.order_id) {
+                            if let Some(order) = self.pools.orders.get(location.order_pool_idx) {
                                 total_remaining += order.remaining_lots();
                             }
                         }
@@ -1462,8 +1494,8 @@ impl MatchingEngine {
                 let list_pool = &self.sell_book.list_pool;
                 while let Some(node_idx) = node_idx_opt {
                     if let Some(list_node) = list_pool.get(node_idx) {
-                        if let Some(&pool_idx) = self.orders.get(&list_node.order_id) {
-                            if let Some(order) = self.pools.orders.get(pool_idx) {
+                        if let Some(location) = self.orders.get(&list_node.order_id) {
+                            if let Some(order) = self.pools.orders.get(location.order_pool_idx) {
                                 total_remaining += order.remaining_lots();
                             }
                         }

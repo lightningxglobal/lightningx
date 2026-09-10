@@ -93,6 +93,13 @@ impl ListNodePool {
     pub fn available_count(&self) -> usize {
         self.capacity - self.allocated
     }
+
+    /// 将所有节点返还池中。
+    pub fn clear(&mut self) {
+        self.free_indices.clear();
+        self.free_indices.extend(0..self.capacity);
+        self.allocated = 0;
+    }
 }
 
 /// 使用节点池的链表

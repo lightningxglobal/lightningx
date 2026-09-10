@@ -41,19 +41,21 @@ pub trait OrderBook {
     /// 获取最优且有订单的价格
     fn best_with_orders(&self) -> Option<&PriceLevel>;
 
-    /// 向指定价格添加订单
+    /// 向指定价格添加订单，价格档位不存在时自动创建。
+    /// 返回链表节点池索引，供后续 O(1) 删除。
     fn add_order_at_level(
         &mut self,
         price_ticks: PriceTicks,
         order_id: u64,
         quantity_lots: QuantityLots,
-    ) -> Result<(), String>;
+    ) -> Result<usize, String>;
 
     /// 从指定价格移除订单
     fn remove_order_at_level(
         &mut self,
         price_ticks: PriceTicks,
         order_id: u64,
+        list_node_idx: usize,
     ) -> Result<(), String>;
 
     /// 移除整个价格档位

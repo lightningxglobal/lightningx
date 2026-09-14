@@ -1,7 +1,8 @@
-# 组合保证金（Portfolio Margin）实现方案 v2
+# 组合保证金（Portfolio Margin）实现方案 v3
 
-状态：设计，未实现。日期：2026-09-15。
+状态：设计，未实现。日期：2026-09-15（v3 同日修订：保证金模型改为情景重估内核）。
 前置文档：`docs/portfolio_margin_design.md`（quota lease 协议草案，本文将其定位为独立的延迟优化轨道）。
+参考：一份面向订单簿型 perp DEX 的风控引擎设计文档（情景法组合保证金 + 强平/ADL/保险基金全链路）。本文 §2、§3、§5 吸收了其中与本仓库相关的部分，§10 列出取舍。
 
 ---
 
@@ -25,170 +26,239 @@
 
 | 维度 | 现状 | 组合保证金目标 |
 |---|---|---|
-| 维持保证金 MM | 账户 `maintenance_margin = Σ 各仓位 notional × rate` 线性相加 | 风险单元内多空净额 + 跨单元相关性折扣 → `portfolio_mm` |
-| 前置初始保证金 IM | `notional / leverage`，与已有仓位无关 | 边际 IM：对冲单少冻或不冻 |
-| 强平 | 全部仓位一起 IOC（分批 `LIQ_TRANCHE_BPS`） | 按风险贡献排序逐仓减仓，对冲对成对处理 |
-| 数据 | `symbol → users` 索引，无 `user → symbols` | 需要按用户遍历其全部仓位 |
+| 维持保证金 MM | 账户 `maintenance_margin = Σ 各仓位 notional × rate` 线性相加 | 组合在**同一情景**下重估的最坏损失 → 对冲收益自然涌现 |
+| 前置初始保证金 IM | `notional / leverage`，与已有仓位无关；按 side 标签判断 reduce-only | 边际 IM = 加单后与加单前的组合 IM 之差；风险方向按需求量变化判断，不按标签 |
+| 强平 | 全部仓位一起 IOC（分批 `LIQ_TRANCHE_BPS`） | 按"每单位释放名义额降低多少需求量"排序逐仓减仓，对冲对成对处理，含收敛检查 |
+| 数据 | `symbol → users` 索引，无 `user → symbols` | 账户级缓存一个情景损失向量，多数路径不再遍历仓位 |
 
 抵押品仍是单一 USDT（多币种抵押是另一个模块，本文不涉及）。
 
 ---
 
-## 2. 保证金模型 v1：净额 + 相关性折扣
+## 2. 保证金模型：情景重估内核
 
-全部定点数，单位 atoms（1e-8 USDT），比率用 bps，中间量 i128。与 `calc.rs` 现有风格一致。
+### 2.1 为什么不用"净额 + 配对折扣表"（v2 的做法）
 
-### 2.1 风险单元（Risk Unit, RU）
+v2 用同风险单元净额 + 跨单元 corr 配对表算折扣。问题：
+- 折扣是**成对**定义的，三个以上单元时"谁和谁抵"需要额外的分配规则；
+- IM 与 MM、前置检查与强平排序各自实现一套折扣逻辑，容易漂移；
+- 无法表达"相关性失效"这类尾部情形，只能靠调低 corr 参数。
 
-RU = base asset（`BTC_USDT` → `BTC`）。当前一个 RU 只有一个 symbol，但模型按 RU 聚合，未来同 RU 多合约（如 `BTC_USDC`）自动净额。`counter_shard::symbol_route_desk_id` 已有 base 解析，复用。
+情景法：定义少量确定性情景，把整个组合在每个情景下重估一次，取最坏损失。对冲收益不用算，它是"多空腿在同一情景下同时重估"的自然结果；三个以上单元没有特殊处理；"相关性失效"就是多加一个情景。IM、MM、前置边际检查、强平排序、ADL 保护共用同一个内核函数。
 
-### 2.2 单 RU 维持保证金
+### 2.2 因子与情景集
 
+- **因子** = 风险单元 RU = base asset（`BTC_USDT` → `BTC`），复用 `counter_shard::symbol_route_desk_id` 的 base 解析。当前一个 RU 一个 symbol；同 RU 多合约自动净额。
+- 线性 perp 的单腿损失是闭式：`loss_i(s) = signed_notional_i × shock_i(s)`，`signed_notional = ±qty × mark / notional_scale`（多为正）。不需要 `value(state)` trait，`Instrument` 抽象在只有线性 perp 的仓库里是多余的。
+- **情景生成**（k = 用户持仓 RU 数，≤ 4 时 S ≤ 32）：
+  - 主方向 D ∈ {−, +}；
+  - 背离子集 X ⊆ RUs：X 中的 RU 反向移动、幅度为背离冲击 `d_i`，其余 RU 沿主方向移动、幅度为全额冲击 `p_i`；
+  - 情景数 = 2 × 2^k。k=1 时退化为 ±p（加两个无害的 ∓d）。
+- **两套冲击网格，同一内核**：
+  - MM 网格：`p_i = maintenance_rate_bps`（现值 50）。单仓位账户的组合 MM = `notional × 50bps`，与今天**完全一致**；
+  - IM 网格：`p_i = 1e4 / default_leverage`（现值 1000）。单仓位账户的组合 IM = `notional / 10`，与今天一致。
+  - 这样非 PM 账户和 PM 单仓账户数值不变，只有多腿账户出现差异，便于灰度对比。
+- **背离冲击** `d_i = p_i × div_bps / 1e4`，`div_bps` 是每 RU 的参数（BTC/ETH 可设 4000 = 40%）。含义：
+  - 多 BTC / 空 ETH 对冲对，最坏情景是"BTC 跌 p、ETH 涨 d"，两腿都亏但 ETH 腿只亏 d，对冲折扣 = `1 − d/p`；
+  - 同向持仓（多 BTC + 多 ETH），最坏情景是"全部同跌 p"，**没有分散收益**。这是有意的保守：危机中相关性趋于 1，分散收益不可靠；
+  - 相关性失效压力测试 = 把 `div_bps` 调到 1e4，折扣归零。参数化即可，不需要改代码。
+- **聚合**：v1 取最坏情景（`max`）。ES 分位数在 S ≤ 32 时意义不大，后置。
+
+### 2.3 内核接口
+
+```rust
+// calc.rs — 纯函数，全部定点数（atoms / bps / i128 中间量）
+pub const MAX_SCENARIOS: usize = 32;
+pub type LossVec = SmallVec<[i64; MAX_SCENARIOS]>;   // 每情景组合损失，正数 = 亏
+
+pub struct RuShock { pub ru: [u8; 8], pub p_bps: i64, pub d_bps: i64 }
+
+/// 单腿在每个情景下的损失向量。losses 可加：多腿向量逐元素相加即组合向量。
+pub fn leg_loss_vec(signed_notional_atoms: i64, ru_index: usize, shocks: &[RuShock]) -> LossVec;
+/// 最坏情景损失 = 需求量（MM 或 IM，取决于传入的网格）。
+pub fn worst(losses: &LossVec) -> i64;   // max(0, max_s losses[s])
 ```
-long_notional  = Σ 多头 |notional|（mark 价）
-short_notional = Σ 空头 |notional|
-net   = |long − short|
-gross = long + short
-hedged = gross − net
-mm_ru = net × mm_rate_bps/1e4 + hedged × mm_rate_bps × hedge_rate_bps / 1e8
-```
 
-`hedge_rate_bps` 是对冲部分保留的比例（如 2000 = 保留 20%，覆盖基差/执行风险）。同 RU 单合约时 `hedged = 0`，退化为现有公式。
+**关键性质：损失向量对腿线性可加**。加一张单、减一个 tranche、撤一张挂单，都是向量加减，O(S)，不需要重新遍历仓位。这就是热路径 O(1)（常数 S ≤ 32）的来源，替代了 v2 的 `hedge_credit` 预计算表。
 
-### 2.3 跨 RU 折扣（只做配对表，不做协方差矩阵）
-
-对配置表中每对 `(A, B, corr_bps)`：
-
-```
-offset(A,B) = min(mm_A 的净多方向敞口对应 MM, mm_B 的净空方向敞口对应 MM) × corr_bps / 1e4
-portfolio_mm = Σ mm_ru − Σ offset
-```
-
-只有 A 净多 / B 净空（或反之）才产生 offset；同向不折扣。配置示例：`PM_CORR=BTC:ETH:5000,ETH:SOL:3000`，解析函数仿 `parse_risk_tiers`。v1 不估波动率，corr 是人工参数。
-
-### 2.4 初始保证金
-
-`portfolio_im = portfolio_mm × im_multiplier_bps / 1e4`（如 20000 = 2×）。IM 与 MM 同源，避免两套模型漂移；杠杆档位（`check_leverage_tier`）继续限制单仓名义额上限，不再决定 IM。
-
-### 2.5 v2（后置）：情景矩阵
-
-每 RU 价格 ±p% × 波动 ±v% 网格，组合最坏损失为 MM。接口不变（`portfolio_mm(positions, marks, params) -> i64`），只换实现。
+情景集的 RU 顺序对每个账户固定（按首次持仓顺序追加，最多 4 个）；账户持仓超过 4 个 RU 时退回 Σ 模式（配置上限，压测后再放）。
 
 ---
 
-## 3. 热路径：边际 IM 的 O(1) 实现
+## 3. 热路径：边际 IM
 
-**问题**：边际 IM = `pim(portfolio ⊕ order) − pim(portfolio)`，要读用户全部仓位，且 `check_and_reserve_margin` 现在是 `accounts.get()` 共享读锁 + 原子 CAS，无法容忍在里面遍历 `positions`。
-
-**方案**：把"边际"拆成"独立 IM × 对冲折扣"，折扣在慢路径预计算：
+### 3.1 账户缓存
 
 ```rust
 // AccountRiskState 新增（只在 get_mut 下写，与 used_margin 同规则）
-pub hedge_credit: SmallVec<[HedgeCredit; 4]>,   // 每个有仓位的 RU 一条
-
-#[derive(Clone, Copy)]
-pub struct HedgeCredit {
-    pub ru: [u8; 8],
-    pub side: u8,              // 哪个方向的新单能享受折扣（与净敞口相反）
-    pub notional_atoms: i64,   // 可折扣的名义额上限（= 当前净敞口）
-    pub discount_bps: i64,     // 1e4 − 保留比例
-}
-```
-
-热路径（owner 侧 `cf_owner_new` 分支与本地 `ws_handler` 分支共用）：
-
-1. 算独立 IM（现有 `calc_initial_margin_atoms`）。
-2. `credit = hedge_credit.iter().find(ru == order.ru && side == order.side)`；命中则 `im -= min(order_notional, credit.notional) × discount_bps / 1e4`。
-3. 原子 CAS 冻结 `im`（现有逻辑不变）。
-
-复杂度：≤4 条 SmallVec 线性查找 + 几次乘除，百纳秒级，不加锁。
-
-**折扣快照的时效**：`hedge_credit` 在 `on_fill`（仓位变化）和 `update_mark_price`（名义额变化）里重算，两处都已持有 `accounts.get_mut`。两笔对冲单并发时第二笔可能重复享受折扣——成交后 `on_fill` 立即按真实 `portfolio_im` 校正 `used_margin`，超冻/少冻的差额通过 `available_margin` 一次性回冲，与现有 `runtime_consume_fill_margin` 的差额回冲路径一致。风险敞口窗口 ≤ 一次成交回执。
-
-跨 RU 折扣不进热路径（v1 只在 MM 侧生效，IM 侧不给跨 RU 折扣）。理由：跨 RU 折扣对单笔订单的边际影响小，而且方向判断依赖两个 RU 的净敞口，预计算表膨胀。
-
----
-
-## 4. 慢路径：MM 重算与风控 tick
-
-### 4.1 需要 `user → positions` 遍历
-
-`RiskEngine` 现只有 `symbol_position_index: symbol → HashSet<user>`。新增：
-
-```rust
-// AccountRiskState 内，get_mut 下维护
+pub margin_mode: u8,                       // 0 = cross-sum（现状），1 = portfolio
+pub ru_order:   SmallVec<[[u8; 8]; 4]>,    // 该账户情景集的 RU 顺序
+pub pos_losses_im: LossVec,                // 仓位在 IM 网格下的损失向量
+pub pos_losses_mm: LossVec,                // 仓位在 MM 网格下的损失向量
+pub pending_losses_im: LossVec,            // 挂单（未成交部分）在 IM 网格下的损失向量
 pub position_symbols: SmallVec<[[u8; 16]; 4]>,
 ```
 
-`on_fill` 开仓/平仓时增删。`update_mark_price` 对某 symbol 的每个用户：`accounts.get_mut(uid)` → 对 `position_symbols` 逐个 `positions.get(&(uid, sym))` → 重算 `portfolio_mm` 与 `hedge_credit`。
+`maintenance_margin` 字段保留，PM 账户下由写入方写入 `worst(pos_losses_mm)`；`run_risk_tick` 不感知模式。
 
-⚠️ 这是 `get_mut` + 多次键控 `get`，不是 `iter_mut` 内套 `iter`，不触发 DashMap 6.x 的嵌套迭代死锁（见 `margin_liquidation_impl` 记录）。测试里要保留 40K 用户 × 2 仓位的 tick 时长断言。
+### 3.2 下单检查（owner 侧 `cf_owner_new` 与本地 `ws_handler` 分支共用）
 
-### 4.2 tick 不改结构
+```
+v_order   = leg_loss_vec(±order_notional, ru, im_grid)
+req_before = worst(pos_losses_im + pending_losses_im)
+req_after  = worst(pos_losses_im + pending_losses_im + v_order)
+marginal   = req_after − req_before
+```
 
-`run_risk_tick` 三段式不动。`AccountRiskState.maintenance_margin` 的**语义**改为 `portfolio_mm`（PM 账户）或 `Σ mm`（非 PM 账户），由写入方（`on_fill` / `update_mark_price`）决定。tick 的阈值判断、`MarginCall` 判定、B2 hydration 保护全部复用。
+- `marginal ≤ 0`（风险下降：平仓、减仓、对冲）→ **不设 IM 闸门**，冻结 0，`MarginCall` 状态也放行。判断依据是需求量的变化，不是 buy/sell 或 reduce-only 标签（多头的卖是平仓，空头的卖是加仓，标签会骗人）。现有 `check_reduce_only` 保留给显式 reduce-only 订单的语义检查，不再用于风控放行。
+- `marginal > 0` → 走现有 `available_margin` 原子 CAS 冻结 `marginal`。
+- 通过后 `pending_losses_im += v_order`（get_mut 写；成交/撤单时减去对应部分）。
 
-### 4.3 账户模式
+**挂单为什么进向量**：两笔并发对冲单若都只对"已有仓位"算边际，会重复享受同一份对冲折扣。把挂单的未成交部分计入向量后，第二笔看到的是"仓位 + 第一笔挂单"的组合，折扣只发一次。v2 承认了这个窗口，v3 把它关掉。
 
-`AccountRiskState.margin_mode: u8`（0 = cross-sum 现状，1 = portfolio）。opt-in，默认 0。来源：`risk_accounts` 表新列 + `RiskAccountSetPayload` 新增 1 字节（占用 `_pad`），hydration 读回。同一 tick 内两种模式并存，只是 MM 数值来源不同。
+**成本**：三次 O(S) 向量运算 + 一次 `accounts.get()`，S ≤ 32 → 百纳秒级。但比今天多了一次 `get_mut`（写 `pending_losses_im`）。若压测显示 get_mut 在 owner recv-spin 路径上有争用，退化方案：`pending_losses_im` 改为 `[AtomicI64; 32]` 用 `fetch_add` 写，与 `available_margin` 同款。
+
+**边际的时效**：下单时冻结的 `marginal` 基于当时的 mark 和仓位；成交时 `on_fill` 按真实向量重算 `im_total = worst(pos + pending)`，并把 `available_margin` 校正为 `equity − im_total − …`，吸收冻结值与真实值的漂移。这一步与现有 `runtime_consume_fill_margin` 的差额回冲路径合并。
+
+### 3.3 与现有字段的关系
+
+| 字段 | 现状语义 | PM 语义 |
+|---|---|---|
+| `order_margin` | Σ 挂单冻结 | Σ 挂单边际冻结（可能小于独立 IM 之和） |
+| `used_margin` | Σ 仓位独立 IM | `worst(pos_losses_im)` |
+| `maintenance_margin` | Σ 仓位 MM | `worst(pos_losses_mm)` |
+| `available_margin` | equity − order − used | 不变，slow path 重算时用 PM 值 |
+
+`equity = available + order_margin + used_margin + unrealized` 的守恒关系保持，S2.4 守恒测试继续有效。
 
 ---
 
-## 5. 组合强平：有序减仓
+## 4. 慢路径：向量维护与风控 tick
 
-现状：`LiquidationPending` → 对该用户**每个仓位**发 `LiquidationEvent` → 各自分批 IOC。组合保证金下这是错的：先平掉对冲对的一条腿，组合风险**上升**。
+### 4.1 `on_fill`
+
+已持有 `accounts.get_mut`。追加：
+1. `pending_losses_im −= v_order × fill_qty / order_qty`；
+2. 仓位变化 → 重算该 RU 腿的向量（旧腿减、新腿加，两套网格）；
+3. `used_margin = worst(pos_losses_im)`，`maintenance_margin = worst(pos_losses_mm)`；
+4. `available_margin` 校正（§3.2）。
+
+新 RU 首次持仓且 `ru_order.len() == 4` → 该账户降级为 Σ 模式（`margin_mode = 0`）并记 metrics，不拒单。
+
+### 4.2 `update_mark_price`
+
+已按 `symbol_position_index` 遍历该 symbol 的用户并 `get_mut` 账户。追加：该 RU 腿的向量按 `notional_new − notional_old` 缩放后加回两套向量，O(S)。40K 用户 × 32 次乘加远小于已有的 DashMap 开销。如果后续压测证明不够，加价格带触发（累计 mark 变动 < 10bps 不重算）。
+
+⚠️ 这里是 `get_mut(acct)` + 键控 `positions.get`，不是 `iter_mut` 内套 `iter`，不触发 DashMap 6.x 嵌套迭代死锁（见 `margin_liquidation_impl` 记录）。测试里保留 40K 用户 × 2 仓位的 tick 时长断言。
+
+### 4.3 `run_risk_tick` 不改结构
+
+三段式不动。阈值判断、`MarginCall` 判定、B2 hydration 保护全部复用；PM 账户只是 `maintenance_margin` 数值来源不同。`symbol_position_index` 本身就是"因子 → 组合"倒排索引，只唤醒有仓位的用户；账户级 `equity vs maintenance_margin` 的比较就是线性预筛。40K 规模不需要 SIMD 预筛/自适应频率那一层。
+
+### 4.4 账户模式
+
+`margin_mode` opt-in，默认 0。来源：`risk_accounts` 表新列 + `RiskAccountSetPayload` 占用 1 字节 `_pad`，hydration 读回。两种模式在同一 tick 内并存。
+
+---
+
+## 5. 组合强平：有序减仓 + 收敛检查
+
+现状：`LiquidationPending` → 对该用户**每个仓位**发 `LiquidationEvent` → 各自分批 IOC。组合保证金下这是错的：先平掉对冲对的一条腿，组合需求量**上升**（对冲腿被拆，剩下裸头寸）。
 
 新规则（在 `run_risk_tick` Pass 2 替换 `positions.iter().filter()`）：
 
-1. 取该用户全部仓位，按 RU 分组。
-2. 对每个候选减仓动作算 `Δmm = portfolio_mm(P) − portfolio_mm(P \ action)`：
-   - 单腿仓位：action = 平该仓一个 tranche。
-   - 对冲对（同 RU 多空，或配置表中有 offset 的两 RU）：action = **两腿按净敞口比例同时减**，永远不单独平一条腿。
-3. 按 `Δmm / 释放名义额` 降序，先执行第一条 action（一个 tick 只发一组 IOC）。
-4. 成交回来 `on_fill` 重算 `portfolio_mm`，下个 tick 重新评估：`equity > portfolio_mm × (1 + buffer_bps)` 则停止，状态回 `Normal`；否则继续下一条。
+1. 取该用户全部仓位腿，候选动作：
+   - 单腿减一个 tranche（`liquidation_tranche_lots`）；
+   - 对冲对（在当前最坏情景下损失符号相反的两腿）按净敞口比例**同时**减一个 tranche。
+2. 对每个候选算 `Δmm = worst(V_mm) − worst(V_mm − v_action)`，O(S)，≤ 6 个候选。
+3. 按 `Δmm / 释放名义额` 降序，执行第一条（一个 tick 只发一组 IOC）。
+4. **收敛检查**：所有候选 `Δmm ≤ 0`（越平越糟）→ 自级联信号 → 跳过单腿，改为全部腿按比例整体减仓（保持净敞口中性）。
+5. 成交后 `on_fill` 重算，下个 tick 重评：`equity > maintenance_margin × (1 + buffer_bps)` → 状态回 `Normal`；否则继续。
 
-入口不变：仍是 `AeronCmd::NewOrder` 市价 IOC，`liq_price_ticks != 0` 标记，`fill_margin = 0`。`LIQ_TRANCHE_BPS` 复用。保险基金结算逻辑不动。
+入口不变：市价 IOC 走 `AeronCmd::NewOrder`，`liq_price_ticks != 0` 标记，`fill_margin = 0`，绕过前置闸门（强平单本来就是降风险单，走闸门会因账户已穿仓被拒，死锁）。保险基金结算逻辑不动。
+
+**ADL 保护**（`run_adl` 小改）：对手方候选在被削仓前算 `worst(V_cp − v_cut)`，若削仓会让对手方自己 `equity ≤ mm`（削掉的是它的对冲腿），降权或跳过。今天的 ADL 评分（uPnL 占比 × 杠杆）保留。
 
 ---
 
 ## 6. 持久化与恢复
 
-- **不持久化派生量**。`portfolio_mm`、`hedge_credit` 都是 `(positions, marks, params)` 的纯函数，崩溃恢复 = hydration 读回仓位后重算。
-- 持久化的只有 `margin_mode`（`RiskAccountSetPayload` 加 1 字节，pg-writer 加列）和模型参数版本号（审计用，落 `PersistEvent` 一条 `PmParamsSet`，可后置）。
-- 对账工具（`reconcile.rs`）加一项：重算 `portfolio_mm` 与内存值一致。
+- **不持久化派生量**。损失向量、`used_margin`、`maintenance_margin` 都是 `(positions, marks, params)` 的纯函数，hydration 读回仓位后重算。
+- 持久化的只有 `margin_mode`（`RiskAccountSetPayload` 加 1 字节，pg-writer 加列）和冲击参数版本号（审计用，`PersistEvent` 一条 `PmParamsSet`，可后置）。
+- 对账（`reconcile.rs`）加一项：从仓位重算向量与内存值一致。
 
 ---
 
-## 7. 落地顺序（每步可独立验证与提交）
+## 7. 参数
+
+| 参数 | 来源 | 现值 / 建议 |
+|---|---|---|
+| MM 网格 `p_i` | `SymbolRules.maintenance_rate_bps` | 50（不变） |
+| IM 网格 `p_i` | `1e4 / SymbolRules.default_leverage` | 1000（不变） |
+| 背离比例 `div_bps` | 新增 env `PM_DIV_BPS=BTC:4000,ETH:4000,SOL:6000` | 待标定；1e4 = 无对冲折扣 |
+| 单账户 RU 上限 | 常量 `MAX_PM_RUS = 4` | 超出降级 Σ 模式 |
+| 强平停止缓冲 | 新增 env `LIQ_STOP_BUFFER_BPS` | 建议 1000 |
+| 账户模式 | `risk_accounts.margin_mode` | 默认 0 |
+
+`div_bps` 的标定方向：取历史 1 秒/10 秒窗口内两 RU 收益率之差的高分位，除以 `p_i`。这需要行情数据，属于上线前的标定工作，不是设计问题。
+
+---
+
+## 8. 落地顺序（每步可独立验证与提交）
 
 | 步 | 改动 | 验证 |
 |---|---|---|
-| 1 | `calc.rs`：`parse_pm_corr`、`ru_of_symbol`、`ru_mm`、`portfolio_mm`、`portfolio_im`、`hedge_credit_for`。纯函数 | 单测：手算数字。BTC 多 1 + BTC 空 1 → mm = 0.2 × 单腿；BTC 多 / ETH 空 corr 5000 → 折扣 = min 腿 × 50%；同向无折扣；溢出用 i128 |
-| 2 | `AccountRiskState` 加 `margin_mode` / `position_symbols` / `hedge_credit`；`on_fill` 与 `update_mark_price` 重算 `maintenance_margin` | `engine.rs` 测试：对冲组合在 cross-sum 下会 `LiquidationPending`、PM 模式下 `Normal`；40K × 2 tick 耗时不回归 |
-| 3 | `check_and_reserve_margin(user, im, ru, side)` 应用 `hedge_credit`；两个调用点（`ws_handler.rs` 本地分支、`desk_server.rs` cf_owner_new 分支）与 batch 分支同步 | 测试：已有 BTC 多，下 BTC 空单冻结 = 20%；超出净敞口部分全额；并发两笔对冲单后 `on_fill` 校正 `used_margin` |
-| 4 | 强平排序 + 对冲对成对减仓（§5） | 测试：对冲对只发成对 IOC；单腿仓位先平 `Δmm` 最大者；组合回安全后停止 |
+| 1 | `calc.rs`：`RuShock`、`gen_scenarios`、`leg_loss_vec`、`worst`、`parse_pm_div` 纯函数 | 单测：单仓 MM/IM 与现公式逐 atom 相等；多 BTC 空 ETH 折扣 = `1 − d/p`；多 BTC 多 ETH 无折扣；`div=1e4` 折扣归零；向量可加性；i128 无溢出 |
+| 2 | `AccountRiskState` 新字段；`on_fill` / `update_mark_price` 维护向量并写 `used_margin` / `maintenance_margin` | `engine.rs` 测试：对冲组合在 Σ 模式下 `LiquidationPending`、PM 模式下 `Normal`；mark 变动后向量与从仓位重算一致；40K × 2 tick 耗时不回归 |
+| 3 | 前置检查改边际 IM（三个调用点：`ws_handler.rs` 本地、`desk_server.rs` cf_owner_new、batch 分支）；`pending_losses_im` 维护 | 测试：对冲单冻结 = 边际；平仓单在 `MarginCall` 下放行；两笔并发对冲单只有第一笔拿折扣；撤单后向量归零 |
+| 4 | 强平排序 + 对冲对成对减仓 + 收敛检查（§5）；ADL 保护 | 测试：对冲对只发成对 IOC；`Δmm` 最大者先平；越平越糟时整体减仓；组合回安全后停止 |
 | 5 | `margin_mode` 持久化 / hydration / reconcile | e2e：重启后 PM 账户 MM 与重启前一致 |
-| 6 | （可选）v2 情景矩阵替换 `portfolio_mm` 实现 | 同步骤 1 的接口测试 |
 
-步骤 1-3 完成即可上线"对冲少冻 + 组合 MM"，是用户可感知的资金效率提升；4-5 是安全闭环，上线前必须完成。
+步骤 1-3 完成即可上线"对冲少冻 + 组合 MM"；4-5 是安全闭环，上线前必须完成。
 
 ---
 
-## 8. 第二轨道：quota lease 与 PM 的衔接
+## 9. 第二轨道：quota lease 与 PM 的衔接
 
 `docs/portfolio_margin_design.md` 的租约协议目标是去掉 ingress → owner 的转发跳。它与 PM 正交，但 PM 改变了它的一个前提：**边际 IM 不可加**，接入柜台没有组合视图，算不出对冲折扣。
 
-衔接规则：柜台本地闸口按**独立 IM（无折扣）**扣租约，保守放行；owner（home）收到成交流后按真实 `portfolio_im` 重算，差额在下个 tick 通过 `LeaseGrant` 增量返还。对冲收益从"下单时少冻"变成"成交后 ≤10ms 回补"，不变式 `Σ 租约 ≤ F × (1 − haircut)` 仍然成立。
+衔接规则：柜台本地闸口按**独立 IM（无折扣）**扣租约，保守放行；owner（home）收到成交流后按真实向量重算，差额在下个 tick 通过 `LeaseGrant` 增量返还。对冲收益从"下单时少冻"变成"成交后 ≤10ms 回补"，不变式 `Σ 租约 ≤ F × (1 − haircut)` 仍然成立。
 
 是否做第二轨道的判据：在 Linux 物理机上复测 forward 路径的 p99。若 p99 在目标内，租约协议不做。
 
 ---
 
-## 9. 假设（未与需求方确认，按此实现）
+## 10. 参考文档的取舍
+
+采纳（已写入上文）：
+
+| 参考文档要点 | 落到本仓库 |
+|---|---|
+| 一个情景内核，对冲收益涌现而非配对表 | §2 情景集 + 可加损失向量 |
+| 前置检查用 `req_after vs req_before` 判风险方向，降风险单不设 IM 闸门 | §3.2 |
+| 相关性失效 = 情景参数，不是特殊代码 | `div_bps → 1e4` |
+| 强平按边际贡献排序、尊重对冲、成对解除、收敛检查 | §5 |
+| ADL 不能把对手方自己的对冲腿削掉 | §5 ADL 保护 |
+| 因子倒排索引 + 只唤醒受影响组合 | 已有 `symbol_position_index`，无需新做 |
+| 强平单绕过闸门 | 已有（`fill_margin = 0`） |
+| IM 用更保守的网格而非 MM × 系数 | §2.2 两套网格，数值与现状对齐 |
+
+不采纳（与本仓库规模或范围不符）：
+
+- `Instrument` trait / `value(state)` / `Axis` 枚举：只有线性 perp，闭式公式足够，抽象是负担。
+- 500K 组合、SoA 列存、大页、SIMD 预筛、自适应重估频率：40K 用户 + DashMap + 10ms tick 已够；`update_mark_price` 的价格带触发作为备选。
+- 多币种抵押、抵押品瀑布、RWA、预测市场跳变轴：抵押品单一 USDT，范围外。
+- L2 / 排序器故障、预言机聚合：本仓库已有 index 冻结 + mark clamp（S4.2），与 PM 无关。
+- 强平结算价政策（破产价接管 vs 按实际成交退还）：现状是接管制（`realized_pnl − bkrpt_pnl` 进保险基金），是独立的产品决策，不在 PM 范围内，但值得单独讨论。
+- ES 分位数聚合：S ≤ 32 时取 max 即可。
+
+---
+
+## 11. 假设（未与需求方确认，按此实现）
 
 1. 单一 USDT 抵押品。
-2. RU = base asset；跨 RU 折扣只做人工配对表，不估相关性。
-3. PM 是账户级 opt-in 模式，非 PM 账户行为完全不变。
-4. IM 侧只给同 RU 对冲折扣，跨 RU 折扣只在 MM 侧生效。
-5. 强平中对冲对永远成对减仓。
-6. 不引入新二进制、新 Aeron 流、新线程；所有改动在 owner shard 的 `RiskEngine` 及其两个调用点内。
+2. RU = base asset；情景集为"主方向 × 背离子集"，背离幅度按 RU 配置，不估相关矩阵。
+3. PM 是账户级 opt-in 模式，非 PM 账户行为完全不变；单仓 PM 账户数值与现状逐 atom 一致。
+4. 单账户最多 4 个 RU 参与情景集，超出降级为 Σ 模式。
+5. 挂单未成交部分计入 IM 向量；降风险单不设闸门但 `Liquidating` 及之后状态仍拒绝用户订单。
+6. 不引入新二进制、新 Aeron 流、新线程；所有改动在 owner shard 的 `RiskEngine` 及其三个调用点内。

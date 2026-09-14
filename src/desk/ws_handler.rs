@@ -17,7 +17,7 @@ use axum::extract::{Request, State};
 use axum::response::Response;
 use dashmap::DashMap as ActorConnMap;
 use dashmap::DashMap;
-use fastwebsockets::{Frame, OpCode, upgrade};
+use fastwebsockets::{upgrade, Frame, OpCode};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -607,6 +607,52 @@ fn best_opposing_from_depth(state: &AppState, symbol: &str, side: &str) -> Optio
     ws_sbe::decode_best_price(&buf, want_ask)
 }
 
+const MARKET_RISK_DEPTH_LEVELS: usize = 256;
+
+fn market_price_band_from_levels(levels: &[(i64, i64)], requested_lots: i64) -> Option<(i64, i64)> {
+    if requested_lots <= 0 {
+        return None;
+    }
+    let best = levels.first()?.0;
+    let mut remaining = requested_lots;
+    for &(price, qty) in levels {
+        if price <= 0 || qty <= 0 {
+            return None;
+        }
+        remaining -= qty;
+        if remaining <= 0 {
+            return Some((best, price));
+        }
+    }
+    None
+}
+
+pub(crate) fn market_price_band_ticks(
+    state: &AppState,
+    engine: Option<&Arc<Mutex<MatchingEngine>>>,
+    symbol: &str,
+    side: Side,
+    requested_lots: i64,
+    rules: crate::symbol_rules::SymbolRules,
+) -> Option<(i64, i64)> {
+    if let Some(engine) = engine {
+        let mut levels = [(0, 0); MARKET_RISK_DEPTH_LEVELS];
+        let count = engine
+            .lock()
+            .unwrap()
+            .fill_top_levels(side == Side::Sell, &mut levels);
+        return market_price_band_from_levels(&levels[..count], requested_lots);
+    }
+    let depth = state.last_depth.get(symbol)?;
+    let requested_qty = rules.lots_to_quantity(requested_lots);
+    let (best, protection) =
+        ws_sbe::decode_market_price_band(&depth, side == Side::Buy, requested_qty)?;
+    Some((
+        rules.price_to_ticks(best).ok()?,
+        rules.price_to_ticks(protection).ok()?,
+    ))
+}
+
 // ─── Per-message handler ──────────────────────────────────────────────────────
 
 async fn handle_client_message(
@@ -781,31 +827,53 @@ async fn handle_client_message(
             let (base_asset, quote_asset) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
             let rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
 
-            // Capture best opposing price before matching — used as the fill
-            // price for market orders AND persisted as freeze_price so the
-            // restart cleanup can release the exact amount later.
-            let needs_opposing_price = side == "buy" && price.is_none();
-            let best_opposing_price: Option<f64> = if needs_opposing_price {
-                if let Some(ref engine) = engine_opt {
-                    let eng = engine.lock().unwrap();
-                    let levels = eng.get_top_levels(1, engine_side == Side::Sell);
-                    levels.first().map(|(p, _)| rules.ticks_to_price(*p))
-                } else if state.aeron_cmd_tx.is_some() {
-                    best_opposing_from_depth(state, &symbol, &side)
-                } else {
-                    None
+            // Market orders are converted to protected IOC limits. The risk
+            // price covers every visible level needed by the requested size;
+            // insufficient visible depth is rejected instead of under-reserving.
+            let (order_price_ticks, margin_price_ticks) = match fixed_shape.price_ticks {
+                Some(limit_ticks) => {
+                    // A sell can execute immediately above its limit, so use at
+                    // least the current best bid when calculating notional.
+                    let best_bid_ticks = if engine_side == Side::Sell {
+                        if let Some(ref engine) = engine_opt {
+                            engine
+                                .lock()
+                                .unwrap()
+                                .get_top_levels(1, true)
+                                .first()
+                                .map(|(p, _)| *p)
+                        } else {
+                            best_opposing_from_depth(state, &symbol, &side)
+                                .and_then(|p| rules.price_to_ticks(p).ok())
+                        }
+                    } else {
+                        None
+                    };
+                    (limit_ticks, limit_ticks.max(best_bid_ticks.unwrap_or(0)))
                 }
-            } else {
-                None
+                None => {
+                    let Some((best_ticks, protection_ticks)) = market_price_band_ticks(
+                        state,
+                        engine_opt.as_ref(),
+                        &symbol,
+                        engine_side,
+                        fixed_shape.quantity_lots,
+                        rules,
+                    ) else {
+                        return Some(ws_sbe::encode_order_rejected(
+                            0,
+                            "Insufficient visible depth for market-order margin",
+                        ));
+                    };
+                    let margin_ticks = if engine_side == Side::Buy {
+                        protection_ticks
+                    } else {
+                        best_ticks
+                    };
+                    (protection_ticks, margin_ticks)
+                }
             };
-
-            // Price that backs the frozen quote-asset amount (buy only).
-            // Sells freeze base_asset by quantity → 0.0 by convention.
-            let freeze_price_val: f64 = if side == "buy" {
-                price.or(best_opposing_price).unwrap_or(0.0)
-            } else {
-                0.0
-            };
+            let freeze_price_val = rules.ticks_to_price(margin_price_ticks);
 
             // ── Aeron fast path: skip DB + freeze in critical path ──────────────
             // Order ID assigned atomically; DB INSERT + fund freeze happen
@@ -813,7 +881,7 @@ async fn handle_client_message(
             if let Some(aeron_cmd_tx) = &state.aeron_cmd_tx {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
                 use crate::tracer::MS_WS_ORDER_RECV;
-                use crate::transport::{AeronCmd, OrderMeta, pack_str16};
+                use crate::transport::{pack_str16, AeronCmd, OrderMeta};
 
                 // PERF DIAG (off by default): sample ~1/256 PlaceOrders per-section timing.
                 // Enable via WS_PLACE_PROFILE=1 env on desk-server.
@@ -839,19 +907,15 @@ async fn handle_client_message(
                         &format!("No engine for symbol: {}", symbol),
                     ));
                 }
+                if state.exchange_config.is_halted(&symbol) {
+                    return Some(ws_sbe::encode_order_rejected(
+                        0,
+                        "trading halted for this symbol",
+                    ));
+                }
 
                 // Futures margin model: freeze initial_margin (notional / leverage) in USDT.
-                let effective_price_ticks = if fixed_shape.price_ticks.unwrap_or(0) > 0 {
-                    fixed_shape.price_ticks.unwrap()
-                } else {
-                    if freeze_price_val <= 0.0 {
-                        return Some(ws_sbe::encode_order_rejected(
-                            0,
-                            "Unable to determine buy reservation price",
-                        ));
-                    }
-                    (freeze_price_val / rules.price_tick).round() as i64
-                };
+                let effective_price_ticks = margin_price_ticks;
 
                 let initial_margin_atoms = if effective_price_ticks > 0 {
                     let notional_atoms = crate::desk::risk::calc::calc_notional_atoms(
@@ -899,7 +963,7 @@ async fn handle_client_message(
                     let sbe_req = SbeNewOrder {
                         client_order_id: order_id,
                         participant_id: user_id as u64,
-                        price_ticks: fixed_shape.price_ticks.unwrap_or(0),
+                        price_ticks: order_price_ticks,
                         quantity_lots: fixed_shape.quantity_lots,
                         side: side_byte,
                         time_in_force: tif_byte,
@@ -962,6 +1026,21 @@ async fn handle_client_message(
                 ) {
                     return Some(ws_sbe::encode_order_rejected(0, reason));
                 }
+                let order_notional = crate::desk::risk::calc::calc_notional_atoms(
+                    margin_price_ticks,
+                    fixed_shape.quantity_lots,
+                    rules.notional_scale,
+                );
+                if let Err(reason) = state.risk_engine.check_leverage_tier(
+                    user_id,
+                    &sym16,
+                    order_notional,
+                    rules.notional_scale,
+                    state.risk_tiers.as_slice(),
+                    rules.default_leverage,
+                ) {
+                    return Some(ws_sbe::encode_order_rejected(0, reason));
+                }
                 if let Err(reason) = state
                     .risk_engine
                     .check_and_reserve_margin(user_id, initial_margin_atoms)
@@ -969,7 +1048,8 @@ async fn handle_client_message(
                     return Some(ws_sbe::encode_order_rejected(0, reason));
                 }
 
-                let margin_usdt = initial_margin_atoms as f64 / 100.0;
+                let margin_usdt =
+                    crate::desk::money::AmountAtoms::from_atoms(initial_margin_atoms).to_f64();
                 if !try_freeze_cache(&state.account_cache, user_id, quote_asset, margin_usdt) {
                     state
                         .risk_engine
@@ -1027,7 +1107,7 @@ async fn handle_client_message(
                 let sbe_req = SbeNewOrder {
                     client_order_id: order_id,
                     participant_id: user_id as u64,
-                    price_ticks: fixed_shape.price_ticks.unwrap_or(0),
+                    price_ticks: order_price_ticks,
                     quantity_lots: fixed_shape.quantity_lots,
                     side: side_byte,
                     time_in_force: tif_byte,
@@ -1170,23 +1250,14 @@ async fn handle_client_message(
                 Ok(order) => order,
                 Err(reason) => return Some(ws_sbe::encode_order_rejected(0, &reason)),
             };
-            let engine_order = if fixed_order.is_market {
-                Order::new_market(
-                    fixed_order.id,
-                    fixed_order.side,
-                    fixed_order.quantity_lots,
-                    fixed_order.timestamp,
-                )
-            } else {
-                Order::new(
-                    fixed_order.id,
-                    fixed_order.side,
-                    fixed_order.price_ticks,
-                    fixed_order.quantity_lots,
-                    fixed_order.time_in_force,
-                    fixed_order.timestamp,
-                )
-            };
+            let engine_order = Order::new(
+                fixed_order.id,
+                fixed_order.side,
+                order_price_ticks,
+                fixed_order.quantity_lots,
+                fixed_order.time_in_force,
+                fixed_order.timestamp,
+            );
 
             // Freeze funds before sending to engine.
             let repo = AccountRepository::new(state.db.as_ref());
@@ -1251,7 +1322,7 @@ async fn handle_client_message(
                             .execute(state.db.as_ref())
                             .await;
                         if side == "buy" {
-                            let p = price.or(best_opposing_price).unwrap_or(0.0);
+                            let p = price.unwrap_or(freeze_price_val);
                             if p > 0.0 {
                                 let _ = repo.release_frozen(user_id, quote_asset, p * qty).await;
                             }
@@ -1283,7 +1354,7 @@ async fn handle_client_message(
             if result.status == OrderStatus::Rejected {
                 // Release frozen funds — no fills occurred.
                 if side == "buy" {
-                    let p = price.or(best_opposing_price).unwrap_or(0.0);
+                    let p = price.unwrap_or(freeze_price_val);
                     if p > 0.0 {
                         let _ = repo.release_frozen(user_id, quote_asset, p * qty).await;
                     }
@@ -1310,7 +1381,7 @@ async fn handle_client_message(
                         .sum();
                     cost / total_filled
                 } else {
-                    price.or(best_opposing_price).unwrap_or(0.0)
+                    price.unwrap_or(freeze_price_val)
                 };
                 let fill_price = avg_fill_price;
 
@@ -1383,9 +1454,18 @@ async fn handle_client_message(
                                         let _ = tx.try_send((
                                             ws_sbe::encode_balance_update(
                                                 asset,
-                                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),
-                                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),
-                                                crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
+                                                crate::desk::money::AmountAtoms::from_atoms(
+                                                    acc.balance_atoms,
+                                                )
+                                                .to_f64(),
+                                                crate::desk::money::AmountAtoms::from_atoms(
+                                                    acc.balance_atoms - acc.frozen_atoms,
+                                                )
+                                                .to_f64(),
+                                                crate::desk::money::AmountAtoms::from_atoms(
+                                                    acc.frozen_atoms,
+                                                )
+                                                .to_f64(),
                                             ),
                                             0,
                                         ));
@@ -1471,10 +1551,7 @@ async fn handle_client_message(
                     let unfilled = qty - total_filled;
                     if unfilled > 0.0 {
                         let (rel_asset, rel_amount) = if side == "buy" {
-                            (
-                                quote_asset,
-                                price.or(best_opposing_price).unwrap_or(fill_price) * unfilled,
-                            )
+                            (quote_asset, price.unwrap_or(freeze_price_val) * unfilled)
                         } else {
                             (base_asset, unfilled)
                         };
@@ -1535,9 +1612,14 @@ async fn handle_client_message(
                             let _ = tx.try_send((
                                 ws_sbe::encode_balance_update(
                                     asset,
-                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),
-                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),
-                                    crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms)
+                                        .to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(
+                                        acc.balance_atoms - acc.frozen_atoms,
+                                    )
+                                    .to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms)
+                                        .to_f64(),
                                 ),
                                 0,
                             ));
@@ -1588,7 +1670,7 @@ async fn handle_client_message(
                 // No fill, not resting — IOC/FOK fully rejected, market with no
                 // matchable book. Release all frozen funds and notify CANCELED.
                 let (rel_asset, rel_amount) = if side == "buy" {
-                    let p = price.or(best_opposing_price).unwrap_or(0.0);
+                    let p = price.unwrap_or(freeze_price_val);
                     (quote_asset, p * qty)
                 } else {
                     (base_asset, qty)
@@ -1619,9 +1701,14 @@ async fn handle_client_message(
                             let _ = tx.try_send((
                                 ws_sbe::encode_balance_update(
                                     rel_asset,
-                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),
-                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),
-                                    crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms)
+                                        .to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(
+                                        acc.balance_atoms - acc.frozen_atoms,
+                                    )
+                                    .to_f64(),
+                                    crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms)
+                                        .to_f64(),
                                 ),
                                 0,
                             ));
@@ -1832,7 +1919,14 @@ async fn handle_client_message(
                         let _ = tx.try_send((
                             ws_sbe::encode_balance_update(
                                 &acc.asset,
-                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms).to_f64(),                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms - acc.frozen_atoms).to_f64(),                                crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms).to_f64(),
+                                crate::desk::money::AmountAtoms::from_atoms(acc.balance_atoms)
+                                    .to_f64(),
+                                crate::desk::money::AmountAtoms::from_atoms(
+                                    acc.balance_atoms - acc.frozen_atoms,
+                                )
+                                .to_f64(),
+                                crate::desk::money::AmountAtoms::from_atoms(acc.frozen_atoms)
+                                    .to_f64(),
                             ),
                             0,
                         ));
@@ -1884,13 +1978,14 @@ async fn handle_client_message(
             // write so the engine sees the full batch before the next 10ms depth snapshot.
             if state.aeron_cmd_tx.is_some() {
                 use crate::sbe::NewOrderRequest as SbeNewOrder;
-                use crate::transport::{OrderMeta, pack_str16};
+                use crate::transport::{pack_str16, OrderMeta};
 
                 struct V {
                     order_id: u64,
                     freeze_asset: String,
                     freeze_amount: f64,
                     initial_margin_atoms: i64,
+                    notional_atoms: i64,
                     sbe_req: SbeNewOrder,
                     meta: OrderMeta, // used for pending_meta.insert on freeze success
                 }
@@ -1962,17 +2057,13 @@ async fn handle_client_message(
                     if !state.valid_symbols.is_empty() && !state.valid_symbols.contains(&symbol) {
                         rej!(format!("No engine for symbol: {}", symbol));
                     }
+                    if state.exchange_config.is_halted(&symbol) {
+                        rej!("trading halted for this symbol");
+                    }
 
                     let (_base_asset, quote_asset) =
                         symbol.split_once('_').unwrap_or(("BTC", "USDT"));
                     let batch_rules = crate::symbol_rules::SymbolRules::for_symbol(&symbol);
-
-                    let best_opposing_price = best_opposing_from_depth(state, &symbol, &side);
-                    let freeze_price_val: f64 = if side == "buy" {
-                        price.or(best_opposing_price).unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
 
                     let batch_fixed_shape = match crate::symbol_rules::normalize_order_shape(
                         &symbol,
@@ -1984,24 +2075,50 @@ async fn handle_client_message(
                         Err(reason) => rej!(reason),
                     };
 
-                    // Futures margin model: freeze initial_margin in USDT for all orders.
-                    let batch_price_ticks = if batch_fixed_shape.price_ticks.unwrap_or(0) > 0 {
-                        batch_fixed_shape.price_ticks.unwrap()
-                    } else {
-                        if freeze_price_val <= 0.0 {
-                            rej!("Unable to determine buy reservation price");
-                        }
-                        (freeze_price_val / batch_rules.price_tick).round() as i64
-                    };
+                    let (batch_order_price_ticks, batch_price_ticks) =
+                        match batch_fixed_shape.price_ticks {
+                            Some(limit_ticks) => {
+                                let best_bid = if engine_side == Side::Sell {
+                                    best_opposing_from_depth(state, &symbol, &side)
+                                        .and_then(|p| batch_rules.price_to_ticks(p).ok())
+                                } else {
+                                    None
+                                };
+                                (limit_ticks, limit_ticks.max(best_bid.unwrap_or(0)))
+                            }
+                            None => {
+                                let Some((best_ticks, protection_ticks)) = market_price_band_ticks(
+                                    state,
+                                    None,
+                                    &symbol,
+                                    engine_side,
+                                    batch_fixed_shape.quantity_lots,
+                                    batch_rules,
+                                ) else {
+                                    rej!("Insufficient visible depth for market-order margin");
+                                };
+                                let margin_ticks = if engine_side == Side::Buy {
+                                    protection_ticks
+                                } else {
+                                    best_ticks
+                                };
+                                (protection_ticks, margin_ticks)
+                            }
+                        };
+                    let freeze_price_val = batch_rules.ticks_to_price(batch_price_ticks);
 
-                    let batch_initial_margin_atoms = if batch_price_ticks > 0 {
-                        let n = crate::desk::risk::calc::calc_notional_atoms(
+                    let batch_notional_atoms = if batch_price_ticks > 0 {
+                        crate::desk::risk::calc::calc_notional_atoms(
                             batch_price_ticks,
                             batch_fixed_shape.quantity_lots,
                             batch_rules.notional_scale,
-                        );
+                        )
+                    } else {
+                        0
+                    };
+                    let batch_initial_margin_atoms = if batch_notional_atoms > 0 {
                         crate::desk::risk::calc::calc_initial_margin_atoms(
-                            n,
+                            batch_notional_atoms,
                             batch_rules.default_leverage,
                         )
                     } else {
@@ -2012,7 +2129,9 @@ async fn handle_client_message(
                         rej!("Unable to determine margin requirement");
                     }
 
-                    let margin_usdt = batch_initial_margin_atoms as f64 / 100.0;
+                    let margin_usdt =
+                        crate::desk::money::AmountAtoms::from_atoms(batch_initial_margin_atoms)
+                            .to_f64();
 
                     let order_id = state.next_order_id.fetch_add(1, Ordering::Relaxed);
                     let mut sym_bytes = [0u8; 16];
@@ -2041,7 +2160,7 @@ async fn handle_client_message(
                     let sbe_req = SbeNewOrder {
                         client_order_id: order_id,
                         participant_id: user_id as u64,
-                        price_ticks: batch_fixed_shape.price_ticks.unwrap_or(0),
+                        price_ticks: batch_order_price_ticks,
                         quantity_lots: batch_fixed_shape.quantity_lots,
                         side: side_byte,
                         time_in_force: tif_byte,
@@ -2055,6 +2174,7 @@ async fn handle_client_message(
                         freeze_asset: quote_asset.to_owned(),
                         freeze_amount: margin_usdt,
                         initial_margin_atoms: batch_initial_margin_atoms,
+                        notional_atoms: batch_notional_atoms,
                         sbe_req,
                         meta,
                     });
@@ -2064,6 +2184,41 @@ async fn handle_client_message(
                 let mut aeron_batch: smallvec::SmallVec<[SbeNewOrder; 32]> =
                     smallvec::SmallVec::new();
                 for v in validated {
+                    let rules = crate::symbol_rules::SymbolRules::for_symbol(
+                        crate::transport::unpack_str16(&v.meta.symbol).unwrap_or("BTC_USDT"),
+                    );
+                    let position_ok = state
+                        .risk_engine
+                        .check_position_limit(
+                            user_id,
+                            &v.meta.symbol,
+                            v.sbe_req.quantity_lots,
+                            rules.max_position_lots,
+                        )
+                        .is_ok();
+                    let oi_ok = state
+                        .risk_engine
+                        .check_symbol_oi_limit(
+                            &v.meta.symbol,
+                            v.sbe_req.quantity_lots,
+                            rules.max_symbol_oi_lots,
+                        )
+                        .is_ok();
+                    let tier_ok = state
+                        .risk_engine
+                        .check_leverage_tier(
+                            user_id,
+                            &v.meta.symbol,
+                            v.notional_atoms,
+                            rules.notional_scale,
+                            state.risk_tiers.as_slice(),
+                            rules.default_leverage,
+                        )
+                        .is_ok();
+                    if !position_ok || !oi_ok || !tier_ok {
+                        sbe_results.push((0, 0, ws_sbe::WS_STATUS_REJECTED));
+                        continue;
+                    }
                     let margin_reserved = state
                         .risk_engine
                         .check_and_reserve_margin(user_id, v.initial_margin_atoms)
@@ -2115,9 +2270,32 @@ async fn handle_client_message(
                             .push(crate::transport::AeronCmd::BatchNewOrder(aeron_batch))
                             .is_err()
                         {
-                            // Bounded mpsc full → reject the whole batch.
-                            // Better to refuse here than to drop silently
-                            // and leave the client expecting acks.
+                            // Nothing reached the engine: roll back every
+                            // reservation made while assembling this batch.
+                            for &(_, order_id, status) in &sbe_results {
+                                if order_id == 0 || status != ws_sbe::WS_STATUS_OPEN {
+                                    continue;
+                                }
+                                if let Some((_, meta)) = state.pending_meta.remove(&order_id) {
+                                    state.risk_engine.release_order_margin(
+                                        meta.user_id,
+                                        meta.initial_margin_atoms,
+                                    );
+                                    let symbol = crate::transport::unpack_str16(&meta.symbol)
+                                        .unwrap_or("BTC_USDT");
+                                    let (_, quote) =
+                                        symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                                    release_cache_frozen(
+                                        &state.account_cache,
+                                        meta.user_id,
+                                        quote,
+                                        crate::desk::money::AmountAtoms::from_atoms(
+                                            meta.initial_margin_atoms,
+                                        )
+                                        .to_f64(),
+                                    );
+                                }
+                            }
                             return Some(ws_sbe::encode_error(
                                 "system busy — aeron command queue full",
                             ));
@@ -2771,7 +2949,7 @@ pub async fn market_data_broadcaster(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMsg, build_depth_json};
+    use super::{build_depth_json, market_price_band_from_levels, ClientMsg};
     use crate::{MatchingEngine, Order, PoolConfig, Side, TimeInForce};
     use serde_json::Value;
     use std::sync::Mutex;
@@ -2858,5 +3036,13 @@ mod tests {
         let engine = empty_engine();
         let v: Value = serde_json::from_str(&build_depth_json(&engine, "ETH_USDT")).unwrap();
         assert_eq!(v["symbol"], "ETH_USDT");
+    }
+
+    #[test]
+    fn market_margin_band_covers_the_full_requested_quantity() {
+        let asks = [(100, 2), (101, 3), (102, 5)];
+        assert_eq!(market_price_band_from_levels(&asks, 1), Some((100, 100)));
+        assert_eq!(market_price_band_from_levels(&asks, 5), Some((100, 101)));
+        assert_eq!(market_price_band_from_levels(&asks, 11), None);
     }
 }

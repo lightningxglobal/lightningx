@@ -352,18 +352,36 @@ impl RiskEngine {
         }
     }
 
-    /// Hot path (recv-spin): lock-free release using fetch_add/fetch_sub.
+    /// Hot path (recv-spin): lock-free release, clamped to the amount that is
+    /// still reserved so duplicate or stale terminal events cannot underflow.
     /// Uses `accounts.get()` (shared shard read-lock) — never blocks concurrent
     /// `check_and_reserve_margin` on other users in the same shard.
-    pub fn release_order_margin(&self, user_id: i64, initial_margin_atoms: i64) {
+    pub fn release_order_margin(&self, user_id: i64, initial_margin_atoms: i64) -> i64 {
         use std::sync::atomic::Ordering;
-        if let Some(entry) = self.accounts.get(&user_id) {
-            entry
-                .available_margin
-                .fetch_add(initial_margin_atoms, Ordering::Relaxed);
-            entry
+        let Some(entry) = self.accounts.get(&user_id) else {
+            return 0;
+        };
+        loop {
+            let current = entry.order_margin.load(Ordering::Relaxed);
+            let released = initial_margin_atoms.max(0).min(current.max(0));
+            if released == 0 {
+                return 0;
+            }
+            if entry
                 .order_margin
-                .fetch_sub(initial_margin_atoms, Ordering::Relaxed);
+                .compare_exchange_weak(
+                    current,
+                    current - released,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                entry
+                    .available_margin
+                    .fetch_add(released, Ordering::Relaxed);
+                return released;
+            }
         }
     }
 
@@ -1001,6 +1019,30 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(state.available_margin.load(Relaxed), 100_000 * A);
         assert_eq!(state.order_margin.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn release_never_exceeds_remaining_order_margin() {
+        let engine = RiskEngine::new();
+        let user_id = 1;
+        engine.initialize_account(user_id, 100_000 * A);
+        engine.check_and_reserve_margin(user_id, 10_000 * A).unwrap();
+
+        assert_eq!(engine.release_order_margin(user_id, 20_000 * A), 10_000 * A);
+        assert_eq!(engine.release_order_margin(user_id, 20_000 * A), 0);
+        let state = engine.accounts.get(&user_id).unwrap();
+        assert_eq!(
+            state
+                .available_margin
+                .load(std::sync::atomic::Ordering::Relaxed),
+            100_000 * A
+        );
+        assert_eq!(
+            state
+                .order_margin
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

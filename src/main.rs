@@ -383,6 +383,9 @@ async fn main() -> anyhow::Result<()> {
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
         read_pool,
         risk_engine: lightning_exchange::desk::risk::RiskEngine::new(),
+        risk_tiers: Arc::new(lightning_exchange::desk::risk::calc::parse_risk_tiers(
+            &std::env::var("RISK_TIERS").unwrap_or_default(),
+        )),
     };
 
     tokio::spawn(market_data_broadcaster(state.clone()));

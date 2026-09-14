@@ -14,10 +14,11 @@ pub fn calc_notional_atoms(price_ticks: i64, qty_lots: i64, notional_scale: i64)
 }
 
 pub fn calc_initial_margin_atoms(notional_atoms: i64, leverage: u8) -> i64 {
-    if leverage == 0 {
+    if leverage == 0 || notional_atoms <= 0 {
         return 0;
     }
-    notional_atoms / leverage as i64
+    let leverage = leverage as i128;
+    ((notional_atoms as i128 + leverage - 1) / leverage) as i64
 }
 
 pub fn calc_maintenance_margin_atoms(notional_atoms: i64, rate_bps: i64) -> i64 {
@@ -260,6 +261,13 @@ mod tests {
         let notional = calc_notional_atoms(5_000_000, 1000, BTC_SCALE);
         let margin = calc_initial_margin_atoms(notional, 1);
         assert_eq!(margin, notional);
+    }
+
+    #[test]
+    fn initial_margin_rounds_up_instead_of_under_reserving() {
+        assert_eq!(calc_initial_margin_atoms(101, 10), 11);
+        assert_eq!(calc_initial_margin_atoms(100, 10), 10);
+        assert_eq!(calc_initial_margin_atoms(-1, 10), 0);
     }
 
     #[test]

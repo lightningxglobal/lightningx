@@ -605,6 +605,46 @@ pub fn decode_best_price(buf: &[u8], want_ask: bool) -> Option<f64> {
     }
 }
 
+/// Return `(best_price, protection_price)` for a market order whose requested
+/// quantity is fully covered by this depth snapshot. The protection price is
+/// the last level needed to fill the order and can be sent to the engine as an
+/// IOC limit, preventing execution beyond the notional used by pre-trade risk.
+pub fn decode_market_price_band(
+    buf: &[u8],
+    want_ask: bool,
+    requested_qty: f64,
+) -> Option<(f64, f64)> {
+    if requested_qty <= 0.0 || !requested_qty.is_finite() {
+        return None;
+    }
+    if buf.len() < 25 || buf[0] != DEPTH_MSG {
+        return None;
+    }
+    let nb = u16::from_le_bytes(buf[17..19].try_into().ok()?) as usize;
+    let na = u16::from_le_bytes(buf[19..21].try_into().ok()?) as usize;
+    let count = if want_ask { na } else { nb };
+    let mut off = if want_ask { 25 + nb * 16 } else { 25 };
+    if count == 0 || buf.len() < off + count * 16 {
+        return None;
+    }
+
+    let best = f64::from_le_bytes(buf[off..off + 8].try_into().ok()?);
+    let mut remaining = requested_qty;
+    for _ in 0..count {
+        let price = f64::from_le_bytes(buf[off..off + 8].try_into().ok()?);
+        let qty = f64::from_le_bytes(buf[off + 8..off + 16].try_into().ok()?);
+        if price <= 0.0 || !price.is_finite() || qty <= 0.0 || !qty.is_finite() {
+            return None;
+        }
+        remaining -= qty;
+        if remaining <= 1e-12 {
+            return Some((best, price));
+        }
+        off += 16;
+    }
+    None
+}
+
 // ── Client→Server binary message types (50+) ────────────────────────────────
 // Text frames (JSON) remain supported for auth/subscribe/etc.
 // Binary frames use these msg_type values for hot-path trading commands.
@@ -712,6 +752,26 @@ mod tests {
     fn client_place_order_rejects_short_buffer() {
         let buf = [CLIENT_PLACE_ORDER; 10]; // too short
         assert!(decode_client_place_order(&buf).is_none());
+    }
+
+    #[test]
+    fn market_price_band_requires_enough_depth_on_both_sides() {
+        let buf = encode_depth(
+            1,
+            "BTC_USDT",
+            &[(100.0, 1.0), (99.0, 2.0)],
+            &[(101.0, 1.5), (102.0, 2.0)],
+        );
+        assert_eq!(
+            decode_market_price_band(&buf, true, 2.0),
+            Some((101.0, 102.0))
+        );
+        assert_eq!(
+            decode_market_price_band(&buf, false, 2.0),
+            Some((100.0, 99.0))
+        );
+        assert_eq!(decode_market_price_band(&buf, true, 4.0), None);
+        assert_eq!(decode_market_price_band(&buf, false, 4.0), None);
     }
 }
 

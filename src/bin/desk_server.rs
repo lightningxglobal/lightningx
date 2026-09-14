@@ -2,37 +2,37 @@ use aeron_wrapper::AeronClient;
 use dashmap::DashMap;
 use lightning_exchange::{
     aeron_channels::{
-        DEPTH_STREAM, DEPTH50_STREAM, LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM,
-        PERSIST_CHANNEL, PERSIST_STREAM, TRADE_STREAM, aeron_dir, counter_forward_channel,
-        counter_forward_cmd_stream_for_desk, counter_forward_resp_stream_for_desk, depth_channel,
-        order_update_channel, order_update_stream_for_desk, orders_channel,
-        orders_stream_for_symbol, trade_channel,
+        aeron_dir, counter_forward_channel, counter_forward_cmd_stream_for_desk,
+        counter_forward_resp_stream_for_desk, depth_channel, order_update_channel,
+        order_update_stream_for_desk, orders_channel, orders_stream_for_symbol, trade_channel,
+        DEPTH50_STREAM, DEPTH_STREAM, LEVEL2_STREAM, METRICS_CHANNEL, METRICS_STREAM,
+        PERSIST_CHANNEL, PERSIST_STREAM, TRADE_STREAM,
     },
     aeron_transport::{
         CounterForwardPublisher, CounterForwardSubscriber, DeskDepthSubscriber, DeskOrderPublisher,
         DeskOrderUpdateSubscriber, DeskTradeSubscriber, PersistPublisher,
     },
-    api::{AccountCache, AppState, router},
+    api::{router, AccountCache, AppState},
     db,
     money::{AccountBalance, AmountAtoms},
-    order_state::{DbOrderStatus, db_status_from_update_kind, ws_status_from_update_kind},
+    order_state::{db_status_from_update_kind, ws_status_from_update_kind, DbOrderStatus},
     tracer::{
+        spawn_tracer,
         DESK_INSTANCE_ID,
         MS_LIQ_FILL_RECV,
         MS_LIQ_ORDER_SENT,
         // MS_CMD_RING_POPPED, MS_AERON_ORDER_SEND, MS_AERON_UPDATE_RECV,
         // MS_USER_TX_SENT, MS_WS_UPDATE_SEND,  // uncomment to enable 6-gap breakdown
         MS_LIQ_TICK_EMIT,
-        spawn_tracer,
     },
     transport::counter_forward::{
         CounterForwardMsg, CounterForwardOrderMeta, CounterForwardWsFrame,
     },
     transport::persist_event::{
-        AccountSetPayload, MatchingEventPayload, OrderDeletePayload, OrderFillUpdatePayload,
-        OrderUpsertPayload, PersistFrame, TradeInsertPayload, matching_event_kind, pack_str,
+        matching_event_kind, pack_str, AccountSetPayload, MatchingEventPayload, OrderDeletePayload,
+        OrderFillUpdatePayload, OrderUpsertPayload, PersistFrame, TradeInsertPayload,
     },
-    transport::{AeronCmd, unpack_str16},
+    transport::{unpack_str16, AeronCmd},
     ws_handler::market_data_broadcaster,
 };
 use std::collections::{HashMap, VecDeque};
@@ -353,9 +353,7 @@ enum DbCmd {
     ReleaseReservation {
         user_id: i64,
         symbol: [u8; 16],
-        side: u8,
-        qty: f64,
-        freeze_price: f64,
+        margin_atoms: i64,
     },
     /// Batched settlement for N fills emitted in the same engine burst.
     /// One txn: multi-row INSERT trades + UPDATE orders FROM (VALUES) +
@@ -394,8 +392,8 @@ struct OrderRuntimeMeta {
     /// so the user is settled at this price; spread → insurance fund.
     liq_price_ticks: i64,
     /// Margin reserved by check_and_reserve_margin for this order (atoms).
-    /// Stored so the else/CANCELLED path (ws_meta=None) can release it.
-    initial_margin_atoms: i64,
+    /// Decremented by fills so cancellation releases only the unconsumed part.
+    remaining_margin_atoms: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,7 +417,7 @@ fn remember_runtime_order(
             side,
             symbol,
             liq_price_ticks: 0,
-            initial_margin_atoms,
+            remaining_margin_atoms: initial_margin_atoms,
         },
     );
 }
@@ -447,6 +445,19 @@ fn runtime_bump_filled(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64, fi
     if let Some(mut meta) = cache.get_mut(&order_id) {
         meta.filled = filled_qty;
     }
+}
+
+fn runtime_consume_fill_margin(
+    cache: &DashMap<u64, OrderRuntimeMeta>,
+    order_id: u64,
+    fill_qty: f64,
+    fill_margin_atoms: i64,
+) -> Option<i64> {
+    let mut meta = cache.get_mut(&order_id)?;
+    meta.filled = (meta.filled + fill_qty).min(meta.quantity);
+    let consumed = fill_margin_atoms.max(0).min(meta.remaining_margin_atoms);
+    meta.remaining_margin_atoms -= consumed;
+    Some(consumed)
 }
 
 fn remove_runtime_order(cache: &DashMap<u64, OrderRuntimeMeta>, order_id: u64, client_id: u64) {
@@ -615,6 +626,22 @@ mod tests {
         runtime_bump_filled(&cache, 5, 1.5);
         assert_eq!(runtime_meta(&cache, 5).unwrap().filled, 1.5);
     }
+
+    #[test]
+    fn runtime_fill_consumes_only_remaining_order_margin() {
+        let cache = DashMap::new();
+        remember_runtime_order(&cache, 5, 1, 100.0, 2.0, 0, sym("X_Y"), 1_000);
+
+        assert_eq!(runtime_consume_fill_margin(&cache, 5, 0.5, 300), Some(300));
+        let m = runtime_meta(&cache, 5).unwrap();
+        assert_eq!(m.filled, 0.5);
+        assert_eq!(m.remaining_margin_atoms, 700);
+
+        assert_eq!(runtime_consume_fill_margin(&cache, 5, 1.5, 900), Some(700));
+        let m = runtime_meta(&cache, 5).unwrap();
+        assert_eq!(m.filled, 2.0);
+        assert_eq!(m.remaining_margin_atoms, 0);
+    }
 }
 
 // ── process_db_cmd: now sync, called directly from the recv-spin thread ──────
@@ -657,7 +684,9 @@ fn publish_matching_order_event(
         lightning_exchange::transport::order_update_kind::PARTIAL_FILL => {
             matching_event_kind::PARTIAL_FILL
         }
-        lightning_exchange::transport::order_update_kind::CANCELLED => matching_event_kind::CANCELLED,
+        lightning_exchange::transport::order_update_kind::CANCELLED => {
+            matching_event_kind::CANCELLED
+        }
         lightning_exchange::transport::order_update_kind::REJECTED => matching_event_kind::REJECTED,
         _ => return,
     };
@@ -745,7 +774,9 @@ fn account_set_payload(
 async fn inject_trigger_order(
     pool: &std::sync::Arc<sqlx::PgPool>,
     engine: &std::sync::Arc<lightning_exchange::desk::risk::RiskEngine>,
-    cmd_tx: &Option<std::sync::Arc<crossbeam_queue::ArrayQueue<lightning_exchange::transport::AeronCmd>>>,
+    cmd_tx: &Option<
+        std::sync::Arc<crossbeam_queue::ArrayQueue<lightning_exchange::transport::AeronCmd>>,
+    >,
     pending_meta: &std::sync::Arc<DashMap<u64, lightning_exchange::transport::OrderMeta>>,
     runtime_meta_cache: &DashMap<u64, OrderRuntimeMeta>,
     response_stream_id: i32,
@@ -760,7 +791,7 @@ async fn inject_trigger_order(
     already_marked: bool,
 ) {
     use lightning_exchange::sbe::NewOrderRequest as SbeNewOrder;
-    use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
+    use lightning_exchange::transport::{pack_str16, AeronCmd, OrderMeta};
     let rules = lightning_exchange::desk::symbol_rules::SymbolRules::for_symbol(symbol);
     let sym16 = lightning_exchange::transport::persist_event::pack_str(symbol);
     let mark = engine.mark_price_ticks(&sym16).unwrap_or(0);
@@ -930,6 +961,7 @@ fn process_db_cmd(
     vwap_cache: &lightning_exchange::api::VwapCache,
     risk_engine: &std::sync::Arc<lightning_exchange::desk::risk::RiskEngine>,
     exchange_config_pdc: &std::sync::Arc<lightning_exchange::desk::exchange_config::ExchangeConfig>,
+    runtime_meta_cache: &DashMap<u64, OrderRuntimeMeta>,
 ) {
     match cmd {
         DbCmd::UpsertOrder {
@@ -1132,23 +1164,16 @@ fn process_db_cmd(
         DbCmd::ReleaseReservation {
             user_id,
             symbol,
-            side,
-            qty,
-            freeze_price,
+            margin_atoms,
         } => {
             // PR5e: cache-only release. Was a PG UPDATE accounts via
             // repo.release_frozen. Same correctness — cache is source of
             // truth; pg-writer mirrors the AccountSet to PG asynchronously.
             let sym_end = symbol.iter().position(|&b| b == 0).unwrap_or(16);
             let sym_str = std::str::from_utf8(&symbol[..sym_end]).unwrap_or("BTC_USDT");
-            let parts: Vec<&str> = sym_str.splitn(2, '_').collect();
-            let base = parts.first().copied().unwrap_or("BTC");
-            let quote = parts.last().copied().unwrap_or("USDT");
-            let (asset, amount) = if side == 0 {
-                (quote.to_string(), freeze_price * qty)
-            } else {
-                (base.to_string(), qty)
-            };
+            let (_, quote) = sym_str.split_once('_').unwrap_or(("BTC", "USDT"));
+            let asset = quote.to_string();
+            let amount = AmountAtoms::from_atoms(margin_atoms).to_f64();
             if amount <= 0.0 {
                 return;
             }
@@ -1230,6 +1255,12 @@ fn process_db_cmd(
                     notional,
                     rules.default_leverage,
                 );
+                runtime_consume_fill_margin(
+                    runtime_meta_cache,
+                    e.maker_id as u64,
+                    e.qty,
+                    fill_margin,
+                );
                 risk_engine.on_fill(
                     e.maker_uid,
                     e.symbol,
@@ -1242,10 +1273,34 @@ fn process_db_cmd(
                     rules.maintenance_rate_bps,
                     0, // makers are never the liquidation order
                 );
+                let (_, quote) = sym_str.split_once('_').unwrap_or(("BTC", "USDT"));
+                release_cache_frozen(
+                    account_cache,
+                    e.maker_uid,
+                    quote,
+                    AmountAtoms::from_atoms(fill_margin).to_f64(),
+                );
+                if let Some(meta) = runtime_meta(runtime_meta_cache, e.maker_id as u64) {
+                    if meta.filled >= meta.quantity {
+                        if meta.remaining_margin_atoms > 0 {
+                            risk_engine
+                                .release_order_margin(meta.user_id, meta.remaining_margin_atoms);
+                            release_cache_frozen(
+                                account_cache,
+                                meta.user_id,
+                                quote,
+                                AmountAtoms::from_atoms(meta.remaining_margin_atoms).to_f64(),
+                            );
+                        }
+                        runtime_meta_cache.remove(&(e.maker_id as u64));
+                    }
+                }
                 // S7: maker fee on this fill's notional → insurance fund.
                 let (maker_bps, _) = exchange_config_pdc.fee_bps(sym_str);
                 let fill_notional = lightning_exchange::desk::risk::calc::calc_notional_atoms(
-                    fp_ticks, fq_lots, rules.notional_scale,
+                    fp_ticks,
+                    fq_lots,
+                    rules.notional_scale,
                 );
                 risk_engine.charge_fee(
                     e.maker_uid,
@@ -1455,7 +1510,6 @@ fn process_db_cmd(
                     ));
                 }
             }
-
         }
     }
 }
@@ -1693,7 +1747,7 @@ async fn async_main() -> anyhow::Result<()> {
                     side: side_byte,
                     symbol: sym_bytes,
                     liq_price_ticks: 0,
-                    initial_margin_atoms: 0, // pre-existing open orders: margin state unknown after restart
+                    remaining_margin_atoms: 0, // pre-existing open orders: margin state unknown after restart
                 },
             );
         }
@@ -2068,9 +2122,8 @@ async fn async_main() -> anyhow::Result<()> {
     // Per-user order-entry rate limiter (WS_RL_* env; off by default).
     // Restore persisted buckets so a restart doesn't mint fresh budgets,
     // and snapshot them back to Redis every 2s.
-    let rate_limiter = std::sync::Arc::new(
-        lightning_exchange::rate_limit::SharedRateLimiter::from_env(),
-    );
+    let rate_limiter =
+        std::sync::Arc::new(lightning_exchange::rate_limit::SharedRateLimiter::from_env());
     if rate_limiter.is_enabled() {
         if let Some(conn) = redis_conn.clone() {
             let mut conn_restore = conn.clone();
@@ -2224,10 +2277,11 @@ async fn async_main() -> anyhow::Result<()> {
     let funding_view: Arc<DashMap<String, (i64, i64, i64)>> = Arc::new(DashMap::new());
     {
         use lightning_exchange::desk::funding::{
-            FundingConfig, FundingScheduler, PremiumTracker, apply_in_memory,
-            compute_settlement, load_funding_schedule,
+            apply_in_memory, compute_settlement, load_funding_schedule, FundingConfig,
+            FundingScheduler, PremiumTracker,
         };
-        let cfg = FundingConfig::from_env().expect("invalid FUNDING_CLAMP_E9 or FUNDING_INTEREST_E9 env var");
+        let cfg = FundingConfig::from_env()
+            .expect("invalid FUNDING_CLAMP_E9 or FUNDING_INTEREST_E9 env var");
         let persisted = load_funding_schedule(&pool).await.unwrap_or_default();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2302,7 +2356,11 @@ async fn async_main() -> anyhow::Result<()> {
                     while let Some(boundary_ms) = sched.due(now_ms) {
                         let cfg = FundingConfig::from_env().unwrap_or_else(|e| {
                             tracing::error!("FundingConfig::from_env failed: {e}; using defaults");
-                            FundingConfig { period_secs: 28_800, interest_e9: 100_000, clamp_e9: 7_500_000 }
+                            FundingConfig {
+                                period_secs: 28_800,
+                                interest_e9: 100_000,
+                                clamp_e9: 7_500_000,
+                            }
                         });
                         let rate_e9 = tracker.close_period(&cfg);
                         let rules =
@@ -2334,10 +2392,7 @@ async fn async_main() -> anyhow::Result<()> {
                             },
                         );
                         publish_frame(&persist_f, &frame);
-                        view.insert(
-                            sym.clone(),
-                            (sched.next_settlement_at_ms, rate_e9, 0),
-                        );
+                        view.insert(sym.clone(), (sched.next_settlement_at_ms, rate_e9, 0));
                         tracing::info!(
                             "funding settled: {} rate_e9={} users={} residue={} next={}",
                             sym,
@@ -2382,6 +2437,9 @@ async fn async_main() -> anyhow::Result<()> {
         write_pool: Arc::new(lightning_exchange::write_actor::WriteActorPool::new()),
         read_pool,
         risk_engine: risk_engine.clone(),
+        risk_tiers: Arc::new(lightning_exchange::desk::risk::calc::parse_risk_tiers(
+            &std::env::var("RISK_TIERS").unwrap_or_default(),
+        )),
     };
 
     // DB worker thread removed. PR5 took every PG SQL call out of
@@ -2458,10 +2516,7 @@ async fn async_main() -> anyhow::Result<()> {
             .unwrap_or(256);
         let exchange_config_send = exchange_config.clone();
         // S6.3: leverage tier table (RISK_TIERS env, e.g. "1000000:20,5000000:10,:5").
-        let risk_tiers_send =
-            lightning_exchange::desk::risk::calc::parse_risk_tiers(
-                &std::env::var("RISK_TIERS").unwrap_or_default(),
-            );
+        let risk_tiers_send = state.risk_tiers.clone();
         let mut counter_forward_cmd_pubs = send_cf_cmd_pubs;
         let mut counter_forward_resp_pubs = send_cf_resp_pubs;
         let thread_name_send = format!("d{desk_id}-send");
@@ -2560,7 +2615,8 @@ async fn async_main() -> anyhow::Result<()> {
                                 // cents-era leftover that inflated the freeze by
                                 // 1e6× and silently rejected every cross-desk
                                 // order (found while wiring S5).
-                                let margin_usdt = initial_margin_atoms as f64 / 100_000_000.0;
+                                let margin_usdt =
+                                    AmountAtoms::from_atoms(initial_margin_atoms).to_f64();
                                 let mut reject = |reason: &str| {
                                     if let Some(frame) = CounterForwardWsFrame::new(
                                         user_id,
@@ -2622,7 +2678,9 @@ async fn async_main() -> anyhow::Result<()> {
                                 }
                                 let order_notional =
                                     lightning_exchange::desk::risk::calc::calc_notional_atoms(
-                                        { let p: i64 = req.price_ticks; p },
+                                        fwd_rules
+                                            .price_to_ticks(meta.freeze_price)
+                                            .unwrap_or(req.price_ticks),
                                         req.quantity_lots,
                                         fwd_rules.notional_scale,
                                     );
@@ -2631,7 +2689,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     &symbol,
                                     order_notional,
                                     fwd_rules.notional_scale,
-                                    &risk_tiers_send,
+                                    risk_tiers_send.as_slice(),
                                     fwd_rules.default_leverage,
                                 ) {
                                     reject(reason);
@@ -3039,6 +3097,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 &vwap_cache_pub,
                                 &risk_engine_pub,
                                 &exchange_config_pub,
+                                &order_meta_cache_pub,
                             );
                             settle_count = 0;
                         }
@@ -3060,6 +3119,7 @@ async fn async_main() -> anyhow::Result<()> {
                             &vwap_cache_pub,
                             &risk_engine_pub,
                             &exchange_config_pub,
+                            &order_meta_cache_pub,
                         );
                         settle_count = 0;
                     }
@@ -3324,6 +3384,10 @@ async fn async_main() -> anyhow::Result<()> {
                         let remaining_qty: f64 = msg.remaining_qty;
                         let update_ts: u64 = msg.timestamp;
                         let kind: u8 = msg.kind;
+                        // The engine marks an IOC partial fill with remaining=0:
+                        // it has fills to settle but no live remainder in the book.
+                        let terminal_ioc_partial = kind == order_update_kind::PARTIAL_FILL
+                            && remaining_qty <= 0.0;
                         // Owner-filter: every desk subscribes to OrderUpdate via
                         // Aeron fan-out, so without this check each desk re-runs
                         // user_tx routing + persist publish + account_cache
@@ -3423,7 +3487,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 filled: 0.0,
                                 side: m.side,
                                 symbol: m.symbol,
-                                initial_margin_atoms: m.initial_margin_atoms,
+                                remaining_margin_atoms: m.initial_margin_atoms,
                                 liq_price_ticks: m.liq_price_ticks,
                             })
                             .or_else(|| runtime_meta(&order_meta_cache, order_id))
@@ -3508,7 +3572,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchUpsertOrder {
                                             entries: accepted_batch,
                                             count: accepted_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                                     accepted_count = 0;
                                 }
                                 accepted_batch[accepted_count] = OrderInsertEntry {
@@ -3526,7 +3590,9 @@ async fn async_main() -> anyhow::Result<()> {
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.unwrap_or("")),
                                 };
                                 accepted_count += 1;
-                            } else if kind == order_update_kind::PARTIAL_FILL {
+                            } else if kind == order_update_kind::PARTIAL_FILL
+                                && !terminal_ioc_partial
+                            {
                                 // Order is still resting — UpsertOrder writes the live row.
                                 process_db_cmd(DbCmd::UpsertOrder {
                                     id:              order_id as i64,
@@ -3541,7 +3607,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     freeze_price:    meta.freeze_price,
                                     do_freeze:       false,
                                     client_order_id: db_cmd::str_bytes(ws_client_oid.unwrap_or("")),
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                             }
                             // kind == FILLED here means "first event was a full fill"
                             // (market / IOC). Skip INSERT — the order is already terminal,
@@ -3552,7 +3618,7 @@ async fn async_main() -> anyhow::Result<()> {
                                 let symbol = unpack_str16(&meta.symbol).unwrap_or("BTC_USDT");
                                 let (_, quote) = symbol.split_once('_').unwrap_or(("BTC", "USDT"));
                                 let rel_amount = if meta.initial_margin_atoms > 0 {
-                                    meta.initial_margin_atoms as f64 / 100.0
+                                    AmountAtoms::from_atoms(meta.initial_margin_atoms).to_f64()
                                 } else if meta.side == 0 {
                                     meta.freeze_price * meta.qty
                                 } else {
@@ -3607,10 +3673,8 @@ async fn async_main() -> anyhow::Result<()> {
                                 process_db_cmd(DbCmd::ReleaseReservation {
                                     user_id: meta.user_id,
                                     symbol: meta.symbol,
-                                    side: meta.side,
-                                    qty: meta.qty,
-                                    freeze_price: meta.freeze_price,
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                                    margin_atoms: meta.initial_margin_atoms,
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                             }
                         } else {
                             // REST-path order OR subsequent WS update (row already exists).
@@ -3631,14 +3695,16 @@ async fn async_main() -> anyhow::Result<()> {
                                 // This path handles GTC ACCEPTED→CANCELLED: pending_meta
                                 // was consumed on ACCEPTED so ws_meta is None above.
                                 if let Some(m) = runtime_meta(&order_meta_cache, order_id) {
-                                    if m.initial_margin_atoms > 0 {
-                                        risk_engine.release_order_margin(m.user_id, m.initial_margin_atoms);
+                                    if m.remaining_margin_atoms > 0 {
+                                        risk_engine.release_order_margin(
+                                            m.user_id,
+                                            m.remaining_margin_atoms,
+                                        );
                                     }
                                 }
                                 let entry = runtime_meta(&order_meta_cache, order_id)
                                     .and_then(|m| {
-                                        let release_qty = (m.quantity - m.filled).max(0.0);
-                                        if release_qty <= 0.0 {
+                                        if m.remaining_margin_atoms <= 0 {
                                             return Some(CancelReleaseEntry {
                                                 id: order_id as i64,
                                                 user_id: m.user_id,
@@ -3648,14 +3714,12 @@ async fn async_main() -> anyhow::Result<()> {
                                         }
                                         let sym_end = m.symbol.iter().position(|&b| b == 0).unwrap_or(16);
                                         let symbol = std::str::from_utf8(&m.symbol[..sym_end]).ok()?;
-                                        let (base, quote) = symbol.split_once('_')?;
-                                        let (asset_str, amount) = if m.side == 1 {
-                                            // sell: release base by remaining qty
-                                            (base, release_qty)
-                                        } else {
-                                            // buy: release quote by freeze_price * remaining qty
-                                            (quote, m.freeze_price * release_qty)
-                                        };
+                                        let (_, quote) = symbol.split_once('_')?;
+                                        let asset_str = quote;
+                                        let amount = AmountAtoms::from_atoms(
+                                            m.remaining_margin_atoms,
+                                        )
+                                        .to_f64();
                                         let mut asset_bytes = [0u8; 16];
                                         let ab = asset_str.as_bytes();
                                         let n = ab.len().min(16);
@@ -3677,12 +3741,13 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchCancelConfirmed {
                                             entries: cancel_batch,
                                             count: cancel_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                                     cancel_count = 0;
                                 }
                                 cancel_batch[cancel_count] = entry;
                                 cancel_count += 1;
                             } else if kind == order_update_kind::FILLED
+                                || terminal_ioc_partial
                                 || kind == order_update_kind::REJECTED
                             {
                                 // Batched DELETE — flushed after the burst.
@@ -3690,7 +3755,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     process_db_cmd(DbCmd::BatchDeleteOrder {
                                             ids: delete_batch,
                                             count: delete_count as u8,
-                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                                        }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                                     delete_count = 0;
                                 }
                                 delete_batch[delete_count] = order_id as i64;
@@ -3701,7 +3766,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     id:     order_id as i64,
                                     status,
                                     filled: fill_qty,
-                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                                }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                             }
                         }
 
@@ -3724,8 +3789,13 @@ async fn async_main() -> anyhow::Result<()> {
                                 }
                             }
                             if let Some(tx) = maybe_tx {
-                                let ws_status = ws_status_from_update_kind(kind);
-                                let status_byte = lightning_exchange::ws_sbe::ws_status_byte_from_str(ws_status.as_str());
+                                let status_byte = if terminal_ioc_partial {
+                                    lightning_exchange::ws_sbe::WS_STATUS_CANCELED
+                                } else {
+                                    lightning_exchange::ws_sbe::ws_status_byte_from_str(
+                                        ws_status_from_update_kind(kind).as_str(),
+                                    )
+                                };
                                 let ts = msg.timestamp;
                                 let upd = lightning_exchange::ws_sbe::encode_order_update(
                                     order_id, 0, status_byte, fill_qty, fill_price, ts,
@@ -3766,8 +3836,13 @@ async fn async_main() -> anyhow::Result<()> {
                                 .map(|e| *e.value())
                                 .or_else(|| forward_origin_recv.get(&client_order_id).map(|e| *e.value()))
                             {
-                                let ws_status = ws_status_from_update_kind(kind);
-                                let status_byte = lightning_exchange::ws_sbe::ws_status_byte_from_str(ws_status.as_str());
+                                let status_byte = if terminal_ioc_partial {
+                                    lightning_exchange::ws_sbe::WS_STATUS_CANCELED
+                                } else {
+                                    lightning_exchange::ws_sbe::ws_status_byte_from_str(
+                                        ws_status_from_update_kind(kind).as_str(),
+                                    )
+                                };
                                 let ts = msg.timestamp;
                                 let public_order_id = engine_to_public_recv
                                     .get(&order_id)
@@ -3823,6 +3898,14 @@ async fn async_main() -> anyhow::Result<()> {
                                             notional, rules.default_leverage,
                                         )
                                     };
+                                    if meta.liq_price_ticks == 0 {
+                                        runtime_consume_fill_margin(
+                                            &order_meta_cache,
+                                            order_id,
+                                            fill_qty,
+                                            fill_margin,
+                                        );
+                                    }
                                     risk_engine.on_fill(
                                         meta.user_id,
                                         meta.symbol,
@@ -3835,6 +3918,25 @@ async fn async_main() -> anyhow::Result<()> {
                                         rules.maintenance_rate_bps,
                                         meta.liq_price_ticks,
                                     );
+                                    if meta.liq_price_ticks == 0 {
+                                        let sym_end = meta
+                                            .symbol
+                                            .iter()
+                                            .position(|&b| b == 0)
+                                            .unwrap_or(16);
+                                        let symbol = std::str::from_utf8(
+                                            &meta.symbol[..sym_end],
+                                        )
+                                        .unwrap_or("BTC_USDT");
+                                        let (_, quote) =
+                                            symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                                        release_cache_frozen(
+                                            &account_cache,
+                                            meta.user_id,
+                                            quote,
+                                            AmountAtoms::from_atoms(fill_margin).to_f64(),
+                                        );
+                                    }
                                     // S7: taker fee (liquidation orders pay
                                     // none — their spread already funds the
                                     // exchange).
@@ -3871,9 +3973,38 @@ async fn async_main() -> anyhow::Result<()> {
                         }
 
                         if kind == order_update_kind::FILLED
+                            || terminal_ioc_partial
                             || kind == order_update_kind::CANCELLED
                             || kind == order_update_kind::REJECTED
                         {
+                            if kind == order_update_kind::FILLED || terminal_ioc_partial {
+                                if let Some(meta) = runtime_meta(&order_meta_cache, order_id) {
+                                    if meta.remaining_margin_atoms > 0 {
+                                        risk_engine.release_order_margin(
+                                            meta.user_id,
+                                            meta.remaining_margin_atoms,
+                                        );
+                                        let sym_end = meta
+                                            .symbol
+                                            .iter()
+                                            .position(|&b| b == 0)
+                                            .unwrap_or(16);
+                                        let symbol = std::str::from_utf8(
+                                            &meta.symbol[..sym_end],
+                                        )
+                                        .unwrap_or("BTC_USDT");
+                                        let (_, quote) =
+                                            symbol.split_once('_').unwrap_or(("BTC", "USDT"));
+                                        release_cache_frozen(
+                                            &account_cache,
+                                            meta.user_id,
+                                            quote,
+                                            AmountAtoms::from_atoms(meta.remaining_margin_atoms)
+                                                .to_f64(),
+                                        );
+                                    }
+                                }
+                            }
                             forward_origin_recv.remove(&order_id);
                             forward_origin_recv.remove(&client_order_id);
                             if let Some((_, public_order_id)) = engine_to_public_recv.remove(&order_id) {
@@ -3896,7 +4027,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchUpsertOrder {
                                 entries: accepted_batch,
                                 count: accepted_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                         accepted_count = 0;
                     }
 
@@ -3906,7 +4037,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchDeleteOrder {
                                 ids: delete_batch,
                                 count: delete_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                         delete_count = 0;
                     }
 
@@ -3917,7 +4048,7 @@ async fn async_main() -> anyhow::Result<()> {
                         process_db_cmd(DbCmd::BatchCancelConfirmed {
                                 entries: cancel_batch,
                                 count: cancel_count as u8,
-                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv);
+                            }, &account_cache, &user_tx, &persist_pub, &vwap_cache, &risk_engine, &exchange_config_recv, &order_meta_cache);
                         cancel_count = 0;
                     }
 
@@ -4012,7 +4143,7 @@ async fn async_main() -> anyhow::Result<()> {
                 for evt in to_liquidate {
                     use lightning_exchange::desk::risk::PositionSide;
                     use lightning_exchange::sbe::NewOrderRequest as SbeNewOrder;
-                    use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
+                    use lightning_exchange::transport::{pack_str16, AeronCmd, OrderMeta};
                     use std::sync::atomic::Ordering;
 
                     // Guard: zero liq_price_ticks means position data is stale — skip
@@ -4161,9 +4292,9 @@ async fn async_main() -> anyhow::Result<()> {
     // ── S5: trigger hydrate + recovery + firing task ───────────────────
     {
         use lightning_exchange::desk::trigger::{
-            PendingTrigger, TriggerWhen, firing_margin_atoms, needs_reinjection,
+            firing_margin_atoms, needs_reinjection, PendingTrigger, TriggerWhen,
         };
-        use lightning_exchange::transport::{AeronCmd, OrderMeta, pack_str16};
+        use lightning_exchange::transport::{pack_str16, AeronCmd, OrderMeta};
         let pool_t = state.db.clone();
         let runtime_meta_t = open_order_meta.clone();
         let books = trigger_books.clone();
@@ -4174,18 +4305,29 @@ async fn async_main() -> anyhow::Result<()> {
         let resp_stream_t = state.response_stream_id;
         tokio::spawn(async move {
             // Hydrate pending triggers.
-            let rows: Vec<(i64, i64, String, String, String, i64, String, Option<i64>, i64)> =
-                sqlx::query_as(
-                    "SELECT id, user_id, symbol, side, order_type, trigger_price_ticks,
+            let rows: Vec<(
+                i64,
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                String,
+                Option<i64>,
+                i64,
+            )> = sqlx::query_as(
+                "SELECT id, user_id, symbol, side, order_type, trigger_price_ticks,
                             trigger_when, price_ticks, qty_lots
                        FROM trigger_orders WHERE status = 'pending'",
                 )
                 .fetch_all(pool_t.as_ref())
                 .await
-                .unwrap_or_default();
+            .unwrap_or_default();
             let hydrated = rows.len();
             for (id, user_id, symbol, side_s, ot, trig, when_s, price, qty) in rows {
-                let Some(when) = TriggerWhen::from_db_str(&when_s) else { continue };
+                let Some(when) = TriggerWhen::from_db_str(&when_s) else {
+                    continue;
+                };
                 books.entry(symbol).or_default().lock().insert(
                     when,
                     PendingTrigger {
@@ -4240,7 +4382,9 @@ async fn async_main() -> anyhow::Result<()> {
                 for entry in books.iter() {
                     let symbol = entry.key().clone();
                     let sym16 = lightning_exchange::transport::persist_event::pack_str(&symbol);
-                    let Some(mark) = engine_t.mark_price_ticks(&sym16) else { continue };
+                    let Some(mark) = engine_t.mark_price_ticks(&sym16) else {
+                        continue;
+                    };
                     let fired = {
                         let mut book = entry.value().lock();
                         if book.is_empty() {

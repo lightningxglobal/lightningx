@@ -8,18 +8,18 @@ use crate::order_state::{
     db_status_from_engine, db_status_from_update_kind, ws_status_from_engine,
 };
 use crate::tracer::ExchangeTracer;
-use crate::transport::{AeronCmd, OrderMeta, OrderUpdateMsg, pack_str16};
+use crate::transport::{pack_str16, AeronCmd, OrderMeta, OrderUpdateMsg};
 use crate::user_service::{self, LoginRequest, RegisterRequest};
 use axum::{
-    Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, patch, post},
+    Json, Router,
 };
 use dashmap::DashMap;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -274,6 +274,8 @@ pub struct AppState {
     pub read_pool: Arc<crate::desk::read_actor::ReadActorPool>,
     /// Margin risk engine: per-account margin state, order reservation.
     pub risk_engine: Arc<crate::desk::risk::RiskEngine>,
+    /// Parsed leverage tiers shared by every order-entry path.
+    pub risk_tiers: Arc<Vec<(i64, u8)>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -288,11 +290,20 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(handle_metrics))
         .route("/api/admin/revoke", post(handle_admin_revoke))
         .route("/api/admin/unrevoke", post(handle_admin_unrevoke))
-        .route("/api/admin/config", get(handle_admin_get_config).post(handle_admin_set_config))
+        .route(
+            "/api/admin/config",
+            get(handle_admin_get_config).post(handle_admin_set_config),
+        )
         .route("/api/admin/force-close", post(handle_admin_force_close))
         .route("/api/deposit/credit", post(handle_deposit_credit))
-        .route("/api/withdrawals", get(handle_list_withdrawals).post(handle_request_withdrawal))
-        .route("/api/withdrawals/:id/status", post(handle_withdrawal_status))
+        .route(
+            "/api/withdrawals",
+            get(handle_list_withdrawals).post(handle_request_withdrawal),
+        )
+        .route(
+            "/api/withdrawals/:id/status",
+            post(handle_withdrawal_status),
+        )
         // User profile & KYC
         .route(
             "/api/user/profile",
@@ -321,7 +332,10 @@ pub fn router(state: AppState) -> Router {
             "/api/trigger-orders",
             get(handle_list_triggers).post(handle_place_trigger),
         )
-        .route("/api/trigger-orders/:id", axum::routing::delete(handle_cancel_trigger))
+        .route(
+            "/api/trigger-orders/:id",
+            axum::routing::delete(handle_cancel_trigger),
+        )
         .route("/api/tickers", get(handle_tickers))
         // K-lines
         .route("/api/klines", get(handle_klines))
@@ -494,11 +508,17 @@ async fn handle_deposit_credit(
     Json(req): Json<DepositCreditRequest>,
 ) -> impl IntoResponse {
     if !deposit_service_authorized(&headers) {
-        return (StatusCode::FORBIDDEN, Json(json!({"error": "deposit service token required"})))
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "deposit service token required"})),
+        )
             .into_response();
     }
     if req.amount_atoms <= 0 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "amount must be positive"})))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "amount must be positive"})),
+        )
             .into_response();
     }
     // The crediting desk must own this user's shard (account state is
@@ -523,7 +543,10 @@ async fn handle_deposit_credit(
     let (credited, new_balance) = match res {
         Ok(v) => v,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
                 .into_response();
         }
     };
@@ -551,7 +574,9 @@ async fn handle_deposit_credit(
                         payload.frozen_atoms = frz;
                         payload.frozen = frz as f64 / 100_000_000.0;
                     }
-                    let _ = pp.push(crate::transport::persist_event::PersistFrame::account_set(payload));
+                    let _ = pp.push(crate::transport::persist_event::PersistFrame::account_set(
+                        payload,
+                    ));
                 }
                 Err(e) => tracing::warn!("deposit: skip AccountSet frame: {e}"),
             }
@@ -605,7 +630,10 @@ async fn handle_request_withdrawal(
         return e.into_response();
     }
     if req.amount_atoms <= 0 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "amount must be positive"})))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "amount must be positive"})),
+        )
             .into_response();
     }
     // Flat withdrawal fee (atoms), env-tunable; the chain service's gas
@@ -630,7 +658,9 @@ async fn handle_request_withdrawal(
                 {
                     p.balance_atoms = bal.balance_atoms;
                     p.frozen_atoms = bal.frozen_atoms;
-                    let _ = pp.push(crate::transport::persist_event::PersistFrame::account_set(p));
+                    let _ = pp.push(crate::transport::persist_event::PersistFrame::account_set(
+                        p,
+                    ));
                 }
             }
             user_service::audit(
@@ -643,12 +673,18 @@ async fn handle_request_withdrawal(
                        "to": req.to_address}),
             )
             .await;
-            (StatusCode::OK, Json(json!({"id": id, "status": "pending",
-                "fee_atoms": fee_atoms}))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({"id": id, "status": "pending",
+                "fee_atoms": fee_atoms})),
+            )
+                .into_response()
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response()
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -670,23 +706,29 @@ async fn handle_withdrawal_status(
     Json(req): Json<WithdrawalStatusRequest>,
 ) -> impl IntoResponse {
     if !deposit_service_authorized(&headers) {
-        return (StatusCode::FORBIDDEN, Json(json!({"error": "service token required"})))
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "service token required"})),
+        )
             .into_response();
     }
     let repo = crate::desk::account_repository::AccountRepository::new(s.db.as_ref());
     // Find the owning user for cache/frame convergence on terminal moves.
-    let owner: Option<(i64, String)> = sqlx::query_as(
-        "SELECT user_id, asset FROM withdrawals WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(s.db.as_ref())
-    .await
-    .unwrap_or(None);
+    let owner: Option<(i64, String)> =
+        sqlx::query_as("SELECT user_id, asset FROM withdrawals WHERE id = $1")
+            .bind(id)
+            .fetch_optional(s.db.as_ref())
+            .await
+            .unwrap_or(None);
 
     let result = match req.status.as_str() {
-        "approved" => repo.set_withdrawal_status(id, "pending", "approved", None).await,
+        "approved" => {
+            repo.set_withdrawal_status(id, "pending", "approved", None)
+                .await
+        }
         "broadcast" => {
-            repo.set_withdrawal_status(id, "approved", "broadcast", req.tx_hash.as_deref()).await
+            repo.set_withdrawal_status(id, "approved", "broadcast", req.tx_hash.as_deref())
+                .await
         }
         "confirmed" => {
             let tx = req.tx_hash.as_deref().unwrap_or("");
@@ -697,8 +739,11 @@ async fn handle_withdrawal_status(
             repo.fail_withdrawal(id, reason).await
         }
         other => {
-            return (StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("unknown status '{other}'")}))).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unknown status '{other}'")})),
+            )
+                .into_response();
         }
     };
     match result {
@@ -719,21 +764,29 @@ async fn handle_withdrawal_status(
                         .fetch_one(s.db.as_ref())
                         .await,
                     ) {
-                        if let Ok(mut p) = account_set_payload(
-                            user_id, &asset, bal as f64 / 1e8, frz as f64 / 1e8,
-                        ) {
+                        if let Ok(mut p) =
+                            account_set_payload(user_id, &asset, bal as f64 / 1e8, frz as f64 / 1e8)
+                        {
                             p.balance_atoms = bal;
                             p.frozen_atoms = frz;
-                            let _ = pp
-                                .push(crate::transport::persist_event::PersistFrame::account_set(p));
+                            let _ = pp.push(
+                                crate::transport::persist_event::PersistFrame::account_set(p),
+                            );
                         }
                     }
                 }
             }
-            (StatusCode::OK, Json(json!({"id": id, "status": req.status, "changed": changed})))
+            (
+                StatusCode::OK,
+                Json(json!({"id": id, "status": req.status, "changed": changed})),
+            )
                 .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -745,11 +798,19 @@ async fn handle_list_withdrawals(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let rows: Vec<(i64, String, String, String, i64, i64, String, Option<String>)> =
-        sqlx::query_as(
-            "SELECT id, asset, chain, to_address, amount_atoms, fee_atoms, status, tx_hash
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, asset, chain, to_address, amount_atoms, fee_atoms, status, tx_hash
                FROM withdrawals WHERE user_id = $1 ORDER BY requested_at DESC LIMIT 200",
-        )
+    )
         .bind(user_id)
         .fetch_all(s.db.as_ref())
         .await
@@ -833,12 +894,16 @@ async fn handle_admin_set_config(
         }),
     )
     .await;
-    (StatusCode::OK, Json(json!({
-        "symbol": req.symbol,
-        "trading_halted": next.trading_halted,
-        "maker_fee_bps": next.maker_fee_bps,
-        "taker_fee_bps": next.taker_fee_bps,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({
+            "symbol": req.symbol,
+            "trading_halted": next.trading_halted,
+            "maker_fee_bps": next.maker_fee_bps,
+            "taker_fee_bps": next.taker_fee_bps,
+        })),
+    )
+        .into_response()
 }
 
 async fn handle_admin_get_config(
@@ -881,7 +946,11 @@ async fn handle_admin_force_close(
     }
     let sym16 = crate::transport::persist_event::pack_str(&req.symbol);
     let Some(pos) = s.risk_engine.positions.get(&(req.user_id, sym16)) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "no open position"}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no open position"})),
+        )
+            .into_response();
     };
     // Closing side: opposite the position.
     let close_side: u8 = match pos.side {
@@ -891,16 +960,30 @@ async fn handle_admin_force_close(
     let qty = pos.qty_lots;
     drop(pos);
     let Some(cmd_tx) = s.liq_cmd_tx.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "no command queue"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "no command queue"})),
+        )
+            .into_response();
     };
     let rules = crate::symbol_rules::SymbolRules::for_symbol(&req.symbol);
     let mark = s.risk_engine.mark_price_ticks(&sym16).unwrap_or(0);
     if mark <= 0 {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "no mark price"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "no mark price"})),
+        )
+            .into_response();
     }
     // Aggressive IOC 5% through the mark so it fills.
-    let exec = if close_side == 0 { mark + mark / 20 } else { mark - mark / 20 };
-    let order_id = s.next_order_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let exec = if close_side == 0 {
+        mark + mark / 20
+    } else {
+        mark - mark / 20
+    };
+    let order_id = s
+        .next_order_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let req_sbe = crate::sbe::NewOrderRequest {
         client_order_id: order_id,
         participant_id: req.user_id as u64,
@@ -914,8 +997,15 @@ async fn handle_admin_force_close(
         symbol: sym16,
     };
     let _ = rules;
-    if cmd_tx.push(crate::transport::AeronCmd::NewOrder(req_sbe)).is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "command queue full"}))).into_response();
+    if cmd_tx
+        .push(crate::transport::AeronCmd::NewOrder(req_sbe))
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "command queue full"})),
+        )
+            .into_response();
     }
     user_service::audit(
         &s.db,
@@ -925,7 +1015,11 @@ async fn handle_admin_force_close(
         json!({"symbol": req.symbol, "qty_lots": qty, "order_id": order_id}),
     )
     .await;
-    (StatusCode::OK, Json(json!({"order_id": order_id, "qty_lots": qty}))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({"order_id": order_id, "qty_lots": qty})),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -945,7 +1039,10 @@ async fn handle_admin_revoke(
     // a business decision; see docs/plans/deferred-todos.md §2. audit_log
     // is already the append-only ledger such a flow would build on.
     if !admin_authorized(&headers) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        );
     }
     let mut redis = s.redis.clone();
     if let Err(e) = user_service::revoke_user(redis.as_mut(), req.user_id).await {
@@ -954,8 +1051,14 @@ async fn handle_admin_revoke(
             Json(json!({"error": e.to_string()})),
         );
     }
-    user_service::audit(&s.db, None, "admin_revoke", None, json!({"user_id": req.user_id}))
-        .await;
+    user_service::audit(
+        &s.db,
+        None,
+        "admin_revoke",
+        None,
+        json!({"user_id": req.user_id}),
+    )
+    .await;
     (StatusCode::OK, Json(json!({"revoked": req.user_id})))
 }
 
@@ -965,7 +1068,10 @@ async fn handle_admin_unrevoke(
     Json(req): Json<RevokeRequest>,
 ) -> impl IntoResponse {
     if !admin_authorized(&headers) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized"})),
+        );
     }
     let mut redis = s.redis.clone();
     if let Err(e) = user_service::unrevoke_user(redis.as_mut(), req.user_id).await {
@@ -974,8 +1080,14 @@ async fn handle_admin_unrevoke(
             Json(json!({"error": e.to_string()})),
         );
     }
-    user_service::audit(&s.db, None, "admin_unrevoke", None, json!({"user_id": req.user_id}))
-        .await;
+    user_service::audit(
+        &s.db,
+        None,
+        "admin_unrevoke",
+        None,
+        json!({"user_id": req.user_id}),
+    )
+    .await;
     (StatusCode::OK, Json(json!({"unrevoked": req.user_id})))
 }
 
@@ -983,7 +1095,10 @@ async fn handle_admin_unrevoke(
 async fn handle_metrics() -> impl IntoResponse {
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         crate::desk::metrics::render(),
     )
 }
@@ -1083,6 +1198,17 @@ fn try_freeze_cache(cache: &AccountCache, user_id: i64, asset: &str, amount: f64
     kv.try_freeze_atoms(amount_atoms.atoms())
 }
 
+fn release_cache_frozen(cache: &AccountCache, user_id: i64, asset: &str, amount_atoms: i64) {
+    if amount_atoms <= 0 {
+        return;
+    }
+    if let Some(mut entry) = cache.get_mut(&user_id) {
+        if let Some(balance) = entry.get_mut(asset) {
+            balance.release_atoms(amount_atoms);
+        }
+    }
+}
+
 fn cache_set_snapshot(cache: &AccountCache, user_id: i64, asset: &str, snapshot: AccountBalance) {
     cache
         .entry(user_id)
@@ -1160,9 +1286,8 @@ fn publish_rest_order_upsert(
     user_id: i64,
     freeze_price: f64,
     quote_asset: &str,
-    base_asset: &str,
 ) {
-    use crate::transport::persist_event::{OrderUpsertPayload, PersistFrame, pack_str};
+    use crate::transport::persist_event::{pack_str, OrderUpsertPayload, PersistFrame};
     let Some(pp) = state.persist_pub.as_ref() else {
         return;
     };
@@ -1201,11 +1326,7 @@ fn publish_rest_order_upsert(
     // the in-memory cache which the freeze step already updated with the
     // PG-RETURNING value. Skip publishing if the cache entry is somehow
     // missing — better silent than fabricated.
-    let asset = if db_order.side == "buy" {
-        quote_asset
-    } else {
-        base_asset
-    };
+    let asset = quote_asset;
     let snapshot: Option<AccountBalance> = state
         .account_cache
         .get(&user_id)
@@ -1474,7 +1595,10 @@ async fn handle_place_trigger(
         "buy" => 0,
         "sell" => 1,
         _ => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error": "side must be buy|sell"})))
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "side must be buy|sell"})),
+            )
                 .into_response();
         }
     };
@@ -1491,7 +1615,10 @@ async fn handle_place_trigger(
     };
     let rules = crate::desk::symbol_rules::SymbolRules::for_symbol(&req.symbol);
     let Ok(trigger_ticks) = rules.price_to_ticks(req.trigger_price) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "trigger_price off tick"})))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "trigger_price off tick"})),
+        )
             .into_response();
     };
     let price_ticks = match (is_market, req.price) {
@@ -1499,7 +1626,10 @@ async fn handle_place_trigger(
         (false, Some(p)) => match rules.price_to_ticks(p) {
             Ok(t) => Some(t),
             Err(_) => {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": "price off tick"})))
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "price off tick"})),
+                )
                     .into_response();
             }
         },
@@ -1512,11 +1642,17 @@ async fn handle_place_trigger(
         }
     };
     let Ok(qty_lots) = rules.quantity_to_lots(req.quantity) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "quantity off step"})))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "quantity off step"})),
+        )
             .into_response();
     };
     if qty_lots <= 0 || trigger_ticks <= 0 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "must be positive"})))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "must be positive"})),
+        )
             .into_response();
     }
     let when = match req.trigger_when.as_deref() {
@@ -1552,7 +1688,10 @@ async fn handle_place_trigger(
     .execute(s.db.as_ref())
     .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
             .into_response();
     }
     // Memory AFTER durable insert: a crash in between just re-hydrates it.
@@ -1608,20 +1747,30 @@ async fn handle_cancel_trigger(
             book.lock().remove(when, trig, id);
         }
     }
-    (StatusCode::OK, Json(json!({"id": id, "status": "cancelled"}))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({"id": id, "status": "cancelled"})),
+    )
+        .into_response()
 }
 
-async fn handle_list_triggers(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn handle_list_triggers(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let user_id = match auth_user(&headers) {
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    let rows: Vec<(i64, String, String, String, i64, String, Option<i64>, i64, String)> =
-        sqlx::query_as(
-            "SELECT id, symbol, side, order_type, trigger_price_ticks, trigger_when,
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<i64>,
+        i64,
+        String,
+    )> = sqlx::query_as(
+        "SELECT id, symbol, side, order_type, trigger_price_ticks, trigger_when,
                     price_ticks, qty_lots, status
                FROM trigger_orders
               WHERE user_id = $1
@@ -1842,54 +1991,117 @@ async fn handle_place_order(
     let quote_asset = sym_parts.last().copied().unwrap_or("USDT");
     let rules = crate::symbol_rules::SymbolRules::for_symbol(&req.symbol);
 
-    // Best opposing price (for market orders that need a freeze estimate).
-    // In Aeron mode (no local engine), read from last_depth — same source
-    // ws_handler uses for the WS path. Without this REST market-buy
-    // returns "Unable to determine buy reservation price" because the
-    // freeze_price falls back to 0.
-    let best_opposing = if let Some(ref engine) = engine_opt {
-        let eng = engine.lock().unwrap();
-        let levels = eng.get_top_levels(1, engine_side == Side::Sell);
-        levels.first().map(|(p, _)| rules.ticks_to_price(*p))
-    } else {
-        // Aeron mode: read from spin-thread-maintained last_depth (SBE bytes).
-        let want_ask = req.side == "buy";
-        s.last_depth
-            .get(&req.symbol)
-            .and_then(|buf| crate::ws_sbe::decode_best_price(&buf, want_ask))
-    };
-
-    // Compute the price that actually backs the frozen quote-asset amount.
-    // For sells we freeze base_asset by quantity, so freeze_price has no
-    // role — persisted as 0.0 by convention.
-    let freeze_price: f64 = if req.side == "buy" {
-        req.price.or(best_opposing).unwrap_or(0.0)
-    } else {
-        0.0
-    };
-
-    // Freeze funds in-memory (account_cache) — was a PG UPDATE round-trip
-    // (~3-5ms). Cache is preloaded at boot from PG; the DB worker
-    // BatchUpsertOrder downstream both mirrors the freeze to PG and
-    // publishes AccountSet → Redis. WS PlaceOrders uses the same pattern.
-    // We keep AccountRepository handle around because the engine-rollback
-    // path below still uses repo.release_frozen on Aeron send failure.
-    let repo = AccountRepository::new(s.db.as_ref());
-    let (freeze_asset, freeze_amount): (&str, f64) = if req.side == "buy" {
-        if freeze_price > 0.0 {
-            (quote_asset, freeze_price * req.quantity)
-        } else {
-            // Market buy with no opposing depth yet — refuse.
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Unable to determine buy reservation price"})),
-            )
-                .into_response();
+    // Use the same protected-market and margin-price rules as WebSocket.
+    let (order_price_ticks, margin_price_ticks) = match fixed_shape.price_ticks {
+        Some(limit_ticks) => {
+            let best_bid = if engine_side == Side::Sell {
+                if let Some(ref engine) = engine_opt {
+                    engine
+                        .lock()
+                        .unwrap()
+                        .get_top_levels(1, true)
+                        .first()
+                        .map(|(p, _)| *p)
+                } else {
+                    s.last_depth
+                        .get(&req.symbol)
+                        .and_then(|buf| crate::ws_sbe::decode_best_price(&buf, false))
+                        .and_then(|p| rules.price_to_ticks(p).ok())
+                }
+            } else {
+                None
+            };
+            (limit_ticks, limit_ticks.max(best_bid.unwrap_or(0)))
         }
-    } else {
-        (base_asset, req.quantity)
+        None => {
+            let Some((best_ticks, protection_ticks)) = crate::ws_handler::market_price_band_ticks(
+                &s,
+                engine_opt.as_ref(),
+                &req.symbol,
+                engine_side,
+                fixed_shape.quantity_lots,
+                rules,
+            ) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "Insufficient visible depth for market-order margin"})),
+                )
+                    .into_response();
+            };
+            let margin_ticks = if engine_side == Side::Buy {
+                protection_ticks
+            } else {
+                best_ticks
+            };
+            (protection_ticks, margin_ticks)
+        }
     };
+    let freeze_price = rules.ticks_to_price(margin_price_ticks);
+    let notional_atoms = crate::desk::risk::calc::calc_notional_atoms(
+        margin_price_ticks,
+        fixed_shape.quantity_lots,
+        rules.notional_scale,
+    );
+    let initial_margin_atoms =
+        crate::desk::risk::calc::calc_initial_margin_atoms(notional_atoms, rules.default_leverage);
+    if initial_margin_atoms <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Unable to determine margin requirement"})),
+        )
+            .into_response();
+    }
+    let sym16 = crate::transport::pack_str16(&req.symbol);
+    if let Err(reason) = s.risk_engine.check_position_limit(
+        user_id,
+        &sym16,
+        fixed_shape.quantity_lots,
+        rules.max_position_lots,
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+    }
+    if let Err(reason) = s.risk_engine.check_symbol_oi_limit(
+        &sym16,
+        fixed_shape.quantity_lots,
+        rules.max_symbol_oi_lots,
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+    }
+    if req.reduce_only {
+        if let Err(reason) = s.risk_engine.check_reduce_only(
+            user_id,
+            &sym16,
+            if engine_side == Side::Buy { 0 } else { 1 },
+            fixed_shape.quantity_lots,
+        ) {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+        }
+    }
+    if let Err(reason) = s.risk_engine.check_leverage_tier(
+        user_id,
+        &sym16,
+        notional_atoms,
+        rules.notional_scale,
+        s.risk_tiers.as_slice(),
+        rules.default_leverage,
+    ) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+    }
+    if let Err(reason) = s
+        .risk_engine
+        .check_and_reserve_margin(user_id, initial_margin_atoms)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
+    }
+
+    // Mirror the reservation into the USDT account cache. RiskEngine remains
+    // authoritative; this keeps balance views and persistence in sync.
+    let repo = AccountRepository::new(s.db.as_ref());
+    let freeze_asset = quote_asset;
+    let freeze_amount = AmountAtoms::from_atoms(initial_margin_atoms).to_f64();
     if !try_freeze_cache(&s.account_cache, user_id, freeze_asset, freeze_amount) {
+        s.risk_engine
+            .release_order_margin(user_id, initial_margin_atoms);
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "Insufficient balance"})),
@@ -1934,14 +2146,7 @@ async fn handle_place_order(
     // Mirror the new row to Redis L1 immediately, before the engine round-trip.
     // Standalone mode (persist_pub=None) skips this; Aeron mode keeps Redis
     // in sync without waiting for the DB worker's batch path.
-    publish_rest_order_upsert(
-        &s,
-        &db_order,
-        user_id,
-        freeze_price,
-        quote_asset,
-        base_asset,
-    );
+    publish_rest_order_upsert(&s, &db_order, user_id, freeze_price, quote_asset);
 
     // ── Route to engine: local (standalone) vs Aeron (desk) ──────────────────
     if let Some(engine) = engine_opt {
@@ -1958,26 +2163,20 @@ async fn handle_place_order(
         ) {
             Ok(order) => order,
             Err(reason) => {
+                s.risk_engine
+                    .release_order_margin(user_id, initial_margin_atoms);
+                release_cache_frozen(&s.account_cache, user_id, quote_asset, initial_margin_atoms);
                 return (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response();
             }
         };
-        let engine_order = if fixed_order.is_market {
-            Order::new_market(
-                fixed_order.id,
-                fixed_order.side,
-                fixed_order.quantity_lots,
-                fixed_order.timestamp,
-            )
-        } else {
-            Order::new(
-                fixed_order.id,
-                fixed_order.side,
-                fixed_order.price_ticks,
-                fixed_order.quantity_lots,
-                fixed_order.time_in_force,
-                fixed_order.timestamp,
-            )
-        };
+        let engine_order = Order::new(
+            fixed_order.id,
+            fixed_order.side,
+            order_price_ticks,
+            fixed_order.quantity_lots,
+            fixed_order.time_in_force,
+            fixed_order.timestamp,
+        );
 
         let engine_result = {
             let mut eng = engine.lock().unwrap();
@@ -1991,16 +2190,9 @@ async fn handle_place_order(
                     .bind(db_order_id)
                     .execute(s.db.as_ref())
                     .await;
-                if req.side == "buy" {
-                    let p = req.price.or(best_opposing).unwrap_or(0.0);
-                    if p > 0.0 {
-                        let _ = repo
-                            .release_frozen(user_id, quote_asset, p * req.quantity)
-                            .await;
-                    }
-                } else {
-                    let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
-                }
+                s.risk_engine
+                    .release_order_margin(user_id, initial_margin_atoms);
+                release_cache_frozen(&s.account_cache, user_id, quote_asset, initial_margin_atoms);
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(json!({"error": e.to_string()})),
@@ -2012,24 +2204,23 @@ async fn handle_place_order(
         let db_status = db_status_from_engine(result.status).as_str();
         let filled_qty = rules.lots_to_quantity(result.filled_lots);
 
-        let _ = sqlx::query("UPDATE orders SET status=$1, filled_atoms=$2, updated_at=NOW() WHERE id=$3")
-            .bind(db_status)
-            .bind(crate::desk::money::AmountAtoms::from_f64_round(filled_qty).map(|a| a.atoms()).unwrap_or(0))
-            .bind(db_order_id)
-            .execute(s.db.as_ref())
-            .await;
+        let _ = sqlx::query(
+            "UPDATE orders SET status=$1, filled_atoms=$2, updated_at=NOW() WHERE id=$3",
+        )
+        .bind(db_status)
+        .bind(
+            crate::desk::money::AmountAtoms::from_f64_round(filled_qty)
+                .map(|a| a.atoms())
+                .unwrap_or(0),
+        )
+        .bind(db_order_id)
+        .execute(s.db.as_ref())
+        .await;
 
         if result.status == OrderStatus::Rejected {
-            if req.side == "buy" {
-                let p = req.price.or(best_opposing).unwrap_or(0.0);
-                if p > 0.0 {
-                    let _ = repo
-                        .release_frozen(user_id, quote_asset, p * req.quantity)
-                        .await;
-                }
-            } else {
-                let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
-            }
+            s.risk_engine
+                .release_order_margin(user_id, initial_margin_atoms);
+            release_cache_frozen(&s.account_cache, user_id, quote_asset, initial_margin_atoms);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "Rejected by matching engine"})),
@@ -2040,12 +2231,36 @@ async fn handle_place_order(
         // ── Settle fills (standalone path) ────────────────────────────────────
         let mut notified_maker_uids: std::collections::HashSet<i64> =
             std::collections::HashSet::new();
+        let mut consumed_margin_atoms = 0i64;
         for &(maker_order_id, fp_ticks, fq_lots) in &result.fills {
             if fp_ticks <= 0 || fq_lots <= 0 {
                 continue;
             }
             let fp = rules.ticks_to_price(fp_ticks);
             let fq = rules.lots_to_quantity(fq_lots);
+            let fill_notional = crate::desk::risk::calc::calc_notional_atoms(
+                fp_ticks,
+                fq_lots,
+                rules.notional_scale,
+            );
+            let fill_margin = crate::desk::risk::calc::calc_initial_margin_atoms(
+                fill_notional,
+                rules.default_leverage,
+            );
+            consumed_margin_atoms = consumed_margin_atoms.saturating_add(fill_margin);
+            s.risk_engine.on_fill(
+                user_id,
+                sym16,
+                if engine_side == Side::Buy { 0 } else { 1 },
+                fp_ticks,
+                fq_lots,
+                fill_margin,
+                rules.notional_scale,
+                rules.default_leverage,
+                rules.maintenance_rate_bps,
+                0,
+            );
+            release_cache_frozen(&s.account_cache, user_id, quote_asset, fill_margin);
 
             let maker_uid: Option<i64> =
                 sqlx::query_scalar("SELECT user_id FROM orders WHERE id=$1")
@@ -2061,12 +2276,6 @@ async fn handle_place_order(
             };
 
             if buyer_id > 0 && seller_id > 0 {
-                if req.side == "buy" {
-                    let over = req.price.map(|lp| (lp - fp) * fq).unwrap_or(0.0).max(0.0);
-                    if over > 0.0 {
-                        let _ = repo.release_frozen(user_id, quote_asset, over).await;
-                    }
-                }
                 // Trade row + four account legs + fund audit: ONE transaction.
                 let (buy_oid, sell_oid) = if req.side == "buy" {
                     (result.order_id as i64, maker_order_id as i64)
@@ -2124,20 +2333,16 @@ async fn handle_place_order(
             }
         }
 
-        if result.status == OrderStatus::Cancelled {
-            let unfilled = req.quantity - filled_qty;
-            if unfilled > 0.0 {
-                let (rel_asset, rel_amount) = if req.side == "buy" {
-                    (
-                        quote_asset,
-                        req.price.or(best_opposing).unwrap_or(0.0) * unfilled,
-                    )
-                } else {
-                    (base_asset, unfilled)
-                };
-                if rel_amount > 0.0 {
-                    let _ = repo.release_frozen(user_id, rel_asset, rel_amount).await;
-                }
+        let terminal_ioc_partial = fixed_order.time_in_force == TimeInForce::IOC
+            && result.status == OrderStatus::PartiallyFilled;
+        if matches!(result.status, OrderStatus::Cancelled | OrderStatus::Filled)
+            || terminal_ioc_partial
+        {
+            let remaining_margin = initial_margin_atoms.saturating_sub(consumed_margin_atoms);
+            if remaining_margin > 0 {
+                s.risk_engine
+                    .release_order_margin(user_id, remaining_margin);
+                release_cache_frozen(&s.account_cache, user_id, quote_asset, remaining_margin);
             }
         }
 
@@ -2189,7 +2394,7 @@ async fn handle_place_order(
                     .sum();
                 cost / filled_qty
             } else {
-                req.price.or(best_opposing).unwrap_or(0.0)
+                rules.ticks_to_price(order_price_ticks)
             };
             let now_us = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2258,7 +2463,7 @@ async fn handle_place_order(
         let sbe_req = SbeNewOrder {
             client_order_id: db_order_id as u64,
             participant_id: user_id as u64,
-            price_ticks: fixed_shape.price_ticks.unwrap_or(0),
+            price_ticks: order_price_ticks,
             quantity_lots: fixed_shape.quantity_lots,
             side: side_byte,
             time_in_force: tif_byte,
@@ -2283,7 +2488,7 @@ async fn handle_place_order(
                 qty: req.quantity,
                 client_order_id: req.client_order_id.clone().unwrap_or_default(),
                 freeze_price,
-                initial_margin_atoms: 0,
+                initial_margin_atoms,
                 liq_price_ticks: 0,
             },
         );
@@ -2297,16 +2502,10 @@ async fn handle_place_order(
                 .bind(db_order_id)
                 .execute(s.db.as_ref())
                 .await;
-            if req.side == "buy" {
-                let p = req.price.or(best_opposing).unwrap_or(0.0);
-                if p > 0.0 {
-                    let _ = repo
-                        .release_frozen(user_id, quote_asset, p * req.quantity)
-                        .await;
-                }
-            } else {
-                let _ = repo.release_frozen(user_id, base_asset, req.quantity).await;
-            }
+            s.pending_meta.remove(&(db_order_id as u64));
+            s.risk_engine
+                .release_order_margin(user_id, initial_margin_atoms);
+            release_cache_frozen(&s.account_cache, user_id, quote_asset, initial_margin_atoms);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": "Aeron channel closed"})),
@@ -2354,6 +2553,9 @@ async fn handle_place_order(
     }
 
     // Neither engine nor Aeron — should not happen.
+    s.risk_engine
+        .release_order_margin(user_id, initial_margin_atoms);
+    release_cache_frozen(&s.account_cache, user_id, quote_asset, initial_margin_atoms);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": "No matching engine configured"})),
@@ -3404,11 +3606,10 @@ async fn handle_debug_mark_price(
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
     for mut evt in events {
-        evt.qty_lots =
-            crate::desk::risk::calc::liquidation_tranche_lots(evt.qty_lots, tranche_bps);
+        evt.qty_lots = crate::desk::risk::calc::liquidation_tranche_lots(evt.qty_lots, tranche_bps);
         use crate::desk::risk::PositionSide;
         use crate::sbe::NewOrderRequest as SbeNewOrder;
-        use crate::transport::{AeronCmd, OrderMeta, pack_str16};
+        use crate::transport::{pack_str16, AeronCmd, OrderMeta};
         use std::sync::atomic::Ordering;
 
         if evt.liq_price_ticks == 0 {

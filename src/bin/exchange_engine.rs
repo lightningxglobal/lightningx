@@ -1036,19 +1036,28 @@ fn spawn_symbol_thread(
                                             )
                                         }
                                         OrderStatus::PartiallyFilled => {
-                                            // Order rests in book after partial fill — must track
-                                            // participant so cancel confirmations route correctly.
-                                            if uid_map
-                                                .insert(
-                                                    result.order_id,
-                                                    (req.participant_id, response_stream_id),
-                                                )
-                                                .is_none()
-                                            {
-                                                open_count_inc(
-                                                    &mut open_counts,
-                                                    req.participant_id,
-                                                );
+                                            // IOC never rests. Encode remaining=0 so the desk can
+                                            // apply the fill and then release the residual margin.
+                                            // GTC partials remain live and need cancel routing.
+                                            let remaining = if req.time_in_force == 1 {
+                                                0.0
+                                            } else {
+                                                if uid_map
+                                                    .insert(
+                                                        result.order_id,
+                                                        (req.participant_id, response_stream_id),
+                                                    )
+                                                    .is_none()
+                                                {
+                                                    open_count_inc(
+                                                        &mut open_counts,
+                                                        req.participant_id,
+                                                    );
+                                                }
+                                                total_qty - filled_qty
+                                            };
+                                            if remaining > 0.0 {
+                                                debug_assert!(req.time_in_force != 1);
                                             }
                                             OrderUpdateMsg::partial_fill(
                                                 result.order_id,
@@ -1056,7 +1065,7 @@ fn spawn_symbol_thread(
                                                 req.participant_id,
                                                 last_price,
                                                 filled_qty,
-                                                total_qty - filled_qty,
+                                                remaining,
                                                 ts,
                                             )
                                         }

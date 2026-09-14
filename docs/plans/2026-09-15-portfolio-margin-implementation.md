@@ -1,277 +1,258 @@
-# 组合保证金（Portfolio Margin）实现方案 v4
+# 组合保证金（Portfolio Margin）实现方案 v5
 
-状态：设计，未实现。日期：2026-09-15（v4：以多 desk / 多引擎 / 跨服务器拓扑为主线重写）。
-相关：`docs/portfolio_margin_design.md`（quota lease 草案，本文 §A6 给出结论）、`docs/plans/counter-sharding-and-route-generation.md`（owner shard 与 route 轮换）、`docs/plans/2026-06-06-ha-replay-model.md`（HA）。
-参考：一份面向订单簿型 perp DEX 的风控引擎设计文档（情景法组合保证金）。§B 的模型吸收了它的内核思想；§A 的架构是按本系统的拓扑独立推导的，§D 列出取舍。
+状态：设计，未实现。日期：2026-09-15。
+v5 变化：确定 PM 账户归属（专属 PM owner desk，而非普通 desk 或独立 risk-engine 服务）；内核升级为产品无关（为现货 / RWA / 预测市场铺路）；增加账户目录、在线迁移、多产品路线。
+已确认的前提：一个 symbol 只在一个引擎，一个引擎可有多个 symbol；mark price 只由 product desk 发布。
+相关：`docs/portfolio_margin_design.md`（quota lease，plan B）、`docs/plans/counter-sharding-and-route-generation.md`、`docs/plans/2026-06-06-ha-replay-model.md`、`src/desk/leader.rs`（fencing epoch）。
+参考：一份面向订单簿型 perp DEX 的风控引擎设计文档。内核思想（情景法、product-blind、按 Δ需求量判风险方向、强平自级联）来自它；账户分层、目录路由、在线迁移、相关块分解、拓扑与故障处理是按本系统推导的。§F 列取舍。
 
 ---
 
 ## 一句话
 
-**账户的组合视图只有一个写者：owner desk（`user_id % 4`）。组合保证金的全部决策（前置边际检查、风控 tick、有序强平、ADL 保护）都在 owner desk 的 `RiskEngine` 内完成；撮合引擎保持纯撮合；desk 之间不复制账户状态。跨服务器只有四条数据流，每条都是已有的或一条定长小消息。**
+**PM 账户归专属的 PM owner desk（同一 desk-server 二进制、`DESK_ROLE=pm`、目录路由），普通账户仍走 `user_id % 4` 的普通 owner desk。两类 desk 共用一个产品无关的风控内核库；撮合引擎保持纯撮合；desk 之间不复制状态。账户可以在线从普通 desk 迁到 PM desk（模式切换），持仓保留、挂单撤销、秒级完成。**
 
 ---
 
-# A. 架构
+# A. PM 账户归属
 
-## A1. 拓扑与角色
+## A1. 三个候选方案
 
-```
- 引擎主机 E1                    引擎主机 E2
- ┌──────────────────┐          ┌──────────────────┐
- │ exchange-engine  │          │ exchange-engine  │
- │  BTC_USDT spin   │          │  ETH_USDT spin   │      每 symbol 一个自旋线程，纯撮合
- │  (+ 其他 symbol) │          │  SOL_USDT spin   │      不知道余额、仓位、保证金
- └───▲──────────┬───┘          └───▲──────────┬───┘
-     │orders    │fills/updates     │orders    │fills/updates
-     │(Aeron UDP, 每 symbol 流)    │          │
- ════╪══════════╪══════════════════╪══════════╪════════ 跨主机边界
-     │          ▼                  │          ▼
- desk 主机 D0 … D3（每台一个 desk-server，三个正交角色）
- ┌─────────────────────────────────────────────────────────────┐
- │ ① edge   : 终端 WS 会话（任意用户可连）                          │
- │ ② owner  : user_id % 4 == desk_id 的账户账本 + PM 风控（单写者）  │
- │ ③ product: 与本机引擎共处的产品线，负责该产品的 mark price 发布     │
- └─────────────────────────────────────────────────────────────┘
-```
+| 方案 | 下单热路径 | 写者 | 隔离 | 多产品演进 | 结论 |
+|---|---|---|---|---|---|
+| ① 普通 owner desk 加 `margin_mode` 标志（v4） | 本地，零跳 | 单写者 ✓ | ✗ PM 的重计算、代码变更、故障与 1/4 零售用户同进程 | ✗ RWA / 预测 / 多币种抵押的代码都要进零售 desk | 只适合 PM 只有 perp 且用户极少的阶段 |
+| ② **专属 PM owner desk**（同一二进制、角色开关、目录路由） | 本地，零跳 | 单写者 ✓ | ✓ 独立进程 / 主机 / 发布节奏；零售 desk 不含 PM 代码路径 | ✓ 新产品的风控只进 PM 角色 | **推荐** |
+| ③ 独立 risk-engine 服务，desk 每单去问它 | +1 跨机往返（50-200µs） | ✗ 账户状态出现第二写者，或 desk 与 risk-engine 之间要同步余额/冻结 | ✓ | ✓ | 热路径与一致性都输给 ②；它能做的 ② 都能做 |
 
-三个角色正交：edge 决定"谁接会话"，owner 决定"谁算风控"，product 决定"谁发 mark"。组合保证金只涉及 owner 角色。
+③ 只有一种形态不输：risk-engine 自己持有账本、自己发单到引擎、自己回执给用户。那它就是 ② 换了个名字。所以问题不是"要不要独立 risk-engine"，而是"PM owner 用不用独立二进制"。答案：**先不用**。PM owner 必须做 desk 的全部事（WS 会话、账本、Aeron 发单、回执、持久化），独立二进制会复制 desk-server 80% 的代码；角色开关 + 把风控抽成库（`risk-core`）能得到同样的隔离。等 PM 侧代码量和发布节奏真的分化了，再拆二进制，届时库边界已经在。
 
-**为什么 owner 是唯一正确的位置**：
-- 组合跨 symbol、跨引擎，引擎里没有组合视图，也不能有（撮合线程百纳秒预算，且一个引擎只看一个 symbol）；
-- owner 已经是账户余额、仓位、挂单冻结的单写者（counter-sharding 设计的核心不变式），PM 只是让它算的"需求量"从 Σ 变成组合最坏损失；
-- 任何"独立风控服务"都会成为账户状态的第二个写者，或者在下单路径上多一跳。pg-writer 的教训（双写死锁）同样适用。
-
-## A2. owner 需要的四条跨主机数据流
-
-| # | 流 | 方向 | 现状 | PM 需要的改动 |
-|---|---|---|---|---|
-| 1 | 订单 / 强平单 | owner → 引擎(symbol) | `orders_stream_for_symbol`，每 symbol 一个流 | 无。但见 A3 端点表 |
-| 2 | 成交 / 订单状态 | 引擎(symbol) → owner | `order_update_stream_for_desk(owner)`，引擎按提交方 desk 回流 | 无 |
-| 3 | mark price（全 symbol） | product desk → 所有 desk | 每个 desk 自己订阅全量 `DEPTH_STREAM`，用 depth 中价 + index 钳制算 mark | **新增 `MarkPrice` 小流**（A4） |
-| 4 | 持久化事件 | owner → pg-writer | `PERSIST_STREAM` | `RiskAccountSet` 加 1 字节 `margin_mode` |
-
-没有第五条。desk 之间不同步仓位、不同步余额、不同步向量。
-
-## A3. 前置条件：多引擎主机的端点表
-
-`aeron_channels.rs` 现在所有通道都指向单一 `ENGINE_HOST`。引擎分布在多台主机时，owner 发 ETH 单要到 E2、发 BTC 单要到 E1，需要：
+## A2. 分层 owner
 
 ```
-ENGINE_ENDPOINTS=BTC_USDT=10.0.0.1:20121,ETH_USDT=10.0.0.2:20121,SOL_USDT=10.0.0.2:20121
+                       account directory（登录时解析一次，desk 内存缓存）
+                       user_id ──► { home_kind: Normal | PM, desk_id, epoch }
+                                    │
+          ┌─────────────────────────┴──────────────────────────┐
+          ▼                                                    ▼
+  普通 owner desk 0..3                                  PM owner desk 8..（编号不进 modulo 环）
+  home = user_id % 4                                    home = 目录指定
+  margin_mode 固定 Σ（现状风控，不含 PM 代码路径）           risk-core 情景内核（C 部分）
+  零售用户，10K+/desk                                    PM 用户，100-10K/desk，10-50 腿/户
+  同时兼 edge + product 角色                             只做 owner（+ 自己用户的 edge）；不发 mark
 ```
 
-`orders_channel_for_symbol(symbol)` 按表解析；找不到的 symbol 走现有 fallback（`valid_symbols` 早拒）。反向流（引擎 → desk）在 UDP 模式下端点是 desk 主机，引擎侧同样需要 `DESK_ENDPOINTS=0=10.0.1.0:20122,…`。
+- 两类 desk 从同一条 `MarkPrice` 流、同一组引擎 order_update 流取输入，向同一组引擎 orders 流发单，向同一 pg-writer 发 PersistEvent。引擎和 pg-writer 不知道 PM desk 的存在，只多了几个 `desk_id`。
+- `counter_shard_for_desk_id(desk_id) = desk_id % 4` 这个环绕必须去掉：PM desk 的 `desk_id` 不属于 modulo 环。`is_user_owned_by_desk` 改为查目录。
+- 订单 id slab 按 `DESK_ID` 预留（现有 `base + DESK_ID × 1e9`），PM desk 直接沿用。
 
-这是**拓扑前置条件，与 PM 无关但 PM 依赖它**：没有它，"引擎在不同服务器"根本跑不起来，更谈不上跨引擎组合。建议作为第 0 步独立提交。
+## A3. 账户目录与路由
 
-## A4. mark price：一个 symbol 一个发布者
-
-现状每个 desk 各自从 depth 算 mark，四个 desk 对同一 symbol 的 mark 可能有微小差异，且跨主机全量 depth 流量大（每 symbol 每 10ms 一帧 50 档）。
-
-改为：**product desk（与该 symbol 引擎同机）** 算 mark（现有逻辑：depth 中价 + `INDEX_SOURCES` 钳制），发布定长帧：
-
-```
-MarkPrice { symbol: [u8;16], mark_ticks: i64, index_ticks: i64, ts_ns: u64, seq: u32 }   // 48B
+```rust
+pub struct AccountHome { pub kind: HomeKind, pub desk_id: u16, pub epoch: u32 }
+pub fn resolve_owner(user_id: i64, dir: &HomeDirectory) -> AccountHome
+// dir miss → Normal, user_id % 4（零售默认路径不查表，不加延迟）
 ```
 
-流：`MARK_STREAM = 7`，通道走引擎主机端点（product desk 与引擎同机，其他 desk 已在订阅该主机）。频率 10ms 或变动 > 1 tick 时。
+- 真相在 PG 表 `account_home(user_id, kind, desk_id, epoch)`，Redis L1 镜像。desk 启动时全量加载 PM 条目（量小），登录时按用户查一次，之后 `HomeSet` PersistEvent 广播增量（复用 `PERSIST_STREAM`，pg-writer 落库，desk 订阅更新缓存）。
+- edge 转发用 `resolve_owner`；登录响应携带 `owner_desk_url`，客户端重连到 owner（v4 §A6 的亲和连接），转发只剩兜底。
+- 引擎回执按提交 desk 回流（`publisher_id = desk_id`），与目录无关。
 
-收益：
-- 一个 symbol 只有一个 mark 写者 → 所有 owner 对同一账户用相同的价格，强平可审计；
-- 跨主机流量从 depth 帧降到 48B/symbol/10ms；
-- 外部 index 源只需 product desk 接，其余 desk 不需要外部行情连接。
+## A4. 模式切换 = 在线迁移（普通 ↔ PM）
 
-owner 侧 `update_mark_price` 的输入从 depth 回调换成 `MarkPrice` 帧；B5 的 `last_mark_update` 冻结检测保留，输入源换成 `MarkPrice.ts_ns`。
-
-## A5. 下单路径（跨主机）
+对比：Binance PM 是独立账户类型，用户要把资产划转进去；OKX 统一账户切换保证金模式时要求无挂单且部分情形无持仓。本方案：**同一账户 id，持仓保留，只撤挂单，秒级完成**。
 
 ```
-用户 ──WS──► edge desk ──(若非 owner: cf_cmd, UDP)──► owner desk ──orders(UDP)──► 引擎
-                                                        ▲  边际 IM 检查（B3）           │
-                                                        │                              │
-用户 ◄──WS── edge desk ◄──(cf_resp, UDP)────────────── owner desk ◄──order_update(UDP)──┘
-                                                           on_fill 重算向量（B4）
+① 旧 owner：目录写 Migrating(epoch+1) → 该账户拒绝新单 → cancel-all → 等引擎回执 drain（≤ LIQ_INFLIGHT_MS 同款超时）
+② 旧 owner：最终快照（余额、仓位、风控状态）同步写 Redis L1；发 HomeSet{user, new_desk, epoch} PersistEvent
+③ 新 owner：收到 HomeSet → 从 Redis 读快照 hydrate 该账户 → 从仓位重算向量（纯函数）→ 跑一次该账户 tick → 目录置 Active
+④ 客户端：旧 owner 回 `rehome{owner_desk_url}`，客户端重连；期间到旧 owner 的请求被拒 `reason=migrating`
 ```
 
-- **只有 owner 能算边际 IM**（需要账户向量）。转发帧 `CounterForwardOrderMeta` 已带 symbol / side / price / qty，owner 自算 `v_order`；帧里的 `initial_margin_atoms` 退化为 Σ 模式账户的独立 IM。
-- 边际检查在 owner 的两个入口共用一个函数：本地 WS（tokio）与转发（`d{n}-send` 自旋线程）。
-- 引擎不参与风控：前置是"闸门在前、一次单向发送"，不存在参考文档里"撮合 → 风控 → 撮合"的往返，所以**风控与撮合不需要同机**。desk 与引擎分机的代价只是订单路径上本来就有的那一跳 UDP。
+- **fencing**：`epoch` 随目录变化递增，转发帧和 PersistEvent 带 epoch，接收方丢弃低 epoch（与 `leader.rs` 同一思路）。旧 owner 在 ③ 之后即使残留状态也无法发单。
+- 为什么撤挂单：挂单的回执按提交 desk 回流，不撤就要旧 owner 代转发回执，引入第二条路径。模式切换是低频操作，撤单代价可接受；持仓是纯数据，直接搬。
+- 同一协议也用于 PM desk 之间的负载再平衡和 PM desk 的计划内下线。
 
-## A6. 去掉 edge → owner 那一跳：owner 亲和连接
+## A5. 与 Binance / OKX 的比较，以及能做得更好的点
 
-40K 压测：转发路径比直连 p50 慢 20-25µs，p99 从 1.5ms 涨到 21-27ms。这一跳是当前系统里唯一"可以不存在"的跨主机跳。
-
-**方案：登录时把会话引导到 owner desk。** 登录响应携带 `owner_desk_url`（`api_key → user_id → user_id % 4`，一次解析），客户端重连；或网关按认证后的 `user_id % 4` 头路由。之后 `ingress == owner`，转发路径只剩兜底（客户端不配合重连时仍能用）。
-
-为什么可行：私有数据（成交、余额、仓位推送）本来就由 owner 产生并经 edge 中转；公开行情走 market-data-gateway，与连接在哪个 desk 无关。产品线亲和的私有连接没有任何收益。
-
-**quota lease 的结论**：它是为了在不能做亲和路由时去掉这一跳。有了亲和路由，它不再需要。保留草案作为 plan B（例如异地 LB 无法按用户路由时），且 PM 下柜台本地只能按独立 IM 扣租约、owner 在下个 tick 返还对冲差额（细节见旧草案 + 本文 v3 §9，不再展开）。
-
-## A7. 强平跨引擎
-
-owner 的风控 tick 一个用户每 tick 只发一组动作（B5）。对冲对成对减仓 = 两张 IOC 发往两个引擎（可能两台主机），**天然非原子**。处理：
-
-1. 两张 IOC 在同一 tick 内连续发出（同一自旋线程，间隔纳秒级）；
-2. 账户置 `Liquidating` 并记 `liq_inflight_until = now + LIQ_INFLIGHT_MS`（建议 50ms），到期或两腿回执齐前不再发下一组；
-3. 回执到齐后 `on_fill` 重算向量，下个 tick 重评：一腿成交一腿未成交时，剩下的单腿 Δmm 最大，自然成为下一组动作；
-4. 某 symbol mark 冻结（B5 现有守卫）→ 该 RU 的腿不参与候选，其他 RU 继续。
-
-强平单绕过前置闸门（现有 `fill_margin = 0`、`liq_price_ticks != 0`），走与用户订单相同的 `orders_stream_for_symbol`，所以 A3 的端点表对它同样生效。
-
-## A8. 故障与降级（按部件）
-
-| 故障 | 表现 | 处理 | PM 特有的部分 |
+| 维度 | Binance PM | OKX 统一账户 | 本方案 |
 |---|---|---|---|
-| 引擎主机 E2 宕机 / 链路分区 | ETH/SOL 的 mark 停更、订单发布失败 | 现有：B5 冻结该 symbol 强平；发布失败拒单 | **冻结该 RU**：该 RU 上的风险上升单拒绝；持仓按最后 mark 估值且冲击放大（`p × PM_STALE_MULT`，建议 2×），组合需求量保守上浮；其他 RU 正常 |
-| owner desk D1 宕机 | 该 shard 用户不能交易（现状） | 重启后 hydration：仓位 + 挂单 → 重算向量（纯函数，不持久化派生量） | hydration 未完成前拒绝所有单（S1.4 守卫现有）；完成后先跑一次全量 tick 再开闸 |
-| product desk 宕机（mark 发布者） | 该产品 mark 停更 | 同引擎宕机的 RU 冻结路径 | 可选：owner 退回 depth 自算 mark 作为兜底（保留旧代码路径一个版本） |
-| edge desk 宕机 | 连在它上面的会话断线 | 客户端重连到 owner（A6） | 无 |
-| owner 主备切换（HA） | 新 owner 接管 | 需要 epoch 防护栏，避免旧 owner 继续向引擎发单 | 与 HA 重放模型同一课题，不在 PM 范围内；PM 不引入新的状态副本，不加重这个问题 |
+| 账户形态 | 独立账户类型，需划转 | 同一账户，模式切换有前置条件 | 同一账户，在线迁移，持仓保留 |
+| 前置检查 | 中心风控，延迟不透明 | 中心风控 | owner 本地向量运算，~100ns，零跨机 |
+| 保证金方法 | uniMMR（按币种 MM 表 + 折扣） | 情景压力测试（价格 × 波动网格） | 情景内核 + **相关块分解**（C3）：独立块需求量相加，无情景爆炸 |
+| 可解释性 | 给 uniMMR 数值 | 公开方法论 | API 返回"哪个情景在约束、每腿 Δ需求量"（C6），用户能算出加一腿后的变化 |
+| 部分故障 | 通常整账户/整市场限制 | 同 | **按风险单元冻结**：一个引擎主机宕机只冻结它的 RU，其他 RU 照常（B6） |
+| 强平 | 按 uniMMR 排序减仓 | 同 | 边际贡献排序 + 对冲对成对解除 + 收敛检查（C5） |
 
-原则与参考文档一致：信息可疑时冻结、加厚、拒绝风险上升，不做不可逆动作；但本系统没有"检测快、执行慢"的不对称（执行是 µs 级 Aeron），不需要待强平队列。
-
-## A9. 否决的方案
-
-| 方案 | 为什么不 |
-|---|---|
-| PM 放进撮合引擎 | 引擎只看一个 symbol，没有组合；自旋线程预算百纳秒 |
-| 独立 Global Risk Coordinator 进程 | 下单路径多一跳；成为账户状态第二写者或需要状态复制；owner 已经是这个角色 |
-| 把仓位/余额复制到所有 desk | 解决"看见"解决不了"互斥"，双花仍需仲裁点；写放大 ×4 |
-| 风控与撮合同机（参考文档的要求） | 它的前提是撮合→风控→撮合往返；本系统是闸门在前的单向发送，不存在往返 |
-| quota lease 作为主路径 | 只解决 edge→owner 一跳；owner 亲和连接更便宜地解决同一问题，且不引入租约状态 |
-| 每 desk 自算 mark（现状） | 同一账户可能在不同 desk 上看到不同 mark；跨主机 depth 流量大 |
+"更好"主要体现在热路径延迟、在线切换、可解释性、局部故障。保证金方法论本身与 OKX 同路（情景法），差异在块分解与参数策略，不宣称模型更准。
 
 ---
 
-# B. 保证金模型：情景重估内核
+# B. 拓扑与数据流
 
-## B1. 为什么不用"净额 + 配对折扣表"
-
-配对折扣在三个以上风险单元时需要额外分配规则；IM、MM、前置检查、强平排序各自维护一套折扣逻辑，容易漂移；"相关性失效"只能靠调低参数。情景法：定义少量确定性情景，把整个组合在每个情景下重估一次取最坏损失。对冲收益是"多空腿在同一情景下同时重估"的自然结果；三个以上单元没有特殊处理；相关性失效就是一个情景参数。IM、MM、前置边际、强平排序、ADL 保护共用同一个内核函数。
-
-## B2. 因子与情景集
-
-- **因子** = 风险单元 RU = base asset（`BTC_USDT` → `BTC`），复用 `counter_shard::symbol_route_desk_id` 的 base 解析。同 RU 多合约自动净额。
-- 线性 perp 单腿损失是闭式：`loss_i(s) = signed_notional_i × shock_i(s)`，`signed_notional = ±qty × mark / notional_scale`。不需要 `value(state)` trait。
-- **情景生成**（k = 持仓 RU 数 ≤ 4，S = 2 × 2^k ≤ 32）：主方向 D ∈ {−,+}；背离子集 X ⊆ RUs，X 内的 RU 反向移动、幅度为背离冲击 `d_i`，其余沿主方向移动、幅度为全额冲击 `p_i`。
-- **两套冲击网格，同一内核**：
-  - MM 网格 `p_i = maintenance_rate_bps`（现值 50）；
-  - IM 网格 `p_i = 1e4 / default_leverage`（现值 1000）。
-  - 单仓位账户的组合 MM/IM 与今天**逐 atom 一致**，只有多腿账户出现差异，便于灰度对比。
-- **背离冲击** `d_i = p_i × div_bps / 1e4`：多 BTC / 空 ETH 的最坏情景是"BTC 跌 p、ETH 涨 d"，对冲折扣 = `1 − d/p`；同向持仓的最坏情景是"全部同跌 p"，**没有分散收益**（危机中相关性趋于 1，分散不可靠）。相关性失效压力测试 = `div_bps → 1e4`。
-- **聚合**：取最坏情景（`max`）。
-
-## B3. 内核接口与可加性
-
-```rust
-// calc.rs — 纯函数，全部定点数（atoms / bps / i128 中间量）
-pub const MAX_SCENARIOS: usize = 32;
-pub type LossVec = SmallVec<[i64; MAX_SCENARIOS]>;   // 每情景组合损失，正数 = 亏
-pub struct RuShock { pub ru: [u8; 8], pub p_bps: i64, pub d_bps: i64 }
-pub fn leg_loss_vec(signed_notional_atoms: i64, ru_index: usize, shocks: &[RuShock]) -> LossVec;
-pub fn worst(losses: &LossVec) -> i64;   // max(0, max_s losses[s])
-```
-
-**损失向量对腿线性可加**：加一张单、减一个 tranche、撤一张挂单都是向量加减，O(S)。这是热路径常数时间的来源。
-
-## B4. 账户缓存与热路径
-
-```rust
-// AccountRiskState 新增（只在 get_mut 下写，与 used_margin 同规则）
-pub margin_mode: u8,                       // 0 = cross-sum（现状），1 = portfolio
-pub ru_order:   SmallVec<[[u8; 8]; 4]>,
-pub pos_losses_im: LossVec,  pub pos_losses_mm: LossVec,
-pub pending_losses_im: LossVec,            // 挂单未成交部分
-pub position_symbols: SmallVec<[[u8; 16]; 4]>,
-```
-
-下单检查（owner 两个入口共用）：
+## B1. 角色
 
 ```
-v_order    = leg_loss_vec(±order_notional, ru, im_grid)
-req_before = worst(pos_im + pending_im)
-req_after  = worst(pos_im + pending_im + v_order)
-marginal   = req_after − req_before
+ 引擎主机 E1: exchange-engine {BTC_USDT, …}     引擎主机 E2: exchange-engine {ETH_USDT, SOL_USDT, …}
+     ▲ orders(symbol 流)  │ order_update(按 desk 流)      ▲                  │
+ ════╪════════════════════╪═══════════════════════════════╪══════════════════╪═════ 跨主机
+ desk 主机：
+   普通 desk 0..3 = edge + owner(modulo) + product(与同机引擎的 symbol 发 MarkPrice)
+   PM desk 8..    = owner(目录) + 自己用户的 edge
+ pg-writer / market-data-gateway 不变
 ```
 
-- `marginal ≤ 0`（平仓、减仓、对冲）→ 不设 IM 闸门，冻结 0，`MarginCall` 也放行。判断依据是需求量变化，不是 buy/sell 或 reduce-only 标签。
-- `marginal > 0` → 现有 `available_margin` 原子 CAS 冻结 `marginal`。
-- 通过后 `pending_losses_im += v_order`；成交/撤单时减去对应部分。**挂单进向量**是为了让两笔并发对冲单只有第一笔拿到折扣。
-- 成本：三次 O(S) 向量运算，百纳秒级。多出的 `get_mut` 若在自旋路径上有争用，`pending_losses_im` 改为 `[AtomicI64; 32]` 用 `fetch_add`。
-- RU 冻结（A8）：`v_order` 所在 RU 冻结且 `marginal > 0` → 拒单 `reason=ru_frozen`。
+## B2. owner 需要的跨主机数据流
 
-字段语义映射：`used_margin = worst(pos_im)`，`maintenance_margin = worst(pos_mm)`，`order_margin = Σ 边际冻结`；`equity = available + order + used + unrealized` 守恒保持，S2.4 守恒测试继续有效。
+| # | 流 | 方向 | 现状 | 改动 |
+|---|---|---|---|---|
+| 1 | 订单 / 强平单 | owner → 引擎(symbol) | 每 symbol 一个流 | 端点表（B3） |
+| 2 | 成交 / 状态 | 引擎 → owner(desk) | 按提交 desk 回流 | PM desk 只是新增 desk_id |
+| 3 | mark price | product desk → 所有 desk | 各 desk 从 depth 自算 | **`MarkPrice` 小流**（B4） |
+| 4 | 持久化 | owner → pg-writer | `PERSIST_STREAM` | `RiskAccountSet` +1 字节 `margin_mode`；新增 `HomeSet` |
 
-## B5. 慢路径
+## B3. 前置条件：多引擎主机端点表
 
-- **`on_fill`**（已持 `get_mut`）：`pending_im −= v_order × fill/qty`；重算该 RU 腿（旧减新加，两套网格）；写 `used_margin` / `maintenance_margin`；`available_margin` 校正为真实值，吸收冻结值与真实值的漂移（与 `runtime_consume_fill_margin` 差额回冲合并）。新 RU 且 `ru_order` 已满 → 账户降级 Σ 模式并计 metrics，不拒单。
-- **`update_mark_price`**（输入换成 `MarkPrice` 帧）：该 RU 腿按 `notional_new − notional_old` 缩放加回，O(S)。是 `get_mut(acct)` + 键控 `positions.get`，不触发 DashMap 嵌套迭代死锁。若压测需要，加价格带触发（累计变动 < 10bps 不重算）。
-- **`run_risk_tick`** 三段式不动；PM 账户只是 `maintenance_margin` 来源不同。`symbol_position_index` 就是"因子 → 组合"倒排索引。
+`aeron_channels.rs` 现在所有通道指向单一 `ENGINE_HOST`。需要 `ENGINE_ENDPOINTS=BTC_USDT=10.0.0.1:20121,ETH_USDT=10.0.0.2:20121,…`（一个引擎多个 symbol 时多条映射到同一端点）与反向 `DESK_ENDPOINTS=0=…,8=…`。与 PM 无关，但 PM 依赖它；第 0 步独立提交。
 
-## B6. 有序强平 + 收敛检查（替换 Pass 2）
+## B4. MarkPrice 流
 
-1. 候选动作：单腿减一个 tranche；对冲对（当前最坏情景下损失符号相反的两腿）按净敞口比例同时减一个 tranche。冻结 RU 的腿不参与。
-2. 每个候选算 `Δmm = worst(V_mm) − worst(V_mm − v_action)`，O(S)，≤ 6 个候选。
-3. 按 `Δmm / 释放名义额` 降序执行第一条；跨引擎发送与 in-flight 守卫见 A7。
-4. 收敛检查：所有候选 `Δmm ≤ 0` → 自级联信号 → 全部腿按比例整体减仓。
-5. `equity > maintenance_margin × (1 + LIQ_STOP_BUFFER_BPS)` → 回 `Normal`；否则下个 tick 继续。
+product desk 用现有逻辑（depth 中价 + `INDEX_SOURCES` 钳制）算 mark，发布 `MarkPrice{symbol, mark_ticks, index_ticks, ts_ns, seq}`（48B，`MARK_STREAM=7`，10ms 或变动 > 1 tick）。一个 symbol 一个写者 → 所有 owner 同价、可审计；跨主机流量从 depth 帧降到 48B；外部 index 源只需 product desk 接。owner 侧 `update_mark_price` 输入换成此帧，B5 `last_mark_update` 冻结检测保留。
 
-**ADL 保护**：`run_adl` 削对手方前算 `worst(V_cp − v_cut)`，若会让对手方自己 `equity ≤ mm`（削的是它的对冲腿）→ 降权或跳过。现有评分保留。
+## B5. 下单路径与跨引擎强平
 
-## B7. 持久化与恢复
+- 只有 owner 能算边际 IM（需要账户向量）；转发帧已带 symbol/side/price/qty，owner 自算。
+- 前置是闸门在前的单向发送，无"撮合 → 风控 → 撮合"往返，**风控与撮合不需要同机**。
+- 强平：每用户每 tick 一组动作；对冲对成对减仓 = 两张 IOC 发往两个引擎，非原子。同 tick 连续发出；账户记 `liq_inflight_until`（`LIQ_INFLIGHT_MS`=50），回执齐或超时前不发下一组；一腿成交一腿未成交时，下个 tick 重评，剩下的单腿自然成为下一组动作。强平单绕过闸门（现有 `fill_margin=0`）。
 
-不持久化派生量（向量、`used_margin`、`maintenance_margin` 都是 `(positions, open_orders, marks, params)` 的纯函数）。持久化 `margin_mode`（`RiskAccountSetPayload` 占 1 字节 `_pad`）与冲击参数版本号（可后置）。hydration 后从仓位 + 挂单重算；`reconcile.rs` 加一项一致性校验。
+## B6. 故障与降级
 
-## B8. 参数
-
-| 参数 | 来源 | 现值 / 建议 |
+| 故障 | 处理 | PM 特有 |
 |---|---|---|
-| MM 网格 `p_i` | `SymbolRules.maintenance_rate_bps` | 50 |
-| IM 网格 `p_i` | `1e4 / SymbolRules.default_leverage` | 1000 |
-| 背离比例 | env `PM_DIV_BPS=BTC:4000,ETH:4000,SOL:6000` | 待标定；1e4 = 无折扣 |
-| RU 冻结冲击放大 | env `PM_STALE_MULT_BPS` | 20000 |
-| 单账户 RU 上限 | 常量 `MAX_PM_RUS = 4` | 超出降级 Σ |
-| 强平 in-flight | env `LIQ_INFLIGHT_MS` | 50 |
-| 强平停止缓冲 | env `LIQ_STOP_BUFFER_BPS` | 1000 |
-| 账户模式 | `risk_accounts.margin_mode` | 默认 0 |
+| 引擎主机宕机 / 分区 | 现有：B5 冻结该 symbol 强平；发布失败拒单 | **冻结该 RU**：其上风险上升单拒绝；持仓按最后 mark 估值、冲击 × `PM_STALE_MULT`；其他 RU 照常 |
+| product desk 宕机（mark 发布者） | 同上 RU 冻结 | 可选：owner 退回 depth 自算 mark 兜底一个版本 |
+| PM desk 宕机 | 其用户不能交易；重启 hydration 后从仓位 + 挂单重算向量；未完成前拒单，完成后先全量 tick 再开闸 | 或用 A4 协议把账户迁到另一台 PM desk（计划内）；非计划宕机的自动接管 = HA 课题，epoch 已就绪 |
+| 普通 desk 宕机 | 现状 | 无 |
+| 目录不一致（edge 缓存旧值） | 转发到旧 owner → 被 epoch 拒 → edge 重查目录重发一次 | — |
 
-`div_bps` 标定：历史 1s/10s 窗口内两 RU 收益率之差的高分位除以 `p_i`，需要行情数据，属上线前标定。
+## B7. 否决
+
+PM 进引擎（无组合视图、百纳秒预算）；独立计算型 risk-engine（多一跳 + 第二写者）；状态复制到所有 desk（有可见性无互斥）；风控撮合同机（无往返）；quota lease 作主路径（亲和连接更便宜；保留 plan B）；各 desk 自算 mark。
 
 ---
 
-# C. 落地顺序（每步独立验证、独立提交）
+# C. 产品无关的情景内核（risk-core 库）
+
+## C1. 设计边界
+
+- **内核只认三样东西**：因子（factor）、腿（leg）的损益形状（payoff）、情景（scenario）。它不认识"perp / 现货 / RWA / 预测"这些产品名。
+- 产品接入 = 把它的持仓映射成若干腿，每腿声明 `(factor, payoff)`。内核零改动。这是参考文档 "enum over axis kinds, not products" 的思想，但用 **闭集枚举 + 纯数据** 实现，不用 `dyn Trait`（热路径无虚调用、可 SoA）。
+
+```rust
+pub struct FactorId(u16);                       // BTC, ETH, NVDA, USDC_PEG, EVENT_1234 …
+pub enum Payoff {                               // 闭集，很少增加
+    Linear  { signed_notional_atoms: i64 },     // perp、现货余额、线性 RWA
+    Binary  { qty_lots: i64, payout_atoms: i64, cur_prob_bps: i64 }, // 预测头寸：跳到 0 / 1
+    // 后续：Option { … } 等
+}
+pub struct Leg { pub factor: FactorId, pub payoff: Payoff }
+
+pub enum Axis {                                 // 闭集
+    Price { p_bps: i64, d_bps: i64 },           // 全额冲击 + 背离冲击（块内联动）
+    Jump  { points_bps: SmallVec<[i64; 4]> },   // 离散跳变：depeg、RWA 缺口、预测结算
+}
+pub struct Factor { pub id: FactorId, pub block: BlockId, pub axes: SmallVec<[Axis; 2]>, pub frozen: bool }
+```
+
+## C2. 情景与损失向量
+
+- 因子按 **相关块**（`BlockId`）分组：加密块 {BTC, ETH, SOL…}、美股块 {NVDA, AAPL…}、每个预测事件自成一块、稳定币锚定自成一块。块内因子联动（主方向 × 背离子集，v3/v4 的生成规则），块间独立。
+- 每块生成自己的情景集 `S_b`（Price 轴 2·2^k，Jump 轴逐点枚举，≤ 32）。每腿在其块的情景下算损失向量：Linear 闭式 `notional × shock`；Binary 在 Jump 点上 `qty × (payout × point − 当前价值)`。
+- **块内可加**：同块各腿向量逐元素相加；加腿/减腿/撤单是向量加减，O(S_b)。
+
+## C3. 相关块分解（避免情景爆炸的关键）
+
+组合损失 = Σ_块 块内损失，块间情景独立（笛卡尔积），于是
+
+```
+max_s Σ_b loss_b(s_b) = Σ_b max_{s_b} loss_b(s_b)
+```
+
+**组合需求量 = 各块最坏损失之和。** 永远不需要跨块联合枚举。一个用户持有 4 个加密 RU + 3 个美股 RU + 10 个预测事件，情景总数是 32 + 16 + 10×2，不是 32 × 16 × 2^10。参考文档把这一点表述为"相关矩阵稀疏 → 子空间重估"；这里把它做成结构：块是一等公民，块内枚举、块间求和。代价：块间不给分散收益（BTC 与 NVDA 同跌不抵消）——这正是危机中应有的保守。
+
+账户缓存：`SmallVec<[BlockState; 4]>`，每块一个 `{block, ru_order, pos_im, pos_mm, pending_im}`，`used_margin = Σ worst(pos_im)`，`maintenance_margin = Σ worst(pos_mm)`。
+
+## C4. 网格与参数
+
+- MM 网格 `p = maintenance_rate_bps`（现值 50），IM 网格 `p = 1e4/leverage`（现值 1000）→ 单仓 PM 账户与现状逐 atom 一致，灰度可对比。
+- 背离 `d = p × div_bps`（`PM_DIV_BPS=BTC:4000,…`；1e4 = 无对冲折扣 = 相关性失效压力测试）。
+- Jump 点按因子配置（`USDC_PEG: [−500, −1000]`，预测事件 `[−cur, +（1e4−cur）]`）。
+- RU 冻结冲击放大 `PM_STALE_MULT_BPS=20000`；`MAX_PM_RUS_PER_BLOCK=4`，超出该块降级为块内 Σ。
+
+## C5. 前置、慢路径、强平（与 v4 相同，按块执行）
+
+- 前置：`marginal = worst_b(pos+pending+order) − worst_b(pos+pending)`，只算订单所在块；`≤ 0` 不设闸门（平仓、减仓、对冲），`MarginCall` 也放行；冻结因子上的风险上升单拒绝。通过后 `pending += v_order`（并发对冲单只有第一笔拿折扣）。
+- `on_fill` / `update_mark_price`：只重算受影响块，O(S_b)；`get_mut(acct)` + 键控 `positions.get`，无嵌套迭代。
+- `run_risk_tick` 三段式不动。
+- 强平候选：单腿 tranche、块内对冲对成对 tranche；`Δmm = worst_b(V) − worst_b(V − v_action)`；按 `Δmm / 释放名义额` 排序；全部 `Δmm ≤ 0` → 整体按比例减仓；冻结因子的腿不参与；ADL 削对手方前检查不破坏其对冲。
+
+## C6. 可解释性 API（PM desk 提供）
+
+`GET /api/pm/margin` 返回：每块的约束情景（哪个方向、哪些 RU 背离）、每腿在该情景下的损失、`Σ 独立 IM − 组合 IM` 的对冲节省、以及"再加 X 名义额的 Y 腿"的边际（前置函数同款）。全部来自已缓存的向量，O(腿数 × S_b)。
+
+## C7. 持久化与恢复
+
+不持久化派生量；持久化 `margin_mode`、`account_home`、参数版本。hydration 从仓位 + 挂单 + mark 重算；`reconcile.rs` 校验一致性。
+
+---
+
+# D. 多产品路线（内核不变，每阶段只加"腿的映射"和"块"）
+
+| 阶段 | 产品 | 新增 | 内核改动 |
+|---|---|---|---|
+| 1 | USDT 本位 perp（现在） | 加密块，Linear 腿，Price 轴 | 无（首个实现） |
+| 2 | 现货 + 统一账户 | 多币种余额：每个非 USDT 余额是一条 Linear 腿（`signed_notional = +qty × mark`），参与同块情景 → **现货 BTC + 空 BTC perp 自动对冲**，haircut 由冲击替代；权益 = Σ 余额 × mark + 未实现；强平新增"卖抵押品结清 USDT 亏损"瀑布（只在 USDT 不足时触发） | 无 |
+| 3 | RWA（美股等） | 美股块；Price + Jump(缺口) 轴；交易时段外因子置 `frozen`（复用 RU 冻结路径：拒开仓、放宽冲击、不强平）；发行方 / 托管信用限额是 desk 层的仓位上限，不进内核 | 无 |
+| 4 | 预测市场 | 每事件一块；Binary 腿；Jump 到 0/1；结算 = 一次 Jump 落地成成交；无可靠结算源的事件不接受为抵押 | 无 |
+| 5 | 期权 / 非线性 | `Payoff::Option`，Price + Vol 轴 | 加一个枚举分支 |
+
+阶段 2 是拐点：多币种权益与抵押品瀑布是账本层的改动（`account.rs`、pg-writer 表结构），比风控内核工作量大，应单独立项。
+
+---
+
+# E. 落地顺序
 
 | 步 | 改动 | 验证 |
 |---|---|---|
-| 0a | 多引擎端点表 `ENGINE_ENDPOINTS` / `DESK_ENDPOINTS`（A3） | UDP 模式两台引擎主机各跑一个 symbol，desk 双向收发 |
-| 0b | `MarkPrice` 流（A4）：product desk 发布，所有 desk 订阅；owner 的 `update_mark_price` 换输入 | 四个 desk 对同一 symbol 的 mark 逐 tick 相等；B5 冻结检测仍生效 |
-| 0c | owner 亲和连接（A6）：登录响应带 `owner_desk_url`，客户端重连 | 40K 压测 forward 占比 → ~0；p50/p99 与 no-forward 基线一致 |
-| 1 | `calc.rs` 内核纯函数（B3） | 单仓 MM/IM 与现公式逐 atom 相等；对冲折扣 = `1 − d/p`；同向无折扣；`div=1e4` 归零；可加性；i128 无溢出 |
-| 2 | 账户新字段；`on_fill` / `update_mark_price` 维护向量（B4/B5） | 对冲组合 Σ 模式 `LiquidationPending`、PM 模式 `Normal`；mark 变动后向量与重算一致；40K×2 tick 不回归 |
-| 3 | 前置边际 IM（三个调用点）+ `pending_losses_im` + RU 冻结拒单 | 对冲单冻结 = 边际；平仓单 `MarginCall` 放行；并发对冲单只有第一笔拿折扣；冻结 RU 拒风险上升单、放行减仓单 |
-| 4 | 有序强平 + 成对减仓 + 收敛检查 + in-flight 守卫 + ADL 保护（B6/A7） | 对冲对成对 IOC 到两个引擎；一腿未成交时下一组动作正确；越平越糟时整体减仓；回安全后停止 |
-| 5 | `margin_mode` 持久化 / hydration / reconcile（B7） | 重启后 PM 账户 MM 与重启前一致 |
+| 0a | `ENGINE_ENDPOINTS` / `DESK_ENDPOINTS` | 两台引擎主机各跑 symbol，desk 双向收发 |
+| 0b | `MarkPrice` 流 | 所有 desk 同 symbol 的 mark 逐 tick 相等 |
+| 0c | owner 亲和连接（登录返回 `owner_desk_url`） | 40K 压测 forward 占比 ≈ 0 |
+| 0d | 账户目录 + `resolve_owner` + 去掉 `desk_id % 4` 环绕 + `DESK_ROLE` 开关 | 目录 miss 走 modulo；PM desk 8 收到目录用户的转发；epoch 低的帧被拒 |
+| 1 | `risk-core` 库：Factor / Leg / Payoff / Axis / 块情景生成 / 损失向量 / `worst` 纯函数 | 单仓与现公式逐 atom 相等；对冲折扣 `1 − d/p`；同向无折扣；块分解 = 联合枚举的上界且相等（独立块）；Binary 腿 Jump 损失；i128 无溢出 |
+| 2 | PM desk 账户块缓存；`on_fill` / `update_mark_price` 维护 | 对冲组合 Σ 模式 `LiquidationPending`、PM 模式 `Normal`；40K×2 tick 不回归（普通 desk 路径不变） |
+| 3 | 前置边际 IM（PM desk 的三个入口）+ pending + 因子冻结拒单 | 边际冻结、平仓放行、并发对冲单单次折扣、冻结因子行为 |
+| 4 | 有序强平 + 成对减仓 + 收敛检查 + in-flight + ADL 保护 | 跨引擎成对 IOC；一腿未成交的续动作；整体减仓；回安全停止 |
+| 5 | 在线迁移协议 A4 + `HomeSet` PersistEvent + 客户端 `rehome` | 普通 → PM → 普通 往返，持仓不变、挂单撤销、epoch 拒旧 owner |
+| 6 | `margin_mode` / `account_home` 持久化、hydration、reconcile、C6 API | 重启后一致；API 输出与内部一致 |
 
-0a/0b/0c 三步彼此独立、与 PM 独立，可以并行或提前做；1-3 完成即可灰度"对冲少冻 + 组合 MM"；4-5 是安全闭环，上线前必须完成。
-
----
-
-# D. 参考文档的取舍
-
-采纳：一个情景内核、对冲收益涌现（B1-B3）；前置按 `req_after vs req_before` 判方向、降风险单不设闸门（B4）；相关性失效 = 参数（B2）；强平按边际贡献排序、成对解除、收敛检查（B6）；ADL 不削对手方对冲腿（B6）；因子冻结而非猜价（A8）；IM 用更保守网格而非 MM × 系数（B2）。
-
-不采纳及原因：`Instrument` trait / `Axis` 枚举（只有线性 perp）；500K 组合的 SoA / SIMD 预筛 / 自适应频率（40K + DashMap + 10ms tick 已够，倒排索引已有）；多币种抵押、抵押品瀑布、RWA、预测市场（范围外）；风控与撮合同机（本系统无往返，A5/A9）；"检测快执行慢"的待强平队列（执行是 µs 级）；L2 / 排序器 / 预言机聚合章节（已有 index 冻结 + mark 钳制）；ES 分位数（S ≤ 32 取 max）。强平结算价政策（破产价接管 vs 按实际成交退还）是它提出的好问题，但属独立产品决策，现状为接管制，不在 PM 范围内。
+0a-0d 彼此独立、与 PM 独立；1-3 灰度"对冲少冻 + 组合 MM"；4-6 上线前必须。阶段 2 产品（现货）另立计划。
 
 ---
 
-# E. 假设（未与需求方确认，按此实现）
+# F. 参考文档的取舍
 
-1. 单一 USDT 抵押品。
-2. 引擎按 symbol 分布在若干主机，一个 symbol 只在一个引擎；desk 与引擎可不同机。
-3. RU = base asset；情景集为"主方向 × 背离子集"，背离幅度按 RU 配置。
-4. PM 为账户级 opt-in；单仓 PM 账户与现状逐 atom 一致。
-5. 单账户最多 4 个 RU 参与情景集，超出降级 Σ 模式。
-6. 挂单未成交部分计入 IM 向量；降风险单不设闸门，但 `Liquidating` 及之后状态仍拒绝用户订单。
-7. 一个 symbol 的 mark 只有一个发布者（product desk）。
-8. 不引入新二进制、新线程；新增一条 Aeron 小流（MarkPrice）与两张端点表；所有风控改动在 owner 的 `RiskEngine` 及其三个调用点内。
+采纳：情景内核、对冲收益涌现；product-blind（闭集轴 + 腿注册）；按 `Δ需求量` 判风险方向、降风险单不设闸门；相关性失效 = 参数；强平边际贡献排序、成对解除、收敛检查；ADL 不削对手方对冲腿；因子冻结而非猜价；IM 用更保守网格；Jump 轴表达 depeg / 缺口 / 预测结算；抵押品与持仓同一内核（阶段 2）。
+
+不采纳：`dyn Instrument` trait（用闭集枚举 + 纯数据）；500K 组合的 SoA / SIMD 预筛 / 自适应频率（PM 用户量级不需要；倒排索引已有）；风控撮合同机（无往返）；待强平队列（执行 µs 级）；L2 / 排序器 / 预言机聚合（已有 index 冻结 + mark 钳制）；ES 分位数。强平结算价政策（接管 vs 退还）是独立产品决策，现状接管制。
+
+---
+
+# G. 假设
+
+1. 阶段 1 单一 USDT 抵押品；多币种在阶段 2。
+2. 一个 symbol 只在一个引擎，一个引擎可多个 symbol；desk 与引擎可不同机；mark 只由 product desk 发布。
+3. PM desk 与普通 desk 同一二进制、`DESK_ROLE` 区分；PM desk 的 `desk_id` 从 8 起，不进 modulo 环。
+4. 账户目录 miss 默认 modulo；目录只存 PM 账户。
+5. 模式切换撤销挂单、保留持仓；切换期间该账户拒单。
+6. 块内最多 4 个 RU 参与联合枚举，超出该块降级块内 Σ；块间不给分散收益。
+7. 挂单未成交部分计入 IM 向量；`Liquidating` 及之后状态拒绝用户订单。
+8. 不引入新二进制；新增一条 Aeron 小流、一张目录表、两张端点表、一个 `risk-core` 库 crate。

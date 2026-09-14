@@ -3,19 +3,20 @@ use crate::order::{PriceTicks, QuantityLots};
 use crate::orderbook::{OrderBook, PriceLevel as OrderBookPriceLevel};
 
 const MAX_LEVEL: usize = 12;
-const NONE: usize = usize::MAX;
+type NodeIndex = u32;
+const NONE: NodeIndex = NodeIndex::MAX;
 // Level promotion probability is 1/4, implemented as a 2-bit draw in
 // random_level (deterministic xorshift64*).
 
 /// 跳表节点 - 使用稳定的 arena 索引支持多级链接
-#[repr(C)]
+#[repr(C, align(64))]
 pub struct SkipListNode {
     pub price_ticks: PriceTicks,
     pub total_quantity_lots: QuantityLots,
     pub orders: PooledList,
     pub level: usize,
     /// 各级下一个节点在 arena 中的索引
-    pub forward: [usize; MAX_LEVEL],
+    pub forward: [NodeIndex; MAX_LEVEL],
 }
 
 impl SkipListNode {
@@ -41,7 +42,7 @@ pub enum SortOrder {
 /// 跳表实现 - 节点和链接都使用稳定的 arena 索引
 pub struct SkipList {
     /// head sentinel 在 arena 中的索引
-    pub head: usize,
+    pub head: NodeIndex,
     /// 当前跳表的最大层级
     level: usize,
     /// 节点总数（不含head sentinel）
@@ -53,7 +54,7 @@ pub struct SkipList {
     /// Arena - 所有 SkipListNode 的唯一所有者
     arena: Vec<SkipListNode>,
     /// Unlinked price-level nodes available for reuse.
-    free_nodes: Vec<usize>,
+    free_nodes: Vec<NodeIndex>,
     /// Deterministic xorshift64* state for level promotion. Seeded with a
     /// fixed constant so replaying the same insert sequence reproduces the
     /// identical internal structure — a prerequisite for bit-exact
@@ -65,6 +66,22 @@ pub struct SkipList {
 }
 
 impl SkipList {
+    #[inline(always)]
+    fn node(&self, index: NodeIndex) -> &SkipListNode {
+        debug_assert!((index as usize) < self.arena.len());
+        // SAFETY: head, forward links, and free-list entries are created only
+        // from valid arena indices. Nodes are never removed from the middle.
+        unsafe { self.arena.get_unchecked(index as usize) }
+    }
+
+    #[inline(always)]
+    fn node_mut(&mut self, index: NodeIndex) -> &mut SkipListNode {
+        debug_assert!((index as usize) < self.arena.len());
+        // SAFETY: same index invariant as node(); mutable access is scoped to
+        // one node at a time and no arena growth occurs while it is borrowed.
+        unsafe { self.arena.get_unchecked_mut(index as usize) }
+    }
+
     /// 创建新跳表，指定链表节点池的容量
     pub fn new_with_pool(order: SortOrder, pool_capacity: usize) -> Self {
         let head_price = if order == SortOrder::Ascending {
@@ -73,7 +90,8 @@ impl SkipList {
             PriceTicks::MAX
         };
 
-        let mut arena = Vec::with_capacity(1000);
+        let arena_capacity = pool_capacity.clamp(1_000, 16_384).saturating_add(1);
+        let mut arena = Vec::with_capacity(arena_capacity);
         arena.push(SkipListNode::new(head_price, MAX_LEVEL - 1));
 
         Self {
@@ -111,19 +129,19 @@ impl SkipList {
     }
 
     /// find_update辅助函数 - 返回所有级别的前驱节点索引
-    fn find_update(&self, price: PriceTicks) -> [usize; MAX_LEVEL] {
+    fn find_update(&self, price: PriceTicks) -> [NodeIndex; MAX_LEVEL] {
         let mut update = [0; MAX_LEVEL];
         let mut current = self.head;
 
         // 从最高层向下遍历
         for i in (0..=self.level).rev() {
             loop {
-                let fwd = self.arena[current].forward[i];
+                let fwd = self.node(current).forward[i];
                 if fwd == NONE {
                     break;
                 }
 
-                let fwd_price = self.arena[fwd].price_ticks;
+                let fwd_price = self.node(fwd).price_ticks;
 
                 // 如果目标价格已经在下一个节点，停止
                 if fwd_price == price {
@@ -168,16 +186,16 @@ impl SkipList {
     #[inline]
     pub fn get_node_at_price(&self, price: PriceTicks) -> Option<&SkipListNode> {
         let update = self.find_update(price);
-        let index = self.arena[update[0]].forward[0];
-        (index != NONE && self.arena[index].price_ticks == price).then(|| &self.arena[index])
+        let index = self.node(update[0]).forward[0];
+        (index != NONE && self.node(index).price_ticks == price).then(|| self.node(index))
     }
 
     /// 获取指定价格的可变节点引用
     #[inline]
     pub fn get_node_mut(&mut self, price: PriceTicks) -> Option<&mut SkipListNode> {
         let update = self.find_update(price);
-        let index = self.arena[update[0]].forward[0];
-        (index != NONE && self.arena[index].price_ticks == price).then(|| &mut self.arena[index])
+        let index = self.node(update[0]).forward[0];
+        (index != NONE && self.node(index).price_ticks == price).then(|| self.node_mut(index))
     }
 
     /// 插入价格档位节点
@@ -191,26 +209,28 @@ impl SkipList {
     }
 
     /// 一次查找返回已有档位，或在同一次查找结果上插入新档位。
-    fn get_or_insert_level(&mut self, price: PriceTicks) -> (usize, bool) {
+    fn get_or_insert_level(&mut self, price: PriceTicks) -> (NodeIndex, bool) {
         let update = self.find_update(price);
-        let existing = self.arena[update[0]].forward[0];
-        if existing != NONE && self.arena[existing].price_ticks == price {
+        let existing = self.node(update[0]).forward[0];
+        if existing != NONE && self.node(existing).price_ticks == price {
             return (existing, false);
         }
 
         let new_level = self.random_level();
         let new_index = if let Some(index) = self.free_nodes.pop() {
-            self.arena[index] = SkipListNode::new(price, new_level);
+            self.arena[index as usize] = SkipListNode::new(price, new_level);
             index
         } else {
-            let index = self.arena.len();
+            let index = NodeIndex::try_from(self.arena.len())
+                .expect("SkipList price-level arena exceeds u32 index space");
             self.arena.push(SkipListNode::new(price, new_level));
             index
         };
 
         for (level, predecessor) in update.iter().copied().enumerate().take(new_level + 1) {
-            self.arena[new_index].forward[level] = self.arena[predecessor].forward[level];
-            self.arena[predecessor].forward[level] = new_index;
+            let successor = self.node(predecessor).forward[level];
+            self.node_mut(new_index).forward[level] = successor;
+            self.node_mut(predecessor).forward[level] = new_index;
         }
 
         self.level = self.level.max(new_level);
@@ -230,19 +250,19 @@ impl SkipList {
     /// 获取最优价格节点（头部）
     #[inline(always)]
     pub fn best(&self) -> Option<&SkipListNode> {
-        let next = self.arena[self.head].forward[0];
-        (next != NONE).then(|| &self.arena[next])
+        let next = self.node(self.head).forward[0];
+        (next != NONE).then(|| self.node(next))
     }
 
     /// 获取最优且有订单的价格节点（跳过空的价格档位）
     #[inline]
     pub fn best_with_orders(&self) -> Option<&SkipListNode> {
-        let mut next = self.arena[self.head].forward[0];
+        let mut next = self.node(self.head).forward[0];
         while next != NONE {
-            if !self.arena[next].orders.is_empty() {
-                return Some(&self.arena[next]);
+            if !self.node(next).orders.is_empty() {
+                return Some(self.node(next));
             }
-            next = self.arena[next].forward[0];
+            next = self.node(next).forward[0];
         }
         None
     }
@@ -255,16 +275,14 @@ impl SkipList {
         order_id: u64,
         quantity: QuantityLots,
     ) -> Result<usize, String> {
-        let node_idx = self
-            .list_pool
-            .acquire(order_id, quantity)
-            .ok_or_else(|| "List pool exhausted".to_string())?;
+        let node_idx = self.list_pool.acquire(order_id, quantity);
 
         let (level_index, _) = self.get_or_insert_level(price);
-        self.arena[level_index]
-            .orders
-            .push_back(node_idx, &mut self.list_pool);
-        self.arena[level_index].total_quantity_lots += quantity;
+        debug_assert!((level_index as usize) < self.arena.len());
+        // SAFETY: get_or_insert_level returns a valid arena index.
+        let level = unsafe { self.arena.get_unchecked_mut(level_index as usize) };
+        level.orders.push_back(node_idx, &mut self.list_pool);
+        level.total_quantity_lots += quantity;
         Ok(node_idx)
     }
 
@@ -275,6 +293,25 @@ impl SkipList {
         order_id: u64,
         node_idx: usize,
     ) -> Result<(), String> {
+        self.remove_order(price, order_id, node_idx, false)
+    }
+
+    pub(crate) fn remove_order_and_empty_level(
+        &mut self,
+        price: PriceTicks,
+        order_id: u64,
+        node_idx: usize,
+    ) -> Result<(), String> {
+        self.remove_order(price, order_id, node_idx, true)
+    }
+
+    fn remove_order(
+        &mut self,
+        price: PriceTicks,
+        order_id: u64,
+        node_idx: usize,
+        remove_empty_level: bool,
+    ) -> Result<(), String> {
         let quantity = self
             .list_pool
             .get(node_idx)
@@ -282,16 +319,42 @@ impl SkipList {
             .map(|node| node.quantity_lots)
             .ok_or_else(|| format!("Order {} not found at price level {}", order_id, price))?;
         let update = self.find_update(price);
-        let level_index = self.arena[update[0]].forward[0];
-        if level_index == NONE || self.arena[level_index].price_ticks != price {
+        let level_index = self.node(update[0]).forward[0];
+        if level_index == NONE || self.node(level_index).price_ticks != price {
             return Err(format!("Price level {} not found", price));
         }
-        self.arena[level_index]
-            .orders
-            .remove(node_idx, &mut self.list_pool);
-        self.arena[level_index].total_quantity_lots -= quantity;
+        debug_assert!((level_index as usize) < self.arena.len());
+        // SAFETY: find_update returned a valid, matching arena index.
+        let level = unsafe { self.arena.get_unchecked_mut(level_index as usize) };
+        level.orders.remove(node_idx, &mut self.list_pool);
+        level.total_quantity_lots -= quantity;
+        let level_empty = level.orders.is_empty();
         self.list_pool.release(node_idx);
+        if remove_empty_level && level_empty {
+            self.unlink_level(&update, level_index);
+        }
         Ok(())
+    }
+
+    fn unlink_level(&mut self, update: &[NodeIndex; MAX_LEVEL], target: NodeIndex) {
+        let node_level = self.node(target).level;
+        for (level, predecessor) in update.iter().copied().enumerate().take(node_level + 1) {
+            if self.node(predecessor).forward[level] == target {
+                let successor = self.node(target).forward[level];
+                self.node_mut(predecessor).forward[level] = successor;
+            }
+        }
+
+        while self.level > 0 && self.node(self.head).forward[self.level] == NONE {
+            self.level -= 1;
+        }
+
+        self.count -= 1;
+        self.node_mut(target).orders.clear();
+        self.node_mut(target).total_quantity_lots = 0;
+        self.node_mut(target).forward = [NONE; MAX_LEVEL];
+        self.free_nodes.push(target);
+        self.best_price = None;
     }
 
     /// Reduce the visible resting quantity for an order that was partially
@@ -319,39 +382,24 @@ impl SkipList {
     /// 移除整个价格档位（从所有级别移除）
     pub fn remove_level(&mut self, price: PriceTicks) -> Result<(), String> {
         let update = self.find_update(price);
-        let target = self.arena[update[0]].forward[0];
-        if target == NONE || self.arena[target].price_ticks != price {
+        let target = self.node(update[0]).forward[0];
+        if target == NONE || self.node(target).price_ticks != price {
             return Err("Price not found".into());
         }
 
-        let node_level = self.arena[target].level;
-        for (level, predecessor) in update.iter().copied().enumerate().take(node_level + 1) {
-            if self.arena[predecessor].forward[level] == target {
-                self.arena[predecessor].forward[level] = self.arena[target].forward[level];
-            }
-        }
-
-        while self.level > 0 && self.arena[self.head].forward[self.level] == NONE {
-            self.level -= 1;
-        }
-
-        self.count -= 1;
-        let mut order_idx = self.arena[target].orders.front();
+        let mut order_idx = self.node(target).orders.front();
         while let Some(idx) = order_idx {
             order_idx = self.list_pool.get(idx).and_then(|node| node.next);
             self.list_pool.release(idx);
         }
-        self.arena[target].orders.clear();
-        self.arena[target].total_quantity_lots = 0;
-        self.arena[target].forward = [NONE; MAX_LEVEL];
-        self.free_nodes.push(target);
+        self.unlink_level(&update, target);
 
         Ok(())
     }
 
     /// 清空跳表
     pub fn clear(&mut self) {
-        self.arena[self.head].forward = [NONE; MAX_LEVEL];
+        self.node_mut(self.head).forward = [NONE; MAX_LEVEL];
         self.arena.truncate(1);
         self.free_nodes.clear();
         self.list_pool.clear();
@@ -386,9 +434,9 @@ impl SkipList {
     /// 获取前N个价格档位（用于生成快照）
     pub fn get_top_levels(&self, limit: usize) -> Vec<(PriceTicks, QuantityLots)> {
         let mut result = Vec::new();
-        let mut next = self.arena[self.head].forward[0];
+        let mut next = self.node(self.head).forward[0];
         while result.len() < limit && next != NONE {
-            let node = &self.arena[next];
+            let node = self.node(next);
             result.push((node.price_ticks, node.total_quantity_lots));
             next = node.forward[0];
         }
@@ -400,9 +448,9 @@ impl SkipList {
     /// entries written. This avoids heap allocation in hot snapshot paths.
     pub fn fill_top_levels(&self, out: &mut [(PriceTicks, QuantityLots)]) -> usize {
         let mut written = 0;
-        let mut next = self.arena[self.head].forward[0];
+        let mut next = self.node(self.head).forward[0];
         while written < out.len() && next != NONE {
-            let node = &self.arena[next];
+            let node = self.node(next);
             out[written] = (node.price_ticks, node.total_quantity_lots);
             written += 1;
             next = node.forward[0];
@@ -421,9 +469,9 @@ impl SkipList {
         buy_taker: bool,
     ) -> bool {
         let mut available: QuantityLots = 0;
-        let mut next = self.arena[self.head].forward[0];
+        let mut next = self.node(self.head).forward[0];
         while next != NONE {
-            let node = &self.arena[next];
+            let node = self.node(next);
             let acceptable = is_market
                 || if buy_taker {
                     limit_price >= node.price_ticks
@@ -624,16 +672,16 @@ mod tests {
         // 验证不是所有节点都在level 0（概率很小会全在level 0）
         // 这个测试可能偶尔失败，但概率极低
         let mut has_higher_levels = false;
-        let mut next = sl.arena[sl.head].forward[0];
+        let mut next = sl.node(sl.head).forward[0];
         for _ in 0..100 {
             if next == NONE {
                 break;
             }
-            if sl.arena[next].level > 0 {
+            if sl.node(next).level > 0 {
                 has_higher_levels = true;
                 break;
             }
-            next = sl.arena[next].forward[0];
+            next = sl.node(next).forward[0];
         }
         assert!(has_higher_levels, "Should have some nodes at higher levels");
     }
@@ -795,15 +843,15 @@ mod tests {
 
         // 验证level 0是升序的
         let mut prev = i64::MIN;
-        let mut next = sl.arena[sl.head].forward[0];
+        let mut next = sl.node(sl.head).forward[0];
         for _ in 0..prices.len() {
             if next == NONE {
                 break;
             }
-            let price = sl.arena[next].price_ticks;
+            let price = sl.node(next).price_ticks;
             assert!(price > prev, "Level 0 should be sorted ascending");
             prev = price;
-            next = sl.arena[next].forward[0];
+            next = sl.node(next).forward[0];
         }
     }
 
@@ -819,15 +867,15 @@ mod tests {
 
         // 验证level 0是降序的
         let mut prev = i64::MAX;
-        let mut next = sl.arena[sl.head].forward[0];
+        let mut next = sl.node(sl.head).forward[0];
         for _ in 0..prices.len() {
             if next == NONE {
                 break;
             }
-            let price = sl.arena[next].price_ticks;
+            let price = sl.node(next).price_ticks;
             assert!(price < prev, "Level 0 should be sorted descending");
             prev = price;
-            next = sl.arena[next].forward[0];
+            next = sl.node(next).forward[0];
         }
     }
 

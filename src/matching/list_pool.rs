@@ -50,17 +50,32 @@ impl ListNodePool {
 
     /// 从池中获取一个节点
     #[inline]
-    pub fn acquire(&mut self, order_id: u64, quantity_lots: QuantityLots) -> Option<usize> {
-        self.free_indices.pop().map(|idx| {
-            self.nodes[idx] = ListNode {
-                order_id,
-                quantity_lots,
-                next: None,
-                prev: None,
-            };
-            self.allocated += 1;
-            idx
-        })
+    pub fn acquire(&mut self, order_id: u64, quantity_lots: QuantityLots) -> usize {
+        if self.free_indices.is_empty() {
+            self.grow();
+        }
+        let idx = self.free_indices.pop().unwrap();
+        self.nodes[idx] = ListNode {
+            order_id,
+            quantity_lots,
+            next: None,
+            prev: None,
+        };
+        self.allocated += 1;
+        idx
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let old_capacity = self.capacity;
+        let new_capacity = old_capacity.max(1).saturating_mul(2);
+        assert!(
+            new_capacity > old_capacity,
+            "ListNodePool capacity overflow"
+        );
+        self.nodes.resize(new_capacity, ListNode::default());
+        self.free_indices.extend(old_capacity..new_capacity);
+        self.capacity = new_capacity;
     }
 
     /// 将节点返还到池中
@@ -99,6 +114,29 @@ impl ListNodePool {
         self.free_indices.clear();
         self.free_indices.extend(0..self.capacity);
         self.allocated = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grows_from_zero_without_invalidating_existing_indices() {
+        let mut pool = ListNodePool::new(0);
+        let first = pool.acquire(1, 10);
+        let second = pool.acquire(2, 20);
+
+        assert_ne!(first, second);
+        assert_eq!(pool.get(first).unwrap().order_id, 1);
+        assert_eq!(pool.get(second).unwrap().order_id, 2);
+        assert!(pool.capacity() >= 2);
+        assert_eq!(pool.allocated_count(), 2);
     }
 }
 

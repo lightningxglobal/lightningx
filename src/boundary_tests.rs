@@ -124,22 +124,19 @@ mod tests {
     }
 
     #[test]
-    fn test_order_pool_exhaustion() {
+    fn test_order_pool_growth() {
         let pool_config = PoolConfig {
             order_capacity: 10, // 很小的容量
             ..PoolConfig::default()
         };
         let mut engine = MatchingEngine::new(pool_config).unwrap();
 
-        // 尝试添加超过容量的订单
+        // 超过初始容量后必须扩容，不能拒单。
         for i in 0..20 {
             let order = Order::new(i, Side::Buy, 100 + i as i64, 10, TimeInForce::GTC, 0);
-            let result = engine.place_order(order);
-            // 应该能够优雅地处理，而不是崩溃
-            if result.is_err() {
-                // 池已满，预期行为
-                break;
-            }
+            engine.place_order(order).unwrap();
         }
+        assert_eq!(engine.stats().total_orders, 20);
+        assert!(engine.stats().pools.orders_capacity >= 20);
     }
 }

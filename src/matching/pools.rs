@@ -30,11 +30,23 @@ impl<T: Default> ObjectPool<T> {
 
     /// 从池中获取对象，返回索引
     #[inline(always)]
-    pub fn acquire(&mut self) -> Option<usize> {
-        self.free_indices.pop().map(|idx| {
-            self.allocated += 1;
-            idx
-        })
+    pub fn acquire(&mut self) -> usize {
+        if self.free_indices.is_empty() {
+            self.grow();
+        }
+        let idx = self.free_indices.pop().unwrap();
+        self.allocated += 1;
+        idx
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let old_capacity = self.capacity;
+        let new_capacity = old_capacity.max(1).saturating_mul(2);
+        assert!(new_capacity > old_capacity, "ObjectPool capacity overflow");
+        self.objects.resize_with(new_capacity, T::default);
+        self.free_indices.extend((old_capacity..new_capacity).rev());
+        self.capacity = new_capacity;
     }
 
     /// 将对象返还到池中
@@ -93,11 +105,6 @@ impl Pools {
         }
     }
 
-    /// 检查是否有足够的资源
-    pub fn has_space_for_order(&self) -> bool {
-        self.orders.available_count() > 0 && self.queues.available_count() > 0
-    }
-
     /// 获取统计信息
     pub fn stats(&self) -> PoolStats {
         PoolStats {
@@ -120,4 +127,32 @@ pub struct PoolStats {
     pub trades_capacity: usize,
     pub queues_allocated: usize,
     pub queues_capacity: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grows_instead_of_returning_pool_exhaustion() {
+        let mut pool = ObjectPool::<u64>::new(1);
+        let first = pool.acquire();
+        let second = pool.acquire();
+
+        assert_ne!(first, second);
+        assert_eq!(pool.capacity, 2);
+        assert_eq!(pool.allocated_count(), 2);
+    }
+
+    #[test]
+    fn zero_capacity_pool_grows_and_preserves_indices() {
+        let mut pool = ObjectPool::<u64>::new(0);
+        let first = pool.acquire();
+        *pool.get_mut(first).unwrap() = 42;
+        let second = pool.acquire();
+
+        assert_eq!(pool.get(first), Some(&42));
+        assert_ne!(first, second);
+        assert!(pool.capacity >= 2);
+    }
 }

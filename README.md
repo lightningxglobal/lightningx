@@ -312,6 +312,8 @@ all buffers are pre-allocated (`SmallVec`, arena SkipList, rtrb ring buffers).
 
 Measured from the moment the server **receives** the client's WS frame to the moment the response WS frame **has been written to the socket** — the complete exchange-side processing, network transit excluded. Captured via beacon / HDR histogram tracing (`TRACER_ENABLED=1`) on an Apple M4 MacBook Pro at 40K concurrent WebSocket connections (4 desks × 10K, `DESK_SPIN=true`).
 
+> Persistence scope: these latency numbers include the enqueue/publication work performed by the request and order-update paths, but do **not** wait for `pg-writer`, a PostgreSQL transaction/WAL flush, Redis, or an Aeron Archive/replica commit. PostgreSQL is an asynchronous projection in this measurement. Reliable local-recording and remote-quorum commit modes must be benchmarked separately before their latency is included in this table.
+
 | Metric | P50 | P90 | P99 | P999 |
 |---|---|---|---|---|
 | **Apple M4 MacBook Pro (40K conns, 14-core)** | **20 µs** | **74 µs** | **709 µs** | — |

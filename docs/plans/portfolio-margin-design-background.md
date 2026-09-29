@@ -5,6 +5,8 @@
 > 状态：Accepted，后续架构和实现工作的共同背景
 >
 > 相关：[Portfolio Margin 系统设计](portfolio-margin-system-design.md)、[多方架构评审决策记录](portfolio-margin-brainstorm-decisions.md)
+>
+> 实施细化：[交易 WAL、提交点与合约内订单 ID 设计](matching-wal-order-id-design.md)
 
 ## 1. 为什么记录这份背景
 

@@ -5,6 +5,8 @@
 > 状态：Accepted，作为 [LightningX Portfolio Margin 系统设计](portfolio-margin-system-design.md) 的实施补充
 >
 > 目的：让后续开发与评审 Agent 使用同一组架构结论、约束和验收标准
+>
+> 背景：[交易核心与 Portfolio Margin 设计背景](portfolio-margin-design-background.md)
 
 ## 1. 评审问题
 

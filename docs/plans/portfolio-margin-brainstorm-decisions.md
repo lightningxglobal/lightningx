@@ -132,9 +132,50 @@ desk-server --Aeron IPC--> pm-risk-node --Aeron IPC/UDP--> Matcher
 
 跨机迁移只改变 `RiskShardDirectory` placement，不应改变资金协议。
 
-## 5. 复制策略的分歧与裁决
+## 5. 权威事实、通知完整性与复制策略
 
-### 5.1 默认生产 PM：同步 quorum
+### 5.1 不追求所有数据流同步完整
+
+客户端 WebSocket 是低延迟通知层，不是订单和账本的权威日志。允许断线、重复和个别事件缺失，客户端通过 `client_order_id`、sequence、REST snapshot/query 和 high watermark 做 reconciliation。WebSocket、PostgreSQL、Redis、报表或审计索引发送失败都不能阻塞或回滚撮合。
+
+可靠性分层如下：
+
+| 层级 | 示例 | 保证 |
+|---|---|---|
+| Tier 0 权威事实 | Matcher accepted/fill、Ledger、settlement、funding、insurance/ADL | 不允许最终丢失，可重放、去重、查询 |
+| Tier 1 可重建状态 | Risk reservation、scenario、available-margin cache | 允许内存丢失，恢复完成前冻结新增风险 |
+| Tier 2 查询投影 | PostgreSQL、Redis、历史索引 | 允许短暂滞后，必须追平并暴露 watermark |
+| Tier 3 通知 | Private WebSocket、余额和订单推送 | best effort，允许缺失和重复 |
+
+`accepted` 响应必须表示订单已进入可恢复的权威顺序域，而不是只进入临时网络队列。用户没有收到 WebSocket 更新时，可以查询权威订单状态；查询层若尚未追平指定 watermark，必须返回 lag/重试语义。
+
+行业公开接口只能证明客户端通知需要容错，不能据此推断交易所内部允许丢失订单或账务事实。OKX Orders channel 不提供订阅初始快照，连接异常需要重连，其更新日志还要求客户端处理重复订单消息；Binance User Data Stream 明确要求预期定期断线，同时提供订单 REST 查询接口。参考：[OKX API](https://www.okx.com/docs-v5/en/)、[OKX API changelog](https://www.okx.com/docs-v5/log_en/)、[Binance User Data Stream](https://developers.binance.com/en/docs/products/derivatives-trading-coin-futures/user-data-streams)、[Binance Portfolio Margin REST API](https://developers.binance.com/en/docs/catalog/advanced-trading-derivatives-trading-portfolio-margin/api/rest-api/trade)。
+
+### 5.2 只保留一个可靠核心提交点
+
+不能未经评估地把两个同步可靠性屏障串联在每笔订单上：
+
+```text
+Risk quorum commit -> Matcher durable/replicated accept
+```
+
+系统支持两种明确模式，并记录在 RiskGroup/shard 配置与 journal 中。
+
+#### `LATENCY_FIRST`
+
+```text
+Risk Leader memory reserve
+  -> issue permit
+  -> Matcher reliable accept（唯一核心提交点）
+  -> order may enter book/match
+  -> Risk standby asynchronous catch-up
+```
+
+Matcher 必须在订单可能产生经济效果前可靠记录完整 permit、reservation、约束和 order state。Risk Leader 故障后冻结整个 shard，从 Matcher/Ledger 权威日志重建，再恢复交易。这是用故障期可用性和 RTO 换取正常路径延迟。
+
+适用于健康、低杠杆、主流币 PM 或对延迟敏感且接受 shard 故障后暂停的专业账户，但只有 Matcher journal/replication 通过故障验收后才能启用。
+
+#### `FAST_RECOVERY`
 
 ```text
 calculate
@@ -144,11 +185,13 @@ calculate
   -> Matcher
 ```
 
-这是第一版生产 PM 默认。它避免 Leader 在 permit 发出后丢失 reservation，并提供较短 RTO。副本位于同 AZ、优先同 rack 的不同主机；跨地域仅异步 DR。
+它避免 Leader 在 permit 发出后丢失 reservation，并提供较短 RTO，但可能与 Matcher commit 形成两次串行屏障。适用于高杠杆、巨鲸、复杂期权/RWA/Prediction、接近 MM 或 Liquidating 的 RiskGroup。副本位于同 AZ、优先同 rack 的不同主机；跨地域仅异步 DR。
 
-### 5.2 异步复制：后续实验模式
+模式只能在明确的 RiskGroup sequence barrier 上切换，切换前排空或保守计入全部 in-flight permit，并持久化 mode/version；禁止逐笔根据当前延迟临时切换。
 
-异步 reservation 复制在理论上可以维持偿付安全，但会把证明责任转移给 Matcher、Ledger 和恢复协议。必须同时满足：
+### 5.3 `LATENCY_FIRST` 的安全前提
+
+异步 Risk reservation 复制会把安全证明转移给 Matcher、Ledger 和恢复协议，必须同时满足：
 
 1. Matcher 在订单能进入订单簿前可靠记录完整 permit、reservation 和 order state。
 2. Fill 有不可丢失、可查询的 execution record。
@@ -158,7 +201,7 @@ calculate
 6. 任一 Matcher 不可达时继续 fail closed，不能推断“没有订单”。
 7. 能证明所有旧 permit 要么未被接受且已 fencing，要么已重建为 reservation/position。
 
-因此异步模式是用更长 RTO、更低可用性和更复杂恢复换取少一次复制 RTT，不是免费优化。当前不用于跨产品 PM、高杠杆、巨鲸或复杂非线性组合。
+因此该模式不是降低数据完整性，而是把权威提交点移到 Matcher，并用更长 RTO、更低故障期可用性和更复杂恢复换取少一次复制 RTT。Matcher journal 不满足可靠接受语义前，必须使用 `FAST_RECOVERY`。
 
 ## 6. 爆仓系统不变量
 
@@ -194,7 +237,7 @@ Liquidation Executor 只能使用绑定 plan/version/instrument/side/max quantit
 
 - 到唯一 Risk Owner 的一次传输。
 - RiskGroup 内串行化与增量 PM 计算。
-- 默认模式的 reservation quorum commit。
+- 当前 durability mode 定义的一个可靠核心提交点。
 - Risk Owner 到 Matcher 的一次传输。
 
 必须消除的成本：
@@ -252,6 +295,8 @@ Batch permit 必须限定单个 Matcher/产品、总数量、价格范围、有�
 ### 正确性
 
 - Accepted/Fill/Cancel/Reject/Expire 任意重复、乱序后资金守恒。
+- WebSocket 随机丢失、重复和断线后，客户端能以 sequence + REST snapshot/query 恢复一致状态。
+- `accepted` 响应前订单已进入当前模式定义的权威提交点。
 - 旧 epoch permit 永远不能进入 Matcher。
 - replay 得到完全一致的余额、仓位、reservation 和 liquidation state。
 - 任意时点 kill -9 不会双重预留、双重释放或盲目继续爆仓。
@@ -281,6 +326,7 @@ matcher_to_ack
 
 - 对 reservation 创建前后、permit dispatch 前后、Accepted/Fill 前后执行故障注入。
 - 同步模式下已签发 permit 的 reservation RPO 为零。
+- `LATENCY_FIRST` 故障后必须冻结整个 shard；所有 Matcher/Ledger barrier 完成前不得恢复新增风险。
 - 接管期间可以拒绝新增风险，但不能乐观放行。
 - Aeron sequence gap 必须补齐或冻结对应 shard。
 
@@ -289,9 +335,10 @@ matcher_to_ack
 1. 先维护逻辑所有权不变量，再讨论部署位置。
 2. 不要把 Product Desk、Risk Owner、Matcher 或 Ledger 的权威性混在一起。
 3. 新方案必须说明 reservation 在何时达到 commit point。
-4. 新增低延迟优化必须说明断线、迟到 Fill、leader crash 和 replay 行为。
-5. 涉及爆仓时必须同时计算所有 outstanding liquidation exposure。
-6. 性能比较必须与“现有非 owner counter-forward 路径”及“进程内最优路径”分别比较。
-7. 未通过真实基准和故障注入前，不把设计目标写成已达到的性能事实。
+4. 新方案必须区分权威事实、可重建状态、查询投影和 best-effort 通知。
+5. 新增低延迟优化必须说明断线、迟到 Fill、leader crash 和 replay 行为。
+6. 涉及爆仓时必须同时计算所有 outstanding liquidation exposure。
+7. 性能比较必须与“现有非 owner counter-forward 路径”及“进程内最优路径”分别比较。
+8. 未通过真实基准和故障注入前，不把设计目标写成已达到的性能事实。
 
 本记录若与 PM 总设计冲突，以更新日期更晚且经过明确评审的决策为准；修改结论时必须同步更新两份文档。

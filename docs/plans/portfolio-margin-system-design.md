@@ -286,14 +286,14 @@ Liquidation Coordinator 执行计划，但不单独拥有账户风险状态：
 
 ```text
 Risk Shard Leader
-  ├── synchronous WAL replica in the same AZ
+  ├── optional synchronous WAL replica in the same AZ
   ├── hot in-memory standby on another host
   └── asynchronous DR replica in another region
 ```
 
-真实资金环境推荐在签发 permit 前，至少把 reservation 日志同步到同 AZ standby。跨地域复制不进入订单热路径。
+系统不追求每条传播路径同步完整，而只要求订单、成交、Ledger 等权威事实可恢复。跨地域复制不进入订单热路径；同 AZ reservation 是否同步提交由 RiskGroup 的 durability mode 决定。
 
-批准路径按以下顺序执行：
+`FAST_RECOVERY` 模式按以下顺序执行：
 
 ```text
 apply reservation in leader memory
@@ -302,9 +302,13 @@ apply reservation in leader memory
   -> issue permit and dispatch directly to Matcher
 ```
 
-同步 quorum 是生产 PM 的默认模式。实现上对不同 RiskGroup 请求做流水线并行，不等待一批订单凑齐；standby 与 leader 优先部署在同 rack 的不同故障主机。目录和 epoch 由独立 quorum 管理，数据面仍保持每个 shard 单 leader，禁止 active-active 写入。
+它适用于高杠杆、巨鲸、复杂非线性组合、接近 MM 或 Liquidating 的账户。实现上对不同 RiskGroup 请求做流水线并行，不等待一批订单凑齐；standby 与 leader 优先部署在同 rack 的不同故障主机。
 
-异步 reservation 复制只有在 Matcher 能在订单进入订单簿前可靠记录完整 permit/order state，并且 failover 后冻结整个 Risk Shard、对所有 Matcher 与 Ledger 完成 epoch fence 和 recovery barrier 时，才可以保持偿付安全。它用更长 RTO 和更低可用性换取正常路径延迟，不作为跨产品 PM 第一版默认；任何目标 Matcher 不可达时都不能恢复新增风险。
+`LATENCY_FIRST` 模式只保留一个可靠核心提交点：Risk Leader 先在内存 reserve，Matcher 必须在订单可进入订单簿或成交前，把完整 permit、reservation 和 order state 写入其可靠顺序域；Risk standby 异步追平。这样避免 Risk quorum 与 Matcher commit 两次串行可靠性屏障。
+
+该模式只有在 Matcher journal/replication 已达到上述语义，并且 failover 后冻结整个 Risk Shard、对所有 Matcher 与 Ledger 完成 epoch fence 和 recovery barrier 时才安全。它用更长 RTO 和更低故障期可用性换取正常路径延迟；任何目标 Matcher 不可达时都不能恢复新增风险。
+
+durability mode 只能在 RiskGroup sequence barrier 上切换，切换事件写入 journal，禁止逐单临时选择。目录和 epoch 由独立 quorum 管理，数据面始终保持每个 shard 单 leader，禁止 active-active 写入。
 
 ### 6.2 日志记录
 
@@ -357,6 +361,19 @@ Reserved -> Dispatching -> Uncertain
 - Matcher 事件有 sequence gap：冻结受影响产品的新增风险并重放补洞。
 - leader 切换：提升 epoch，旧 leader 和旧未消费 permit 被 fencing。
 - 无法确认账户状态：进入 `Restricted`，不能乐观恢复额度。
+
+### 6.5 权威事实与客户端通知
+
+可靠性按语义分层：
+
+| 层级 | 数据 | 允许的行为 |
+|---|---|---|
+| 权威事实 | Matcher accepted/fill、Ledger、settlement、funding、insurance/ADL | 不允许最终丢失；必须可重放、去重、查询 |
+| 可重建状态 | Risk reservation/scenario/available-margin cache | 允许内存丢失；重建完成前 fail closed |
+| 查询投影 | PostgreSQL、Redis、报表和历史索引 | 允许短暂滞后；必须暴露或校验 high watermark |
+| 客户端通知 | Private WebSocket、订单/余额/爆仓提醒 | 允许断线、重复和缺失；通过 sequence、snapshot 和 REST reconciliation 恢复 |
+
+订单响应中的 `accepted` 必须表示订单已经进入某个可恢复的权威顺序域。WebSocket 推送、PostgreSQL/Redis 投影和报表不能阻塞撮合，也不能因为发送失败回滚订单。客户端使用幂等 `client_order_id`、事件 sequence 和查询 high watermark 检测缺口；REST 查询若尚未追平目标 watermark，必须明确返回 lag/重试语义，不能把旧投影伪装成最终状态。
 
 ## 7. RiskPermit 协议
 
@@ -1048,7 +1065,7 @@ src/bin/liquidation_coordinator.rs
 
 - 把同一 Risk Shard worker 移入独立 `pm-risk-node` 进程。
 - `desk-server -> pm-risk-node` 使用 Aeron IPC；协议和状态机保持不变。
-- Risk Node 独立绑核、内存预算、发布与重启；同步副本位于另一台故障主机。
+- Risk Node 独立绑核、内存预算、发布与重启；standby/replica 位于另一台故障主机。
 - 按 RiskGroup canary 迁移，禁止两个 RiskEngine 同时拥有写权限。
 
 验收：进程 kill -9 后可恢复；Desk 与 Risk Node 可独立升级；同机 sidecar 的 p99 额外成本在实测预算内。

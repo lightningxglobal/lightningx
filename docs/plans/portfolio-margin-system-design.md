@@ -4,10 +4,11 @@
 > 日期：2026-09-15
 > 范围：现货、永续、交割合约、RWA、Prediction Markets；跨 Desk、跨撮合引擎、跨服务器
 > 优先级：偿付能力与状态一致性优先，其次是延迟、吞吐和资金效率
+> 补充决策：[Portfolio Margin 多方架构评审决策记录](portfolio-margin-brainstorm-decisions.md)（2026-09-29）
 
 ## 1. 结论
 
-Portfolio Margin 不能继续作为 `desk-server` 内部的一个计算模块存在。目标系统必须把三种所有权解耦：
+Portfolio Margin 不能继续作为 `desk-server` 内部由 Product Desk 身份隐式拥有的计算模块存在。必须立即解耦逻辑所有权；进程和物理服务器的拆分按“进程内单写 Risk Shard → 同机 sidecar → 跨机 Risk Cluster”渐进实施。目标系统必须把三种所有权解耦：
 
 - 撮合所有权按 `instrument_id` 分片。
 - 风险所有权按 `risk_group_id` 分片。
@@ -41,7 +42,7 @@ Spot Matcher  Perp Matcher  Futures Matcher  RWA Matcher  Prediction Matcher
 
 撮合引擎不计算 PM。Matcher 只验证 RiskPermit、执行订单并产生有序事实事件。PM Risk Shard 是新增风险能否进入系统的唯一授权者。
 
-因此，对“PM 账户是否需要特殊 owner desk”的直接答案是：逻辑上需要唯一的风险 owner，物理上不应绑定任何产品 Desk。长期形态是独立的 `PM Risk Owner Shard`；Desk 只负责接入，批准后的订单由 Risk Owner 直接发给目标 Matcher。
+因此，对“PM 账户是否需要特殊 owner desk”的直接答案是：逻辑上需要唯一的风险 owner，物理上不应绑定任何产品 Desk。长期形态是独立的 `PM Risk Owner Shard`；过渡期可以由现有服务器承载该 shard，但其权威性来自 RiskShardDirectory 和 leader epoch，而不是 Desk 身份。Desk 只负责接入，批准后的订单由 Risk Owner 直接发给目标 Matcher。
 
 ## 2. 与参考架构的取舍
 
@@ -301,7 +302,9 @@ apply reservation in leader memory
   -> issue permit and dispatch directly to Matcher
 ```
 
-这一份同 AZ 副本确认是防止 leader 在 permit 发出后丢失 reservation 的必要成本，不能用异步复制换取表面延迟。实现上对不同 RiskGroup 请求做流水线并行，不等待一批订单凑齐；standby 与 leader 优先部署在同 rack 的不同故障主机。目录和 epoch 由独立 quorum 管理，数据面仍保持每个 shard 单 leader，禁止 active-active 写入。
+同步 quorum 是生产 PM 的默认模式。实现上对不同 RiskGroup 请求做流水线并行，不等待一批订单凑齐；standby 与 leader 优先部署在同 rack 的不同故障主机。目录和 epoch 由独立 quorum 管理，数据面仍保持每个 shard 单 leader，禁止 active-active 写入。
+
+异步 reservation 复制只有在 Matcher 能在订单进入订单簿前可靠记录完整 permit/order state，并且 failover 后冻结整个 Risk Shard、对所有 Matcher 与 Ledger 完成 epoch fence 和 recovery barrier 时，才可以保持偿付安全。它用更长 RTO 和更低可用性换取正常路径延迟，不作为跨产品 PM 第一版默认；任何目标 Matcher 不可达时都不能恢复新增风险。
 
 ### 6.2 日志记录
 
@@ -1033,14 +1036,30 @@ src/bin/liquidation_coordinator.rs
 
 验收：同一 RiskGroup 在任意 Desk 下单都只由一个 Risk Owner reserve；故障注入下无双花。
 
-### Phase 1：提取独立 PM Risk Node
+### Phase 1A：在 desk-server 内建立独立逻辑 Risk Shard
 
-- 从 desk-server 提取当前 RiskEngine。
-- Desk 改为 Risk Client。
-- 建立 leader/standby、journal、snapshot、epoch fencing。
+- 将当前共享 `RiskEngine` 改为单写 shard event loop，Desk 只能通过 RiskCheck 协议请求授权。
+- 建立 journal、snapshot、reservation、幂等、sequence 和 epoch fencing。
 - Matcher 强制要求 permit。
 
-验收：kill -9 leader 后从 standby 接管；不重复 fill、不丢 reservation、不错误释放 uncertain order。
+验收：即使物理上仍共进程，任意 Desk 并发下单也只有一个逻辑写者；重放结果一致；不重复 fill、不错误释放 uncertain order。
+
+### Phase 1B：同机 PM Risk sidecar
+
+- 把同一 Risk Shard worker 移入独立 `pm-risk-node` 进程。
+- `desk-server -> pm-risk-node` 使用 Aeron IPC；协议和状态机保持不变。
+- Risk Node 独立绑核、内存预算、发布与重启；同步副本位于另一台故障主机。
+- 按 RiskGroup canary 迁移，禁止两个 RiskEngine 同时拥有写权限。
+
+验收：进程 kill -9 后可恢复；Desk 与 Risk Node 可独立升级；同机 sidecar 的 p99 额外成本在实测预算内。
+
+### Phase 1C：按指标迁移到跨机 PM Risk Cluster
+
+- 仅在 PM 计算挤压 Desk、需要 whale 隔离、独立故障域或独立扩容时迁移。
+- 只改变 RiskShardDirectory 的物理 placement，不改变 RiskCheck/RiskPermit/MatcherEvent 协议。
+- Ingress 直接路由 Risk Leader，Risk Leader 直接投递 Matcher，不增加中心 Router 或 Product Desk 中转。
+
+验收：kill -9 leader 后从 standby 接管；同步模式不丢 reservation；完成 recovery barrier 前 fail closed；端到端仍满足产品 SLO。
 
 ### Phase 2：统一仓位和抵押物模型
 

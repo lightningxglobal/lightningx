@@ -142,6 +142,12 @@ exchange-engine
 | `journal-replicate` | Replicates journal streams for HA/replay experiments |
 | `journal-audit` | Audits journal output for sequence and replay consistency checks |
 
+Target HA v2 architecture and operations are defined in
+[`docs/plans/high-availability-system-design.md`](docs/plans/high-availability-system-design.md)
+and [`docs/ops/ha-v2-runbook.md`](docs/ops/ha-v2-runbook.md). These documents describe
+the planned three-replica quorum design; they do not claim that the current binaries
+already provide HA v2 commit semantics.
+
 ---
 
 ## Order Types

@@ -7,6 +7,7 @@
 > 补充决策：[Portfolio Margin 多方架构评审决策记录](portfolio-margin-brainstorm-decisions.md)（2026-09-29）
 > 设计背景：[交易核心与 Portfolio Margin 设计背景](portfolio-margin-design-background.md)（2026-09-29）
 > WAL 与标识：[交易 WAL、提交点与合约内订单 ID 设计](matching-wal-order-id-design.md)（2026-09-29）
+> 高可用：[LightningX 高可用与一致性系统设计](high-availability-system-design.md)（2026-09-30）
 
 ## 1. 结论
 

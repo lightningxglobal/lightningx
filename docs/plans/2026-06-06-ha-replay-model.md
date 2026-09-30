@@ -1,5 +1,9 @@
 # HA And Replay Model
 
+> Historical HA v1 design. The HA v2 target superseding its PostgreSQL-lease and
+> side-recording assumptions is [LightningX 高可用与一致性系统设计](high-availability-system-design.md).
+> Keep this document for implementation history; do not use it as the HA v2 acceptance baseline.
+
 This note defines the next production-hardening target after fixed-point accounts,
 sequenced private updates, matching event persistence, transactional pg-writer
 flush, STP, and price-band protection.

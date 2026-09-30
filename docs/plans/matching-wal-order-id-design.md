@@ -4,7 +4,7 @@
 >
 > 状态：Accepted，代码迁移实施基线
 >
-> 相关：[Portfolio Margin 系统设计](portfolio-margin-system-design.md)、[设计背景](portfolio-margin-design-background.md)、[多方评审决策](portfolio-margin-brainstorm-decisions.md)
+> 相关：[Portfolio Margin 系统设计](portfolio-margin-system-design.md)、[高可用与一致性系统设计](high-availability-system-design.md)、[设计背景](portfolio-margin-design-background.md)、[多方评审决策](portfolio-margin-brainstorm-decisions.md)
 
 ## 1. 决策摘要
 
